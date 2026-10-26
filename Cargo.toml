@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/protocol",
+  "crates/core",
+  "crates/metrics",
+  "crates/agent",
+  "crates/controller",
+  "crates/cli",
+  "crates/power-helper",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+
+[workspace.dependencies]
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "1.0.69"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
+unicode-width = "0.2.2"
+
+# macOS 27 dyld rejects stripped proc-macro dylibs with misaligned LINKEDIT
+# entries. Keep release build-time dependencies (including proc macros)
+# unstripped so release builds still work on that platform.
+[profile.release.build-override]
+strip = "none"

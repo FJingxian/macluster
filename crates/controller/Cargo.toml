@@ -1,0 +1,13 @@
+[package]
+name = "macluster-controller"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+macluster-core = { path = "../core" }
+macluster-metrics = { path = "../metrics" }
+macluster-protocol = { path = "../protocol" }
+libc.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

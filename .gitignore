@@ -1,0 +1,9 @@
+/target/
+**/controller.sqlite3
+**/agent-state.json
+**/*.log
+/docs/
+/.superpowers/
+/config/
+/.cargo/
+rust-toolchain.toml

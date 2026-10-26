@@ -1,0 +1,27 @@
+[package]
+name = "macluster-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "macluster_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "macluster"
+path = "src/main.rs"
+
+[dependencies]
+macluster-agent = { path = "../agent" }
+macluster-controller = { path = "../controller" }
+macluster-core = { path = "../core" }
+macluster-metrics = { path = "../metrics" }
+macluster-protocol = { path = "../protocol" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true

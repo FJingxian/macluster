@@ -1,0 +1,13 @@
+[package]
+name = "macluster-metrics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+macluster-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+macmon = { version = "0.10.0", default-features = false }

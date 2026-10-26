@@ -78,6 +78,22 @@ fn invalid_time_environment_and_duplicate_script_are_rejected() {
 }
 
 #[test]
+fn regression_double_quoted_declarations_preserve_spaces_and_backslashes() {
+    for (declaration, expected) in [
+        (r#"#MSUB -J "hello world""#, "hello world"),
+        (
+            r#"#MSUB -J "path\project with spaces""#,
+            r"path\project with spaces",
+        ),
+        (r#"#MSUB -J "say \"hello world\"""#, "say \"hello world\""),
+        (r#"#MSUB -J "$HOME literal""#, "$HOME literal"),
+    ] {
+        let options = parse_script_declarations(&format!("{declaration}\necho done\n")).unwrap();
+        assert_eq!(options.name.as_deref(), Some(expected));
+    }
+}
+
+#[test]
 fn script_declarations_are_literal_and_command_line_wins() {
     let declarations = parse_script_declarations("#MSUB -n 2\n").unwrap_err();
     assert!(

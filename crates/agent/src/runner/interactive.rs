@@ -321,6 +321,16 @@ pub(super) fn run_authorized(
     mut record: AgentRecord,
 ) -> Result<(), AgentError> {
     let shared_root = PathBuf::from(&record.shared_root).canonicalize()?;
+    if super::verbose_output_conflict(
+        &record,
+        &shared_root,
+        &[
+            Path::new(&record.spec.stdout_path),
+            Path::new(&record.spec.stderr_path),
+        ],
+    )? {
+        return super::fail_record(state_dir, record, super::RESERVED_VERBOSE_OUTPUT_ERROR);
+    }
     let output_roots = super::permitted_output_roots(&record, &shared_root)?;
     let local_dir = state_dir.join("jobs").join(job_id.to_string());
     fs::create_dir_all(&local_dir)?;
@@ -330,6 +340,9 @@ pub(super) fn run_authorized(
     let stderr_local = local_dir.join("stderr.log");
     let stdout_path = super::resolve_output(&record.spec.stdout_path, job_id, &output_roots)?;
     let stderr_path = super::resolve_output(&record.spec.stderr_path, job_id, &output_roots)?;
+    if super::verbose_output_conflict(&record, &shared_root, &[&stdout_path, &stderr_path])? {
+        return super::fail_record(state_dir, record, super::RESERVED_VERBOSE_OUTPUT_ERROR);
+    }
     if stdout_path == stderr_path {
         return super::fail_record(
             state_dir,

@@ -14,6 +14,8 @@ pub const EXPLICIT_TASK_PATH_ENV: &str = "MCLUSTER_INTERNAL_EXPLICIT_PATH";
 pub const VERBOSE_TASK_LOG_ENV: &str = "MCLUSTER_INTERNAL_VERBOSE_LOG";
 /// Visible shared root for the sidecar logs produced by verbose submissions.
 pub const VERBOSE_TASK_LOG_ROOT_ENV: &str = "MCLUSTER_INTERNAL_VERBOSE_LOG_ROOT";
+/// Sidecar names reserved inside each verbose task's shared job directory.
+pub const VERBOSE_TASK_LOG_FILES: &[&str] = &["monitor.log", "resources.jsonl", "summary.json"];
 /// Internal JobSpec value used to scope a node-local Cargo target cache.
 pub const ACTIVE_ENV_PREFIX_ENV: &str = "MCLUSTER_INTERNAL_ACTIVE_ENV_PREFIX";
 pub const NAMESPACED_JOBS_FEATURE: &str = "agent.namespaced-jobs.v1";
@@ -107,6 +109,94 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// Protect task metadata from user-selected stdout/stderr destinations.
+    /// Check numeric IDs and the submission template before an ID is allocated.
+    pub fn verbose_log_output_conflicts(
+        &self,
+        shared_root: &std::path::Path,
+        output: &std::path::Path,
+    ) -> bool {
+        if self.env.get(VERBOSE_TASK_LOG_ENV).map(String::as_str) != Some("1") {
+            return false;
+        }
+        let mut jobs = shared_root.join("jobs");
+        if let Some(namespace) = self.storage_namespace {
+            jobs.push(namespace.to_string());
+        }
+        let absolute;
+        let output = if output.is_absolute() {
+            output
+        } else {
+            absolute = shared_root.join(output);
+            &absolute
+        };
+        // Reserve case variants too: typical macOS volumes are case-insensitive,
+        // and canonicalize() does not normalize the spelling of every component.
+        let mut parts = output.components();
+        for expected in jobs.components() {
+            let Some(actual) = parts.next() else {
+                // An output file cannot replace a required metadata directory.
+                return true;
+            };
+            if !actual
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+            {
+                return false;
+            }
+        }
+        let Some(job_part) = parts.next() else {
+            return true;
+        };
+        let Some(job) = job_part.as_os_str().to_str() else {
+            return false;
+        };
+        if job != "%j" && job.parse::<u64>().is_err() {
+            return false;
+        }
+        match parts.next() {
+            None => true,
+            Some(part) => part.as_os_str().to_str().is_some_and(|name| {
+                VERBOSE_TASK_LOG_FILES
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            }),
+        }
+    }
+
+    /// Check a concrete job directory after resolving filesystem aliases.
+    pub fn verbose_log_output_conflicts_in(
+        &self,
+        directory: &std::path::Path,
+        output: &std::path::Path,
+    ) -> bool {
+        if self.env.get(VERBOSE_TASK_LOG_ENV).map(String::as_str) != Some("1") {
+            return false;
+        }
+        let mut parts = output.components();
+        for expected in directory.components() {
+            let Some(actual) = parts.next() else {
+                return true;
+            };
+            if !actual
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+            {
+                return false;
+            }
+        }
+        match parts.next() {
+            None => true,
+            Some(part) => part.as_os_str().to_str().is_some_and(|name| {
+                VERBOSE_TASK_LOG_FILES
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            }),
+        }
+    }
+
     pub fn shared_job_dir(&self, shared_root: &std::path::Path, job_id: u64) -> std::path::PathBuf {
         let root = shared_root.join("jobs");
         let root = match self.storage_namespace {

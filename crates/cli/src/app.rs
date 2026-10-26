@@ -927,6 +927,19 @@ fn build_submission(
         },
         snapshot: None,
     };
+    for output in [&spec.stdout_path, &spec.stderr_path] {
+        if [&shared_root, &config.shared_root]
+            .into_iter()
+            .any(|root| spec.verbose_log_output_conflicts(root, Path::new(output)))
+        {
+            return Err((
+                2,
+                format!(
+                    "output path {output} is reserved for verbose task logs; choose a different stdout/stderr path"
+                ),
+            ));
+        }
+    }
     Ok((spec, script))
 }
 
@@ -1052,20 +1065,11 @@ fn prepare_task_environment(
         .cloned()
         .collect::<Vec<_>>();
     task_env.extend(overrides);
-    let has_cc_flags = task_env.keys().any(|key| is_cc_rs_flags_variable(key));
-    let cc_shell_escaped_flags =
-        if let Some(value) = task_env.get("CC_SHELL_ESCAPED_FLAGS").cloned() {
-            !matches!(value.as_str(), "" | "0" | "false" | "no")
-        } else if has_cc_flags {
-            // remap_compiler_flags uses shell quoting so that values containing
-            // spaces survive the trip through the job record. Tell cc-rs to parse
-            // those flags with the same shell rules instead of splitting literally
-            // on whitespace.
-            task_env.insert("CC_SHELL_ESCAPED_FLAGS".into(), "1".into());
-            true
-        } else {
-            false
-        };
+    // Match cc-rs's source parser mode. Enabling shell parsing implicitly can
+    // remove literal quotes from string macros that compiled on the login Mac.
+    let cc_shell_escaped_flags = task_env
+        .get("CC_SHELL_ESCAPED_FLAGS")
+        .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no"));
     if explicit_path {
         task_env.insert(EXPLICIT_TASK_PATH_ENV.into(), "1".into());
     }
@@ -1832,6 +1836,8 @@ fn remap_compiler_flags(
     // quotes. In particular, --cfg name="value" must keep its double quotes.
     let words = if rustflags {
         value.split_whitespace().map(str::to_owned).collect()
+    } else if is_cc_rs_flags_variable(key) && !cc_shell_escaped_flags {
+        value.split_ascii_whitespace().map(str::to_owned).collect()
     } else {
         tokenize_shell_words(value).map_err(|_| {
             (
@@ -2311,27 +2317,25 @@ fn validate_shared_output_path(
     } else {
         submitter_cwd.join(path)
     };
-    let checked = absolute.to_string_lossy().replace("%j", "0");
-    let checked = PathBuf::from(checked);
-    if checked
+    if absolute
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
         return Err((2, "output path cannot contain '..'".into()));
     }
-    let parent = checked
+    let parent = absolute
         .parent()
         .ok_or_else(|| (2, "output path must name a file".into()))?;
     let file_name = absolute
         .file_name()
         .ok_or_else(|| (2, "output path must name a file".into()))?;
-    let canonical_parent = parent.canonicalize().map_err(|error| {
+    // Keep job-ID templates intact, and resolve the existing ancestor without
+    // creating directories on the submitter. The Agent expands and checks the
+    // concrete path before it creates the task's output directory.
+    let canonical_parent = canonicalize_with_missing_suffix(parent).ok_or_else(|| {
         (
             2,
-            format!(
-                "output directory {} must exist and resolve: {error}",
-                parent.display()
-            ),
+            format!("cannot resolve output directory {}", parent.display()),
         )
     })?;
     let normalized = canonical_parent.join(file_name);
@@ -2633,7 +2637,15 @@ fn stream_job_log(
             if count == 0 {
                 break;
             }
-            if line.contains("] [stderr]") || line.contains("] [stderr:continued]") {
+            let is_stderr = line
+                .strip_prefix('[')
+                .and_then(|line| line.split_once("] ["))
+                .is_some_and(|(header, rest)| {
+                    header.contains(" / MEM ")
+                        && header.contains(" / CPU ")
+                        && (rest.starts_with("stderr] ") || rest.starts_with("stderr:continued] "))
+                });
+            if is_stderr {
                 stdout
                     .write_all(line.as_bytes())
                     .map_err(|error| (1, error.to_string()))?;
@@ -5034,7 +5046,7 @@ mod tests {
     }
 
     #[test]
-    fn msub_enables_shell_parsing_for_remapped_cc_flags() {
+    fn msub_preserves_explicit_shell_parsing_for_remapped_cc_flags() {
         let root = std::env::temp_dir().join(format!(
             "macluster-cc-flags-{}-{}",
             std::process::id(),
@@ -5044,6 +5056,7 @@ mod tests {
         let environment = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("CFLAGS".into(), "-DNAME='Hello World'".into()),
+            ("CC_SHELL_ESCAPED_FLAGS".into(), "1".into()),
         ]);
 
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
@@ -5057,7 +5070,7 @@ mod tests {
     }
 
     #[test]
-    fn msub_rejects_spaced_cc_flags_when_shell_parsing_is_disabled() {
+    fn msub_preserves_whitespace_split_cc_flags_when_shell_parsing_is_disabled() {
         let root = std::env::temp_dir().join(format!(
             "macluster-cc-flags-disabled-{}-{}",
             std::process::id(),
@@ -5070,10 +5083,9 @@ mod tests {
             ("CXXFLAGS".into(), "-DNAME='Hello World'".into()),
         ]);
 
-        let error = prepare_task_environment(&config, environment, BTreeMap::new())
-            .expect_err("cc-rs cannot preserve a spaced flag with whitespace splitting");
-
-        assert!(error.1.contains("CC_SHELL_ESCAPED_FLAGS"), "{error:?}");
+        let mapped = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
+        assert_eq!(mapped["CC_SHELL_ESCAPED_FLAGS"], "0");
+        assert_eq!(mapped["CXXFLAGS"], "-DNAME='Hello World'");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5177,6 +5189,152 @@ mod tests {
                     .to_string()
             ]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_cc_flags_preserve_the_source_parser_and_string_macros() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let root = std::env::temp_dir().join(format!("macluster-cc-macros-{}", Id128::random()));
+        let (config, _, _) = environment_fixture(&root, &root.join("software"));
+        for key in ["CFLAGS", "CXXFLAGS", "CFLAGS_aarch64_apple_darwin"] {
+            for mode in [None, Some("0"), Some("false"), Some("1")] {
+                let flags = if mode == Some("1") {
+                    r#"-DMESSAGE="\"hello world\"""#
+                } else {
+                    r#"-DMESSAGE="hello""#
+                };
+                let mut env = BTreeMap::from([
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (key.into(), flags.into()),
+                ]);
+                if let Some(mode) = mode {
+                    env.insert("CC_SHELL_ESCAPED_FLAGS".into(), mode.into());
+                }
+                let mapped = prepare_task_environment(&config, env, BTreeMap::new()).unwrap();
+                let shell_mode = mapped
+                    .get("CC_SHELL_ESCAPED_FLAGS")
+                    .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no"));
+                let args = if shell_mode {
+                    super::tokenize_shell_words(&mapped[key]).unwrap()
+                } else {
+                    mapped[key]
+                        .split_ascii_whitespace()
+                        .map(str::to_owned)
+                        .collect()
+                };
+                let mut child = Command::new("/usr/bin/cc")
+                    .args([
+                        "-x",
+                        if key == "CXXFLAGS" { "c++" } else { "c" },
+                        "-fsyntax-only",
+                    ])
+                    .args(&args)
+                    .arg("-")
+                    .stdin(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"const char *message = MESSAGE;\n")
+                    .unwrap();
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{key} mode={mode:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(
+                    mapped.get("CC_SHELL_ESCAPED_FLAGS").map(String::as_str),
+                    mode
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_custom_verbose_output_preserves_job_template() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-output-template-{}", Id128::random()));
+        let (config, shared, _) = environment_fixture(&root, &root.join("software"));
+        let output = shared.join("logs/%j/monitor.log");
+        let options = crate::arguments::SubmitOptions {
+            verbose: true,
+            wrap: Some("echo done".into()),
+            cwd: Some(shared.clone()),
+            stdout_path: Some(output.clone()),
+            env: BTreeMap::from([
+                ("CONDA_PREFIX".into(), "".into()),
+                ("VIRTUAL_ENV".into(), "".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ]),
+            ..Default::default()
+        };
+        let (spec, _) = build_submission(&config, &options).unwrap();
+        assert_eq!(Path::new(&spec.stdout_path), output);
+        assert!(!shared.join("logs").exists());
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, shared.join("escape")).unwrap();
+        let mut invalid = options;
+        invalid.stdout_path = Some(shared.join("escape/missing/monitor.log"));
+        let error = match build_submission(&config, &invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("an output directory symlink must not escape the share"),
+        };
+        assert!(error.1.contains("inside"), "{error:?}");
+        assert!(!outside.join("missing").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn regression_verbose_submission_rejects_reserved_sidecar_outputs() {
+        let root = std::env::temp_dir().join(format!("macluster-log-reserved-{}", Id128::random()));
+        let (config, shared, _) = environment_fixture(&root, &root.join("software"));
+        let jobs = shared.join("jobs").join(&config.share_uuid);
+        fs::create_dir_all(jobs.join("0")).unwrap();
+        fs::create_dir_all(jobs.join("1")).unwrap();
+        for interactive in [false, true] {
+            for path in [
+                jobs.join("%j/monitor.log"),
+                jobs.join("1/resources.jsonl"),
+                jobs.join("%j/summary.json"),
+                jobs.join("1/MONITOR.LOG"),
+                shared
+                    .join("JOBS")
+                    .join(config.share_uuid.to_uppercase())
+                    .join("%j/SUMMARY.JSON"),
+                jobs.join("%j"),
+                jobs.clone(),
+                shared.join("jobs"),
+            ] {
+                let options = crate::arguments::SubmitOptions {
+                    verbose: true,
+                    interactive,
+                    wrap: Some("echo done".into()),
+                    cwd: Some(shared.clone()),
+                    stdout_path: Some(path),
+                    env: BTreeMap::from([
+                        ("CONDA_PREFIX".into(), "".into()),
+                        ("VIRTUAL_ENV".into(), "".into()),
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                    ]),
+                    ..Default::default()
+                };
+                let error = match build_submission(&config, &options) {
+                    Err(error) => error,
+                    Ok(_) => panic!("reserved sidecar output must be rejected before submission"),
+                };
+                assert!(error.1.contains("reserved"), "{error:?}");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

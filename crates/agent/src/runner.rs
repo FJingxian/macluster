@@ -36,13 +36,15 @@ use macluster_protocol::{
     framing::sha256_hex,
     identifiers::{Id128, StartToken},
     types::{
-        ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase, VERBOSE_TASK_LOG_ENV,
+        ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase,
+        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_FILES,
     },
 };
 
 use crate::{AgentError, AgentRecord, active_record, local_script_path, write_active};
 
 const BASE_TASK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+const RESERVED_VERBOSE_OUTPUT_ERROR: &str = "task output path is reserved for verbose task logs; choose a different stdout/stderr destination";
 const TASK_GATE_SCRIPT: &str = "gate=$1; shift; tries=0; while [ ! -e \"$gate\" ]; do tries=$((tries + 1)); [ \"$tries\" -lt 1000 ] || exit 125; /bin/sleep 0.01; done; /bin/rm -f \"$gate\"; exec \"$@\"";
 
 pub fn run(state_dir: &Path, job_id: u64, token: StartToken) -> Result<(), AgentError> {
@@ -74,6 +76,16 @@ fn run_authorized(
         return interactive::run_authorized(state_dir, job_id, token, record);
     }
     let shared_root = PathBuf::from(&record.shared_root).canonicalize()?;
+    if verbose_output_conflict(
+        &record,
+        &shared_root,
+        &[
+            Path::new(&record.spec.stdout_path),
+            Path::new(&record.spec.stderr_path),
+        ],
+    )? {
+        return fail_record(state_dir, record, RESERVED_VERBOSE_OUTPUT_ERROR);
+    }
     let output_roots = permitted_output_roots(&record, &shared_root)?;
     let local_dir = state_dir.join("jobs").join(job_id.to_string());
     fs::create_dir_all(&local_dir)?;
@@ -82,6 +94,9 @@ fn run_authorized(
     let stderr_local = local_dir.join("stderr.log");
     let stdout_path = resolve_output(&record.spec.stdout_path, job_id, &output_roots)?;
     let stderr_path = resolve_output(&record.spec.stderr_path, job_id, &output_roots)?;
+    if verbose_output_conflict(&record, &shared_root, &[&stdout_path, &stderr_path])? {
+        return fail_record(state_dir, record, RESERVED_VERBOSE_OUTPUT_ERROR);
+    }
     if stdout_path == stderr_path {
         return fail_record(
             state_dir,
@@ -888,6 +903,27 @@ fn permitted_output_roots(
     Ok(roots)
 }
 
+fn project_output_directory(path: &Path) -> Result<PathBuf, AgentError> {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        suffix.push(
+            ancestor
+                .file_name()
+                .ok_or_else(|| AgentError::State("output parent cannot be resolved".into()))?
+                .to_os_string(),
+        );
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| AgentError::State("output parent cannot be resolved".into()))?;
+    }
+    let mut projected = ancestor.canonicalize()?;
+    for component in suffix.iter().rev() {
+        projected.push(component);
+    }
+    Ok(projected)
+}
+
 fn resolve_output(
     path: &str,
     job_id: u64,
@@ -913,23 +949,7 @@ fn resolve_output(
     let parent = absolute
         .parent()
         .ok_or_else(|| AgentError::State("output path has no parent".into()))?;
-    let mut ancestor = parent;
-    let mut suffix = Vec::new();
-    while !ancestor.exists() {
-        suffix.push(
-            ancestor
-                .file_name()
-                .ok_or_else(|| AgentError::State("output parent cannot be resolved".into()))?
-                .to_os_string(),
-        );
-        ancestor = ancestor
-            .parent()
-            .ok_or_else(|| AgentError::State("output parent cannot be resolved".into()))?;
-    }
-    let mut projected_parent = ancestor.canonicalize()?;
-    for component in suffix.iter().rev() {
-        projected_parent.push(component);
-    }
+    let projected_parent = project_output_directory(parent)?;
     if !shared_roots
         .iter()
         .any(|root| projected_parent.starts_with(root))
@@ -991,14 +1011,9 @@ pub(super) fn sync_pending_logs(
         .is_some_and(|value| value == "1")
     {
         let job_dir = record.spec.shared_job_dir(&shared_root, record.job_id);
-        let destinations = [
-            ("monitor.log", "monitor.log"),
-            ("resources.jsonl", "resources.jsonl"),
-            ("summary.json", "summary.json"),
-        ];
-        for (local_name, shared_name) in destinations {
-            let local = local_job_dir.join(local_name);
-            let requested = job_dir.join(shared_name);
+        for name in VERBOSE_TASK_LOG_FILES {
+            let local = local_job_dir.join(name);
+            let requested = job_dir.join(name);
             let shared = resolve_output(&requested.to_string_lossy(), record.job_id, &output_roots)
                 .map_err(|error| io::Error::other(error.to_string()))?;
             publish_sidecar_atomically(&local, &shared, &mut progress)?;
@@ -1385,6 +1400,58 @@ fn continuous_time_ns() -> u128 {
     START.get_or_init(Instant::now).elapsed().as_nanos()
 }
 
+fn verbose_output_conflict(
+    record: &AgentRecord,
+    shared_root: &Path,
+    outputs: &[&Path],
+) -> Result<bool, AgentError> {
+    if record
+        .spec
+        .env
+        .get(VERBOSE_TASK_LOG_ENV)
+        .map(String::as_str)
+        != Some("1")
+    {
+        return Ok(false);
+    }
+    if outputs.iter().any(|output| {
+        [shared_root, Path::new(&record.shared_root)]
+            .into_iter()
+            .any(|root| record.spec.verbose_log_output_conflicts(root, output))
+    }) {
+        return Ok(true);
+    }
+    let directory =
+        project_output_directory(&record.spec.shared_job_dir(shared_root, record.job_id))?;
+    for output in outputs {
+        let expanded = PathBuf::from(
+            output
+                .to_string_lossy()
+                .replace("%j", &record.job_id.to_string()),
+        );
+        let absolute = if expanded.is_absolute() {
+            expanded
+        } else {
+            shared_root.join(expanded)
+        };
+        let parent = absolute
+            .parent()
+            .ok_or_else(|| AgentError::State("output path has no parent".into()))?;
+        let projected = project_output_directory(parent)?.join(
+            absolute
+                .file_name()
+                .ok_or_else(|| AgentError::State("output path has no filename".into()))?,
+        );
+        if record
+            .spec
+            .verbose_log_output_conflicts_in(&directory, &projected)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn fail_record(state_dir: &Path, mut record: AgentRecord, reason: &str) -> Result<(), AgentError> {
     record.phase = RuntimePhase::Idle;
     record.terminal_state = Some(JobState::Failed);
@@ -1748,6 +1815,125 @@ mod tests {
         };
         crate::write_store(&state_dir, &store).unwrap();
         (root, state_dir, token)
+    }
+
+    #[test]
+    fn regression_verbose_output_collision_is_rejected_without_pending_sync() {
+        for (path, stderr) in [
+            ("monitor.log", false),
+            ("resources.jsonl", true),
+            ("summary.json", false),
+            ("monitor.log/child.log", false),
+            ("MONITOR.LOG", false),
+            ("", false),
+        ] {
+            let (root, state_dir, token) =
+                ready_state("#!/bin/sh\necho task-ran > started\n", None);
+            let mut record = crate::active_record(&state_dir, 1, token).unwrap();
+            record
+                .spec
+                .env
+                .insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
+            if path.is_empty() {
+                record.spec.stderr_path = root
+                    .join("shared/projects/custom.stderr")
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            let output = record
+                .spec
+                .shared_job_dir(&root.join("shared"), 1)
+                .join(path)
+                .to_string_lossy()
+                .into_owned();
+            if stderr {
+                record.spec.stderr_path = output;
+            } else {
+                record.spec.stdout_path = output;
+            }
+            crate::write_active(&state_dir, record).unwrap();
+            run(&state_dir, 1, token).unwrap();
+            let record = crate::active_record(&state_dir, 1, token).unwrap();
+            let started = root.join("shared/projects/started").exists();
+            fs::remove_dir_all(root).unwrap();
+            assert_eq!(record.terminal_state, Some(JobState::Failed));
+            assert!(
+                record
+                    .end_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("reserved")
+            );
+            assert!(!record.log_sync_pending);
+            assert!(!started);
+        }
+    }
+
+    #[test]
+    fn regression_verbose_output_collision_through_metadata_alias_is_rejected() {
+        for job_alias in [false, true] {
+            let (root, state_dir, token) =
+                ready_state("#!/bin/sh\necho task-ran > started\n", None);
+            let shared = root.join("shared");
+            let target = shared.join("logdata");
+            fs::create_dir(&target).unwrap();
+            if job_alias {
+                fs::create_dir(shared.join("jobs")).unwrap();
+                std::os::unix::fs::symlink(&target, shared.join("jobs/1")).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&target, shared.join("jobs")).unwrap();
+            }
+            let mut record = crate::active_record(&state_dir, 1, token).unwrap();
+            record
+                .spec
+                .env
+                .insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
+            record.spec.stdout_path = target
+                .join(if job_alias {
+                    "monitor.log"
+                } else {
+                    "1/monitor.log"
+                })
+                .to_string_lossy()
+                .into_owned();
+            crate::write_active(&state_dir, record).unwrap();
+            run(&state_dir, 1, token).unwrap();
+            let record = crate::active_record(&state_dir, 1, token).unwrap();
+            let started = shared.join("projects/started").exists();
+            fs::remove_dir_all(root).unwrap();
+            assert_eq!(record.terminal_state, Some(JobState::Failed));
+            assert!(!record.log_sync_pending);
+            assert!(!started);
+        }
+    }
+
+    #[test]
+    fn verbose_custom_output_name_outside_metadata_publishes_normally() {
+        let (root, state_dir, token) = ready_state("#!/bin/sh\necho log-content\n", None);
+        let mut record = crate::active_record(&state_dir, 1, token).unwrap();
+        record
+            .spec
+            .env
+            .insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
+        let output = root.join("shared/projects/monitor.log");
+        record.spec.stdout_path = output.to_string_lossy().into_owned();
+        crate::write_active(&state_dir, record).unwrap();
+        run(&state_dir, 1, token).unwrap();
+        let record = crate::active_record(&state_dir, 1, token).unwrap();
+        assert_eq!(record.terminal_state, Some(JobState::Completed));
+        publish_logs_for_test(&state_dir, record).unwrap();
+        assert!(
+            !crate::active_record(&state_dir, 1, token)
+                .unwrap()
+                .log_sync_pending
+        );
+        assert_eq!(fs::read_to_string(output).unwrap(), "log-content\n");
+        assert!(
+            fs::read_to_string(root.join("shared/jobs/1/monitor.log"))
+                .unwrap()
+                .contains("[stdout] log-content")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

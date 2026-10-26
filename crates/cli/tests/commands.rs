@@ -19,6 +19,69 @@ use macluster_protocol::framing::sha256_hex;
 use macluster_protocol::types::JobState;
 
 #[test]
+fn regression_stderr_filter_ignores_stream_markers_in_stdout_body() {
+    use macluster_protocol::{
+        identifiers::{NodeId, RequestId},
+        types::JobSpec,
+    };
+    let (root, shared, config) = fixture();
+    let state = root.join("controller");
+    let storage = Storage::open(&state).unwrap();
+    let snapshot = storage.stage_snapshot(b"echo done\n").unwrap();
+    let spec: JobSpec = serde_json::from_value(serde_json::json!({
+        "queue":"mini01", "node":null, "name":"filter", "cwd":shared,
+        "stdout_path":shared.join("jobs/1/stdout.log"), "stderr_path":shared.join("jobs/1/stderr.log"),
+        "walltime_secs":null, "snapshot":snapshot, "mode":"batch",
+        "env":{"MCLUSTER_INTERNAL_VERBOSE_LOG":"1", "MCLUSTER_INTERNAL_VERBOSE_LOG_ROOT":shared}
+    })).unwrap();
+    let job = storage.submit_once(RequestId::random(), spec).unwrap();
+    storage
+        .reserve_job(job.id, NodeId::new("mini01-a").unwrap())
+        .unwrap();
+    storage.mark_running(job.id).unwrap();
+    storage
+        .finish_job(job.id, JobState::Completed, Some(0), None)
+        .unwrap();
+    drop(storage);
+    let dir = shared.join("jobs/1");
+    fs::create_dir_all(&dir).unwrap();
+    let ordinary =
+        "[2026-10-26T12:00:00.000+08:00 / MEM 0.01GiB / CPU 1.0%] [stdout] body ] [stderr] fake\n";
+    let error = "[2026-10-26T12:00:00.000+08:00 / MEM 0.01GiB / CPU 1.0%] [stderr] actual error\n";
+    let continued =
+        "[2026-10-26T12:00:00.000+08:00 / MEM 0.01GiB / CPU 1.0%] [stderr:continued] tail\n";
+    fs::write(
+        dir.join("monitor.log"),
+        format!("{ordinary}{error}{continued}"),
+    )
+    .unwrap();
+    fs::write(dir.join("summary.json"), "{\"annotation_failed\":null}").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "mjob",
+            "--log",
+            "1",
+            "--stderr",
+        ])
+        .output()
+        .unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(result.stdout).unwrap(),
+        format!("{error}{continued}")
+    );
+}
+
+#[test]
 fn capabilities_report_primary_storage_source_support() {
     let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
         .args(["internal", "capabilities", "--json"])

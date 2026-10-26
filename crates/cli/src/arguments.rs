@@ -278,8 +278,13 @@ fn tokenize_declaration(input: &str) -> Result<Vec<String>, CliError> {
     let mut escaped = false;
     for character in input.chars() {
         if escaped {
-            token.push(character);
-            token_started = true;
+            if quote == Quote::Double && !matches!(character, '"' | '\\' | '$' | '`' | '\n') {
+                token.push('\\');
+            }
+            if character != '\n' {
+                token.push(character);
+                token_started = true;
+            }
             escaped = false;
             continue;
         }
@@ -296,7 +301,7 @@ fn tokenize_declaration(input: &str) -> Result<Vec<String>, CliError> {
             }
             (Quote::Single, _) => token.push(character),
             (Quote::Double, '\\') | (Quote::None, '\\') => escaped = true,
-            (Quote::Double | Quote::None, c) if c.is_whitespace() => {
+            (Quote::None, c) if c.is_whitespace() => {
                 if token_started {
                     result.push(std::mem::take(&mut token));
                     token_started = false;

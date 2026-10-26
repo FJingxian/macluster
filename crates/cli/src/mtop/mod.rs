@@ -13,7 +13,7 @@ mod ui_tests;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
-    sync::Once,
+    sync::{Once, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +39,16 @@ const EVENT_POLL: Duration = Duration::from_millis(100);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const ONE_SHOT_DEADLINE: Duration = Duration::from_secs(10);
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
+
+pub(crate) enum MtopPostAction {
+    CheckBuilds(crate::node_admin::AgentBuildCompatibility),
+    RecoverMaintenance,
+}
+
+enum StartupValidation {
+    Builds(crate::node_admin::AgentBuildCompatibility),
+    RecoverMaintenance,
+}
 
 fn now_unix_ms() -> u64 {
     SystemTime::now()
@@ -132,9 +142,10 @@ pub(crate) fn sample_one_shot(
 pub fn run_interactive(
     config: ClusterConfig,
     state_dir: PathBuf,
+    config_path: PathBuf,
     selected_queue: Option<String>,
     no_color: bool,
-) -> Result<(), String> {
+) -> Result<Option<MtopPostAction>, String> {
     static PANIC_HOOK: Once = Once::new();
     PANIC_HOOK.call_once(install_panic_restore_hook);
 
@@ -147,7 +158,7 @@ pub fn run_interactive(
         host: local_node
             .map(|node| node.host.clone())
             .unwrap_or_else(|| "localhost".into()),
-        machine_uuid: local_machine_uuid(),
+        machine_uuid: local_node.and_then(|node| node.machine_uuid.clone()),
     };
     let configured = configured_node_identities(&config);
     let identities = display_node_identities(&login, &configured, queue_filter);
@@ -192,6 +203,7 @@ pub fn run_interactive(
             .unwrap_or_else(|| "all queues".into()),
     );
     state.no_color = no_color;
+    state.status_message = Some("Agent validation: CHECKING all configured nodes".into());
     state.job_store_error = Some("reading local task database".into());
     state.nodes = identities
         .iter()
@@ -211,13 +223,44 @@ pub fn run_interactive(
     let mut process_caches: BTreeMap<String, ProcessCache> = BTreeMap::new();
     let mut process_selection: Option<String> = None;
     let mut next_process_sample = Instant::now();
-    let jobs = JobPoller::spawn(state_dir);
+    let jobs = JobPoller::spawn(state_dir.clone());
     let mut caches: BTreeMap<String, NodeMetricCache> = BTreeMap::new();
     let mut histories: BTreeMap<String, CpuHistory> = BTreeMap::new();
     let mut auto_round: Option<VecDeque<String>> = Some(target_ids.iter().cloned().collect());
     let mut manual_round: Option<VecDeque<String>> = None;
     let mut next_sample = Instant::now() + SAMPLE_INTERVAL;
     let mut status_message: Option<String> = None;
+    let (validation_tx, validation_rx) = mpsc::sync_channel(1);
+    let validation_config = config.clone();
+    let validation_state_dir = state_dir.clone();
+    let validation_config_path = config_path.clone();
+    thread::Builder::new()
+        .name("mtop-agent-validation".into())
+        .spawn(move || {
+            let result = (|| {
+                let node_recovery = crate::node_admin::node_admin_recovery_pending(
+                    &validation_config_path,
+                    &validation_state_dir,
+                )?;
+                let update_recovery = crate::node_admin::agent_update_recovery_pending(
+                    &validation_config_path,
+                    &validation_state_dir,
+                )?;
+                if node_recovery || update_recovery {
+                    return Ok(StartupValidation::RecoverMaintenance);
+                }
+                crate::node_admin::configured_agent_build_compatibility_cached(
+                    &validation_config,
+                    &validation_state_dir.join("mtop-cache"),
+                )
+                .map(StartupValidation::Builds)
+                .map_err(|(_, error)| error)
+            })();
+            let _ = validation_tx.send(result);
+        })
+        .map_err(|error| format!("could not start background Agent validation: {error}"))?;
+    let mut validation_finished = false;
+    let mut post_action = None;
     let mut last_draw = Instant::now() - REDRAW_INTERVAL;
     let mut next_age_tick = Instant::now() + Duration::from_secs(1);
     let mut dirty = true;
@@ -227,6 +270,41 @@ pub fn run_interactive(
     let result = (|| {
         loop {
             let now = Instant::now();
+            if !validation_finished {
+                match validation_rx.try_recv() {
+                    Ok(Ok(StartupValidation::RecoverMaintenance)) => {
+                        validation_finished = true;
+                        state.status_message = Some(
+                            "Agent maintenance recovery required; leaving mtop to resume it".into(),
+                        );
+                        post_action = Some(MtopPostAction::RecoverMaintenance);
+                        break;
+                    }
+                    Ok(Ok(StartupValidation::Builds(compatibility))) => {
+                        validation_finished = true;
+                        if compatibility.requires_update() {
+                            post_action = Some(MtopPostAction::CheckBuilds(compatibility));
+                            break;
+                        }
+                        status_message = Some(format!(
+                            "Agent validation complete: {} current, {} unknown/offline",
+                            compatibility.current.len(),
+                            compatibility.unknown.len()
+                        ));
+                        post_action = Some(MtopPostAction::CheckBuilds(compatibility));
+                    }
+                    Ok(Err(error)) => {
+                        validation_finished = true;
+                        status_message = Some(format!("Agent validation failed: {error}"));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        validation_finished = true;
+                        status_message =
+                            Some("Agent validation worker stopped unexpectedly".into());
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
             if state.refresh_requested {
                 state.refresh_requested = false;
                 enqueue_manual_refresh(&mut manual_round, &target_ids);
@@ -391,7 +469,7 @@ pub fn run_interactive(
     match (result, restore) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => Ok(post_action),
     }
 }
 
@@ -528,25 +606,4 @@ mod scheduling_tests {
 
         assert_eq!(round.unwrap().into_iter().collect::<Vec<_>>(), ["b", "c"]);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn local_machine_uuid() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/ioreg")
-        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .find(|line| line.contains("IOPlatformUUID"))
-        .and_then(|line| line.rsplit_once('=').map(|(_, value)| value.trim()))
-        .map(|value| value.trim_matches('"').trim().to_ascii_lowercase())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn local_machine_uuid() -> Option<String> {
-    None
 }

@@ -38,6 +38,18 @@ fn submission_parses_queue_node_parallel_settings_and_time() {
 }
 
 #[test]
+fn verbose_task_logging_is_opt_in() {
+    let ordinary = parse_submit_args(["echo", "done"]).unwrap();
+    assert!(!ordinary.verbose);
+
+    let short = parse_submit_args(["-v", "echo", "done"]).unwrap();
+    assert!(short.verbose);
+
+    let long = parse_submit_args(["--verbose", "job.sh"]).unwrap();
+    assert!(long.verbose);
+}
+
+#[test]
 fn core_and_memory_request_flags_are_rejected_explicitly() {
     assert!(matches!(
         parse_submit_args(["-q", "mini01", "-n", "4", "job.sh"]),

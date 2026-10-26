@@ -341,11 +341,22 @@ pub(super) fn run_authorized(
         return super::fail_record(state_dir, record, "output path already exists");
     }
 
-    let mut stdout_log = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&stdout_local)?;
+    let verbose_logs = record
+        .spec
+        .env
+        .get(macluster_protocol::types::VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1");
+    let mut stdout_log = if verbose_logs {
+        None
+    } else {
+        Some(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&stdout_local)?,
+        )
+    };
     let stderr_log = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -419,9 +430,35 @@ pub(super) fn run_authorized(
         }
     };
     let child_pid = child.id();
+    let mut log_session = if verbose_logs {
+        match super::task_logs::TaskLogSession::start_pty(
+            &local_dir,
+            record.controller.controller_uuid.to_string(),
+            record.share_uuid.clone(),
+            job_id,
+            token,
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                super::signal_group(child_pid, libc::SIGKILL);
+                let _ = child.wait();
+                let _ = fs::remove_file(&socket_path);
+                return super::fail_record(
+                    state_dir,
+                    record,
+                    &format!("could not start verbose PTY logging: {error}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let Some(child_start_id) = crate::wait_for_process_start_identity(child_pid) else {
         super::signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         let _ = fs::remove_file(&socket_path);
         return super::fail_record(
             state_dir,
@@ -435,12 +472,18 @@ pub(super) fn run_authorized(
     if let Err(error) = crate::write_active(state_dir, record.clone()) {
         super::signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         let _ = fs::remove_file(&socket_path);
         return Err(error);
     }
     if let Err(error) = super::release_task_gate(&gate_path) {
         super::signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         let _ = fs::remove_file(&gate_path);
         let _ = fs::remove_file(&socket_path);
         return super::fail_record(
@@ -455,7 +498,8 @@ pub(super) fn run_authorized(
         &mut child,
         &mut master,
         &mut attachment,
-        &mut stdout_log,
+        stdout_log.as_mut(),
+        log_session.as_mut(),
         job_id,
         token,
         child_pid,
@@ -480,6 +524,23 @@ pub(super) fn run_authorized(
             }
         }
     };
+    let mut result = result;
+    if let Some(session) = log_session.take() {
+        match session.finish() {
+            Ok(completion) => {
+                if let Some(reason) = completion.raw_capture_failed {
+                    result.state = JobState::Failed;
+                    result.reason = Some(format!("raw PTY log capture failed: {reason}"));
+                }
+                if let Some(reason) = completion.annotation_failed {
+                    eprintln!("macluster-agent: enhanced task log failed: {reason}");
+                }
+            }
+            Err(error) => {
+                eprintln!("macluster-agent: could not seal enhanced PTY logs: {error}");
+            }
+        }
+    }
     crate::finalize_active(
         state_dir,
         job_id,
@@ -632,7 +693,8 @@ fn supervise_pty(
     child: &mut Child,
     master: &mut File,
     attachment: &mut UnixStream,
-    output_log: &mut File,
+    mut output_log: Option<&mut File>,
+    mut log_session: Option<&mut super::task_logs::TaskLogSession>,
     job_id: u64,
     token: StartToken,
     pgid: u32,
@@ -648,8 +710,34 @@ fn supervise_pty(
     let mut pty_eof = false;
     let mut attachment_open = true;
     let mut kill_started = false;
+    let mut next_sample = Instant::now();
+    let mut last_output_at = next_sample;
+    let mut last_heartbeat_at = next_sample;
+    let mut observed_output_bytes = 0;
+    if let Some(session) = log_session.as_deref_mut() {
+        session.initialize_sample(pgid);
+        next_sample += Duration::from_secs(5);
+    }
 
     loop {
+        if let Some(session) = log_session.as_deref_mut() {
+            let now = Instant::now();
+            let output_bytes = session.output_bytes();
+            if output_bytes != observed_output_bytes {
+                observed_output_bytes = output_bytes;
+                last_output_at = now;
+            }
+            if now >= next_sample {
+                session.sample(pgid);
+                next_sample = now + Duration::from_secs(5);
+            }
+            if now.duration_since(last_output_at) >= Duration::from_secs(5)
+                && now.duration_since(last_heartbeat_at) >= Duration::from_secs(5)
+            {
+                session.heartbeat();
+                last_heartbeat_at = now;
+            }
+        }
         let record = crate::active_record(state_dir, job_id, token)?;
         if termination.is_none() {
             if let Some(cause) = record.termination_cause {
@@ -747,7 +835,8 @@ fn supervise_pty(
             if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 read_pty_output(
                     master,
-                    output_log,
+                    output_log.as_deref_mut(),
+                    log_session.as_deref_mut(),
                     &mut pending_output,
                     &mut pty_eof,
                     attachment_open,
@@ -824,7 +913,14 @@ fn supervise_pty(
                 }
             }
             if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-                read_pty_output(master, output_log, &mut pending_output, &mut pty_eof, false)?;
+                read_pty_output(
+                    master,
+                    output_log.as_deref_mut(),
+                    log_session.as_deref_mut(),
+                    &mut pending_output,
+                    &mut pty_eof,
+                    false,
+                )?;
             }
         }
 
@@ -862,7 +958,8 @@ fn supervise_pty(
 
 fn read_pty_output(
     master: &mut File,
-    output_log: &mut File,
+    mut output_log: Option<&mut File>,
+    mut log_session: Option<&mut super::task_logs::TaskLogSession>,
     pending: &mut VecDeque<u8>,
     pty_eof: &mut bool,
     deliver_to_attachment: bool,
@@ -875,7 +972,13 @@ fn read_pty_output(
                 return Ok(());
             }
             Ok(count) => {
-                output_log.write_all(&buffer[..count])?;
+                if let Some(session) = log_session.as_deref_mut() {
+                    session.append_pty_output(&buffer[..count])?;
+                } else if let Some(output_log) = output_log.as_deref_mut() {
+                    output_log.write_all(&buffer[..count])?;
+                } else {
+                    return Err(io::Error::other("interactive output logger is unavailable"));
+                }
                 if deliver_to_attachment {
                     pending.extend(&buffer[..count]);
                 }

@@ -3,17 +3,17 @@ use std::{
     env,
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, IsTerminal, Read, Seek, Write},
+    io::{self, BufRead, IsTerminal, Write},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process, thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_core::{
     config::{ClusterConfig, Transport},
     maintenance::MaintenanceLock,
-    storage::{Storage, SubmitError},
+    storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
 use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
@@ -21,9 +21,11 @@ use macluster_protocol::{
     types::{
         ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord,
         JobSpec, JobState, METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION,
+        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
     },
 };
 use serde::{Deserialize, Serialize};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::arguments::{
     CliError, SubmitOptions, merge_submit_options, parse_script_declarations, parse_submit_args,
@@ -87,7 +89,11 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let command = command.expect("argv0 alias or parsed subcommand is present");
 
     let (global, args) = take_global_options(args, command == "submit")?;
-    if should_preflight_agent_update(&command, &args) && is_macluster_executable() {
+    let defer_mtop_preflight = command == "top" && top_will_use_tui(&args);
+    if should_preflight_agent_update(&command, &args)
+        && is_macluster_executable()
+        && !defer_mtop_preflight
+    {
         preflight_agent_update(&command, &args, &global)?;
     }
     match command.as_str() {
@@ -119,6 +125,19 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     !matches!(command, "internal" | "agent") && !help_requested
 }
 
+fn top_will_use_tui(args: &[String]) -> bool {
+    let once = args.iter().any(|argument| argument == "--once");
+    let json = args.iter().any(|argument| argument == "--json");
+    let term_is_dumb = env::var("TERM").is_ok_and(|value| value == "dumb");
+    crate::mtop::should_use_tui(
+        once,
+        json,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        term_is_dumb,
+    )
+}
+
 fn should_defer_agent_update_for_node_recovery(command: &str, recovery_pending: bool) -> bool {
     matches!(command, "node" | "init") && recovery_pending
 }
@@ -147,6 +166,15 @@ fn is_macluster_binary_path(path: &Path) -> bool {
 }
 
 fn preflight_agent_update(command: &str, args: &[String], global: &GlobalOptions) -> AppResult<()> {
+    preflight_agent_update_with_compatibility(command, args, global, None)
+}
+
+fn preflight_agent_update_with_compatibility(
+    command: &str,
+    args: &[String],
+    global: &GlobalOptions,
+    checked_compatibility: Option<crate::node_admin::AgentBuildCompatibility>,
+) -> AppResult<()> {
     let config_path = resolved_config_path(global.config.as_deref());
     let config_exists = match fs::symlink_metadata(&config_path) {
         Ok(_) => true,
@@ -188,14 +216,29 @@ fn preflight_agent_update(command: &str, args: &[String], global: &GlobalOptions
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
     }
-    let compatibility = crate::node_admin::configured_agent_build_compatibility(&config).map_err(
-        |(code, error)| {
-            (
-                code,
-                format!("cannot check configured Agent builds: {error}"),
+    let compatibility = match checked_compatibility {
+        Some(_) if command == "top" => {
+            crate::node_admin::configured_agent_build_compatibility_cached(
+                &config,
+                &state_dir.join("mtop-cache"),
             )
-        },
-    )?;
+            .map_err(|(code, error)| {
+                (
+                    code,
+                    format!("cannot revalidate configured Agent builds: {error}"),
+                )
+            })?
+        }
+        Some(compatibility) => compatibility,
+        None => crate::node_admin::configured_agent_build_compatibility(&config).map_err(
+            |(code, error)| {
+                (
+                    code,
+                    format!("cannot check configured Agent builds: {error}"),
+                )
+            },
+        )?,
+    };
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -859,7 +902,14 @@ fn build_submission(
                 "wrap".into()
             }
         });
-    let task_env = prepare_task_environment(config, inherited_task_environment(), merged.env)?;
+    let mut task_env = prepare_task_environment(config, inherited_task_environment(), merged.env)?;
+    if merged.verbose {
+        task_env.insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
+        task_env.insert(
+            VERBOSE_TASK_LOG_ROOT_ENV.into(),
+            config.shared_root.to_string_lossy().into_owned(),
+        );
+    }
     let spec = JobSpec {
         storage_namespace: Some(storage_namespace),
         queue,
@@ -1002,6 +1052,20 @@ fn prepare_task_environment(
         .cloned()
         .collect::<Vec<_>>();
     task_env.extend(overrides);
+    let has_cc_flags = task_env.keys().any(|key| is_cc_rs_flags_variable(key));
+    let cc_shell_escaped_flags =
+        if let Some(value) = task_env.get("CC_SHELL_ESCAPED_FLAGS").cloned() {
+            !matches!(value.as_str(), "" | "0" | "false" | "no")
+        } else if has_cc_flags {
+            // remap_compiler_flags uses shell quoting so that values containing
+            // spaces survive the trip through the job record. Tell cc-rs to parse
+            // those flags with the same shell rules instead of splitting literally
+            // on whitespace.
+            task_env.insert("CC_SHELL_ESCAPED_FLAGS".into(), "1".into());
+            true
+        } else {
+            false
+        };
     if explicit_path {
         task_env.insert(EXPLICIT_TASK_PATH_ENV.into(), "1".into());
     }
@@ -1042,6 +1106,7 @@ fn prepare_task_environment(
                 selected_prefix.as_deref()
             },
             &login_path,
+            cc_shell_escaped_flags,
         )?;
     }
     if !explicit_path && let Some(prefix) = selected_prefix.as_ref() {
@@ -1416,6 +1481,13 @@ const COMPILER_SINGLE_PATH_VARIABLES: &[&str] = &[
     "CMAKE_TOOLCHAIN_FILE",
     "CMAKE_SYSROOT",
     "CMAKE_OSX_SYSROOT",
+    "OPENSSL_DIR",
+    "VCPKG_ROOT",
+    "ZLIB_ROOT",
+    "CUDA_HOME",
+    "CUDA_PATH",
+    "LIBCLANG_PATH",
+    "PROTOC_INCLUDE",
 ];
 
 fn remap_task_environment_value(
@@ -1424,9 +1496,13 @@ fn remap_task_environment_value(
     value: &str,
     active_prefix: Option<&Path>,
     login_path: &str,
+    cc_shell_escaped_flags: bool,
 ) -> AppResult<String> {
     if value.is_empty() {
         return Ok(String::new());
+    }
+    if key == "CC_SHELL_ESCAPED_FLAGS" {
+        return Ok(value.to_owned());
     }
     if matches!(
         key,
@@ -1441,7 +1517,14 @@ fn remap_task_environment_value(
         if key == "CARGO_ENCODED_RUSTFLAGS" {
             return remap_encoded_rustflags(config, value, active_prefix, login_path);
         }
-        return remap_compiler_flags(config, key, value, active_prefix, login_path);
+        return remap_compiler_flags(
+            config,
+            key,
+            value,
+            active_prefix,
+            login_path,
+            cc_shell_escaped_flags,
+        );
     }
     if is_build_path_list_variable(key) {
         return remap_compiler_path_list(config, key, value);
@@ -1476,79 +1559,103 @@ fn filter_runtime_library_path(config: &ClusterConfig, value: &str) -> String {
 }
 
 fn is_build_executable_variable(key: &str) -> bool {
-    if COMPILER_EXECUTABLE_VARIABLES.contains(&key) {
+    let upper = key.to_ascii_uppercase();
+    if COMPILER_EXECUTABLE_VARIABLES
+        .iter()
+        .any(|known| upper == known.to_ascii_uppercase())
+    {
         return true;
     }
-    let upper = key.to_ascii_uppercase();
-    upper.starts_with("CARGO_TARGET_")
+    is_target_variant_variable(
+        &upper,
+        &[
+            "CC", "CXX", "CPP", "AR", "AS", "LD", "RANLIB", "NM", "STRIP", "FC", "F77", "F90",
+            "OBJC", "OBJCXX",
+        ],
+    ) || upper.starts_with("CARGO_TARGET_")
         && (upper.ends_with("_LINKER") || upper.ends_with("_RUNNER") || upper.ends_with("_AR"))
-        || [
-            "CC_", "CXX_", "CPP_", "AR_", "AS_", "LD_", "RANLIB_", "NM_", "STRIP_", "FC_", "F77_",
-            "F90_", "OBJC_", "OBJCXX_",
-        ]
-        .iter()
-        .any(|prefix| upper.starts_with(prefix))
-        || upper.ends_with("_COMPILER")
-        || upper.ends_with("_COMPILER_LAUNCHER")
-        || upper.ends_with("_LINKER")
-        || upper.ends_with("_EXECUTABLE")
 }
 
 fn is_build_flag_variable(key: &str) -> bool {
-    COMPILER_FLAG_VARIABLES.contains(&key)
-        || key == "RUSTFLAGS"
-        || key == "CARGO_ENCODED_RUSTFLAGS"
-        || key.to_ascii_uppercase().ends_with("_FLAGS")
-        || [
-            "CFLAGS_",
-            "CPPFLAGS_",
-            "CXXFLAGS_",
-            "LDFLAGS_",
-            "FFLAGS_",
-            "FCFLAGS_",
-            "OBJCFLAGS_",
-            "OBJCXXFLAGS_",
-            "BINDGEN_EXTRA_CLANG_ARGS",
-        ]
+    let upper = key.to_ascii_uppercase();
+    COMPILER_FLAG_VARIABLES
         .iter()
-        .any(|prefix| key.to_ascii_uppercase().starts_with(prefix))
-        || (key.to_ascii_uppercase().starts_with("CARGO_TARGET_")
-            && key.to_ascii_uppercase().ends_with("_RUSTFLAGS"))
+        .any(|known| upper == known.to_ascii_uppercase())
+        || matches!(upper.as_str(), "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS")
+        || upper == "BINDGEN_EXTRA_CLANG_ARGS"
+        || is_target_variant_variable(&upper, COMPILER_FLAG_VARIABLES)
+        || (upper.starts_with("CARGO_TARGET_") && upper.ends_with("_RUSTFLAGS"))
 }
 
 fn is_build_path_list_variable(key: &str) -> bool {
-    COMPILER_PATH_LIST_VARIABLES.contains(&key)
-        || key == "GOPATH"
-        || key.to_ascii_uppercase().ends_with("_PATH")
+    COMPILER_PATH_LIST_VARIABLES
+        .iter()
+        .any(|known| key.eq_ignore_ascii_case(known))
+        || key.eq_ignore_ascii_case("GOPATH")
 }
 
 fn is_build_single_path_variable(key: &str) -> bool {
-    COMPILER_SINGLE_PATH_VARIABLES.contains(&key)
+    COMPILER_SINGLE_PATH_VARIABLES
+        .iter()
+        .any(|known| key.eq_ignore_ascii_case(known))
         || matches!(
             key,
             "CARGO_HOME"
                 | "RUSTUP_HOME"
+                | "CARGO_TARGET_DIR"
                 | "CCACHE_DIR"
                 | "SCCACHE_DIR"
                 | "GOPATH"
                 | "GOBIN"
                 | "GOROOT"
         )
-        || [
-            "_DIR",
-            "_HOME",
-            "_ROOT",
-            "_PREFIX",
-            "_SYSROOT",
-            "_SDK",
-            "_TOOLCHAIN",
-            "_FILE",
-            "_EXE",
-            "_LIBDIR",
-            "_INCLUDEDIR",
-        ]
-        .iter()
-        .any(|suffix| key.to_ascii_uppercase().ends_with(suffix))
+}
+
+fn is_target_variant_variable(key: &str, bases: &[&str]) -> bool {
+    bases.iter().any(|base| {
+        key.strip_prefix(&format!("{base}_"))
+            .is_some_and(is_target_triple_suffix)
+            || ["HOST_", "TARGET_"]
+                .iter()
+                .any(|scope| key == format!("{scope}{base}"))
+    })
+}
+
+fn is_target_triple_suffix(target: &str) -> bool {
+    const TARGET_ARCHITECTURES: &[&str] = &[
+        "AARCH64",
+        "ARM64",
+        "X86_64",
+        "I386",
+        "I486",
+        "I586",
+        "I686",
+        "WASM32",
+        "WASM64",
+        "RISCV32",
+        "RISCV64",
+        "POWERPC",
+        "POWERPC64",
+        "PPC",
+        "PPC64",
+        "S390X",
+        "SPARC64",
+        "MIPS",
+        "MIPSEL",
+        "LOONGARCH64",
+        "HEXAGON",
+    ];
+    let upper = target.to_ascii_uppercase();
+    TARGET_ARCHITECTURES.iter().any(|architecture| {
+        upper.strip_prefix(architecture).is_some_and(|remainder| {
+            remainder.is_empty() || remainder.starts_with('_') || remainder.starts_with('-')
+        })
+    }) || upper.strip_prefix("ARMV").is_some_and(|remainder| {
+        remainder
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+    })
 }
 
 fn remap_compiler_command(
@@ -1601,7 +1708,11 @@ fn remap_compiler_command(
             login_path,
         )?);
     }
-    Ok(quote_argv(&words))
+    // Toolchain variables such as CXX are parsed by consumers like cc-rs with
+    // whitespace splitting. Shell-quoting each word here leaves literal quote
+    // characters in the environment value, so cc-rs searches for a compiler
+    // whose filename includes those quotes.
+    Ok(words.join(" "))
 }
 
 fn resolve_compiler_executable(
@@ -1713,6 +1824,7 @@ fn remap_compiler_flags(
     value: &str,
     active_prefix: Option<&Path>,
     login_path: &str,
+    cc_shell_escaped_flags: bool,
 ) -> AppResult<String> {
     let words = tokenize_shell_words(value).map_err(|_| {
         (
@@ -1720,13 +1832,35 @@ fn remap_compiler_flags(
             format!("{key} contains invalid shell-style compiler flags"),
         )
     })?;
-    Ok(quote_argv(&remap_compiler_flag_words(
-        config,
-        key,
-        words,
-        active_prefix,
-        login_path,
-    )?))
+    let words = remap_compiler_flag_words(config, key, words, active_prefix, login_path)?;
+    if is_cc_rs_flags_variable(key) {
+        if cc_shell_escaped_flags {
+            return Ok(quote_argv(&words));
+        }
+        if words
+            .iter()
+            .any(|word| word.chars().any(char::is_whitespace))
+        {
+            return Err((
+                2,
+                format!(
+                    "{key} contains a flag with spaces but CC_SHELL_ESCAPED_FLAGS is disabled; enable it to preserve the flag argument"
+                ),
+            ));
+        }
+        return Ok(words.join(" "));
+    }
+    Ok(quote_argv(&words))
+}
+
+fn is_cc_rs_flags_variable(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    ["CFLAGS", "CXXFLAGS"].iter().any(|base| {
+        upper == *base
+            || is_target_variant_variable(&upper, &[*base])
+            || upper == format!("HOST_{base}")
+            || upper == format!("TARGET_{base}")
+    })
 }
 
 fn remap_compiler_flag_words(
@@ -2205,7 +2339,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--stderr] [--follow]"
+            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]"
         );
         return Ok(());
     }
@@ -2216,6 +2350,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     let mut log_id = None;
     let mut stderr = false;
     let mut follow = false;
+    let mut raw = false;
     let mut positional = None;
     let mut index = 0;
     while index < args.len() {
@@ -2224,6 +2359,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             "--json" => json = true,
             "--stderr" => stderr = true,
             "--follow" => follow = true,
+            "--raw" => raw = true,
             "--state" => {
                 index += 1;
                 let value = args
@@ -2264,6 +2400,9 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     if stderr && log_id.is_none() {
         return Err((2, "--stderr requires --log JOBID".into()));
     }
+    if raw && log_id.is_none() {
+        return Err((2, "--raw requires --log JOBID".into()));
+    }
     if log_id.is_some() && json {
         return Err((2, "--json cannot be combined with --log".into()));
     }
@@ -2280,7 +2419,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             .get_job(id)
             .map_err(operation_error)?
             .ok_or_else(|| (1, format!("job {id} not found")))?;
-        return stream_job_log(&storage, &record, stderr, follow);
+        return stream_job_log(&storage, &record, stderr, follow, raw);
     }
     if let Some(request_id) = request_id {
         let record = storage
@@ -2331,64 +2470,156 @@ fn stream_job_log(
     record: &JobRecord,
     stderr: bool,
     follow: bool,
+    raw: bool,
 ) -> AppResult<()> {
+    let current_record;
+    let publication_pending;
+    let verbose = record
+        .spec
+        .env
+        .get(VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1");
+    if follow {
+        if !record.state.is_terminal() || record.log_sync_pending {
+            eprintln!(
+                "Waiting for job {} to finish and publish its output; press Ctrl-C to stop waiting.",
+                record.id
+            );
+        }
+        let mut terminal_sync_since = None;
+        loop {
+            let latest = storage
+                .get_job(record.id)
+                .map_err(operation_error)?
+                .ok_or_else(|| (1, format!("job {} not found", record.id)))?;
+            if latest.state.is_terminal() && !latest.log_sync_pending {
+                current_record = latest;
+                publication_pending = false;
+                break;
+            }
+            if latest.state.is_terminal() {
+                let began = terminal_sync_since.get_or_insert_with(Instant::now);
+                if began.elapsed() >= Duration::from_secs(60) {
+                    current_record = latest;
+                    publication_pending = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    } else {
+        let latest = storage
+            .get_job(record.id)
+            .map_err(operation_error)?
+            .ok_or_else(|| (1, format!("job {} not found", record.id)))?;
+        if !latest.state.is_terminal() {
+            return Err((
+                1,
+                format!(
+                    "job {} is still active; use --follow to wait for its output",
+                    record.id
+                ),
+            ));
+        }
+        publication_pending = latest.log_sync_pending;
+        current_record = latest;
+    }
+
     let raw_path = if stderr {
         &record.spec.stderr_path
     } else {
         &record.spec.stdout_path
     };
-    let path = PathBuf::from(raw_path.replace("%j", &record.id.to_string()));
-    let mut offset = 0_u64;
-    loop {
-        match File::open(&path) {
-            Ok(mut file) => {
-                if offset > 0 {
-                    file.seek(io::SeekFrom::Start(offset))
-                        .map_err(|error| (1, error.to_string()))?;
-                }
-                let mut buffer = [0_u8; 64 * 1024];
-                let count = file
-                    .read(&mut buffer)
-                    .map_err(|error| (1, format!("cannot read log {}: {error}", path.display())))?;
-                if count > 0 {
-                    io::stdout()
-                        .lock()
-                        .write_all(&buffer[..count])
-                        .map_err(|error| (1, error.to_string()))?;
-                    offset += count as u64;
-                }
+    let raw_path = PathBuf::from(raw_path.replace("%j", &record.id.to_string()));
+    let enhanced_dir = if verbose {
+        record
+            .spec
+            .env
+            .get(VERBOSE_TASK_LOG_ROOT_ENV)
+            .map(PathBuf::from)
+            .map(|root| record.spec.shared_job_dir(&root, record.id))
+    } else {
+        None
+    };
+    let mut selected = if verbose && !raw {
+        enhanced_dir
+            .as_ref()
+            .map(|directory| directory.join("monitor.log"))
+            .unwrap_or_else(|| raw_path.clone())
+    } else {
+        raw_path.clone()
+    };
+    if current_record.started_unix_ms.is_none() {
+        return Ok(());
+    }
+    let mut filter_stderr = verbose && !raw && stderr;
+    let annotation_problem = if verbose && !raw {
+        match enhanced_dir.as_ref() {
+            None => Some("enhanced log location is missing".to_owned()),
+            Some(directory) => match fs::read(directory.join("summary.json")) {
+                Err(error) => Some(format!("summary is unavailable: {error}")),
+                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Err(error) => Some(format!("summary is invalid: {error}")),
+                    Ok(summary) => summary
+                        .get("annotation_failed")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            (!directory.join("monitor.log").is_file())
+                                .then(|| "monitor log is missing".to_owned())
+                        }),
+                },
+            },
+        }
+    } else {
+        None
+    };
+    if verbose && !raw && annotation_problem.is_some() {
+        eprintln!(
+            "mjob: enhanced log unavailable ({}); showing raw {} instead",
+            annotation_problem.as_deref().unwrap_or("unknown error"),
+            if stderr { "stderr" } else { "stdout" }
+        );
+        selected = raw_path.clone();
+        filter_stderr = false;
+    }
+    if record.spec.mode == JobMode::Interactive && stderr {
+        eprintln!("mjob: PTY merges stdout and stderr; no separate stderr stream exists");
+        return Ok(());
+    }
+    if publication_pending && selected.exists() {
+        eprintln!(
+            "mjob: job {} output synchronization remains pending; the available shared copy may be incomplete",
+            record.id
+        );
+    }
+    let file = File::open(&selected).map_err(|error| {
+        (
+            1,
+            format!("cannot read shared log {}: {error}", selected.display()),
+        )
+    })?;
+    if filter_stderr {
+        let mut input = io::BufReader::new(file);
+        let mut line = String::new();
+        let mut stdout = io::stdout().lock();
+        loop {
+            line.clear();
+            let count = input
+                .read_line(&mut line)
+                .map_err(|error| (1, format!("cannot read log line: {error}")))?;
+            if count == 0 {
+                break;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err((
-                    1,
-                    format!("cannot open shared log {}: {error}", path.display()),
-                ));
+            if line.contains("] [stderr]") || line.contains("] [stderr:continued]") {
+                stdout
+                    .write_all(line.as_bytes())
+                    .map_err(|error| (1, error.to_string()))?;
             }
         }
-        let latest = storage
-            .get_job(record.id)
-            .map_err(operation_error)?
-            .ok_or_else(|| (1, format!("job {} not found", record.id)))?;
-        if !follow {
-            if offset == 0 && latest.log_sync_pending {
-                return Err((
-                    1,
-                    "log is still on the compute node; shared log sync is pending".into(),
-                ));
-            }
-            if offset == 0 && !path.exists() {
-                return Err((1, format!("shared log {} does not exist", path.display())));
-            }
-            break;
-        }
-        let file_len = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if latest.state.is_terminal() && !latest.log_sync_pending && offset >= file_len {
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
+    } else {
+        let mut input = file;
+        io::copy(&mut input, &mut io::stdout().lock()).map_err(|error| (1, error.to_string()))?;
     }
     Ok(())
 }
@@ -2751,6 +2982,7 @@ fn top(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
     }
     let term_is_dumb = env::var("TERM").is_ok_and(|value| value == "dumb");
+    let state_dir = state_root(global.state_dir.as_deref())?;
     if crate::mtop::should_use_tui(
         once,
         json,
@@ -2758,16 +2990,33 @@ fn top(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         io::stdout().is_terminal(),
         term_is_dumb,
     ) {
-        let state_dir = state_root(global.state_dir.as_deref())?;
-        return crate::mtop::run_interactive(
+        let post_action = crate::mtop::run_interactive(
             config,
             state_dir,
+            resolved_config_path(global.config.as_deref()),
             selected_queue.map(|queue| queue.to_string()),
             env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
         )
-        .map_err(|error| (1, error));
+        .map_err(|error| (1, error))?;
+        return match post_action {
+            Some(crate::mtop::MtopPostAction::CheckBuilds(compatibility))
+                if is_macluster_executable() =>
+            {
+                if compatibility.requires_update() {
+                    println!(
+                        "Agent build mismatch detected; entering the cluster update workflow."
+                    );
+                }
+                preflight_agent_update_with_compatibility("top", args, &global, Some(compatibility))
+            }
+            Some(crate::mtop::MtopPostAction::RecoverMaintenance) if is_macluster_executable() => {
+                preflight_agent_update("top", args, &global)
+            }
+            None if is_macluster_executable() => preflight_agent_update("top", args, &global),
+            _ => Ok(()),
+        };
     }
-    let view = sample_cluster(&config, selected_queue.as_ref());
+    let view = sample_cluster(&config, selected_queue.as_ref(), &state_dir);
     if json {
         println!(
             "{}",
@@ -2924,9 +3173,15 @@ struct ClusterMetricView {
     pool_total: MetricSnapshot,
     #[serde(skip)]
     login_compute_node_id: Option<String>,
+    #[serde(skip)]
+    task_counts_by_node: Option<BTreeMap<String, (usize, usize)>>,
 }
 
-fn sample_cluster(config: &ClusterConfig, selected_queue: Option<&QueueName>) -> ClusterMetricView {
+fn sample_cluster(
+    config: &ClusterConfig,
+    selected_queue: Option<&QueueName>,
+    state_dir: &Path,
+) -> ClusterMetricView {
     let local_uuid = local_machine_uuid().ok();
     let login_compute_node_id = config
         .nodes
@@ -2980,7 +3235,47 @@ fn sample_cluster(config: &ClusterConfig, selected_queue: Option<&QueueName>) ->
         missing_nodes,
         pool_total,
         login_compute_node_id,
+        task_counts_by_node: one_shot_task_counts(config, state_dir),
     }
+}
+
+fn one_shot_task_counts(
+    config: &ClusterConfig,
+    state_dir: &Path,
+) -> Option<BTreeMap<String, (usize, usize)>> {
+    let store = ReadOnlyJobStore::open(state_dir).ok()?;
+    let jobs = store.list_monitor_jobs().ok()?;
+    let mut counts: BTreeMap<String, (usize, usize)> = config
+        .nodes
+        .keys()
+        .filter(|id| !config.is_login_node(id))
+        .map(|id| (id.clone(), (0, 0)))
+        .collect();
+
+    for job in jobs {
+        match job.state {
+            JobState::Starting | JobState::Running | JobState::Cancelling => {
+                if let Some(node) = job.node.as_ref().and_then(|id| counts.get_mut(id.as_str())) {
+                    node.0 += 1;
+                }
+            }
+            JobState::Pending => {
+                if let Some(node_id) = job.spec.node.as_ref() {
+                    if let Some(node) = counts.get_mut(node_id.as_str()) {
+                        node.1 += 1;
+                    }
+                } else {
+                    for node_id in config.queue_compute_nodes(job.spec.queue.as_str()) {
+                        if let Some(node) = counts.get_mut(&node_id) {
+                            node.1 += 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(counts)
 }
 
 fn explain_legacy_power_agent(snapshot: &mut MetricSnapshot) {
@@ -3062,40 +3357,98 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
     }
 }
 
+const METRIC_HEADERS: [&str; 10] = [
+    "NODE",
+    "RUN/WAIT",
+    "CPU%",
+    "MEM(GiB)",
+    "GPU%",
+    "DISK(R/W)",
+    "NET(down/up)",
+    "POWER",
+    "TEMP",
+    "STATE",
+];
+
 fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool) {
     if color {
         println!("\x1b[1;36mMACLUSTER NODE MONITOR\x1b[0m");
-        println!(
-            "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
-            view.missing_nodes,
-            view.nodes.len()
-        );
-        println!("\x1b[1m{}\x1b[0m", metric_table_header());
     } else {
         println!("MACLUSTER NODE MONITOR");
-        println!(
-            "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
-            view.missing_nodes,
-            view.nodes.len()
-        );
-        println!("{}", metric_table_header());
     }
-    println!("{}", "─".repeat(123));
+    println!(
+        "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
+        view.missing_nodes,
+        view.nodes.len()
+    );
+
+    let mut rows = Vec::with_capacity(view.nodes.len() + 2);
     if view.login_compute_node_id.is_none() {
-        print_metric_row("login", &view.login, "LOCAL", color);
+        rows.push(metric_cells(
+            "login",
+            Some(&view.login),
+            "LOCAL",
+            Some("0/0".into()),
+        ));
     }
     for node in &view.nodes {
-        if let Some(metrics) = &node.metrics {
-            print_metric_row(&node.id, metrics, "ONLINE", color);
-        } else {
-            println!(
-                "{:<18} {:>11} {:>19} {:>10} {:>18} {:>18} {:>12} {:>10}",
-                node.id, "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "DOWN"
-            );
+        let task_count = view
+            .task_counts_by_node
+            .as_ref()
+            .and_then(|counts| counts.get(&node.id))
+            .map(|(running, waiting)| format!("{running}/{waiting}"));
+        rows.push(metric_cells(
+            &node.id,
+            node.metrics.as_ref(),
+            if node.reachable { "ONLINE" } else { "DOWN" },
+            task_count,
+        ));
+    }
+    rows.push(metric_cells(
+        "POOL TOTAL",
+        Some(&view.pool_total),
+        "COMPUTE",
+        None,
+    ));
+
+    let is_tty = io::stdout().is_terminal();
+    let terminal_width = is_tty
+        .then(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| usize::from(width))
+        })
+        .flatten();
+    if terminal_width.is_some() {
+        for row in &mut rows {
+            row[0] = truncate_display(&sanitize_cell(&row[0]), 24);
         }
     }
-    println!("{}", "─".repeat(123));
-    print_metric_row("POOL TOTAL", &view.pool_total, "COMPUTE", color);
+    let (visible_columns, widths, compact) = table_layout(&rows, terminal_width);
+    if compact {
+        println!("{}", compact_metric_table(&rows));
+    } else {
+        let header = METRIC_HEADERS
+            .iter()
+            .map(|cell| (*cell).to_owned())
+            .collect::<Vec<_>>();
+        let line = format_table_line(&header, &visible_columns, &widths, false);
+        println!(
+            "{}",
+            if color {
+                format!("\x1b[1m{line}\x1b[0m")
+            } else {
+                line
+            }
+        );
+        let rule_width = widths.iter().take(visible_columns.len()).sum::<usize>()
+            + visible_columns.len().saturating_sub(1) * 2;
+        println!("{}", "─".repeat(rule_width));
+        for row in &rows {
+            let line = format_table_line(row, &visible_columns, &widths, color);
+            println!("{line}");
+        }
+    }
     let mut power_errors = Vec::new();
     if view.login_compute_node_id.is_none()
         && let Some(reason) = view.login.errors.get("power")
@@ -3109,25 +3462,33 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
             .map(|reason| (node.id.as_str(), reason))
     }));
     for (node, reason) in power_errors {
-        println!("Power {node}: {reason}");
+        println!("Power {node}: {}", sanitize_cell(reason));
     }
     if continuous {
         println!("\nPress Ctrl-C to exit");
     }
 }
 
-fn print_metric_row(name: &str, metric: &MetricSnapshot, state: &str, color: bool) {
-    println!("{}", metric_row(name, metric, state, color));
-}
-
-fn metric_table_header() -> String {
-    format!(
-        "{:<18} {:>11} {:>19} {:>10} {:>18} {:>18} {:>12} {:>10}",
-        "NODE", "CPU%", "MEM(GiB)", "TEMP", "DISK(R/W)", "NET(down/up)", "POWER", "STATE"
-    )
-}
-
-fn metric_row(name: &str, metric: &MetricSnapshot, state: &str, color: bool) -> String {
+fn metric_cells(
+    name: &str,
+    metric: Option<&MetricSnapshot>,
+    state: &str,
+    task_count: Option<String>,
+) -> Vec<String> {
+    let Some(metric) = metric else {
+        return vec![
+            name.into(),
+            task_count.unwrap_or_else(|| "N/A".into()),
+            "N/A".into(),
+            "N/A".into(),
+            "N/A".into(),
+            "N/A".into(),
+            "N/A".into(),
+            "N/A".into(),
+            "N/A".into(),
+            state.into(),
+        ];
+    };
     let cpu = format_opt(metric.cpu_percent.map(|value| {
         format!(
             "{value:.0}/{:.0}",
@@ -3140,6 +3501,7 @@ fn metric_row(name: &str, metric: &MetricSnapshot, state: &str, color: bool) -> 
             format!("{:.1}/{:.1}", used as f64 / GIB, total as f64 / GIB)
         },
     ));
+    let gpu = format_opt(metric.gpu_percent.map(|value| format!("{value:.0}")));
     let cpu_temperature = format_opt(metric.cpu_temp_celsius.map(|value| format!("{value:.1}°C")));
     let disk = format_pair(
         metric.disk_read_bytes_per_sec,
@@ -3154,25 +3516,185 @@ fn metric_row(name: &str, metric: &MetricSnapshot, state: &str, color: bool) -> 
         "MiB/s",
     );
     let power = format_power(metric.power_watts, metric.power_scope.as_deref());
-    let state = if color {
-        match state {
-            "DOWN" => format!("\x1b[1;31m{state}\x1b[0m"),
-            "ONLINE" | "LOCAL" => format!("\x1b[1;32m{state}\x1b[0m"),
-            _ => format!("\x1b[1;36m{state}\x1b[0m"),
+    vec![
+        name.into(),
+        task_count.unwrap_or_else(|| "N/A".into()),
+        cpu,
+        memory,
+        gpu,
+        disk,
+        network,
+        power,
+        cpu_temperature,
+        state.into(),
+    ]
+}
+
+#[cfg(test)]
+fn metric_table_header() -> String {
+    let header = METRIC_HEADERS
+        .iter()
+        .map(|cell| (*cell).to_owned())
+        .collect::<Vec<_>>();
+    let columns: Vec<_> = (0..METRIC_HEADERS.len()).collect();
+    let widths = natural_column_widths(&header, &[], &columns);
+    format_table_line(&header, &columns, &widths, false)
+}
+
+#[cfg(test)]
+fn metric_row(name: &str, metric: &MetricSnapshot, state: &str, color: bool) -> String {
+    let cells = metric_cells(name, Some(metric), state, None);
+    let columns: Vec<_> = (0..METRIC_HEADERS.len()).collect();
+    let widths = natural_column_widths(
+        &METRIC_HEADERS.map(|cell| cell.to_owned()),
+        &[cells.clone()],
+        &columns,
+    );
+    format_table_line(&cells, &columns, &widths, color)
+}
+
+fn table_layout(
+    rows: &[Vec<String>],
+    terminal_width: Option<usize>,
+) -> (Vec<usize>, Vec<usize>, bool) {
+    let all_columns: Vec<_> = (0..METRIC_HEADERS.len()).collect();
+    let header = METRIC_HEADERS.map(str::to_owned);
+    let selected = if let Some(max_width) = terminal_width {
+        let mut columns = vec![0, 1, 2, 3];
+        let required = natural_column_widths(&header, rows, &columns);
+        if table_width(&required, columns.len()) > max_width {
+            return (Vec::new(), Vec::new(), true);
         }
+        for column in [4, 5, 6, 7, 8, 9] {
+            columns.push(column);
+            let widths = natural_column_widths(&header, rows, &columns);
+            if table_width(&widths, columns.len()) > max_width {
+                columns.pop();
+            }
+        }
+        columns
     } else {
-        state.to_owned()
+        all_columns
     };
-    format!(
-        "{:<18} {:>11} {:>19} {:>10} {:>18} {:>18} {:>12} {:>10}",
-        name, cpu, memory, cpu_temperature, disk, network, power, state
-    )
+    let widths = natural_column_widths(&header, rows, &selected);
+    (selected, widths, false)
+}
+
+fn natural_column_widths(header: &[String], rows: &[Vec<String>], columns: &[usize]) -> Vec<usize> {
+    columns
+        .iter()
+        .map(|column| {
+            let header_width = display_width(&sanitize_cell(&header[*column]));
+            let row_width = rows
+                .iter()
+                .map(|row| display_width(&sanitize_cell(&row[*column])))
+                .max()
+                .unwrap_or_default();
+            header_width.max(row_width)
+        })
+        .collect()
+}
+
+fn table_width(widths: &[usize], columns: usize) -> usize {
+    widths.iter().sum::<usize>() + columns.saturating_sub(1) * 2
+}
+
+fn format_table_line(
+    cells: &[String],
+    columns: &[usize],
+    widths: &[usize],
+    color_state: bool,
+) -> String {
+    columns
+        .iter()
+        .zip(widths)
+        .map(|(column, width)| {
+            let cell = sanitize_cell(&cells[*column]);
+            let cell = pad_cell(&cell, *width);
+            if *column == 9 && color_state {
+                let state = cells[*column].as_str();
+                let style = match state {
+                    "DOWN" => "\x1b[1;31m",
+                    "ONLINE" | "LOCAL" => "\x1b[1;32m",
+                    _ => "\x1b[1;36m",
+                };
+                format!("{style}{cell}\x1b[0m")
+            } else {
+                cell
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn compact_metric_table(rows: &[Vec<String>]) -> String {
+    let mut lines = Vec::new();
+    for row in rows {
+        lines.push(format!("NODE  {}", sanitize_cell(&row[0])));
+        for column in 1..row.len() {
+            if column == 9 && row[column] == "COMPUTE" {
+                continue;
+            }
+            lines.push(format!(
+                "  {}  {}",
+                METRIC_HEADERS[column],
+                sanitize_cell(&row[column])
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn sanitize_cell(value: &str) -> String {
+    let mut clean = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => clean.push_str("\\n"),
+            '\r' => clean.push_str("\\r"),
+            '\t' => clean.push_str("\\t"),
+            character if character.is_control() => clean.push('�'),
+            character => clean.push(character),
+        }
+    }
+    clean
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(display_width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn truncate_display(value: &str, maximum: usize) -> String {
+    if display_width(value) <= maximum {
+        return value.to_owned();
+    }
+    if maximum == 0 {
+        return String::new();
+    }
+    let target = maximum.saturating_sub(1);
+    let mut output = String::new();
+    let mut width = 0;
+    for character in value.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width + char_width > target {
+            break;
+        }
+        output.push(character);
+        width += char_width;
+    }
+    output.push('…');
+    output
 }
 
 fn format_power(watts: Option<f64>, scope: Option<&str>) -> String {
-    match (watts, scope) {
-        (Some(watts), Some(scope)) => format!("{watts:.1} W {scope}"),
-        _ => "N/A".into(),
+    let _ = scope;
+    match watts {
+        Some(watts) => format!("{watts:.1} W"),
+        None => "N/A".into(),
     }
 }
 
@@ -4391,6 +4913,110 @@ mod tests {
     }
 
     #[test]
+    fn msub_preserves_compiler_environment_without_shell_quotes() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-quoted-compiler-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let software_root = root.join("mamba");
+        let compiler = software_root.join("envs/analysis/bin/arm64-apple-darwin20.0.0-clang++");
+        fs::create_dir_all(compiler.parent().unwrap()).unwrap();
+        fs::write(&compiler, "clang++").unwrap();
+        let (config, _, _) = environment_fixture(&root, &software_root);
+        let compiler_path = fs::canonicalize(&compiler)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let environment = BTreeMap::from([
+            (
+                "PATH".into(),
+                format!("{}:/usr/bin:/bin", compiler.parent().unwrap().display()),
+            ),
+            ("CXX".into(), format!("'{compiler_path}'")),
+        ]);
+
+        let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
+
+        assert_eq!(task_env["CXX"], compiler_path);
+        assert!(!task_env["CXX"].contains(['\'', '"']));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn msub_preserves_non_toolchain_environment_variables_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-env-pass-through-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let (config, _, _) = environment_fixture(&root, &root.join("mounted-mamba"));
+        let environment = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CC_ENABLE_DEBUG_OUTPUT".into(), "1".into()),
+            ("CC_FORCE_DISABLE".into(), "0".into()),
+            ("CC_KNOWN_WRAPPER_CUSTOM".into(), "custom-compiler".into()),
+            ("CUSTOM_FLAGS".into(), "--mode='fast build'".into()),
+            ("CUSTOM_HOME".into(), "/Users/login/custom-home".into()),
+        ]);
+
+        let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
+
+        assert_eq!(task_env["CC_ENABLE_DEBUG_OUTPUT"], "1");
+        assert_eq!(task_env["CC_FORCE_DISABLE"], "0");
+        assert_eq!(task_env["CC_KNOWN_WRAPPER_CUSTOM"], "custom-compiler");
+        assert_eq!(task_env["CUSTOM_FLAGS"], "--mode='fast build'");
+        assert_eq!(task_env["CUSTOM_HOME"], "/Users/login/custom-home");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msub_enables_shell_parsing_for_remapped_cc_flags() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-cc-flags-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let (config, _, _) = environment_fixture(&root, &root.join("mounted-mamba"));
+        let environment = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CFLAGS".into(), "-DNAME='Hello World'".into()),
+        ]);
+
+        let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
+
+        assert_eq!(task_env["CC_SHELL_ESCAPED_FLAGS"], "1");
+        assert_eq!(
+            super::tokenize_shell_words(&task_env["CFLAGS"]).unwrap(),
+            vec!["-DNAME=Hello World"]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msub_rejects_spaced_cc_flags_when_shell_parsing_is_disabled() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-cc-flags-disabled-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let (config, _, _) = environment_fixture(&root, &root.join("mounted-mamba"));
+        let environment = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CC_SHELL_ESCAPED_FLAGS".into(), "0".into()),
+            ("CXXFLAGS".into(), "-DNAME='Hello World'".into()),
+        ]);
+
+        let error = prepare_task_environment(&config, environment, BTreeMap::new())
+            .expect_err("cc-rs cannot preserve a spaced flag with whitespace splitting");
+
+        assert!(error.1.contains("CC_SHELL_ESCAPED_FLAGS"), "{error:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn msub_rejects_unshared_absolute_compiler_and_build_paths() {
         use std::fs;
 
@@ -4730,14 +5356,14 @@ mod tests {
 
     #[test]
     fn power_display_includes_measured_scope() {
-        assert_eq!(format_power(Some(9.8), Some("SoC")), "9.8 W SoC");
-        assert_eq!(format_power(Some(4.2), Some("CPU")), "4.2 W CPU");
+        assert_eq!(format_power(Some(9.8), Some("SoC")), "9.8 W");
+        assert_eq!(format_power(Some(4.2), Some("CPU")), "4.2 W");
     }
 
     #[test]
-    fn power_display_is_na_when_sample_or_scope_is_missing() {
+    fn power_display_uses_watts_even_without_scope() {
         assert_eq!(format_power(None, Some("CPU")), "N/A");
-        assert_eq!(format_power(Some(9.8), None), "N/A");
+        assert_eq!(format_power(Some(9.8), None), "9.8 W");
     }
 
     #[test]
@@ -4815,6 +5441,7 @@ mod tests {
             nodes,
             pool_total,
             login_compute_node_id: None,
+            task_counts_by_node: None,
         };
         let encoded = serde_json::to_value(view).unwrap();
         let object = encoded.as_object().unwrap();
@@ -4855,6 +5482,6 @@ fn print_help() {
 
 fn print_submit_help() {
     println!(
-        "Usage: msub [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\nThe submitting process's exported environment is forwarded to the task by default; --env overrides individual values. A nonempty active VIRTUAL_ENV or CONDA_PREFIX must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Before every operational command and before `init` with an existing valid config, macluster checks all configured Agent version/hash values and automatically updates every node when a known mismatch exists. If that update stops a running controller, restart it and retry the command. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
+        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. A nonempty active VIRTUAL_ENV or CONDA_PREFIX must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Before every operational command and before `init` with an existing valid config, macluster checks all configured Agent version/hash values and automatically updates every node when a known mismatch exists. If that update stops a running controller, restart it and retry the command. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
     );
 }

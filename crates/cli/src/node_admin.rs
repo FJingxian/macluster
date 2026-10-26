@@ -1,12 +1,12 @@
 //! SSH based enrollment and removal of compute nodes.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     net::Ipv4Addr,
     os::fd::AsRawFd,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
@@ -1057,7 +1057,7 @@ pub(crate) enum AgentBuildState {
     Unknown,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AgentBuildCompatibility {
     pub(crate) current: Vec<String>,
     pub(crate) stale: Vec<String>,
@@ -1074,6 +1074,18 @@ struct AgentBuildProbe {
     version: String,
     sha256: Option<String>,
 }
+
+#[derive(Deserialize, Serialize)]
+struct AgentValidationCache {
+    schema: u32,
+    key: String,
+    checked_unix_ms: u64,
+    compatibility: AgentBuildCompatibility,
+}
+
+const AGENT_VALIDATION_CACHE_TTL_MS: u64 = 30_000;
+const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 1;
+const AGENT_VALIDATION_CACHE_MAX_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn current_agent_sha256() -> AppResult<String> {
     let executable = std::env::current_exe().map_err(io_error)?;
@@ -1099,26 +1111,192 @@ pub(crate) fn configured_agent_build_compatibility(
     // A legacy path has no digest in the config. Probe all such nodes in
     // parallel so one offline host does not delay a blocked submission by
     // one SSH timeout per queue member.
-    let probed = std::thread::scope(|scope| {
-        let handles = legacy_ssh
-            .into_iter()
-            .map(|(node_id, node)| {
-                let current_digest = current_digest.clone();
+    let probed = bounded_legacy_agent_probes(legacy_ssh, &current_digest);
+    for (node_id, state) in probed {
+        compatibility.record(node_id, state);
+    }
+    Ok(compatibility)
+}
+
+pub(crate) fn configured_agent_build_compatibility_cached(
+    config: &ClusterConfig,
+    cache_root: &Path,
+) -> AppResult<AgentBuildCompatibility> {
+    let key = agent_validation_cache_key(config)?;
+    let cache_path = cache_root.join("mtop-agent-validation.json");
+    if let Some(cache) = read_agent_validation_cache(&cache_path, &key) {
+        return Ok(cache);
+    }
+
+    let compatibility = configured_agent_build_compatibility(config)?;
+    if compatibility.unknown.is_empty()
+        && agent_validation_cache_key(config).is_ok_and(|after| after == key)
+    {
+        write_agent_validation_cache(
+            &cache_path,
+            AgentValidationCache {
+                schema: AGENT_VALIDATION_CACHE_SCHEMA,
+                key,
+                checked_unix_ms: validation_now_ms(),
+                compatibility: compatibility.clone(),
+            },
+        );
+    }
+    Ok(compatibility)
+}
+
+fn bounded_legacy_agent_probes(
+    nodes: Vec<(String, NodeConfig)>,
+    current_digest: &str,
+) -> Vec<(String, AgentBuildState)> {
+    const MAX_PROBES: usize = 4;
+    let queue = Mutex::new(VecDeque::from(nodes));
+    let worker_count = MAX_PROBES.min(queue.lock().map_or(0, |queue| queue.len()));
+    std::thread::scope(|scope| {
+        let handles = (0..worker_count)
+            .map(|_| {
+                let queue = &queue;
+                let current_digest = current_digest.to_owned();
                 scope.spawn(move || {
-                    let state = probe_configured_agent_build(&node, &current_digest);
-                    (node_id, state)
+                    let mut results = Vec::new();
+                    loop {
+                        let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                        let Some((node_id, node)) = task else {
+                            break;
+                        };
+                        let state = probe_configured_agent_build(&node, &current_digest);
+                        results.push((node_id, state));
+                    }
+                    results
                 })
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
             .filter_map(|handle| handle.join().ok())
-            .collect::<Vec<_>>()
-    });
-    for (node_id, state) in probed {
-        compatibility.record(node_id, state);
+            .flatten()
+            .collect()
+    })
+}
+
+fn agent_validation_cache_key(config: &ClusterConfig) -> AppResult<String> {
+    let executable = std::env::current_exe().map_err(io_error)?;
+    let mut identity = format!(
+        "schema={AGENT_VALIDATION_CACHE_SCHEMA};uid={};config={config:?};exe={}",
+        unsafe { libc::geteuid() },
+        file_identity_fingerprint(&executable)
+    );
+    for (node_id, node) in &config.nodes {
+        if node.transport == Transport::Local {
+            identity.push_str(&format!(
+                ";local={node_id}:{}",
+                file_identity_fingerprint(Path::new(&node.remote_binary))
+            ));
+        }
     }
-    Ok(compatibility)
+    sha256_hex(identity.as_bytes()).map_err(|error| (1, error.to_string()))
+}
+
+fn file_identity_fingerprint(path: &Path) -> String {
+    let canonical = path.canonicalize().ok();
+    let Some(canonical) = canonical else {
+        return format!("{}:missing", path.display());
+    };
+    let Ok(metadata) = fs::metadata(&canonical) else {
+        return format!("{}:missing", canonical.display());
+    };
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        canonical.display(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.mode()
+    )
+}
+
+fn read_agent_validation_cache(path: &Path, key: &str) -> Option<AgentBuildCompatibility> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > AGENT_VALIDATION_CACHE_MAX_BYTES
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(AGENT_VALIDATION_CACHE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > AGENT_VALIDATION_CACHE_MAX_BYTES {
+        return None;
+    }
+    let cache: AgentValidationCache = serde_json::from_slice(&bytes).ok()?;
+    let age = validation_now_ms().checked_sub(cache.checked_unix_ms)?;
+    (cache.schema == AGENT_VALIDATION_CACHE_SCHEMA
+        && cache.key == key
+        && age <= AGENT_VALIDATION_CACHE_TTL_MS
+        && cache.compatibility.unknown.is_empty())
+    .then_some(cache.compatibility)
+}
+
+fn write_agent_validation_cache(path: &Path, cache: AgentValidationCache) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(metadata) = fs::symlink_metadata(parent) else {
+        return;
+    };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return;
+    }
+    if fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).is_err() {
+        return;
+    }
+    let temp_path = parent.join(format!(
+        ".mtop-agent-validation-{}-{}.tmp",
+        std::process::id(),
+        validation_now_ms()
+    ));
+    let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp_path)
+    else {
+        return;
+    };
+    let result = serde_json::to_vec(&cache)
+        .map_err(io::Error::other)
+        .and_then(|bytes| file.write_all(&bytes))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp_path, path));
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn validation_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn classify_configured_agents(
@@ -3427,8 +3605,99 @@ fn sync_one_remote_config(
 }
 
 fn local_sha256(path: &Path) -> AppResult<String> {
+    hash_file_sha256(path)
+}
+
+#[cfg(target_vendor = "apple")]
+#[repr(C, align(4))]
+struct CommonCryptoSha256Context {
+    words: [u32; 26],
+}
+
+#[cfg(target_vendor = "apple")]
+unsafe extern "C" {
+    fn CC_SHA256_Init(context: *mut CommonCryptoSha256Context) -> i32;
+    fn CC_SHA256_Update(
+        context: *mut CommonCryptoSha256Context,
+        data: *const libc::c_void,
+        len: u32,
+    ) -> i32;
+    fn CC_SHA256_Final(digest: *mut u8, context: *mut CommonCryptoSha256Context) -> *mut u8;
+}
+
+#[cfg(target_vendor = "apple")]
+fn hash_file_sha256(path: &Path) -> AppResult<String> {
+    use std::fmt::Write as _;
+
+    let path = path.canonicalize().map_err(io_error)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(io_error)?;
+    let before = file.metadata().map_err(io_error)?;
+    if !before.is_file() {
+        return Err((1, format!("{} is not a regular file", path.display())));
+    }
+    let mut context = CommonCryptoSha256Context { words: [0; 26] };
+    if unsafe { CC_SHA256_Init(&mut context) } != 1 {
+        return Err((1, "CommonCrypto could not initialize SHA-256".into()));
+    }
+    let mut buffer = [0_u8; 256 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        if unsafe {
+            CC_SHA256_Update(
+                &mut context,
+                buffer.as_ptr().cast(),
+                u32::try_from(count).unwrap_or(u32::MAX),
+            )
+        } != 1
+        {
+            return Err((1, "CommonCrypto could not update SHA-256".into()));
+        }
+    }
+    let after = file.metadata().map_err(io_error)?;
+    if file_metadata_identity(&before) != file_metadata_identity(&after) {
+        return Err((
+            1,
+            format!(
+                "{} changed while its SHA-256 was being read",
+                path.display()
+            ),
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    if unsafe { CC_SHA256_Final(digest.as_mut_ptr(), &mut context) }.is_null() {
+        return Err((1, "CommonCrypto could not finalize SHA-256".into()));
+    }
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn hash_file_sha256(path: &Path) -> AppResult<String> {
     let bytes = fs::read(path).map_err(io_error)?;
     sha256_hex(&bytes).map_err(|error| (1, error.to_string()))
+}
+
+#[cfg(target_vendor = "apple")]
+fn file_metadata_identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 
 fn scp_to_node(node: &NodeConfig, local_path: &Path, remote_path: &str) -> AppResult<()> {
@@ -3578,9 +3847,10 @@ fn nfs_exports_update_baseline_read_command(exports_path: &str, backup_path: &st
     let legacy_temporaries = format!("{legacy_prefix}*.tmp");
     let empty_hash =
         shell_quote("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    format!(
+    let script = format!(
         "if [ -L {state_path} ]; then echo 'NFS transaction state is a symlink' >&2; exit 1; fi\nif [ -f {state_path} ]; then\n  IFS='|' read -r version had_original had_enabled had_running baseline_hash accepted_before accepted_candidate < {state_path} || exit 1\n  if [ \"$version\" != MACLUSTER_NFS_TXN_V1 ]; then echo 'NFS transaction state has an unsupported format' >&2; exit 1; fi\n  printf 'MACLUSTER_PENDING_V1\\n'\n  case \"$had_original\" in\n    yes) [ -f {backup_path} ] || {{ echo 'NFS transaction backup is missing' >&2; exit 1; }}; /bin/cat {backup_path} ;;\n    no) : ;;\n    *) echo 'NFS transaction state is malformed' >&2; exit 1 ;;\n  esac\nelse\n  legacy_count=0; legacy_backup=\n  for possible_backup in {legacy_backups}; do [ -e \"$possible_backup\" ] || continue; legacy_count=$((legacy_count + 1)); legacy_backup=$possible_backup; done\n  if [ \"$legacy_count\" -gt 1 ]; then echo 'multiple legacy NFS transactions need manual recovery; no exports were changed' >&2; exit 1; fi\n  if [ \"$legacy_count\" -eq 1 ]; then\n    legacy_temp=${{legacy_backup%.bak}}.tmp\n    if [ -e {exports_path} ]; then actual=$(/usr/bin/shasum -a 256 {exports_path}); actual=${{actual%% *}}; else actual={empty_hash}; fi\n    saved=$(/usr/bin/shasum -a 256 \"$legacy_backup\"); saved=${{saved%% *}}\n    if [ \"$actual\" != \"$saved\" ]; then\n      if [ ! -f \"$legacy_temp\" ]; then echo 'legacy NFS transaction backup does not match exports; manual recovery is required' >&2; exit 1; fi\n      candidate=$(/usr/bin/shasum -a 256 \"$legacy_temp\"); candidate=${{candidate%% *}}\n      if [ \"$actual\" != \"$candidate\" ]; then echo 'legacy NFS transaction exports do not match its backup or candidate; manual recovery is required' >&2; exit 1; fi\n    fi\n    printf 'MACLUSTER_PENDING_V1\\n'; /bin/cat \"$legacy_backup\"\n  else\n    if [ -e {exports_path} ]; then actual=$(/usr/bin/shasum -a 256 {exports_path}); actual=${{actual%% *}}; else actual={empty_hash}; fi\n    for possible_temp in {legacy_temporaries}; do\n      [ -e \"$possible_temp\" ] || continue\n      candidate=$(/usr/bin/shasum -a 256 \"$possible_temp\"); candidate=${{candidate%% *}}\n      if [ \"$actual\" = \"$candidate\" ]; then echo 'legacy NFS candidate has no original backup; manual recovery is required' >&2; exit 1; fi\n    done\n    printf 'MACLUSTER_CLEAN_V1\\n'; if [ -e {exports_path} ]; then /bin/cat {exports_path}; fi\n  fi\nfi"
-    )
+    );
+    format!("/bin/sh -c {}", shell_quote(&script))
 }
 
 pub(crate) fn read_nfs_exports_update_baseline(node: &NodeConfig) -> AppResult<(String, bool)> {
@@ -11734,6 +12004,35 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         assert_eq!(
             parse_nfs_exports_update_baseline(&response).unwrap(),
             (original.to_owned(), true)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nfs_exports_baseline_reader_handles_missing_legacy_backups_under_zsh() {
+        let root = std::env::temp_dir().join(format!("macluster-zsh-nfs-glob-{}", Id128::random()));
+        fs::create_dir_all(&root).expect("create empty exports directory");
+        let exports = root.join("exports");
+        let backup = root.join("exports.bak");
+        let command = nfs_exports_update_baseline_read_command(
+            &exports.to_string_lossy(),
+            &backup.to_string_lossy(),
+        );
+
+        let output = Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("run baseline reader under the default macOS SSH shell");
+
+        assert!(
+            output.status.success(),
+            "zsh rejected the no-backup glob: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            parse_nfs_exports_update_baseline(&String::from_utf8(output.stdout).unwrap()).unwrap(),
+            (String::new(), false)
         );
         let _ = fs::remove_dir_all(root);
     }

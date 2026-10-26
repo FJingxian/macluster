@@ -10,6 +10,10 @@ pub const METRICS_FAN_SPEED_FEATURE: &str = "metrics.fan-speed.v1";
 /// Internal JobSpec environment marker: keep the submitted PATH authoritative
 /// instead of adding Agent-registered tool directories ahead of it.
 pub const EXPLICIT_TASK_PATH_ENV: &str = "MCLUSTER_INTERNAL_EXPLICIT_PATH";
+/// Internal JobSpec marker enabling optional per-task resource and output logs.
+pub const VERBOSE_TASK_LOG_ENV: &str = "MCLUSTER_INTERNAL_VERBOSE_LOG";
+/// Visible shared root for the sidecar logs produced by verbose submissions.
+pub const VERBOSE_TASK_LOG_ROOT_ENV: &str = "MCLUSTER_INTERNAL_VERBOSE_LOG_ROOT";
 /// Internal JobSpec value used to scope a node-local Cargo target cache.
 pub const ACTIVE_ENV_PREFIX_ENV: &str = "MCLUSTER_INTERNAL_ACTIVE_ENV_PREFIX";
 pub const NAMESPACED_JOBS_FEATURE: &str = "agent.namespaced-jobs.v1";

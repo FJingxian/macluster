@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SubmitOptions {
     pub interactive: bool,
+    pub verbose: bool,
     pub queue: Option<QueueName>,
     pub node: Option<NodeId>,
     pub name: Option<String>,
@@ -87,6 +88,7 @@ pub fn merge_submit_options(declarations: SubmitOptions, cli: SubmitOptions) -> 
     env.extend(cli.env);
     SubmitOptions {
         interactive: cli.interactive,
+        verbose: declarations.verbose || cli.verbose,
         queue: cli.queue.or(declarations.queue),
         node: cli.node.or(declarations.node),
         name: cli.name.or(declarations.name),
@@ -132,6 +134,7 @@ fn parse_options(args: Vec<String>, declarations_only: bool) -> Result<SubmitOpt
         };
         match argument.as_str() {
             "-Is" if !declarations_only => options.interactive = true,
+            "-v" | "--verbose" => options.verbose = true,
             "-q" | "--queue" => {
                 let raw = takes_value(argument, &mut index)?;
                 options.queue =

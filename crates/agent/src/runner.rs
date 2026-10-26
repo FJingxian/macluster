@@ -1,6 +1,7 @@
 //! Detached supervisor for a single whole-node task.
 
 mod interactive;
+mod task_logs;
 
 pub fn serve_attach_stdio<R, W>(
     input: &mut R,
@@ -34,7 +35,9 @@ use std::{
 use macluster_protocol::{
     framing::sha256_hex,
     identifiers::{Id128, StartToken},
-    types::{ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase},
+    types::{
+        ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase, VERBOSE_TASK_LOG_ENV,
+    },
 };
 
 use crate::{AgentError, AgentRecord, active_record, local_script_path, write_active};
@@ -90,16 +93,26 @@ fn run_authorized(
         return fail_record(state_dir, record, "output path already exists");
     }
 
-    let stdout = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&stdout_local)?;
-    let stderr = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&stderr_local)?;
+    let verbose_logs = record
+        .spec
+        .env
+        .get(VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1");
+    let (stdout, stderr) = if verbose_logs {
+        (Stdio::piped(), Stdio::piped())
+    } else {
+        let stdout = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stdout_local)?;
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&stderr_local)?;
+        (Stdio::from(stdout), Stdio::from(stderr))
+    };
     let script_path = local_script_path(state_dir, job_id);
     let task_command = build_task_command(&script_path)?;
     let gate_path = local_dir.join(format!(".task-gate-{}", Id128::random()));
@@ -107,8 +120,8 @@ fn run_authorized(
     configure_task_environment(&mut command, job_id, &record)?;
     command
         .current_dir(&record.spec.cwd)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(stdout)
+        .stderr(stderr)
         .stdin(Stdio::null())
         .process_group(0);
 
@@ -119,9 +132,54 @@ fn run_authorized(
         }
     };
     let child_pid = child.id();
+    let mut log_session = if verbose_logs {
+        let Some(stdout) = child.stdout.take() else {
+            signal_group(child_pid, libc::SIGKILL);
+            let _ = child.wait();
+            return fail_record(
+                state_dir,
+                record,
+                "verbose task stdout pipe was unavailable",
+            );
+        };
+        let Some(stderr) = child.stderr.take() else {
+            signal_group(child_pid, libc::SIGKILL);
+            let _ = child.wait();
+            return fail_record(
+                state_dir,
+                record,
+                "verbose task stderr pipe was unavailable",
+            );
+        };
+        match task_logs::TaskLogSession::start(
+            &local_dir,
+            record.controller.controller_uuid.to_string(),
+            record.share_uuid.clone(),
+            job_id,
+            token,
+            stdout,
+            stderr,
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                signal_group(child_pid, libc::SIGKILL);
+                let _ = child.wait();
+                return fail_record(
+                    state_dir,
+                    record,
+                    &format!("could not start verbose task logging: {error}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let Some(child_start_id) = super::wait_for_process_start_identity(child_pid) else {
         signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         return fail_record(state_dir, record, "could not verify task process identity");
     };
     record.child_pid = Some(child_pid);
@@ -130,11 +188,17 @@ fn run_authorized(
     if let Err(error) = write_active(state_dir, record.clone()) {
         signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         return Err(error);
     }
     if let Err(error) = release_task_gate(&gate_path) {
         signal_group(child_pid, libc::SIGKILL);
         let _ = child.wait();
+        if let Some(session) = log_session.take() {
+            let _ = session.finish();
+        }
         let _ = fs::remove_file(&gate_path);
         return fail_record(
             state_dir,
@@ -143,14 +207,51 @@ fn run_authorized(
         );
     }
 
-    let result = monitor_task(
+    let mut result = match monitor_task(
         state_dir,
         &mut child,
         job_id,
         token,
         child_pid,
         record.spec.walltime_secs,
-    )?;
+        log_session.as_mut(),
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            signal_group(child_pid, libc::SIGTERM);
+            let began = Instant::now();
+            while child.try_wait()?.is_none() && began.elapsed() < Duration::from_secs(2) {
+                thread::sleep(Duration::from_millis(25));
+            }
+            let status = if let Some(status) = child.try_wait()? {
+                status
+            } else {
+                signal_group(child_pid, libc::SIGKILL);
+                child.wait()?
+            };
+            TaskResult {
+                state: JobState::Failed,
+                exit_code: status.code(),
+                reason: Some(format!("task monitor failed: {error}")),
+            }
+        }
+    };
+    if let Some(session) = log_session.take() {
+        match session.finish() {
+            Ok(completion) => {
+                if let Some(reason) = completion.raw_capture_failed {
+                    result.state = JobState::Failed;
+                    result.reason = Some(format!("raw task log capture failed: {reason}"));
+                }
+                if let Some(reason) = completion.annotation_failed {
+                    eprintln!("macluster-agent: enhanced task log failed: {reason}");
+                }
+            }
+            Err(error) => {
+                eprintln!("macluster-agent: could not seal enhanced task logs: {error}");
+            }
+        }
+    }
     crate::finalize_active(
         state_dir,
         job_id,
@@ -579,11 +680,52 @@ fn monitor_task(
     token: StartToken,
     pgid: u32,
     walltime: Option<u64>,
+    mut log_session: Option<&mut task_logs::TaskLogSession>,
 ) -> Result<TaskResult, AgentError> {
     let start = continuous_time_ns();
     let timeout = walltime.map(|seconds| u128::from(seconds).saturating_mul(1_000_000_000));
     let mut termination: Option<(JobState, String, Instant)> = None;
+    let mut next_sample = Instant::now();
+    let mut last_output_at = next_sample;
+    let mut last_heartbeat_at = next_sample;
+    let mut observed_output_bytes = 0;
+    if let Some(session) = log_session.as_deref_mut() {
+        session.initialize_sample(pgid);
+        next_sample += Duration::from_secs(5);
+    }
     loop {
+        if let Some(session) = log_session.as_deref_mut() {
+            if let Some(reason) = session.raw_error() {
+                if termination.is_none() {
+                    let reason = format!("raw task log capture failed: {reason}");
+                    crate::mark_termination_cause(
+                        state_dir,
+                        job_id,
+                        token,
+                        JobState::Failed,
+                        &reason,
+                    )?;
+                    termination = Some((JobState::Failed, reason, Instant::now()));
+                    signal_group(pgid, libc::SIGTERM);
+                }
+            }
+            let now = Instant::now();
+            let output_bytes = session.output_bytes();
+            if output_bytes != observed_output_bytes {
+                observed_output_bytes = output_bytes;
+                last_output_at = now;
+            }
+            if now >= next_sample {
+                session.sample(pgid);
+                next_sample = now + Duration::from_secs(5);
+            }
+            if now.duration_since(last_output_at) >= Duration::from_secs(5)
+                && now.duration_since(last_heartbeat_at) >= Duration::from_secs(5)
+            {
+                session.heartbeat();
+                last_heartbeat_at = now;
+            }
+        }
         let record = active_record(state_dir, job_id, token)?;
         if termination.is_none() {
             if let Some(cause) = record.termination_cause {
@@ -841,7 +983,28 @@ pub(super) fn sync_pending_logs(
         ));
     }
     sync_log_with_progress(&local_job_dir.join("stdout.log"), &stdout, &mut progress)?;
-    sync_log_with_progress(&local_job_dir.join("stderr.log"), &stderr, &mut progress)
+    sync_log_with_progress(&local_job_dir.join("stderr.log"), &stderr, &mut progress)?;
+    if record
+        .spec
+        .env
+        .get(VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1")
+    {
+        let job_dir = record.spec.shared_job_dir(&shared_root, record.job_id);
+        let destinations = [
+            ("monitor.log", "monitor.log"),
+            ("resources.jsonl", "resources.jsonl"),
+            ("summary.json", "summary.json"),
+        ];
+        for (local_name, shared_name) in destinations {
+            let local = local_job_dir.join(local_name);
+            let requested = job_dir.join(shared_name);
+            let shared = resolve_output(&requested.to_string_lossy(), record.job_id, &output_roots)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            publish_sidecar_atomically(&local, &shared, &mut progress)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -932,6 +1095,94 @@ fn sync_log_with_progress(
     output.seek(SeekFrom::End(0))?;
     copy_log_contents(&mut local, &mut output, progress)?;
     output.sync_all()
+}
+
+fn publish_sidecar_atomically(
+    local: &Path,
+    shared: &Path,
+    progress: &mut dyn FnMut(),
+) -> io::Result<()> {
+    let local_metadata = fs::symlink_metadata(local)?;
+    if local_metadata.file_type().is_symlink() || !local_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "local task sidecar is not a regular file",
+        ));
+    }
+    if shared.exists() {
+        return compare_files(local, shared, progress);
+    }
+    let parent = shared
+        .parent()
+        .ok_or_else(|| io::Error::other("shared sidecar has no parent"))?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        shared
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sidecar"),
+        Id128::random()
+    ));
+    let mut input = File::open(local)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    let copy_result =
+        copy_log_contents(&mut input, &mut output, progress).and_then(|()| output.sync_all());
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    match fs::hard_link(&temp, shared) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temp);
+            return compare_files(local, shared, progress);
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    fs::remove_file(&temp)?;
+    File::open(parent)?.sync_all()
+}
+
+fn compare_files(left: &Path, right: &Path, progress: &mut dyn FnMut()) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(right)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "shared task sidecar is not a regular file",
+        ));
+    }
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "shared task sidecar already exists with different contents",
+        ));
+    }
+    let mut left_bytes = [0_u8; 64 * 1024];
+    let mut right_bytes = [0_u8; 64 * 1024];
+    loop {
+        let left_count = left.read(&mut left_bytes)?;
+        let right_count = right.read(&mut right_bytes)?;
+        if left_count != right_count || left_bytes[..left_count] != right_bytes[..right_count] {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "shared task sidecar already exists with different contents",
+            ));
+        }
+        if left_count == 0 {
+            return Ok(());
+        }
+        progress();
+    }
 }
 
 fn copy_log_contents(
@@ -1522,6 +1773,73 @@ mod tests {
         );
         assert!(!record.log_sync_pending);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    #[ignore = "manual no-output task benchmark; run with --ignored --nocapture"]
+    fn benchmark_empty_task_resource_logging_overhead() {
+        fn run_case(verbose: bool) -> (f64, f64, Option<serde_json::Value>, u64) {
+            let (root, state_dir, token) = ready_state("#!/bin/bash\n/bin/sleep 8\n", None);
+            if verbose {
+                let mut record = crate::active_record(&state_dir, 1, token).unwrap();
+                record
+                    .spec
+                    .env
+                    .insert(VERBOSE_TASK_LOG_ENV.to_owned(), "1".to_owned());
+                record.spec.env.insert(
+                    macluster_protocol::types::VERBOSE_TASK_LOG_ROOT_ENV.to_owned(),
+                    root.join("shared").to_string_lossy().into_owned(),
+                );
+                crate::write_active(&state_dir, record).unwrap();
+            }
+
+            let cpu_before = test_process_cpu_seconds();
+            let began = Instant::now();
+            run(&state_dir, 1, token).unwrap();
+            let wall_seconds = began.elapsed().as_secs_f64();
+            let cpu_seconds = (test_process_cpu_seconds() - cpu_before).max(0.0);
+            let job_dir = state_dir.join("jobs/1");
+            let summary = verbose.then(|| {
+                serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(job_dir.join("summary.json")).unwrap(),
+                )
+                .unwrap()
+            });
+            let extra_log_bytes = ["monitor.log", "resources.jsonl", "summary.json"]
+                .into_iter()
+                .map(|name| fs::metadata(job_dir.join(name)).map_or(0, |metadata| metadata.len()))
+                .sum();
+            fs::remove_dir_all(root).unwrap();
+            (wall_seconds, cpu_seconds, summary, extra_log_bytes)
+        }
+
+        fn test_process_cpu_seconds() -> f64 {
+            let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+            let seconds =
+                |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
+            seconds(usage.ru_utime) + seconds(usage.ru_stime)
+        }
+
+        let baseline = run_case(false);
+        let verbose = run_case(true);
+        let summary = verbose.2.as_ref().unwrap();
+        println!(
+            "empty task baseline: wall={:.2}s runner_cpu={:.4}s; verbose: wall={:.2}s runner_cpu={:.4}s sampler_cpu={:.4}s sampled_rss_growth={}B samples={} additional_logs={}B",
+            baseline.0,
+            baseline.1,
+            verbose.0,
+            verbose.1,
+            summary["runner_cpu_user_seconds"].as_f64().unwrap_or(0.0)
+                + summary["runner_cpu_system_seconds"].as_f64().unwrap_or(0.0),
+            summary["runner_peak_rss_sampled_growth_bytes"]
+                .as_u64()
+                .map_or_else(|| "N/A".to_owned(), |value| value.to_string()),
+            summary["samples"].as_u64().unwrap_or(0),
+            verbose.3,
+        );
+        assert!(verbose.2.is_some());
     }
 
     #[test]

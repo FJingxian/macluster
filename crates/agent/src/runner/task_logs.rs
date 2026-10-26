@@ -4,7 +4,14 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    net::Shutdown,
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{OpenOptionsExt, PermissionsExt},
+            net::UnixStream,
+        },
+    },
     path::{Path, PathBuf},
     process::{ChildStderr, ChildStdout},
     sync::{
@@ -26,6 +33,7 @@ const IO_BUFFER_BYTES: usize = 64 * 1024;
 const ENHANCEMENT_QUEUE_DEPTH: usize = 64;
 const MAX_LINE_BYTES: usize = 16 * 1024;
 const MAX_TRACKED_PROCESSES: usize = 4096;
+const CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
 enum OutputStream {
@@ -92,6 +100,7 @@ enum EnhancementEvent {
 struct CaptureStats {
     retained_bytes: u64,
     discarded_bytes: u64,
+    closed_before_eof: bool,
 }
 
 #[derive(Serialize)]
@@ -115,6 +124,8 @@ struct TaskResourceSummary {
     stdout_discarded_bytes: u64,
     stderr_retained_bytes: u64,
     stderr_discarded_bytes: u64,
+    stdout_closed_before_eof: bool,
+    stderr_closed_before_eof: bool,
     monitor_discarded_bytes: u64,
     resources_discarded_bytes: u64,
     annotation_dropped_bytes: u64,
@@ -138,7 +149,7 @@ pub(super) struct TaskLogSession {
     identity: LogIdentity,
     local_dir: PathBuf,
     sender: Option<SyncSender<EnhancementEvent>>,
-    collectors: Vec<JoinHandle<io::Result<CaptureStats>>>,
+    collectors: Vec<PipeCollector>,
     pty_raw_log: Option<SegmentedLog>,
     enhancer: Option<JoinHandle<EnhancementResult>>,
     latest_sample: Arc<Mutex<Option<ResourceSample>>>,
@@ -159,6 +170,11 @@ struct EnhancementResult {
     annotation_failed: Option<String>,
     monitor_discarded_bytes: u64,
     resources_discarded_bytes: u64,
+}
+
+struct PipeCollector {
+    stop: UnixStream,
+    worker: JoinHandle<io::Result<CaptureStats>>,
 }
 
 impl TaskLogSession {
@@ -458,8 +474,13 @@ impl TaskLogSession {
 
     pub(super) fn finish(mut self) -> io::Result<TaskLogCompletion> {
         let mut capture_stats = [None, None];
+        // Wake both collectors before joining either one. Waiting for EOF is
+        // unbounded when a detached descendant inherits the output pipes.
+        for collector in &self.collectors {
+            let _ = collector.stop.shutdown(Shutdown::Write);
+        }
         for (index, collector) in std::mem::take(&mut self.collectors).into_iter().enumerate() {
-            match collector.join() {
+            match collector.worker.join() {
                 Ok(Ok(stats)) => capture_stats[index] = Some(stats),
                 Ok(Err(error)) => store_first_error(&self.raw_error, error.to_string()),
                 Err(_) => {
@@ -514,6 +535,8 @@ impl TaskLogSession {
             stdout_discarded_bytes: stdout.discarded_bytes,
             stderr_retained_bytes: stderr.retained_bytes,
             stderr_discarded_bytes: stderr.discarded_bytes,
+            stdout_closed_before_eof: stdout.closed_before_eof,
+            stderr_closed_before_eof: stderr.closed_before_eof,
             monitor_discarded_bytes: enhancement.monitor_discarded_bytes,
             resources_discarded_bytes: enhancement.resources_discarded_bytes,
             annotation_dropped_bytes: self.annotation_dropped_bytes.load(Ordering::Relaxed),
@@ -555,7 +578,7 @@ impl TaskLogSession {
     }
 }
 
-fn spawn_collector<R: Read + Send + 'static>(
+fn spawn_collector<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,
     stream: OutputStream,
     segment_dir: PathBuf,
@@ -565,8 +588,14 @@ fn spawn_collector<R: Read + Send + 'static>(
     byte_counter: Arc<AtomicU64>,
     raw_error: Arc<Mutex<Option<String>>>,
     annotation_dropped_bytes: Arc<AtomicU64>,
-) -> io::Result<JoinHandle<io::Result<CaptureStats>>> {
-    thread::Builder::new()
+) -> io::Result<PipeCollector> {
+    let (stop, wakeup) = UnixStream::pair()?;
+    let fd = reader.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let worker = thread::Builder::new()
         .name(format!("macluster-capture-{}", stream.label()))
         .spawn(move || {
             let mut log = match SegmentedLog::create(&segment_dir, LOG_LIMIT_BYTES) {
@@ -578,11 +607,53 @@ fn spawn_collector<R: Read + Send + 'static>(
             };
             let mut buffer = [0_u8; IO_BUFFER_BYTES];
             let mut read_error = None;
+            let mut drain_deadline: Option<Instant> = None;
+            let mut closed_before_eof = false;
             loop {
+                if drain_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    closed_before_eof = true;
+                    break;
+                }
+                // An idle collector sleeps until output or an explicit stop;
+                // no periodic polling is added to a running task.
+                let mut fds = [
+                    libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: wakeup.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let timeout = if drain_deadline.is_some() { 0 } else { -1 };
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    read_error = Some(error);
+                    break;
+                }
+                if fds[1].revents != 0 && drain_deadline.is_none() {
+                    drain_deadline = Some(Instant::now() + CAPTURE_DRAIN_TIMEOUT);
+                }
+                if fds[0].revents == 0 && drain_deadline.is_none() {
+                    continue;
+                }
                 let count = match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(count) => count,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if drain_deadline.is_some() {
+                            closed_before_eof = true;
+                            break;
+                        }
+                        continue;
+                    }
                     Err(error) => {
                         read_error = Some(error);
                         break;
@@ -610,18 +681,16 @@ fn spawn_collector<R: Read + Send + 'static>(
                     Err(TrySendError::Full(_)) => {}
                 }
             }
-            let stats = CaptureStats {
-                retained_bytes: log.retained_bytes,
-                discarded_bytes: log.discarded_bytes,
-            };
             let flatten_result = log.flatten_to(&flat_path);
             if let Some(error) = read_error {
                 store_first_error(&raw_error, error.to_string());
                 return Err(error);
             }
-            flatten_result?;
+            let mut stats = flatten_result?;
+            stats.closed_before_eof = closed_before_eof;
             Ok(stats)
-        })
+        })?;
+    Ok(PipeCollector { stop, worker })
 }
 
 fn store_first_error(slot: &Mutex<Option<String>>, message: String) {
@@ -698,6 +767,38 @@ impl SegmentedLog {
                 segment.len += count;
             }
             offset += count;
+        }
+        Ok(())
+    }
+
+    fn append_record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let count = bytes.len() as u64;
+        if count > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log record exceeds the retention budget",
+            ));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // Small resource budgets need multiple segments too. Evict whole
+        // segments before a write so a JSON record is never split or truncated.
+        let target = (self.limit / 8).max(1).min(SEGMENT_TARGET_BYTES as u64) as usize;
+        while self.retained_bytes.saturating_add(count) > self.limit {
+            self.discard_oldest()?;
+        }
+        if self.current.is_none() || self.current_len.saturating_add(bytes.len()) > target {
+            self.open_next_segment()?;
+        }
+        self.current
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log segment writer is unavailable"))?
+            .write_all(bytes)?;
+        self.current_len += bytes.len();
+        self.retained_bytes += count;
+        if let Some(segment) = self.segments.back_mut() {
+            segment.len += bytes.len();
         }
         Ok(())
     }
@@ -783,6 +884,7 @@ impl SegmentedLog {
         Ok(CaptureStats {
             retained_bytes: self.retained_bytes,
             discarded_bytes: self.discarded_bytes,
+            closed_before_eof: false,
         })
     }
 }
@@ -948,7 +1050,7 @@ struct ResourceLogRecord<'a> {
 fn append_json_line(log: &mut SegmentedLog, value: &impl Serialize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
-    log.append(&bytes)
+    log.append_record(&bytes)
 }
 
 #[derive(Default)]
@@ -1488,7 +1590,149 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(all(test, target_vendor = "apple"))]
 mod tests {
-    use super::current_process_rss_bytes;
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn verbose_capture_finishes_while_a_writer_keeps_pipes_open() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-open-log-pipe-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'ready\\n'; printf 'warning\\n' >&2; /bin/sleep 3",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let session = TaskLogSession::start(
+            &root,
+            "cluster".into(),
+            None,
+            1,
+            StartToken(Id128::random()),
+            writer.stdout.take().unwrap(),
+            writer.stderr.take().unwrap(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while session.output_bytes() < 14 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let began = Instant::now();
+        let result = session.finish();
+        let elapsed = began.elapsed();
+        unsafe {
+            libc::kill(-(writer.id() as i32), libc::SIGKILL);
+        }
+        let _ = writer.wait();
+        let stdout = fs::read(root.join("stdout.log")).unwrap();
+        let stderr = fs::read(root.join("stderr.log")).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("summary.json")).unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.unwrap().raw_capture_failed.is_none());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "collector waited for an unrelated writer: {elapsed:?}"
+        );
+        assert_eq!(stdout, b"ready\n");
+        assert_eq!(stderr, b"warning\n");
+        assert_eq!(summary["stdout_closed_before_eof"], true);
+        assert_eq!(summary["stderr_closed_before_eof"], true);
+    }
+
+    #[test]
+    fn verbose_capture_preserves_buffered_output_through_normal_eof() {
+        let root = std::env::temp_dir().join(format!("macluster-log-eof-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let mut writer = Command::new("/bin/dd")
+            .args(["if=/dev/zero", "bs=65536", "count=4"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let session = TaskLogSession::start(
+            &root,
+            "cluster".into(),
+            None,
+            1,
+            StartToken(Id128::random()),
+            writer.stdout.take().unwrap(),
+            writer.stderr.take().unwrap(),
+        )
+        .unwrap();
+        assert!(writer.wait().unwrap().success());
+        let completion = session.finish().unwrap();
+        let stdout = fs::read(root.join("stdout.log")).unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("summary.json")).unwrap()).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(completion.raw_capture_failed.is_none());
+        assert_eq!(stdout, vec![0_u8; 262144]);
+        assert_eq!(summary["stdout_closed_before_eof"], false);
+        assert_eq!(summary["stderr_closed_before_eof"], false);
+    }
+
+    #[test]
+    fn resource_log_rejects_oversized_records_without_corrupting_history() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-jsonl-oversize-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let mut log = SegmentedLog::create(&root.join("segments"), 32).unwrap();
+        append_json_line(&mut log, &serde_json::json!({"index":1})).unwrap();
+        let error =
+            append_json_line(&mut log, &serde_json::json!({"data":"x".repeat(64)})).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        log.flatten_to(&root.join("resources.jsonl")).unwrap();
+        let bytes = fs::read(root.join("resources.jsonl")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({"index":1})
+        );
+    }
+
+    #[test]
+    fn resource_log_rotation_keeps_complete_recent_json_records() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-jsonl-rotation-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let mut log = SegmentedLog::create(&root.join("segments"), RESOURCE_LIMIT_BYTES).unwrap();
+        let padding = "x".repeat(700);
+        for index in 0..3000 {
+            append_json_line(
+                &mut log,
+                &serde_json::json!({"index":index, "padding":padding}),
+            )
+            .unwrap();
+        }
+        let stats = log.flatten_to(&root.join("resources.jsonl")).unwrap();
+        let text = fs::read_to_string(root.join("resources.jsonl")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        let records = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("retention must not split a JSON record");
+        assert_eq!(records.last().unwrap()["index"], 2999);
+        for pair in records.windows(2) {
+            assert_eq!(
+                pair[1]["index"].as_u64(),
+                pair[0]["index"].as_u64().map(|value| value + 1)
+            );
+        }
+        assert!(stats.discarded_bytes > 0);
+        assert!(stats.retained_bytes <= RESOURCE_LIMIT_BYTES);
+        assert!(
+            stats.retained_bytes >= RESOURCE_LIMIT_BYTES * 3 / 4,
+            "rotation discarded almost all recent samples"
+        );
+    }
 
     #[test]
     fn process_rusage_reports_nonzero_current_process_memory() {

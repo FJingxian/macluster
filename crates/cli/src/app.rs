@@ -1826,13 +1826,35 @@ fn remap_compiler_flags(
     login_path: &str,
     cc_shell_escaped_flags: bool,
 ) -> AppResult<String> {
-    let words = tokenize_shell_words(value).map_err(|_| {
-        (
-            2,
-            format!("{key} contains invalid shell-style compiler flags"),
-        )
-    })?;
+    let rustflags =
+        key == "RUSTFLAGS" || (key.starts_with("CARGO_TARGET_") && key.ends_with("_RUSTFLAGS"));
+    // Cargo splits these variables on whitespace and does not remove shell
+    // quotes. In particular, --cfg name="value" must keep its double quotes.
+    let words = if rustflags {
+        value.split_whitespace().map(str::to_owned).collect()
+    } else {
+        tokenize_shell_words(value).map_err(|_| {
+            (
+                2,
+                format!("{key} contains invalid shell-style compiler flags"),
+            )
+        })?
+    };
     let words = remap_compiler_flag_words(config, key, words, active_prefix, login_path)?;
+    if rustflags {
+        if words
+            .iter()
+            .any(|word| word.chars().any(char::is_whitespace))
+        {
+            return Err((
+                2,
+                format!(
+                    "{key} maps to an argument containing whitespace; use CARGO_ENCODED_RUSTFLAGS to preserve argument boundaries"
+                ),
+            ));
+        }
+        return Ok(words.join(" "));
+    }
     if is_cc_rs_flags_variable(key) {
         if cc_shell_escaped_flags {
             return Ok(quote_argv(&words));
@@ -5155,6 +5177,62 @@ mod tests {
                     .to_string()
             ]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn msub_rustflags_remain_usable_by_cargo() {
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("macluster-rustflags-{}", Id128::random()));
+        let (config, _, _) = environment_fixture(&root, &root.join("software"));
+        fs::create_dir_all(root.join("project/src")).unwrap();
+        fs::write(root.join("project/Cargo.toml"), "[package]\nname = \"rustflags-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n").unwrap();
+        fs::write(root.join("project/src/lib.rs"), "#[cfg(not(macluster_probe = \"inherited\"))]\ncompile_error!(\"quoted cfg value was not inherited\");\npub fn probe() {}\n").unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let version = Command::new(rustc).arg("-vV").output().unwrap();
+        assert!(version.status.success());
+        let version = String::from_utf8(version.stdout).unwrap();
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let target_key = format!(
+            "CARGO_TARGET_{}_RUSTFLAGS",
+            host.replace('-', "_").to_uppercase()
+        );
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        for key in ["RUSTFLAGS", target_key.as_str()] {
+            let task_env = prepare_task_environment(
+                &config,
+                BTreeMap::from([
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (
+                        key.into(),
+                        "-C opt-level=1 --cfg macluster_probe=\"inherited\"".into(),
+                    ),
+                ]),
+                BTreeMap::new(),
+            )
+            .unwrap();
+            let output = Command::new(&cargo)
+                .args(["check", "--offline", "--quiet", "--target", host])
+                .current_dir(root.join("project"))
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_BUILD_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env("CARGO_TARGET_DIR", root.join("target").join(key))
+                .env(key, &task_env[key])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{key}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

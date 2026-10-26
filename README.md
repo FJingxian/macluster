@@ -19,8 +19,11 @@ This is an early-stage project for home and lab clusters.
 - Rust 1.90 or newer to build the application.
 - Remote Login enabled on compute Macs, with SSH access from the login Mac.
 - Accounts and file permissions that allow NFS clients to read and write shared files.
+- Shared directories on volumes that support macOS NFS export, such as APFS. ExFAT volumes cannot be exported.
 
 Setup may ask for administrator authorization on each affected Mac. Use a binary built for that Mac's CPU architecture.
+
+For protected folders or external volumes, the storage Mac may also require **System Settings → Privacy & Security → Full Disk Access** for `/sbin/nfsd`. After granting access, run `sudo /sbin/nfsd restart` on that Mac and retry enrollment.
 
 ## Install
 

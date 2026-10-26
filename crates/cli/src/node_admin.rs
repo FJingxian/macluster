@@ -3994,8 +3994,8 @@ pub(crate) fn ensure_nfs_exports_with_setup(
         Err(error) => (
             managed,
             Err(format!(
-                "could not add managed NFS entries: {error}\n{}",
-                nfs_admin_steps_for_requests(requests)
+                "could not configure NFS exports on {}: {error}\nResolve the server error shown above, then rerun the same mnode --add command to resume",
+                storage_node.host
             )),
         ),
     }
@@ -4453,6 +4453,24 @@ transaction_active=no
 legacy_backup=
 legacy_temp=
 legacy_recovered=no
+check_nfs_exports() {{
+  if nfs_check_output=$({nfsd_path} "$@" checkexports 2>&1); then
+    if [ -n "$nfs_check_output" ]; then printf '%s\n' "$nfs_check_output" >&2; fi
+  else
+    nfs_check_status=$?
+    printf '%s\n' "$nfs_check_output" >&2
+    case "$nfs_check_output" in
+      *"sandbox_check failed"*"nfsd has no read access"*)
+        echo 'macOS privacy protection blocks nfsd on this NFS server. In System Settings > Privacy & Security > Full Disk Access, add /sbin/nfsd and enable it. sudo cannot grant this permission.' >&2
+        echo 'After authorizing nfsd, run sudo /sbin/nfsd restart on this server, then rerun the same mnode --add command. A full Mac restart is not the first step.' >&2
+        ;;
+      *"NFS exporting not supported by fstype"*)
+        echo 'This volume cannot be exported by macOS NFS. Choose a directory on an NFS-capable volume, such as APFS; sudo and export options cannot add filesystem support.' >&2
+        ;;
+    esac
+    return "$nfs_check_status"
+  fi
+}}
 rollback_nfs_transaction() {{
   result=$?
   trap - EXIT HUP INT TERM
@@ -4551,7 +4569,7 @@ else
   case "$nfsd_status" in *"nfsd is running"*) had_running=yes ;; *) had_running=no ;; esac
 fi
 printf '%s' {candidate} > {temporary_path}
-{nfsd_path} -F {temporary_path} checkexports
+check_nfs_exports -F {temporary_path}
 "#,
         candidate = shell_quote(candidate),
     ));
@@ -4577,7 +4595,7 @@ transaction_active=yes
         r#"/bin/cat {temporary_path} > {exports_path}
 if [ "$had_enabled" = no ]; then {nfsd_path} enable; fi
 if [ "$had_running" = no ]; then {nfsd_path} start; fi
-{nfsd_path} checkexports
+check_nfs_exports
 {nfsd_path} update
 transaction_active=no
 /bin/rm -f {state_path}
@@ -6983,8 +7001,8 @@ pub(crate) fn prepare_share_source(
         return Err((
             1,
             format!(
-                "share source {root} must be on a local filesystem: {}",
-                command_error("local filesystem check failed", &output)
+                "share source {root} is not a usable NFS export: {}",
+                command_error("NFS source check failed", &output)
             ),
         ));
     }
@@ -12754,6 +12772,45 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         );
         assert_eq!(fs::read_to_string(&exports).unwrap(), candidate_a);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nfs_privacy_denial_preserves_exports_and_explains_server_authorization() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let exports = root.join("exports");
+        let temporary = root.join("exports.tmp");
+        let backup = root.join("exports.bak");
+        let nfsd = root.join("nfsd");
+        let original = "/Users/Shared/old 192.0.2.7\n";
+        fs::write(&exports, original).unwrap();
+        fs::write(
+            &nfsd,
+            "#!/bin/sh\nif [ \"$1\" = status ]; then\n  echo 'nfsd service is enabled'; echo 'nfsd is running'; exit 0\nfi\necho 'exports:2: sandbox_check failed. nfsd has no read access to /Volumes/private' >&2\nexit 1\n",
+        ).unwrap();
+        fs::set_permissions(&nfsd, fs::Permissions::from_mode(0o755)).unwrap();
+        let script = super::nfs_exports_update_body(
+            "/Volumes/private 192.0.2.8\n",
+            original,
+            &exports.to_string_lossy(),
+            &temporary.to_string_lossy(),
+            &backup.to_string_lossy(),
+            &nfsd.to_string_lossy(),
+        )
+        .unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(&exports).unwrap(), original);
+        assert!(!backup.exists());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("sandbox_check failed"), "{error}");
+        assert!(error.contains("Full Disk Access"), "{error}");
+        assert!(error.contains("/sbin/nfsd restart"), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

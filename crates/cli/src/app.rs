@@ -4158,6 +4158,45 @@ fn verify_local_share_source(path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
+        // Local does not imply exportable: an ExFAT volume can be read and
+        // written normally but lack the file handles required by the NFS server.
+        // Query the volume once, without sudo, before changing exports/markers.
+        #[repr(C)]
+        struct VolumeCapabilities {
+            length: u32,
+            values: libc::vol_capabilities_attr_t,
+        }
+        let mut attributes: libc::attrlist = unsafe { std::mem::zeroed() };
+        attributes.bitmapcount = libc::ATTR_BIT_MAP_COUNT as _;
+        attributes.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_CAPABILITIES;
+        let mut capabilities = MaybeUninit::<VolumeCapabilities>::zeroed();
+        if unsafe {
+            libc::getattrlist(
+                path_c.as_ptr(),
+                (&mut attributes as *mut libc::attrlist).cast(),
+                capabilities.as_mut_ptr().cast(),
+                std::mem::size_of::<VolumeCapabilities>(),
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "cannot inspect NFS export capability of {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        let capabilities = unsafe { capabilities.assume_init() };
+        let interfaces = libc::VOL_CAPABILITIES_INTERFACES;
+        let export = libc::VOL_CAP_INT_NFSEXPORT;
+        if capabilities.values.valid[interfaces] & export != 0
+            && capabilities.values.capabilities[interfaces] & export == 0
+        {
+            return Err(format!(
+                "share source {} uses filesystem '{filesystem}', which does not support macOS NFS export; choose a directory on an NFS-capable volume, such as APFS. Administrator authorization cannot enable this filesystem capability",
+                path.display()
+            ));
+        }
         Ok(())
     }
     #[cfg(not(target_vendor = "apple"))]

@@ -898,7 +898,13 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     match action {
         Action::List => list_nodes(&config_path, &state_dir),
         Action::Add(options) => add_node(&config_path, &state_dir, options),
-        Action::Remove(node_id) => remove_node(&config_path, &state_dir, &node_id),
+        Action::Remove(target) => {
+            if let Some(share_id) = target.strip_prefix("share:") {
+                remove_pending_share(&config_path, &state_dir, share_id)
+            } else {
+                remove_node(&config_path, &state_dir, &target)
+            }
+        }
     }
 }
 
@@ -1782,10 +1788,14 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         }
         "-rm" | "--remove" => {
             if inline.is_some() || args.len() != 2 {
-                return Err((2, format!("{key} requires exactly one node ID")));
+                return Err((
+                    2,
+                    format!("{key} requires exactly one node ID or pending share ID"),
+                ));
             }
             let value = args[1].clone();
-            NodeId::new(value.clone()).map_err(|error| (2, error.to_string()))?;
+            let identifier = value.strip_prefix("share:").unwrap_or(&value);
+            NodeId::new(identifier.to_owned()).map_err(|error| (2, error.to_string()))?;
             Ok(Action::Remove(value))
         }
         _ => Err((2, format!("unknown mnode option '{key}'"))),
@@ -1794,7 +1804,7 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
 
 fn print_help() {
     println!(
-        "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID | --remove NODE_ID\n\nSSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues. local adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share. Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
+        "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID | --remove NODE_ID | share:SHARE_ID\n\nSSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues. local adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources. Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
     );
 }
 
@@ -5126,6 +5136,380 @@ fn abort_pending_enrollment(
     save_admin_state(journal_path, state)?;
     println!("Cancelled pending enrollment {node_id}; its ID remains permanently reserved.");
     Ok(true)
+}
+
+fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
+    let _maintenance = acquire_node_maintenance(config_path, state_dir, "mnode --remove share")?;
+    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+        (
+            1,
+            format!("cluster config/state directory binding failed: {error}"),
+        )
+    })?;
+    let config_path = config_path.canonicalize().map_err(io_error)?;
+    let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
+    let config = ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
+    let journal_path = state_dir.join("node-admin.json");
+    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+    let key = format!("share:{share_id}");
+    let Some(mut operation) = state.operations.get(&key).cloned() else {
+        return Err((
+            2,
+            format!("no pending named-share operation exists for '{share_id}'"),
+        ));
+    };
+    if config.shares.contains_key(share_id) || operation.phase == "READY" {
+        return Err((
+            1,
+            format!(
+                "share {share_id} is already configured; `mnode -rm share:{share_id}` only cancels an incomplete setup"
+            ),
+        ));
+    }
+    if operation.phase == "ABORTED" {
+        println!("Pending named share {share_id} was already cancelled.");
+        return Ok(());
+    }
+    if operation.action != "share" || operation.phase != "SETUP_PENDING" {
+        return Err((
+            1,
+            format!(
+                "share operation {} is in phase {}; rerun its original mnode add command or use `macluster init` to reset the cluster",
+                operation.id, operation.phase
+            ),
+        ));
+    }
+    let digest = sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+    if operation.old_config_sha256.as_deref() != Some(digest.as_str()) {
+        return Err((
+            1,
+            format!(
+                "cluster config changed during setup of share {share_id}; inspect node-admin.json before cancelling"
+            ),
+        ));
+    }
+    let (endpoint_share_id, server_id, source_root, mount_root) =
+        parse_pending_named_share_endpoint(&operation.endpoint)?;
+    if endpoint_share_id != share_id || operation.node_id != server_id {
+        return Err((
+            1,
+            format!(
+                "share operation {} does not match the requested share or configured NFS server",
+                operation.id
+            ),
+        ));
+    }
+    let share_uuid = operation.machine_uuid.as_deref().ok_or_else(|| {
+        (
+            1,
+            format!("pending share {share_id} has no recorded share UUID"),
+        )
+    })?;
+    Id128::parse(share_uuid).map_err(|error| {
+        (
+            1,
+            format!("pending share {share_id} has an invalid share UUID: {error}"),
+        )
+    })?;
+    let pending_share = ShareConfig {
+        server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
+        source_root: source_root.clone(),
+        mount_root: mount_root.clone(),
+        share_uuid: share_uuid.to_owned(),
+    };
+    let replaced = replaced_child_shares(&config, &pending_share);
+    if !replaced.is_empty() {
+        return Err((
+            1,
+            format!(
+                "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster init` to reset safely",
+                replaced.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+    let server = config.nodes.get(&server_id).ok_or_else(|| {
+        (
+            1,
+            format!("NFS server {server_id} for pending share {share_id} is missing"),
+        )
+    })?;
+
+    // Validate every endpoint before removing any share resource. A pending
+    // share is cluster-wide, so its clients must still be the registered Macs.
+    for (node_id, node) in &config.nodes {
+        verify_registered_node_identity(node_id, node, &state)?;
+        check_remote_idle(node, node_id, &config_path)?;
+    }
+
+    let source = format!("{}:{}", server.host, source_root.display());
+    let mut clients = Vec::new();
+    for (node_id, node) in &config.nodes {
+        if node_id == &server_id {
+            continue;
+        }
+        let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
+            (
+                1,
+                format!(
+                    "cannot inspect NFS mounts on {node_id} before cancelling {share_id}: {error}"
+                ),
+            )
+        })?;
+        if !mounts.status.success() {
+            return Err((
+                1,
+                format!(
+                    "cannot inspect NFS mounts on {node_id} before cancelling {share_id}: {}",
+                    command_error("mount inspection failed", &mounts)
+                ),
+            ));
+        }
+        let mount_text = String::from_utf8_lossy(&mounts.stdout);
+        let mounted =
+            pending_share_mount_present(&mount_text, &source, &mount_root.to_string_lossy())
+                .map_err(|error| {
+                    (
+                        1,
+                        format!("cannot safely cancel share {share_id} on {node_id}: {error}"),
+                    )
+                })?;
+        let request = mounted.then(|| ClientUnmountRequest {
+            source: source.clone(),
+            mount_root: mount_root.clone(),
+            share_uuid: share_uuid.to_owned(),
+            label: format!("pending NFS share {share_id}"),
+        });
+        clients.push((node_id.clone(), node.clone(), request));
+    }
+
+    operation.detail =
+        Some("cancelling pending named-share setup and removing exact managed resources".into());
+    state.operations.insert(key.clone(), operation.clone());
+    save_admin_state(&journal_path, &state)?;
+
+    for (node_id, node, request) in &clients {
+        let requests = request.iter().cloned().collect::<Vec<_>>();
+        let aliases = if source_root != mount_root {
+            vec![(source_root.clone(), mount_root.clone())]
+        } else {
+            Vec::new()
+        };
+        let script = client_nfs_cleanup_batch_script(&requests, &aliases);
+        if requests.is_empty() && aliases.is_empty() {
+            continue;
+        }
+        run_pending_share_cleanup(
+            node,
+            &script,
+            &format!("remove exact pending NFS share {share_id} mount and alias on {node_id}"),
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!("cannot cancel pending share {share_id} on {node_id}: {error}"),
+            )
+        })?;
+    }
+
+    let export_requests = config
+        .nodes
+        .iter()
+        .filter(|(node_id, _)| node_id.as_str() != server_id)
+        .map(|(node_id, node)| NfsExportRequest {
+            root: source_root.to_string_lossy().into_owned(),
+            client_ip: node.host.to_string(),
+            share_uuid: share_uuid.to_owned(),
+            node_id: node_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !export_requests.is_empty() {
+        remove_managed_nfs_exports(server, &export_requests, &operation.id).map_err(|error| {
+            (
+                1,
+                format!("cannot remove pending NFS exports for share {share_id}: {error}"),
+            )
+        })?;
+    }
+
+    if source_root != mount_root {
+        remove_pending_share_alias(server, &mount_root, &source_root, share_id)?;
+        for (node_id, node, _) in &clients {
+            remove_pending_share_alias(node, &source_root, &mount_root, share_id).map_err(
+                |(_, error)| {
+                    (
+                        1,
+                        format!("cannot remove pending share alias on {node_id}: {error}"),
+                    )
+                },
+            )?;
+        }
+    }
+    remove_pending_share_marker(server, &source_root, share_uuid, share_id)?;
+
+    operation.phase = "ABORTED".into();
+    operation.detail = Some("pending named-share setup was explicitly cancelled".into());
+    state.operations.insert(key, operation);
+    save_admin_state(&journal_path, &state)?;
+    println!("Cancelled pending named share {share_id}; exact managed NFS resources were removed.");
+    println!("Restart the controller to resume scheduling.");
+    Ok(())
+}
+
+fn parse_pending_named_share_endpoint(
+    endpoint: &str,
+) -> AppResult<(String, String, PathBuf, PathBuf)> {
+    let fields = endpoint
+        .strip_prefix("share:")
+        .map(|endpoint| endpoint.splitn(4, ':').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let [share_id, server_id, source, mount_root] = fields.as_slice() else {
+        return Err((
+            1,
+            format!("pending named-share endpoint '{endpoint}' has an invalid format"),
+        ));
+    };
+    NodeId::new((*share_id).to_owned()).map_err(|error| (1, error.to_string()))?;
+    NodeId::new((*server_id).to_owned()).map_err(|error| (1, error.to_string()))?;
+    for (path, label) in [(*source, "source"), (*mount_root, "mount root")] {
+        if !safe_absolute_remote_path(path) || path == "/" {
+            return Err((
+                1,
+                format!("pending named-share {label} path is invalid: {path}"),
+            ));
+        }
+    }
+    let source_root = PathBuf::from(source);
+    let mount_root = PathBuf::from(mount_root);
+    validate_share_alias_paths(&source_root, &mount_root)?;
+    Ok((
+        (*share_id).to_owned(),
+        (*server_id).to_owned(),
+        source_root,
+        mount_root,
+    ))
+}
+
+fn pending_share_mount_present(
+    output: &str,
+    source: &str,
+    mount_root: &str,
+) -> Result<bool, String> {
+    let mut mounts_at_path = 0;
+    let mut expected_mounts = 0;
+    for line in output.lines() {
+        let Some((actual_source, destination)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((actual_mount, filesystem)) = destination.split_once(" (") else {
+            continue;
+        };
+        if actual_mount != mount_root {
+            continue;
+        }
+        mounts_at_path += 1;
+        let filesystem = filesystem.split(',').next().unwrap_or_default();
+        if actual_source == source && filesystem == "nfs" {
+            expected_mounts += 1;
+        }
+    }
+    match (expected_mounts, mounts_at_path) {
+        (0, _) => Ok(false),
+        (1, 1) => Ok(true),
+        _ => Err(format!(
+            "the expected share mount is stacked with another filesystem at {mount_root}"
+        )),
+    }
+}
+
+fn verify_registered_node_identity(
+    node_id: &str,
+    node: &NodeConfig,
+    state: &AdminState,
+) -> AppResult<()> {
+    let actual = if node.transport == Transport::Local {
+        local_platform_uuid()?
+    } else {
+        remote_machine_uuid(node).map_err(|(_, error)| {
+            (
+                1,
+                format!("cannot verify registered node {node_id} identity: {error}"),
+            )
+        })?
+    };
+    let configured = node.machine_uuid.as_deref();
+    let journal = state.machine_uuids.get(node_id).map(String::as_str);
+    let expected = configured.or(journal).ok_or_else(|| {
+        (
+            1,
+            format!(
+                "cannot cancel pending share: no recorded machine UUID is available for node {node_id}; restore its recorded identity or run `macluster init` to reset safely"
+            ),
+        )
+    })?;
+    if !expected.eq_ignore_ascii_case(&actual)
+        || configured
+            .zip(journal)
+            .is_some_and(|(configured, journal)| !configured.eq_ignore_ascii_case(journal))
+    {
+        return Err((
+            1,
+            format!(
+                "cannot cancel pending share: registered identity for {node_id} does not match the recorded Mac"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn run_pending_share_cleanup(node: &NodeConfig, script: &str, purpose: &str) -> Result<(), String> {
+    let output = ssh_output(node, script, None).map_err(|(_, error)| error)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = command_error(purpose, &output);
+    if mount_point_permission_error(&detail) {
+        run_interactive_admin_with_reason(node, purpose, script)
+    } else {
+        Err(detail)
+    }
+}
+
+fn remove_pending_share_alias(
+    node: &NodeConfig,
+    alias: &Path,
+    target: &Path,
+    share_id: &str,
+) -> AppResult<()> {
+    let alias_text = shell_quote(&alias.to_string_lossy());
+    let target_text = shell_quote(&target.to_string_lossy());
+    let script = format!(
+        "set -eu\nalias_path={alias_text}\ntarget_path={target_text}\nif alias_type=$(/usr/bin/stat -f '%HT' \"$alias_path\" 2>&1); then if [ \"$alias_type\" = 'Symbolic Link' ]; then actual=$(/usr/bin/readlink \"$alias_path\"); if [ \"$actual\" = \"$target_path\" ]; then /bin/rm \"$alias_path\"; fi; fi; else case \"$alias_type\" in *'No such file or directory'*) : ;; *) echo \"$alias_type\" >&2; exit 1 ;; esac; fi\n"
+    );
+    run_pending_share_cleanup(
+        node,
+        &script,
+        &format!("remove exact alias for pending NFS share {share_id}"),
+    )
+    .map_err(|error| (1, error))
+}
+
+fn remove_pending_share_marker(
+    node: &NodeConfig,
+    source_root: &Path,
+    share_uuid: &str,
+    share_id: &str,
+) -> AppResult<()> {
+    let marker = shell_quote(&source_root.join(".macluster-share-id").to_string_lossy());
+    let uuid = shell_quote(share_uuid);
+    let script = format!(
+        "set -eu\nmarker={marker}\nexpected={uuid}\nif marker_type=$(/usr/bin/stat -f '%HT' \"$marker\" 2>&1); then [ \"$marker_type\" = 'Regular File' ] || {{ echo 'share marker is not a regular file' >&2; exit 1; }}; actual=$(/bin/cat \"$marker\"); [ \"$actual\" = \"$expected\" ] || {{ echo 'share marker UUID changed' >&2; exit 1; }}; /bin/rm \"$marker\"; else case \"$marker_type\" in *'No such file or directory'*) : ;; *) echo \"$marker_type\" >&2; exit 1 ;; esac; fi\n"
+    );
+    run_pending_share_cleanup(
+        node,
+        &script,
+        &format!("remove exact marker for pending NFS share {share_id}"),
+    )
+    .map_err(|error| (1, error))
 }
 
 fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult<()> {
@@ -10696,6 +11080,178 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             .map(str::to_owned);
             assert!(parse_action(&args).is_ok());
         }
+    }
+
+    #[test]
+    fn remove_accepts_a_pending_share_identifier() {
+        let args = ["-rm", "share:volumes_data"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Remove(target)) if target == "share:volumes_data"
+        ));
+    }
+
+    #[test]
+    fn pending_share_mount_cleanup_matches_only_one_exact_nfs_mount() {
+        let expected = "192.0.2.1:/Volumes/Data on /Volumes/Data (nfs, nodev)\n";
+        assert_eq!(
+            super::pending_share_mount_present(
+                expected,
+                "192.0.2.1:/Volumes/Data",
+                "/Volumes/Data"
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            super::pending_share_mount_present(
+                "/dev/disk5s1 on /Volumes/Data (apfs, local)\n",
+                "192.0.2.1:/Volumes/Data",
+                "/Volumes/Data"
+            ),
+            Ok(false),
+            "a local volume at the destination is not a pending NFS mount"
+        );
+        let stacked = concat!(
+            "192.0.2.1:/Volumes/Data on /Volumes/Data (nfs, nodev)\n",
+            "/dev/disk5s1 on /Volumes/Data (apfs, local)\n",
+        );
+        assert!(
+            super::pending_share_mount_present(stacked, "192.0.2.1:/Volumes/Data", "/Volumes/Data")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_share_endpoint_parser_checks_share_server_and_paths() {
+        let parsed = super::parse_pending_named_share_endpoint(
+            "share:volumes_data:default-a:/Volumes/Data:/Volumes/Data",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "volumes_data");
+        assert_eq!(parsed.1, "default-a");
+        assert_eq!(parsed.2, PathBuf::from("/Volumes/Data"));
+        assert_eq!(parsed.3, PathBuf::from("/Volumes/Data"));
+        assert!(
+            super::parse_pending_named_share_endpoint(
+                "share:bad/id:default-a:/Volumes/Data:/Volumes/Data"
+            )
+            .is_err()
+        );
+        assert!(
+            super::parse_pending_named_share_endpoint(
+                "share:volumes_data:default-a:relative:/Volumes/Data"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pending_share_cancellation_rejects_nodes_without_recorded_machine_identity() {
+        let mut node = NodeEndpoint::parse("operator@127.0.0.1")
+            .unwrap()
+            .node_config("unused".into(), None);
+        node.transport = Transport::Local;
+        node.machine_uuid = None;
+        let state = AdminState {
+            version: 1,
+            config_path: "/tmp/config.toml".into(),
+            state_dir: "/tmp/state".into(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::new(),
+            operations: BTreeMap::new(),
+        };
+
+        let error = super::verify_registered_node_identity("login-01", &node, &state)
+            .expect_err("cleanup must fail closed without a recorded machine UUID");
+        assert!(error.1.contains("no recorded machine UUID"), "{error:?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pending_share_cancellation_accepts_identity_recorded_in_admin_journal() {
+        let mut node = NodeEndpoint::parse("operator@127.0.0.1")
+            .unwrap()
+            .node_config("unused".into(), None);
+        node.transport = Transport::Local;
+        node.machine_uuid = None;
+        let state = AdminState {
+            version: 1,
+            config_path: "/tmp/config.toml".into(),
+            state_dir: "/tmp/state".into(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::from([(
+                "login-01".into(),
+                super::local_platform_uuid().unwrap(),
+            )]),
+            operations: BTreeMap::new(),
+        };
+
+        super::verify_registered_node_identity("login-01", &node, &state)
+            .expect("the admin journal can supply the recorded machine UUID");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pending_share_cancellation_removes_only_its_marker_and_records_abort() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("external-share");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), "shared data").unwrap();
+        let config_path = share_registration_fixture(&root, &source, &source, false);
+        let machine_uuid = super::local_platform_uuid().unwrap();
+        let config_text = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("01234567-89ab-cdef-0123-456789abcdef", &machine_uuid);
+        fs::write(&config_path, &config_text).unwrap();
+        let config_path = config_path.canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+        let share_uuid = "00000000-0000-4000-8000-000000000002";
+        fs::write(source.join(".macluster-share-id"), share_uuid).unwrap();
+
+        let mut state =
+            super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
+                .unwrap();
+        state.machine_uuids.insert("storage".into(), machine_uuid);
+        state.operations.insert(
+            "share:tools".into(),
+            super::NodeOperation {
+                id: "pending-share-cancel-test".into(),
+                action: "share".into(),
+                node_id: "storage".into(),
+                endpoint: format!(
+                    "share:tools:storage:{}:{}",
+                    source.display(),
+                    source.display()
+                ),
+                machine_uuid: Some(share_uuid.into()),
+                phase: "SETUP_PENDING".into(),
+                old_config_sha256: Some(sha256_hex(config_text.as_bytes()).unwrap()),
+                candidate_config_sha256: None,
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(false),
+                detail: None,
+            },
+        );
+        super::save_admin_state(&state_dir.join("node-admin.json"), &state).unwrap();
+
+        super::remove_pending_share(&config_path, &state_dir, "tools").unwrap();
+
+        let state =
+            super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
+                .unwrap();
+        assert_eq!(state.operations["share:tools"].phase, "ABORTED");
+        assert!(!source.join(".macluster-share-id").exists());
+        assert_eq!(
+            fs::read_to_string(source.join("keep.txt")).unwrap(),
+            "shared data"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

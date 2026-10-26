@@ -144,6 +144,7 @@ CPU 利用率可以超过 100%，例如有 8 个逻辑 CPU 的 Mac 最高为 800
 | --- | --- |
 | `mnode -l` | 查看节点和 NFS 共享路径。 |
 | `mnode -rm NODE_ID` | 移除空闲且没有托管共享目录的节点。 |
+| `mnode -rm share:SHARE_ID` | 取消尚未完成的共享目录配置。 |
 | `macluster init` | 确认重置当前集群，然后重新配置。 |
 | `macluster init --force` | 重置时允许放弃已结束任务的待同步输出；活动任务仍需先结束。 |
 

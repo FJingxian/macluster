@@ -1408,17 +1408,16 @@ impl ResetPlan {
             let output = outputs
                 .get(&mount.node_id)
                 .expect("mount output was collected");
-            let expected = mount_matches(
+            if mount_conflict(
                 output,
                 &mount.server_host,
                 &mount.source_root,
                 &mount.mount_root,
-            );
-            if mount_conflict(output, &mount.mount_root, expected) {
+            ) {
                 return Err((
                     1,
                     format!(
-                        "cannot reset {} on {}: mount point {} is occupied by a different source or filesystem",
+                        "cannot reset {} on {}: its expected NFS mount at {} is stacked or ambiguous",
                         mount.label,
                         mount.node_id,
                         mount.mount_root.display()
@@ -1581,20 +1580,27 @@ fn admin_operation_matches_digest(
         || operation.candidate_config_sha256.as_deref() == Some(config_digest)
 }
 
-fn mount_conflict(output: &str, mount_root: &Path, expected: bool) -> bool {
+fn mount_conflict(output: &str, host: &str, source_root: &Path, mount_root: &Path) -> bool {
+    let expected_source = format!("{host}:{}", source_root.display());
     let root = mount_root.to_string_lossy();
-    let mounts_at_path = output
-        .lines()
-        .filter(|line| {
-            line.split_once(" on ")
-                .is_some_and(|(_, destination)| destination.starts_with(&format!("{root} (")))
-        })
-        .count();
-    if expected {
-        mounts_at_path != 1
-    } else {
-        mounts_at_path != 0
+    let mut mounts_at_path = 0;
+    let mut expected_mounts = 0;
+    for line in output.lines() {
+        let Some((source, destination)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((target, filesystem)) = destination.split_once(" (") else {
+            continue;
+        };
+        if target != root {
+            continue;
+        }
+        mounts_at_path += 1;
+        if source == expected_source && filesystem.split(',').next() == Some("nfs") {
+            expected_mounts += 1;
+        }
     }
+    expected_mounts > 0 && (expected_mounts != 1 || mounts_at_path != 1)
 }
 
 fn reset_mount_unmount_step(source: &str, mount_root: &Path) -> String {
@@ -1938,11 +1944,16 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                     &mount.source_root,
                     &mount.mount_root,
                 );
-                if mount_conflict(&mount_table, &mount.mount_root, expected) {
+                if mount_conflict(
+                    &mount_table,
+                    &mount.server_host,
+                    &mount.source_root,
+                    &mount.mount_root,
+                ) {
                     return Err((
                         1,
                         format!(
-                            "mount {} on {node_id} changed after reset preflight; refusing to unmount it",
+                            "managed mount {} on {node_id} became stacked or ambiguous after reset preflight; refusing to unmount it",
                             mount.mount_root.display()
                         ),
                     ));
@@ -3793,8 +3804,31 @@ mod tests {
         );
         assert!(!expected, "a stacked destination is not one exact mount");
         assert!(
-            mount_conflict(stacked, Path::new("/Users/Shared/macluster"), expected),
+            mount_conflict(
+                stacked,
+                "192.168.2.1",
+                Path::new("/Volumes/Storage/macluster"),
+                Path::new("/Users/Shared/macluster"),
+            ),
             "a second mount at the same destination must block reset"
+        );
+        assert!(
+            !mount_conflict(
+                "/dev/disk5s1 on /Volumes/Data (apfs, local, journaled)\n",
+                "192.168.2.1",
+                Path::new("/Volumes/Data"),
+                Path::new("/Volumes/Data"),
+            ),
+            "an unrelated local volume at a configured target must be preserved, not block reset"
+        );
+        assert!(
+            !mount_conflict(
+                "192.168.2.9:/other on /Volumes/Data (nfs, nodev)\n",
+                "192.168.2.1",
+                Path::new("/Volumes/Data"),
+                Path::new("/Volumes/Data"),
+            ),
+            "a different NFS source is not ours to unmount and must remain untouched"
         );
 
         let unmount_step = super::reset_mount_unmount_step(

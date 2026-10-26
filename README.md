@@ -144,6 +144,7 @@ CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable 
 | --- | --- |
 | `mnode -l` | Show nodes and their NFS paths. |
 | `mnode -rm NODE_ID` | Remove an idle node that does not host a share. |
+| `mnode -rm share:SHARE_ID` | Cancel an incomplete named-share setup. |
 | `macluster init` | Ask to reset the current cluster, then configure a new one. |
 | `macluster init --force` | Allow reset to abandon unsynchronized output from finished jobs. Active jobs still block reset. |
 

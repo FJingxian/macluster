@@ -315,6 +315,7 @@ pub(crate) fn run(
                 ));
             }
         };
+        begin_controller_reset(&config_path, &state_dir)?;
         journal.phase = "CLEANING".into();
         save_journal(&path, &journal, false)?;
         cleanup_resources(&mut journal, &plan, &path)?;
@@ -322,6 +323,7 @@ pub(crate) fn run(
         save_journal(&path, &journal, false)?;
     }
     if journal.phase == "CLEANING" {
+        begin_controller_reset(&config_path, &state_dir)?;
         let old = ClusterConfig::parse(&journal.old_config)
             .map_err(|error| (1, format!("saved old config is invalid: {error}")))?;
         let plan = ResetPlan::preflight_cleanup_resume(
@@ -380,6 +382,26 @@ pub(crate) fn run(
         println!("Start the controller with `macluster controller run`.");
     }
     Ok(None)
+}
+
+fn begin_controller_reset(config_path: &Path, state_dir: &Path) -> AppResult<()> {
+    let binding = macluster_core::service::ServiceBinding::load(config_path, state_dir)
+        .map_err(|error| (1, format!("cannot bind controller service reset: {error}")))?;
+    let manager = crate::service::ServiceManager::current(binding).map_err(|error| {
+        (
+            1,
+            format!("cannot prepare controller service reset: {error}"),
+        )
+    })?;
+    if !manager.service_dir().join("intent.json").exists() && !manager.plist_path().exists() {
+        return Ok(());
+    }
+    manager.begin_reset().map_err(|error| {
+        (
+            1,
+            format!("cannot stop the controller service for reset: {error}"),
+        )
+    })
 }
 
 fn cancel_temporary_drain(path: &Path) {

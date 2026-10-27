@@ -286,7 +286,6 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         write_remote_init_journal(&config_path, &journal, true)?;
         finish_remote_init(&config_path, &state_dir, journal)?;
         println!("Cluster '{}' initialized.", config.name);
-        println!("Restart the controller to apply the configuration change.");
         return Ok(());
     }
 
@@ -302,7 +301,6 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     write_local_init_journal(&config_path, &journal)?;
     finish_local_init(&config_path, &state_dir, &journal)?;
     println!("Cluster '{}' initialized.", config.name);
-    println!("Restart the controller to apply the configuration change.");
     Ok(())
 }
 
@@ -464,7 +462,6 @@ fn resume_remote_init(config_path: &Path, state_dir: &Path) -> AppResult<()> {
         .name;
     finish_remote_init(config_path, state_dir, journal)?;
     println!("Resumed interrupted remote initialization for cluster '{cluster_name}'.");
-    println!("Restart the controller to apply the configuration change.");
     Ok(())
 }
 
@@ -784,7 +781,6 @@ fn resume_local_init(config_path: &Path, state_dir: &Path) -> AppResult<()> {
         .map_err(|error| (1, format!("cannot lock initialization recovery: {error}")))?;
     finish_local_init(config_path, state_dir, &journal)?;
     println!("Resumed interrupted local initialization.");
-    println!("Restart the controller to apply the configuration change.");
     Ok(())
 }
 

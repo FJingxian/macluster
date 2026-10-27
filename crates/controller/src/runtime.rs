@@ -291,6 +291,13 @@ impl RuntimeState {
         id
     }
 
+    fn pending_work(&self) -> usize {
+        self.node_probe_pool.pending
+            + self.control_pool.pending
+            + self.share_pool.pending
+            + self.snapshot_pool.pending
+    }
+
     fn tag<T: NodeTransport>(
         &self,
         service: &ControllerService<T>,
@@ -1212,6 +1219,16 @@ pub(crate) fn run_forever<T: NodeTransport + 'static>(
 pub(crate) fn run_forever_with_idle_maintenance<T: NodeTransport + 'static>(
     service: &mut ControllerService<T>,
     interval: Duration,
+    requested: impl FnMut() -> bool,
+    apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
+) -> Result<(), ControllerError> {
+    run_forever_with_shutdown(service, interval, || false, requested, apply)
+}
+
+pub(crate) fn run_forever_with_shutdown<T: NodeTransport + 'static>(
+    service: &mut ControllerService<T>,
+    interval: Duration,
+    mut shutdown_requested: impl FnMut() -> bool,
     mut requested: impl FnMut() -> bool,
     mut apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
 ) -> Result<(), ControllerError> {
@@ -1231,6 +1248,19 @@ pub(crate) fn run_forever_with_idle_maintenance<T: NodeTransport + 'static>(
     let mut next_maintenance_attempt = Instant::now();
 
     loop {
+        if shutdown_requested() {
+            let drain_deadline = Instant::now() + Duration::from_secs(9);
+            while runtime.pending_work() > 0 && Instant::now() < drain_deadline {
+                runtime.poll_workers(service)?;
+                if runtime.pending_work() > 0 {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+            eprintln!(
+                "macluster: controller is shutting down; durable jobs remain available for recovery"
+            );
+            return Ok(());
+        }
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
         runtime.poll_workers(service)?;

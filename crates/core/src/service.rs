@@ -2,7 +2,7 @@ use std::{
     fs, io,
     os::fd::AsRawFd,
     os::unix::{
-        fs::{MetadataExt, PermissionsExt},
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -12,6 +12,7 @@ use macluster_protocol::{
     framing::{FrameError, sha256_hex},
     identifiers::Id128,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{ClusterConfig, ConfigError};
@@ -43,6 +44,199 @@ pub enum ServiceError {
     UnsafeEndpointDirectory { path: PathBuf, uid: u32 },
     #[error("control socket path is too long for a Unix-domain socket: {0}")]
     EndpointPathTooLong(PathBuf),
+    #[error("cannot prepare controller service directory {path}: {source}")]
+    ServiceDirectory { path: PathBuf, source: io::Error },
+    #[error("controller service directory is not private and owned by uid {1}: {0}")]
+    UnsafeServiceDirectory(PathBuf, u32),
+    #[error("cannot access controller service intent {path}: {source}")]
+    ServiceIntentIo { path: PathBuf, source: io::Error },
+    #[error("controller service intent at {path} is not a private regular file")]
+    UnsafeServiceIntent { path: PathBuf },
+    #[error("controller service intent at {path} belongs to a different service binding")]
+    ServiceIntentBinding { path: PathBuf },
+    #[error("controller service intent at {path} is invalid: {source}")]
+    ServiceIntentFormat {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+/// Whether ordinary CLI calls may start the user's LaunchAgent.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceIntent {
+    #[default]
+    Auto,
+    Stopped,
+    Resetting,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ServiceIntentRecord {
+    version: u32,
+    binding_digest: String,
+    intent: ServiceIntent,
+}
+
+/// A private, binding-scoped atomic store for the controller's desired state.
+#[derive(Clone, Debug)]
+pub struct ServiceIntentStore {
+    path: PathBuf,
+    binding_digest: String,
+    uid: u32,
+}
+
+impl ServiceIntentStore {
+    pub fn open(binding: &ServiceBinding) -> Result<Self, ServiceError> {
+        let directory = binding.state_dir.join("service");
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(ServiceError::ServiceDirectory {
+                    path: directory,
+                    source,
+                });
+            }
+        }
+        prepare_private_directory(&directory, binding.uid)?;
+        Ok(Self {
+            path: directory.join("intent.json"),
+            binding_digest: binding.binding_digest.clone(),
+            uid: binding.uid,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read(&self) -> Result<ServiceIntent, ServiceError> {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ServiceIntent::Auto),
+            Err(source) => Err(ServiceError::ServiceIntentIo {
+                path: self.path.clone(),
+                source,
+            }),
+            Ok(metadata) => {
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != self.uid
+                    || metadata.permissions().mode() & 0o777 != 0o600
+                {
+                    return Err(ServiceError::UnsafeServiceIntent {
+                        path: self.path.clone(),
+                    });
+                }
+                let bytes =
+                    fs::read(&self.path).map_err(|source| ServiceError::ServiceIntentIo {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                let record: ServiceIntentRecord =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        ServiceError::ServiceIntentFormat {
+                            path: self.path.clone(),
+                            source,
+                        }
+                    })?;
+                if record.version != 1 || record.binding_digest != self.binding_digest {
+                    return Err(ServiceError::ServiceIntentBinding {
+                        path: self.path.clone(),
+                    });
+                }
+                Ok(record.intent)
+            }
+        }
+    }
+
+    pub fn write(&self, intent: ServiceIntent) -> Result<(), ServiceError> {
+        let directory = self.path.parent().expect("service intent has a parent");
+        validate_private_directory(directory, self.uid)?;
+        let temporary = directory.join(format!(".intent-{}.tmp", Id128::random()));
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|source| ServiceError::ServiceIntentIo {
+                    path: temporary.clone(),
+                    source,
+                })?;
+            let record = ServiceIntentRecord {
+                version: 1,
+                binding_digest: self.binding_digest.clone(),
+                intent,
+            };
+            serde_json::to_writer(&mut file, &record).map_err(|source| {
+                ServiceError::ServiceIntentFormat {
+                    path: temporary.clone(),
+                    source,
+                }
+            })?;
+            file.sync_all()
+                .map_err(|source| ServiceError::ServiceIntentIo {
+                    path: temporary.clone(),
+                    source,
+                })?;
+            fs::rename(&temporary, &self.path).map_err(|source| ServiceError::ServiceIntentIo {
+                path: self.path.clone(),
+                source,
+            })?;
+            fs::File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| ServiceError::ServiceIntentIo {
+                    path: directory.to_path_buf(),
+                    source,
+                })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn validate_private_directory(path: &Path, uid: u32) -> Result<(), ServiceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ServiceError::ServiceDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(ServiceError::UnsafeServiceDirectory(
+            path.to_path_buf(),
+            uid,
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_private_directory(path: &Path, uid: u32) -> Result<(), ServiceError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ServiceError::ServiceDirectory {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid {
+        return Err(ServiceError::UnsafeServiceDirectory(
+            path.to_path_buf(),
+            uid,
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ServiceError::ServiceDirectory {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    validate_private_directory(path, uid)
 }
 
 /// Identifies one local controller instance without relying on a PID or socket file.
@@ -231,9 +425,9 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceBinding, append_binding_part};
+    use super::{ServiceBinding, ServiceIntent, ServiceIntentStore, append_binding_part};
     use macluster_protocol::identifiers::Id128;
-    use std::{fs, path::PathBuf};
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
     fn config_text(shared: &PathBuf) -> String {
         format!(
@@ -269,5 +463,59 @@ mod tests {
         append_binding_part(&mut right, b"a");
         append_binding_part(&mut right, b"bc");
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn service_intent_defaults_to_auto_and_round_trips_atomically() {
+        let root = std::env::temp_dir().join(format!("macluster-intent-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        fs::write(&config, config_text(&root)).unwrap();
+        let binding = ServiceBinding::load(&config, &state).unwrap();
+        let store = ServiceIntentStore::open(&binding).unwrap();
+
+        assert_eq!(store.read().unwrap(), ServiceIntent::Auto);
+        store.write(ServiceIntent::Stopped).unwrap();
+        assert_eq!(store.read().unwrap(), ServiceIntent::Stopped);
+        store.write(ServiceIntent::Resetting).unwrap();
+        assert_eq!(store.read().unwrap(), ServiceIntent::Resetting);
+        assert_eq!(
+            fs::symlink_metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn service_intent_is_bound_to_config_and_state_identity() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-intent-binding-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let alternate_config = root.join("alternate.toml");
+        let state = root.join("state");
+        fs::create_dir(&state).unwrap();
+        fs::write(&config, config_text(&root)).unwrap();
+        fs::write(&alternate_config, config_text(&root)).unwrap();
+        let original = ServiceBinding::load(&config, &state).unwrap();
+        let alternate = ServiceBinding::load(&alternate_config, &state).unwrap();
+        ServiceIntentStore::open(&original)
+            .unwrap()
+            .write(ServiceIntent::Stopped)
+            .unwrap();
+
+        assert!(
+            ServiceIntentStore::open(&alternate)
+                .unwrap()
+                .read()
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

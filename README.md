@@ -61,13 +61,17 @@ mnode -l
 
 Enrollment installs the Agent, writes its configuration, and sets up shared storage. If needed, it helps you verify the SSH host key and install an SSH key. The SSH login password and each Mac's administrator password are separate.
 
-Start the controller and leave it running:
+After initialization, macluster installs and starts a per-user LaunchAgent in the current GUI login session. It keeps scheduling after you close Terminal. The controller runs only while that user session is active; logging out stops it.
+
+Manage the service with:
 
 ~~~sh
-macluster controller run
+macluster controller status
+macluster controller stop
+macluster controller start
 ~~~
 
-Use another Terminal window to submit jobs.
+`macluster controller run` remains available for foreground troubleshooting. A foreground instance can be reused by `controller start`, but stop it with Ctrl-C before asking launchd to stop or restart it.
 
 ## Run jobs
 
@@ -150,6 +154,8 @@ CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable 
 | `mnode -rm share:SHARE_ID` | Cancel an incomplete named-share setup. |
 | `macluster init` | Ask to reset the current cluster, then configure a new one. |
 | `macluster init --force` | Allow reset to abandon unsynchronized output from finished jobs. Active jobs still block reset. |
+| `macluster controller status` | Show whether the local service is ready without starting it. |
+| `macluster controller start/stop/restart` | Manage the login Mac's background controller. |
 
 Reset preserves shared data files and archives old configuration and job state.
 
@@ -176,7 +182,7 @@ Run `macluster --help` or `msub --help` for options.
 
 If a job stays pending, check that the controller is running and its queue has a `READY` compute node. If a tool is missing, check its shared path and the environment in the submitting terminal.
 
-A launchd service template is available at [packaging/launchd/org.macluster.controller.plist](packaging/launchd/org.macluster.controller.plist). Edit its paths before installing it.
+If the service cannot start, `macluster controller status` reports its state and `macluster controller start` retries it. Service logs are in `~/Library/Logs/macluster/`.
 
 ## License
 

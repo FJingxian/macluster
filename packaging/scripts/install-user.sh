@@ -20,3 +20,4 @@ for alias in msub mjob mqueue mkill mtop mnode; do
 done
 printf 'Installed macluster (with embedded power helper) and command aliases in %s\n' "$prefix"
 printf 'Add this directory to PATH if needed: %s\n' "$prefix"
+printf 'Run `macluster init` to configure a cluster and start its per-user controller service.\n'

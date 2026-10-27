@@ -61,13 +61,17 @@ mnode -l
 
 加入节点时会安装 Agent、写入配置并设置共享目录。如果还没有 SSH 密钥登录，程序会引导核对主机指纹并安装密钥。SSH 登录密码与各台 Mac 的管理员密码分别用于不同操作。
 
-启动控制器，并保持它运行：
+初始化完成后，macluster 会在当前图形登录会话中安装并启动用户级 LaunchAgent。关闭终端后，任务仍会继续调度；用户注销后服务会停止。
+
+可以这样查看或管理服务：
 
 ~~~sh
-macluster controller run
+macluster controller status
+macluster controller stop
+macluster controller start
 ~~~
 
-再打开一个终端提交任务。
+`macluster controller run` 仍可用于前台排查。若前台 controller 已运行，`controller start` 会复用它；停止或重启前台实例时请先按 Ctrl-C。
 
 ## 提交任务
 
@@ -150,6 +154,8 @@ CPU 利用率可以超过 100%，例如有 8 个逻辑 CPU 的 Mac 最高为 800
 | `mnode -rm share:SHARE_ID` | 取消尚未完成的共享目录配置。 |
 | `macluster init` | 确认重置当前集群，然后重新配置。 |
 | `macluster init --force` | 重置时允许放弃已结束任务的待同步输出；活动任务仍需先结束。 |
+| `macluster controller status` | 查看本机服务状态，不会启动服务。 |
+| `macluster controller start/stop/restart` | 管理登录 Mac 上的后台控制器。 |
 
 移除节点会直接验证机器 UUID、任务状态和待同步输出，无需先更新即将移除的 Agent。新连接地址会保存在移除记录中，便于中断后重试；NFS 授权仍按原登记地址清理。SSH 主机密钥校验保持启用，遇到密钥变化需先核实目标机器。
 
@@ -178,7 +184,7 @@ mnode -a local
 
 任务一直等待时，检查控制器是否运行、队列中是否有 `READY` 的计算节点。找不到工具时，检查软件目录是否共享，以及提交终端是否激活了正确环境。
 
-仓库提供 [launchd 服务模板](../packaging/launchd/org.macluster.controller.plist)，修改其中的路径后再安装。
+如果服务没有启动，使用 `macluster controller status` 查看状态，再用 `macluster controller start` 重试。服务日志位于 `~/Library/Logs/macluster/`。
 
 ## 许可证
 

@@ -1,27 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Reference template only. macluster generates a binding-specific file after `macluster init`. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>org.macluster.controller</string>
+  <string>org.macluster.controller.REPLACE_WITH_CLUSTER_UUID</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/REPLACE/.local/bin/macluster</string>
+    <string>/Users/REPLACE/Library/Application Support/macluster/controller/service/versions/REPLACE_WITH_BINARY_SHA256/macluster</string>
     <string>--config</string>
     <string>/Users/REPLACE/.config/macluster/config.toml</string>
     <string>--state-dir</string>
     <string>/Users/REPLACE/Library/Application Support/macluster/controller</string>
-    <string>controller</string>
-    <string>run</string>
-    <string>--interval</string>
-    <string>2</string>
+    <string>internal</string>
+    <string>controller-service</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MACLUSTER_SERVICE_BINDING</key>
+    <string>REPLACE_WITH_BINDING_SHA256</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ProcessType</key>
   <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
   <key>StandardOutPath</key>
   <string>/Users/REPLACE/Library/Logs/macluster/controller.out.log</string>
   <key>StandardErrorPath</key>

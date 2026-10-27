@@ -506,6 +506,22 @@ impl<T: NodeTransport> ControllerService<T> {
         )
     }
 
+    pub fn run_forever_with_shutdown(
+        &mut self,
+        interval_secs: u64,
+        shutdown_requested: impl FnMut() -> bool,
+        requested: impl FnMut() -> bool,
+        apply: impl FnMut(&mut Self) -> Result<bool, ControllerError>,
+    ) -> Result<(), ControllerError> {
+        runtime::run_forever_with_shutdown(
+            self,
+            Duration::from_secs(interval_secs.max(1)),
+            shutdown_requested,
+            requested,
+            apply,
+        )
+    }
+
     pub fn apply_idle_address_config(
         &mut self,
         config: ClusterConfig,

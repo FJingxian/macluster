@@ -14,9 +14,11 @@ use std::{
 use macluster_core::{
     config::{ClusterConfig, Transport},
     maintenance::MaintenanceLock,
+    service::{ServiceBinding, ServiceIntent, ServiceIntentStore},
     storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
 use macluster_protocol::{
+    control::{ControllerHello, ControllerLifecycle},
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
@@ -177,12 +179,30 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
         "top" => top(global, &args, address_migration_deferred),
-        "controller" => controller(global, &args),
-        "init" => crate::init::run(
-            resolved_config_path(global.config.as_deref()),
-            state_root(global.state_dir.as_deref())?,
-            &args,
-        ),
+        "controller" => controller(global, &args, false),
+        "init" => {
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let initialized = crate::init::run(config_path.clone(), state_dir.clone(), &args)?;
+            let help = args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+            let disabled_for_test = env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some();
+            if !help && !disabled_for_test && is_macluster_executable() && config_path.is_file() {
+                match controller_service_manager(&global, &state_dir).and_then(|manager| {
+                    manager.start(Duration::from_secs(5)).map_err(service_error)
+                }) {
+                    Ok(hello) => println!(
+                        "Controller service ready ({:?}, epoch {}).",
+                        hello.lifecycle, hello.controller_epoch.epoch
+                    ),
+                    Err((_, error)) => eprintln!(
+                        "Cluster initialization completed, but the controller did not start: {error}. Start it with `macluster controller start`."
+                    ),
+                }
+            }
+            Ok(initialized)
+        }
         "node" => node_admin(global, &args),
         "internal" => internal(global, &args),
         "agent" => Err((1, format!("`{command}` is not implemented yet"))),
@@ -194,6 +214,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     // Init owns reset/recovery and stages any artifacts needed by a new cluster.
     // Updating the old cluster first can block the very operation repairing it.
     if command == "init" {
+        return false;
+    }
+    if command == "controller"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "start" | "stop" | "restart" | "status"))
+    {
         return false;
     }
     // Removing a moved or unreachable node must not first update that node
@@ -216,6 +243,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
     if matches!(command, "internal" | "agent" | "init") {
+        return false;
+    }
+    if command == "controller"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "start" | "stop" | "restart" | "status"))
+    {
         return false;
     }
     if command == "node"
@@ -3312,16 +3346,48 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
     Ok(())
 }
 
-fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
+fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: macluster controller run [--once] [--interval SECONDS]\n       macluster controller status\n\nThe controller must run continuously to dispatch jobs and reconcile node status."
+            "Usage: macluster controller start|stop|restart|status\n       macluster controller run [--once] [--interval SECONDS]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use."
         );
         return Ok(());
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
     match args[0].as_str() {
         "status" => {
+            if resolved_config_path(global.config.as_deref()).is_file() {
+                match controller_service_manager(&global, &state_dir).and_then(|manager| {
+                    manager
+                        .inspect(Duration::from_millis(200))
+                        .map_err(service_error)
+                }) {
+                    Ok(status) => {
+                        let launch_state = if status.loaded {
+                            "loaded"
+                        } else {
+                            "not loaded"
+                        };
+                        let readiness =
+                            status
+                                .hello
+                                .as_ref()
+                                .map_or("not ready".to_owned(), |hello| {
+                                    format!(
+                                        "{:?}, epoch {}",
+                                        hello.lifecycle, hello.controller_epoch.epoch
+                                    )
+                                });
+                        println!(
+                            "Controller service: {launch_state} ({readiness}; intent {:?})",
+                            status.intent
+                        );
+                    }
+                    Err((_, error)) => println!("Controller service: unavailable ({error})"),
+                }
+            } else {
+                println!("Controller service: not configured");
+            }
             let storage = Storage::open(&state_dir).map_err(operation_error)?;
             let jobs = storage.list_jobs(None).map_err(operation_error)?;
             let pending = jobs
@@ -3340,6 +3406,35 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             println!(
                 "Controller state database: {}\nPending: {pending}\nActive: {active}",
                 state_dir.join("controller.sqlite3").display()
+            );
+            Ok(())
+        }
+        "start" => {
+            let hello = controller_service_manager(&global, &state_dir)?
+                .start(Duration::from_secs(5))
+                .map_err(service_error)?;
+            println!(
+                "Controller ready ({:?}, epoch {}).",
+                hello.lifecycle, hello.controller_epoch.epoch
+            );
+            Ok(())
+        }
+        "stop" => {
+            controller_service_manager(&global, &state_dir)?
+                .stop()
+                .map_err(service_error)?;
+            println!(
+                "Controller service stopped. Automatic start is disabled until `macluster controller start`."
+            );
+            Ok(())
+        }
+        "restart" => {
+            let hello = controller_service_manager(&global, &state_dir)?
+                .restart(Duration::from_secs(5))
+                .map_err(service_error)?;
+            println!(
+                "Controller restarted ({:?}, epoch {}).",
+                hello.lifecycle, hello.controller_epoch.epoch
             );
             Ok(())
         }
@@ -3366,6 +3461,29 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 index += 1;
             }
             let config_file = resolved_config_path(global.config.as_deref());
+            if service_child {
+                let binding = ServiceBinding::load(&config_file, &state_dir)
+                    .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
+                let configured_binding = env::var("MACLUSTER_SERVICE_BINDING").map_err(|_| {
+                    (
+                        1,
+                        "private controller service entry is missing its binding identity".into(),
+                    )
+                })?;
+                if configured_binding != binding.binding_digest() {
+                    return Err((
+                        1,
+                        "private controller service entry has a different binding identity".into(),
+                    ));
+                }
+                match ServiceIntentStore::open(&binding)
+                    .and_then(|intent| intent.read())
+                    .map_err(|error| (1, error.to_string()))?
+                {
+                    ServiceIntent::Auto => {}
+                    ServiceIntent::Stopped | ServiceIntent::Resetting => return Ok(()),
+                }
+            }
             crate::init::reset::ensure_no_reset_in_progress(&config_file, &state_dir)?;
             let maintenance_lock = MaintenanceLock::shared(&config_file).map_err(|error| {
                 (
@@ -3381,7 +3499,7 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             })?;
             crate::node_admin::ensure_controller_recovery_clean(&config_file, &state_dir)
                 .map_err(|error| (1, error))?;
-            let _instance =
+            let instance =
                 macluster_controller::InstanceLock::acquire(&state_dir).map_err(|error| {
                     (
                         1,
@@ -3452,6 +3570,40 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                     "macluster: peer config synchronization is pending; controller will reconcile status and cancellations but will not dispatch new jobs"
                 );
             }
+            let address_migration = crate::node_admin::address_migration_pending(&state_dir);
+            let maintenance_pending =
+                macluster_core::maintenance::maintenance_barrier_path(&config_file).exists();
+            let lifecycle = if sync_pending || address_migration {
+                ControllerLifecycle::RecoveryPending
+            } else if maintenance_pending {
+                ControllerLifecycle::Paused
+            } else {
+                ControllerLifecycle::Ready
+            };
+            let _control_listener = if once {
+                None
+            } else {
+                let binding = ServiceBinding::load(&config_file, &state_dir)
+                    .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
+                let hello = ControllerHello {
+                    protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+                    binding_digest: binding.binding_digest().to_owned(),
+                    namespace: binding.namespace().to_owned(),
+                    uid: binding.uid(),
+                    build_id: crate::service::current_executable_build_id()
+                        .map_err(service_error)?,
+                    capabilities: vec!["status.v1".into()],
+                    controller_epoch: service.epoch(),
+                    config_generation: 0,
+                    lifecycle,
+                };
+                Some(
+                    macluster_controller::ControlListener::bind(&binding, &instance, hello)
+                        .map_err(|error| {
+                            (1, format!("cannot start local controller IPC: {error}"))
+                        })?,
+                )
+            };
             if once {
                 service
                     .tick_with_storage_health(macluster_controller::verify_shared_storage(&config))
@@ -3469,8 +3621,10 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 let pending = watcher.pending_flag();
                 let requested = std::sync::Arc::clone(&pending);
                 let mut maintenance_lock = Some(maintenance_lock);
+                let _signal_guard = ControllerSignalGuard::install()?;
                 service
-                    .run_forever_with_idle_maintenance(interval,
+                    .run_forever_with_shutdown(interval,
+                        || CONTROLLER_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst),
                         || requested.load(std::sync::atomic::Ordering::SeqCst),
                         |service| {
                             drop(maintenance_lock.take());
@@ -3494,6 +3648,73 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             }
         }
         value => Err((2, format!("unknown controller command '{value}'"))),
+    }
+}
+
+fn controller_service_manager(
+    global: &GlobalOptions,
+    state_dir: &Path,
+) -> AppResult<crate::service::ServiceManager<crate::service::LaunchdServiceLauncher>> {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let binding = ServiceBinding::load(&config_path, state_dir)
+        .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
+    crate::service::ServiceManager::current(binding).map_err(service_error)
+}
+
+fn service_error(error: crate::service::ServiceLifecycleError) -> (i32, String) {
+    (1, error.to_string())
+}
+
+static CONTROLLER_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn controller_signal_handler(_: libc::c_int) {
+    CONTROLLER_SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+struct ControllerSignalGuard {
+    old_term: libc::sigaction,
+    old_int: libc::sigaction,
+}
+
+impl ControllerSignalGuard {
+    fn install() -> AppResult<Self> {
+        CONTROLLER_SHUTDOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = controller_signal_handler as usize;
+        action.sa_flags = 0;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        let mut old_term: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut old_int: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGTERM, &action, &mut old_term) } != 0 {
+            return Err((
+                1,
+                format!(
+                    "cannot install controller SIGTERM handler: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        if unsafe { libc::sigaction(libc::SIGINT, &action, &mut old_int) } != 0 {
+            unsafe { libc::sigaction(libc::SIGTERM, &old_term, std::ptr::null_mut()) };
+            return Err((
+                1,
+                format!(
+                    "cannot install controller SIGINT handler: {}",
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        Ok(Self { old_term, old_int })
+    }
+}
+
+impl Drop for ControllerSignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
+        }
     }
 }
 
@@ -4062,6 +4283,12 @@ fn now_unix_ms() -> u64 {
 
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
+        Some("controller-service") => {
+            if args.len() != 1 {
+                return Err((2, "internal controller-service takes no arguments".into()));
+            }
+            controller(global, &["run".into()], true)
+        }
         Some("claim-agent") => {
             let node_id = option_value(args, "--node")?
                 .ok_or_else(|| (2, "claim-agent requires --node".into()))?;
@@ -4761,6 +4988,16 @@ mod tests {
             &["python".into(), "-h".into()]
         ));
         assert!(!super::should_refresh_node_addresses("init", &[]));
+        for lifecycle_command in ["start", "stop", "restart", "status"] {
+            assert!(!should_preflight_agent_update(
+                "controller",
+                &[lifecycle_command.into()]
+            ));
+            assert!(!super::should_refresh_node_addresses(
+                "controller",
+                &[lifecycle_command.into()]
+            ));
+        }
     }
 
     #[test]

@@ -298,6 +298,7 @@ fn init_in_pty_with_args(
         .env_remove("FC")
         .env_remove("CMAKE_C_COMPILER")
         .env_remove("CMAKE_CXX_COMPILER")
+        .env("MACLUSTER_DISABLE_SERVICE_AUTOSTART", "1")
         .env("PATH", "/usr/bin:/bin:/sbin")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))

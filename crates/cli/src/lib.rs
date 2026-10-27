@@ -7,6 +7,7 @@ mod embedded_power;
 mod init;
 mod mtop;
 mod node_admin;
+pub mod service;
 mod ssh_bootstrap;
 mod terminal;
 

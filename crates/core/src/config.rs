@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use macluster_protocol::{
     framing::sha256_hex,
-    identifiers::{IdentifierError, NodeId, QueueName},
+    identifiers::{Id128, IdentifierError, NodeId, QueueName},
     types::{PROTOCOL_VERSION, SchedulerKind},
 };
 use thiserror::Error;
@@ -54,9 +55,29 @@ pub struct ShareConfig {
 }
 
 impl NodeConfig {
+    pub fn ssh_host_key_pin(&self) -> Option<(PathBuf, String)> {
+        let uuid = Id128::parse(self.machine_uuid.as_deref()?).ok()?;
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        if !home.is_absolute() {
+            return None;
+        }
+        Some((
+            home.join(".ssh/macluster").join(format!("host-{uuid}")),
+            format!("macluster-{uuid}"),
+        ))
+    }
+
+    pub fn add_pinned_host_key_args(&self, command: &mut Command) {
+        let Some((path, alias)) = self.ssh_host_key_pin() else {
+            return;
+        };
+        add_trusted_node_ssh_args(command, &path, &alias, &self.host);
+    }
+
     /// Add explicit SSH identity options while leaving legacy nodes to OpenSSH
     /// configuration when those fields are absent.
     pub fn add_ssh_identity_args(&self, command: &mut Command) {
+        self.add_pinned_host_key_args(command);
         if let Some(port) = self.ssh_port {
             command.arg("-p").arg(port.to_string());
         }
@@ -77,6 +98,61 @@ impl NodeConfig {
         if let Some(path) = &self.remote_config {
             command.arg("--config").arg(path);
         }
+    }
+}
+
+fn add_trusted_node_ssh_args(
+    command: &mut Command,
+    path: &Path,
+    alias: &str,
+    registered_host: &str,
+) {
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return;
+    };
+    let private_parent = path
+        .parent()
+        .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+        .is_some_and(|parent| {
+            parent.is_dir()
+                && !parent.file_type().is_symlink()
+                && parent.uid() == unsafe { libc::geteuid() }
+                && parent.permissions().mode() & 0o022 == 0
+        });
+    if metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.permissions().mode() & 0o077 == 0
+        && private_parent
+    {
+        command
+            .arg(format!("-oUserKnownHostsFile={}", path.display()))
+            .arg(format!("-oHostKeyAlias={alias}"));
+        let address_path = path.with_extension("address");
+        if let Ok(metadata) = std::fs::symlink_metadata(&address_path)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.len() <= 128
+            && let Ok(text) = std::fs::read_to_string(&address_path)
+        {
+            let fields = text.split_whitespace().collect::<Vec<_>>();
+            if (2..=8).contains(&fields.len())
+                && fields.contains(&registered_host)
+                && fields[1]
+                    .parse::<std::net::Ipv4Addr>()
+                    .is_ok_and(|ip| !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback())
+            {
+                command.arg(format!("-oHostName={}", fields[1]));
+            }
+        }
+    } else {
+        command.args([
+            "-oUserKnownHostsFile=/dev/null",
+            "-oGlobalKnownHostsFile=/dev/null",
+            "-oStrictHostKeyChecking=yes",
+        ]);
     }
 }
 
@@ -930,5 +1006,49 @@ fn parse_error(line: usize, message: &str) -> ConfigError {
     ConfigError::Parse {
         line,
         message: message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod address_ssh_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn verified_address_cache_is_scoped_to_original_host_and_private_pin() {
+        let root = std::env::temp_dir().join(format!("macluster-address-ssh-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let pin = root.join("host-node");
+        fs::write(&pin, "macluster-node ssh-ed25519 fixture\n").unwrap();
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o600)).unwrap();
+        let cache = pin.with_extension("address");
+        fs::write(&cache, "192.0.2.1 192.0.2.3\n").unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o600)).unwrap();
+        let args = |host: &str| {
+            let mut command = Command::new("ssh");
+            add_trusted_node_ssh_args(&mut command, &pin, "macluster-node", host);
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(args("192.0.2.1").contains(&"-oHostName=192.0.2.3".into()));
+        assert!(args("192.0.2.3").contains(&"-oHostKeyAlias=macluster-node".into()));
+        assert!(
+            !args("192.0.2.9")
+                .iter()
+                .any(|arg| arg.starts_with("-oHostName="))
+        );
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !args("192.0.2.1")
+                .iter()
+                .any(|arg| arg.starts_with("-oHostName="))
+        );
+        fs::set_permissions(&pin, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(args("192.0.2.1").contains(&"-oUserKnownHostsFile=/dev/null".into()));
+        assert!(args("192.0.2.1").contains(&"-oStrictHostKeyChecking=yes".into()));
+        fs::remove_dir_all(root).unwrap();
     }
 }

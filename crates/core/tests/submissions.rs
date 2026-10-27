@@ -352,6 +352,21 @@ fn controller_epoch_increments_and_uuid_survives_reopen() {
 }
 
 #[test]
+fn current_controller_epoch_can_be_read_without_advancing_the_fence() {
+    let root = temp_dir("read-controller-epoch");
+    let storage = Storage::open(&root).unwrap();
+    assert_eq!(storage.current_controller_epoch().unwrap(), None);
+    let first = storage.begin_controller_epoch().unwrap();
+    assert_eq!(storage.current_controller_epoch().unwrap(), Some(first));
+    assert_eq!(storage.current_controller_epoch().unwrap(), Some(first));
+    let second = storage.begin_controller_epoch().unwrap();
+    assert_eq!(second.epoch, first.epoch + 1);
+    assert_eq!(storage.current_controller_epoch().unwrap(), Some(second));
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn schema_v1_migrates_atomically_and_can_be_reopened() {
     let root = temp_dir("schema-v1");
     let database = root.join("controller.sqlite3");

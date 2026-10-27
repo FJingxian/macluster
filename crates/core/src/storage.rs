@@ -174,6 +174,18 @@ impl ReadOnlyJobStore {
             .map(|payload| decode_job(&payload))
             .collect()
     }
+
+    /// Return whether cluster maintenance must wait for active jobs or output
+    /// synchronization. This existence query does not load or deserialize
+    /// terminal job history.
+    pub fn has_maintenance_work(&self) -> Result<bool, SubmitError> {
+        let sql = if self.schema_version >= 3 {
+            "SELECT state FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') OR snapshot_sync_pending=1 OR log_sync_pending=1 LIMIT 1"
+        } else {
+            "SELECT state FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') LIMIT 1"
+        };
+        Ok(!self.connection.query_texts(sql, None)?.is_empty())
+    }
 }
 
 /// A single SQLite connection. The controller owns it behind its serialized
@@ -549,6 +561,35 @@ impl Storage {
                 let _ = self.connection.exec("ROLLBACK");
                 Err(error)
             }
+        }
+    }
+
+    /// Read the active controller identity without advancing its fencing
+    /// epoch. Idle maintenance performed by a live controller must keep using
+    /// the epoch already held by that controller.
+    pub fn current_controller_epoch(&self) -> Result<Option<ControllerEpoch>, SubmitError> {
+        let uuid = self.connection.query_text(
+            "SELECT value FROM schema_meta WHERE key='controller_uuid'",
+            None,
+        )?;
+        let epoch = self.connection.query_text(
+            "SELECT value FROM schema_meta WHERE key='controller_epoch'",
+            None,
+        )?;
+        match (uuid, epoch) {
+            (None, None) => Ok(None),
+            (Some(uuid), Some(epoch)) => Ok(Some(ControllerEpoch {
+                controller_uuid: ControllerUuid(
+                    Id128::parse(&uuid)
+                        .map_err(|error| SubmitError::Database(error.to_string()))?,
+                ),
+                epoch: epoch
+                    .parse::<u64>()
+                    .map_err(|error| SubmitError::Database(error.to_string()))?,
+            })),
+            _ => Err(SubmitError::Database(
+                "controller identity and fencing epoch are inconsistent".into(),
+            )),
         }
     }
 
@@ -1353,6 +1394,67 @@ mod read_only_tests {
         assert!(ReadOnlyJobStore::open(&root).is_err());
         assert_eq!(fs::read(&database).unwrap(), before);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maintenance_work_query_detects_active_jobs_and_pending_sync_only() {
+        let root = fresh_root();
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("controller.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .exec(
+                "CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO schema_meta VALUES('schema_version','3');
+                 CREATE TABLE jobs(state TEXT, snapshot_sync_pending INTEGER, log_sync_pending INTEGER);
+                 INSERT INTO jobs VALUES('COMPLETED', 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            !ReadOnlyJobStore::open(&root)
+                .unwrap()
+                .has_maintenance_work()
+                .unwrap()
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .exec("INSERT INTO jobs VALUES('RUNNING', 0, 0);")
+            .unwrap();
+        drop(connection);
+        assert!(
+            ReadOnlyJobStore::open(&root)
+                .unwrap()
+                .has_maintenance_work()
+                .unwrap()
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .exec("DELETE FROM jobs WHERE state='RUNNING'; INSERT INTO jobs VALUES('COMPLETED', 1, 0);")
+            .unwrap();
+        drop(connection);
+        assert!(
+            ReadOnlyJobStore::open(&root)
+                .unwrap()
+                .has_maintenance_work()
+                .unwrap()
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .exec("UPDATE jobs SET snapshot_sync_pending=0;")
+            .unwrap();
+        drop(connection);
+        assert!(
+            !ReadOnlyJobStore::open(&root)
+                .unwrap()
+                .has_maintenance_work()
+                .unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

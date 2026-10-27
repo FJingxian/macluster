@@ -6,7 +6,7 @@ use std::{
     },
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -25,7 +25,7 @@ use macluster_protocol::{
 };
 use thiserror::Error;
 
-use crate::InstanceLock;
+use crate::{InstanceLock, events::RuntimeSignal};
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
@@ -60,6 +60,7 @@ pub struct ControlListener<'lock> {
     stopping: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     request_receiver: Receiver<PendingControlEvent>,
+    runtime_signal: Arc<Mutex<Option<RuntimeSignal>>>,
     _instance: &'lock InstanceLock,
 }
 
@@ -151,8 +152,10 @@ impl<'lock> ControlListener<'lock> {
         let (request_sender, request_receiver) = mpsc::sync_channel(MAX_PENDING_REQUESTS);
         let stopping = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
+        let runtime_signal = Arc::new(Mutex::new(None));
         let thread_stopping = Arc::clone(&stopping);
         let thread_connections = Arc::clone(&active_connections);
+        let thread_signal = Arc::clone(&runtime_signal);
         let thread_binding = binding.clone();
         let accept_thread = match thread::Builder::new()
             .name("macluster-control-accept".into())
@@ -164,6 +167,7 @@ impl<'lock> ControlListener<'lock> {
                     request_sender,
                     thread_stopping,
                     thread_connections,
+                    thread_signal,
                 );
             }) {
             Ok(thread) => thread,
@@ -180,12 +184,19 @@ impl<'lock> ControlListener<'lock> {
             stopping,
             accept_thread: Some(accept_thread),
             request_receiver,
+            runtime_signal,
             _instance: instance,
         })
     }
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    pub fn set_runtime_signal(&mut self, signal: RuntimeSignal) {
+        if let Ok(mut current) = self.runtime_signal.lock() {
+            *current = Some(signal);
+        }
     }
 
     pub fn poll_request(&mut self) -> Option<PendingControlRequest> {
@@ -249,6 +260,7 @@ fn accept_loop(
     request_sender: SyncSender<PendingControlEvent>,
     stopping: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
+    runtime_signal: Arc<Mutex<Option<RuntimeSignal>>>,
 ) {
     loop {
         let (stream, _) = match listener.accept() {
@@ -271,6 +283,7 @@ fn accept_loop(
         let connection_binding = binding.clone();
         let connection_hello = hello.clone();
         let connection_requests = request_sender.clone();
+        let connection_signal = Arc::clone(&runtime_signal);
         let spawn = thread::Builder::new()
             .name("macluster-control-client".into())
             .spawn(move || {
@@ -279,6 +292,7 @@ fn accept_loop(
                     &connection_binding,
                     &connection_hello,
                     &connection_requests,
+                    &connection_signal,
                 );
                 connection_count.fetch_sub(1, Ordering::AcqRel);
             });
@@ -322,6 +336,7 @@ fn serve_connection(
     binding: &ServiceBinding,
     controller_hello: &ControllerHello,
     request_sender: &SyncSender<PendingControlEvent>,
+    runtime_signal: &Arc<Mutex<Option<RuntimeSignal>>>,
 ) {
     if stream.set_read_timeout(Some(HELLO_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(HELLO_TIMEOUT)).is_err()
@@ -348,6 +363,7 @@ fn serve_connection(
     let _disconnect_notice = DisconnectNotice {
         session: client_session,
         sender: request_sender.clone(),
+        runtime_signal: Arc::clone(runtime_signal),
     };
     if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(REQUEST_TIMEOUT)).is_err()
@@ -383,7 +399,7 @@ fn serve_connection(
             response_sender,
             client_session,
         })) {
-            Ok(()) => {}
+            Ok(()) => notify_runtime(runtime_signal),
             Err(mpsc::TrySendError::Full(_)) => {
                 let response = ControlResponse {
                     request_id,
@@ -416,13 +432,26 @@ fn serve_connection(
 struct DisconnectNotice {
     session: Id128,
     sender: SyncSender<PendingControlEvent>,
+    runtime_signal: Arc<Mutex<Option<RuntimeSignal>>>,
 }
 
 impl Drop for DisconnectNotice {
     fn drop(&mut self) {
-        let _ = self
+        if self
             .sender
-            .try_send(PendingControlEvent::Disconnected(self.session));
+            .try_send(PendingControlEvent::Disconnected(self.session))
+            .is_ok()
+        {
+            notify_runtime(&self.runtime_signal);
+        }
+    }
+}
+
+fn notify_runtime(runtime_signal: &Mutex<Option<RuntimeSignal>>) {
+    if let Ok(signal) = runtime_signal.lock()
+        && let Some(signal) = signal.as_ref()
+    {
+        signal.notify();
     }
 }
 

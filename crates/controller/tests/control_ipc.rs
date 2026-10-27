@@ -8,7 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_controller::{ControlListener, InstanceLock, PendingControlEvent};
+use macluster_controller::{
+    ControlListener, InstanceLock, PendingControlEvent, events::RuntimeSignal,
+};
 use macluster_core::service::ServiceBinding;
 use macluster_protocol::{
     control::{
@@ -156,6 +158,44 @@ fn authenticated_client_receives_status_and_correlated_response() {
 
     let request = wait_request(&mut listener);
     assert_eq!(request.request().command, ControlCommand::Status);
+    request
+        .respond(Ok(ControlPayload::Status(response_hello)))
+        .unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn a_control_request_wakes_the_runtime_before_the_client_deadline() {
+    let fixture = Fixture::new();
+    let binding = fixture.binding();
+    let hello = controller_hello(&binding);
+    let instance = InstanceLock::acquire(&fixture.root().join("state")).unwrap();
+    let mut listener = ControlListener::bind(&binding, &instance, hello.clone()).unwrap();
+    let (signal, mut waiter) = RuntimeSignal::pair();
+    listener.set_runtime_signal(signal);
+    let path = listener.path().to_path_buf();
+    let client_identity = client_hello(&binding);
+    let response_hello = hello.clone();
+
+    let client = thread::spawn(move || {
+        let (mut stream, greeting) = connect_and_handshake(&path, &client_identity);
+        assert!(matches!(greeting, HelloResponse::Accepted(_)));
+        let request_id = RequestId(Id128::random());
+        write_frame(
+            &mut stream,
+            &ControlRequest {
+                request_id,
+                expected_generation: Some(hello.config_generation),
+                command: ControlCommand::Status,
+            },
+        )
+        .unwrap();
+        let response: ControlResponse = read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(response.request_id, request_id);
+    });
+
+    assert!(waiter.wait_until(Instant::now() + Duration::from_secs(2)));
+    let request = wait_request(&mut listener);
     request
         .respond(Ok(ControlPayload::Status(response_hello)))
         .unwrap();

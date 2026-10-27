@@ -28,8 +28,9 @@ use macluster_protocol::{
 
 use crate::{
     ControllerError, ControllerService,
+    events::RuntimeSignal,
     transport::{NodeTransport, TransportError},
-    wake::{ControllerWake, WakeError},
+    wake::{ControllerWake, WakeError, notify_controller},
 };
 
 const PROBE_WORKERS: usize = 8;
@@ -43,7 +44,7 @@ const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
-const LOOP_QUANTUM: Duration = Duration::from_millis(100);
+const MAX_IDLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
 type WorkerTask<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 
@@ -55,7 +56,11 @@ struct WorkerPool<R: Send + 'static> {
 }
 
 impl<R: Send + 'static> WorkerPool<R> {
-    fn new(worker_count: usize, queue_capacity: usize) -> io::Result<Self> {
+    fn new(
+        worker_count: usize,
+        queue_capacity: usize,
+        signal: Option<RuntimeSignal>,
+    ) -> io::Result<Self> {
         let worker_count = worker_count.max(1);
         let (sender, tasks) = mpsc::sync_channel::<WorkerTask<R>>(queue_capacity);
         let tasks = Arc::new(Mutex::new(tasks));
@@ -63,6 +68,7 @@ impl<R: Send + 'static> WorkerPool<R> {
         for index in 0..worker_count {
             let tasks = Arc::clone(&tasks);
             let results = results.clone();
+            let signal = signal.clone();
             thread::Builder::new()
                 .name(format!("macluster-worker-{index}"))
                 .spawn(move || {
@@ -74,6 +80,9 @@ impl<R: Send + 'static> WorkerPool<R> {
                         let Ok(task) = task else { return };
                         if results.send(task()).is_err() {
                             return;
+                        }
+                        if let Some(signal) = &signal {
+                            signal.notify();
                         }
                     }
                 })?;
@@ -254,9 +263,18 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
+    #[cfg(test)]
     fn new<T: NodeTransport>(
         service: &ControllerService<T>,
         probe_interval: Duration,
+    ) -> Result<Self, ControllerError> {
+        Self::new_with_signal(service, probe_interval, None)
+    }
+
+    fn new_with_signal<T: NodeTransport>(
+        service: &ControllerService<T>,
+        probe_interval: Duration,
+        signal: Option<RuntimeSignal>,
     ) -> Result<Self, ControllerError> {
         let now = Instant::now();
         let configured_nodes = service.config.nodes.len().max(1);
@@ -270,10 +288,26 @@ impl RuntimeState {
                 .keys()
                 .map(|id| (id.clone(), NodeRuntime::new(now)))
                 .collect(),
-            node_probe_pool: WorkerPool::new(probe_workers, probe_workers * WORK_QUEUE_FACTOR)?,
-            control_pool: WorkerPool::new(control_workers, control_workers * WORK_QUEUE_FACTOR)?,
-            share_pool: WorkerPool::new(SHARE_WORKERS, SHARE_WORKERS * WORK_QUEUE_FACTOR)?,
-            snapshot_pool: WorkerPool::new(SNAPSHOT_WORKERS, SNAPSHOT_WORKERS * WORK_QUEUE_FACTOR)?,
+            node_probe_pool: WorkerPool::new(
+                probe_workers,
+                probe_workers * WORK_QUEUE_FACTOR,
+                signal.clone(),
+            )?,
+            control_pool: WorkerPool::new(
+                control_workers,
+                control_workers * WORK_QUEUE_FACTOR,
+                signal.clone(),
+            )?,
+            share_pool: WorkerPool::new(
+                SHARE_WORKERS,
+                SHARE_WORKERS * WORK_QUEUE_FACTOR,
+                signal.clone(),
+            )?,
+            snapshot_pool: WorkerPool::new(
+                SNAPSHOT_WORKERS,
+                SNAPSHOT_WORKERS * WORK_QUEUE_FACTOR,
+                signal,
+            )?,
             share_in_flight: None,
             share_ready: None,
             next_share_probe: now,
@@ -284,6 +318,31 @@ impl RuntimeState {
             queue_cursor: 0,
             probe_interval,
         })
+    }
+
+    fn next_deadline(&self, now: Instant) -> Instant {
+        let fallback = now + MAX_IDLE_RECONCILE_INTERVAL;
+        let mut deadline = fallback;
+        if self.share_in_flight.is_none() {
+            deadline = deadline.min(self.next_share_probe);
+        }
+        for node in self.nodes.values() {
+            if node.in_flight.is_some() {
+                continue;
+            }
+            deadline = deadline.min(node.next_probe_at);
+            if let Some(health) = &node.health {
+                deadline = deadline.min(if health.valid && health.ready {
+                    health.sampled_at + NODE_HEALTH_TTL
+                } else {
+                    health.retry_at
+                });
+            }
+            if node.pending_start.is_some() {
+                deadline = deadline.min(node.next_control_at);
+            }
+        }
+        if deadline <= now { fallback } else { deadline }
     }
 
     fn operation_id(&mut self) -> u64 {
@@ -1283,7 +1342,20 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         Err(error) => return Err(error.into()),
     };
-    let mut runtime = RuntimeState::new(service, interval.max(Duration::from_secs(1)))?;
+    let (signal, mut waiter) = RuntimeSignal::pair();
+    let _wake_forwarder = wake
+        .map(|wake| {
+            WakeForwarder::start(wake, signal.clone(), service.storage.root().to_path_buf())
+        })
+        .transpose()?;
+    if let Some((listener, _)) = control.as_mut() {
+        listener.set_runtime_signal(signal.clone());
+    }
+    let mut runtime = RuntimeState::new_with_signal(
+        service,
+        interval.max(Duration::from_secs(1)),
+        Some(signal.clone()),
+    )?;
     let mut queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
     let mut next_maintenance_attempt = Instant::now();
 
@@ -1293,7 +1365,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
             while runtime.pending_work() > 0 && Instant::now() < drain_deadline {
                 runtime.poll_workers(service)?;
                 if runtime.pending_work() > 0 {
-                    thread::sleep(Duration::from_millis(25));
+                    waiter.wait_until(Instant::now() + Duration::from_millis(25));
                 }
             }
             eprintln!(
@@ -1348,16 +1420,16 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                     && runtime.snapshot_pool.pending == 0;
                 if quiescent && Instant::now() >= next_maintenance_attempt {
                     if apply(service)? {
-                        runtime = RuntimeState::new(service, interval.max(Duration::from_secs(1)))?;
+                        runtime = RuntimeState::new_with_signal(
+                            service,
+                            interval.max(Duration::from_secs(1)),
+                            Some(signal.clone()),
+                        )?;
                         queue_names = service.config.queues.keys().cloned().collect();
                     }
                     next_maintenance_attempt = Instant::now() + Duration::from_secs(30);
                 }
-                if let Some(wake) = &wake {
-                    let _ = wake.wait(LOOP_QUANTUM)?;
-                } else {
-                    thread::sleep(LOOP_QUANTUM);
-                }
+                waiter.wait_until(runtime.next_deadline(Instant::now()));
                 continue;
             }
         }
@@ -1385,10 +1457,53 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                 return Ok(());
             }
         }
-        if let Some(wake) = &wake {
-            let _ = wake.wait(LOOP_QUANTUM)?;
-        } else {
-            thread::sleep(LOOP_QUANTUM);
+        waiter.wait_until(runtime.next_deadline(Instant::now()));
+    }
+}
+
+struct WakeForwarder {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    state_dir: std::path::PathBuf,
+}
+
+impl WakeForwarder {
+    fn start(
+        wake: ControllerWake,
+        signal: RuntimeSignal,
+        state_dir: std::path::PathBuf,
+    ) -> io::Result<Self> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("macluster-wake-forwarder".into())
+            .spawn(move || {
+                while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    match wake.wait(Duration::from_secs(60)) {
+                        Ok(true) => signal.notify(),
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("macluster: controller wake listener failed: {error}");
+                            signal.notify();
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+            state_dir,
+        })
+    }
+}
+
+impl Drop for WakeForwarder {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = notify_controller(&self.state_dir);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -1444,10 +1559,11 @@ fn now_ms() -> u64 {
 mod tests {
     use super::{
         InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL, NodeHealthCache, NodeRuntime,
-        NodeStatusCache, RuntimeState, WorkKind, WorkTag, WorkerCompletion, WorkerPool,
-        WorkerResult, maintenance_drain_complete, node_result_is_current, now_ms,
+        NodeStatusCache, RuntimeState, WakeForwarder, WorkKind, WorkTag, WorkerCompletion,
+        WorkerPool, WorkerResult, maintenance_drain_complete, node_result_is_current, now_ms,
         reset_drain_complete, retry_delay, run_forever,
     };
+    use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
     use macluster_protocol::{
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
@@ -2142,7 +2258,7 @@ scheduler = "fifo"
 
     #[test]
     fn a_slow_worker_does_not_block_another_worker_result() {
-        let mut pool = WorkerPool::new(2, 2).unwrap();
+        let mut pool = WorkerPool::new(2, 2, None).unwrap();
         assert!(pool.try_spawn(|| {
             std::thread::sleep(Duration::from_millis(150));
             1
@@ -2159,6 +2275,79 @@ scheduler = "fifo"
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(fast_finished, "fast task waited for an unrelated slow task");
+    }
+
+    #[test]
+    fn worker_completion_bursts_wake_once_and_keep_all_results_available() {
+        let (signal, mut waiter) = RuntimeSignal::pair();
+        let mut pool = WorkerPool::new(4, 8, Some(signal)).unwrap();
+        for value in 0..8 {
+            assert!(pool.try_spawn(move || value));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut results = Vec::new();
+        while pool.pending > 0 && Instant::now() < deadline {
+            waiter.wait_until(deadline);
+            results.extend(pool.poll());
+        }
+        results.sort_unstable();
+        assert_eq!(results, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_external_wake_datagram_signals_the_runtime_waiter() {
+        use crate::wake::{ControllerWake, notify_controller};
+
+        let root =
+            std::env::temp_dir().join(format!("macluster-wake-forwarder-{}", Id128::random()));
+        std::fs::create_dir_all(&root).unwrap();
+        let wake = ControllerWake::bind(&root).unwrap();
+        let (signal, mut waiter) = RuntimeSignal::pair();
+        let forwarder = WakeForwarder::start(wake, signal, root.clone()).unwrap();
+
+        notify_controller(&root).unwrap();
+
+        assert!(waiter.wait_until(Instant::now() + Duration::from_secs(1)));
+        drop(forwarder);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn next_deadline_uses_the_earliest_probe_and_has_a_two_second_idle_cap() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!("macluster-deadline-{}", Id128::random()));
+        let config = login_and_worker_config(&root);
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let now = Instant::now();
+        runtime.next_share_probe = now + Duration::from_secs(20);
+        for node in runtime.nodes.values_mut() {
+            node.next_probe_at = now + Duration::from_secs(20);
+            node.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                sampled_at: now,
+                retry_at: now + NODE_HEALTH_TTL,
+            });
+        }
+
+        assert_eq!(
+            runtime.next_deadline(now),
+            now + Duration::from_secs(2),
+            "external barrier and offline submissions must be revisited within two seconds"
+        );
+        runtime.nodes.get_mut("worker").unwrap().next_probe_at = now + Duration::from_millis(250);
+        assert_eq!(runtime.next_deadline(now), now + Duration::from_millis(250));
+
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2362,6 +2551,41 @@ scheduler = "fifo"
     }
 
     #[test]
+    fn idle_controller_does_not_run_one_hundred_reconciliation_cycles_in_ten_seconds() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!("macluster-idle-runtime-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let start = Instant::now();
+        let mut loop_checks = 0_u32;
+
+        super::run_forever_with_shutdown(
+            &mut service,
+            Duration::from_secs(1),
+            || {
+                loop_checks += 1;
+                start.elapsed() >= Duration::from_secs(10)
+            },
+            || false,
+            |_| Ok(false),
+        )
+        .unwrap();
+
+        assert!(
+            loop_checks < 100,
+            "idle runtime ran {loop_checks} reconciliation cycles in ten seconds"
+        );
+        eprintln!("idle controller reconciliation cycles over ten seconds: {loop_checks}");
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reset_barrier_disables_dispatch_and_is_removed_when_temporary_barrier_clears() {
         use crate::ControllerService;
         use macluster_core::storage::Storage;
@@ -2545,7 +2769,7 @@ scheduler = "fifo"
 
     #[test]
     fn worker_pool_rejects_work_beyond_its_running_and_queued_capacity() {
-        let mut pool = WorkerPool::new(1, 1).unwrap();
+        let mut pool = WorkerPool::new(1, 1, None).unwrap();
         let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
         assert!(pool.try_spawn(move || {

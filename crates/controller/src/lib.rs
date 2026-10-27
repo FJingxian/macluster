@@ -1,6 +1,7 @@
 //! Login-node reconciliation and whole-node FIFO dispatch.
 
 mod control;
+pub mod events;
 mod ipc;
 mod runtime;
 pub mod transport;

@@ -488,6 +488,54 @@ impl<T: NodeTransport> ControllerService<T> {
     pub fn run_forever(&mut self, interval_secs: u64) -> Result<(), ControllerError> {
         runtime::run_forever(self, Duration::from_secs(interval_secs.max(1)))
     }
+
+    pub fn run_forever_with_idle_maintenance(
+        &mut self,
+        interval_secs: u64,
+        requested: impl FnMut() -> bool,
+        apply: impl FnMut(&mut Self) -> Result<bool, ControllerError>,
+    ) -> Result<(), ControllerError> {
+        runtime::run_forever_with_idle_maintenance(
+            self,
+            Duration::from_secs(interval_secs.max(1)),
+            requested,
+            apply,
+        )
+    }
+
+    pub fn apply_idle_address_config(
+        &mut self,
+        config: ClusterConfig,
+    ) -> Result<(), ControllerError> {
+        let jobs = self.storage.list_jobs(None)?;
+        if jobs.iter().any(|job| {
+            matches!(
+                job.state,
+                JobState::Starting | JobState::Running | JobState::Cancelling
+            )
+        }) {
+            return Err(
+                io::Error::other("cannot reload node addresses while tasks are active").into(),
+            );
+        }
+        let mut expected = self.config.clone();
+        for (node_id, node) in &mut expected.nodes {
+            let Some(replacement) = config.nodes.get(node_id) else {
+                return Err(io::Error::other("address reload cannot remove nodes").into());
+            };
+            node.host = replacement.host.clone();
+            node.remote_binary = replacement.remote_binary.clone();
+        }
+        if expected != config {
+            return Err(
+                io::Error::other("idle address reload only permits node address changes").into(),
+            );
+        }
+        self.config = config;
+        self.fenced_nodes.clear();
+        self.idle_since.clear();
+        Ok(())
+    }
 }
 
 fn namespace_waiting_reason(

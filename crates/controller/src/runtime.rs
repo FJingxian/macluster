@@ -1206,6 +1206,15 @@ pub(crate) fn run_forever<T: NodeTransport + 'static>(
     service: &mut ControllerService<T>,
     interval: Duration,
 ) -> Result<(), ControllerError> {
+    run_forever_with_idle_maintenance(service, interval, || false, |_| Ok(false))
+}
+
+pub(crate) fn run_forever_with_idle_maintenance<T: NodeTransport + 'static>(
+    service: &mut ControllerService<T>,
+    interval: Duration,
+    mut requested: impl FnMut() -> bool,
+    mut apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
+) -> Result<(), ControllerError> {
     let wake = match ControllerWake::bind(service.storage.root()) {
         Ok(wake) => Some(wake),
         Err(WakeError::PathTooLong(path)) => {
@@ -1218,12 +1227,41 @@ pub(crate) fn run_forever<T: NodeTransport + 'static>(
         Err(error) => return Err(error.into()),
     };
     let mut runtime = RuntimeState::new(service, interval.max(Duration::from_secs(1)))?;
-    let queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
+    let mut queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
+    let mut next_maintenance_attempt = Instant::now();
 
     loop {
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
         runtime.poll_workers(service)?;
+        let address_maintenance = reset_policy.is_none() && !maintenance_active && requested();
+        if address_maintenance {
+            let all_jobs = service.storage.list_jobs(None)?;
+            if all_jobs.iter().all(|job| {
+                !matches!(
+                    job.state,
+                    JobState::Starting | JobState::Running | JobState::Cancelling
+                )
+            }) {
+                let quiescent = runtime.node_probe_pool.pending == 0
+                    && runtime.control_pool.pending == 0
+                    && runtime.share_pool.pending == 0
+                    && runtime.snapshot_pool.pending == 0;
+                if quiescent && Instant::now() >= next_maintenance_attempt {
+                    if apply(service)? {
+                        runtime = RuntimeState::new(service, interval.max(Duration::from_secs(1)))?;
+                        queue_names = service.config.queues.keys().cloned().collect();
+                    }
+                    next_maintenance_attempt = Instant::now() + Duration::from_secs(30);
+                }
+                if let Some(wake) = &wake {
+                    let _ = wake.wait(LOOP_QUANTUM)?;
+                } else {
+                    thread::sleep(LOOP_QUANTUM);
+                }
+                continue;
+            }
+        }
         runtime.schedule_share_probe(service);
         let jobs = service.storage.list_reconcile_jobs()?;
         runtime.schedule_controls(service, &jobs)?;
@@ -1231,7 +1269,9 @@ pub(crate) fn run_forever<T: NodeTransport + 'static>(
         if !reset_policy.is_some_and(|policy| policy.discard_terminal_sync) {
             runtime.schedule_snapshots(service, &jobs, &queue_names);
         }
-        runtime.dispatch(service, jobs, &queue_names)?;
+        if !address_maintenance {
+            runtime.dispatch(service, jobs, &queue_names)?;
+        }
         if let Some(policy) = reset_policy {
             let all_jobs = service.storage.list_jobs(None)?;
             if reset_drain_complete(&all_jobs, policy) {
@@ -1647,6 +1687,89 @@ scheduler = "fifo"
             .unwrap();
         storage.publish_snapshot(job.id, shared_root).unwrap();
         job
+    }
+
+    #[test]
+    fn address_reload_preserves_pending_logs_and_rejects_active_tasks_or_topology_changes() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-address-reload-{}", Id128::random()));
+        let config = login_and_worker_config(&root);
+        let storage = macluster_core::storage::Storage::open(root.join("state")).unwrap();
+        let job = submit_dispatch_test_job(&storage, &config.shared_root, None);
+        let mut service =
+            crate::ControllerService::new(config.clone(), storage, IsolatedNodeTransport).unwrap();
+        service
+            .storage
+            .reserve_job(job.id, NodeId::new("worker").unwrap())
+            .unwrap();
+        service.storage.mark_running(job.id).unwrap();
+        let mut next = config.clone();
+        next.nodes.get_mut("worker").unwrap().host = "192.0.2.3".into();
+        assert!(service.apply_idle_address_config(next.clone()).is_err());
+        service
+            .storage
+            .finish_job(job.id, JobState::Completed, Some(0), None)
+            .unwrap();
+        service.storage.set_log_sync_pending(job.id, true).unwrap();
+        service.apply_idle_address_config(next.clone()).unwrap();
+        assert_eq!(service.config.nodes["worker"].host, "192.0.2.3");
+        let retained = service.storage.get_job(job.id).unwrap().unwrap();
+        assert_eq!(retained.state, JobState::Completed);
+        assert!(retained.log_sync_pending);
+        next.shared_root = root.join("unrelated");
+        assert!(service.apply_idle_address_config(next).is_err());
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn address_maintenance_waits_for_active_tasks_and_never_dispatches_queued_work() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-address-idle-hook-{}", Id128::random()));
+        let config = login_and_worker_config(&root);
+        let state = root.join("state");
+        let storage = macluster_core::storage::Storage::open(&state).unwrap();
+        let active = submit_dispatch_test_job(&storage, &config.shared_root, None);
+        let queued = submit_dispatch_test_job(&storage, &config.shared_root, None);
+        storage
+            .reserve_job(active.id, NodeId::new("worker").unwrap())
+            .unwrap();
+        storage.mark_running(active.id).unwrap();
+        let mut service =
+            crate::ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let finish = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let storage = macluster_core::storage::Storage::open(state).unwrap();
+            storage
+                .finish_job(active.id, JobState::Completed, Some(0), None)
+                .unwrap();
+            storage.set_log_sync_pending(active.id, true).unwrap();
+        });
+        let result = super::run_forever_with_idle_maintenance(
+            &mut service,
+            Duration::from_secs(1),
+            || true,
+            |service| {
+                assert_eq!(
+                    service.storage.get_job(active.id).unwrap().unwrap().state,
+                    JobState::Completed
+                );
+                assert_eq!(
+                    service.storage.get_job(queued.id).unwrap().unwrap().state,
+                    JobState::Pending
+                );
+                Err(std::io::Error::other("address idle hook reached").into())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("address idle hook reached")
+        );
+        finish.join().unwrap();
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

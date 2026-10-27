@@ -24,6 +24,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
 const MAX_OUTSTANDING_PROBES: usize = 64;
+const INTERACTIVE_SSH_ALIVE_INTERVAL: &str = "-oServerAliveInterval=15";
+const INTERACTIVE_SSH_ALIVE_COUNT: &str = "-oServerAliveCountMax=4";
 static OUTSTANDING_PROBES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Error)]
@@ -128,8 +130,8 @@ impl ClusterTransport {
                     "-oBatchMode=yes",
                     "-oStrictHostKeyChecking=yes",
                     "-oConnectTimeout=5",
-                    "-oServerAliveInterval=5",
-                    "-oServerAliveCountMax=1",
+                    INTERACTIVE_SSH_ALIVE_INTERVAL,
+                    INTERACTIVE_SSH_ALIVE_COUNT,
                 ]);
                 node.add_ssh_identity_args(&mut command);
                 command.arg(&node.host).arg(&node.remote_binary);
@@ -174,8 +176,21 @@ impl ClusterTransport {
         let status = command
             .status()
             .map_err(|error| TransportError::Io(error.to_string()))?;
-        Ok(status.code().unwrap_or(1))
+        interactive_attach_exit_code(node.transport, node_id, status.code().unwrap_or(1))
     }
+}
+
+fn interactive_attach_exit_code(
+    transport: Transport,
+    node_id: &NodeId,
+    exit_code: i32,
+) -> Result<i32, TransportError> {
+    if transport == Transport::Ssh && exit_code == 255 {
+        return Err(TransportError::Io(format!(
+            "interactive SSH connection to node '{node_id}' ended with exit status 255; see the SSH diagnostics above"
+        )));
+    }
+    Ok(exit_code)
 }
 
 impl NodeTransport for ClusterTransport {
@@ -664,6 +679,8 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "-T"));
         assert!(args.iter().any(|arg| arg == "-oLogLevel=ERROR"));
         assert!(args.iter().any(|arg| arg == "-oStrictHostKeyChecking=yes"));
+        assert!(args.iter().any(|arg| arg == "-oServerAliveInterval=15"));
+        assert!(args.iter().any(|arg| arg == "-oServerAliveCountMax=4"));
         assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
         assert!(args.windows(2).any(|pair| pair == ["-l", "operator"]));
         let host_index = args.iter().position(|arg| arg == "192.168.2.3").unwrap();
@@ -681,6 +698,18 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|pair| { pair == ["--start-token", token.to_string().as_str()] })
+        );
+    }
+
+    #[test]
+    fn ssh_interactive_exit_255_is_reported_as_a_transport_failure() {
+        let node_id = "mini01-a".parse().unwrap();
+        let error = interactive_attach_exit_code(Transport::Ssh, &node_id, 255).unwrap_err();
+        assert!(error.to_string().contains("interactive SSH connection"));
+        assert!(error.to_string().contains("mini01-a"));
+        assert_eq!(
+            interactive_attach_exit_code(Transport::Local, &node_id, 255).unwrap(),
+            255
         );
     }
 

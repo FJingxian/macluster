@@ -4005,11 +4005,42 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                 ControllerLifecycle::Ready
             };
             let mut control_listener = None;
+            let mut control_maintenance = None;
             let control_hello = if once {
                 None
             } else {
                 let binding = ServiceBinding::load(&config_file, &state_dir)
                     .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
+                let config_bytes =
+                    fs::read(&config_file).map_err(|error| (1, error.to_string()))?;
+                let config_digest =
+                    sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
+                let maintenance = macluster_controller::maintenance::MaintenanceCoordinator::open(
+                    &state_dir,
+                    binding.binding_digest(),
+                    &config_digest,
+                )
+                .map_err(|error| {
+                    (
+                        1,
+                        format!("controller maintenance metadata failed: {error}"),
+                    )
+                })?;
+                if maintenance.startup_config_mismatch() {
+                    service.set_maintenance_recovery_blocked(true);
+                    eprintln!(
+                        "macluster: controller config digest differs from its persisted generation; dispatch is blocked until maintenance recovery completes"
+                    );
+                }
+                let lifecycle = if maintenance.startup_config_mismatch()
+                    || maintenance.inspect().is_some_and(|status| {
+                        status.phase
+                            == macluster_protocol::control::MaintenancePhase::RecoveryRequired
+                    }) {
+                    ControllerLifecycle::RecoveryPending
+                } else {
+                    lifecycle
+                };
                 let hello = ControllerHello {
                     protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
                     binding_digest: binding.binding_digest().to_owned(),
@@ -4023,9 +4054,10 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                         "snapshot.upload.v1".into(),
                         "agent.compatibility.v1".into(),
                         "monitor.v1".into(),
+                        "maintenance.v1".into(),
                     ],
                     controller_epoch: service.epoch(),
-                    config_generation: 0,
+                    config_generation: maintenance.generation(),
                     lifecycle,
                 };
                 let listener =
@@ -4034,6 +4066,7 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                             (1, format!("cannot start local controller IPC: {error}"))
                         })?;
                 control_listener = Some(listener);
+                control_maintenance = Some(maintenance);
                 Some(hello)
             };
             if once {
@@ -4059,6 +4092,8 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                     .expect("long-running controller always has a control listener");
                 service
                     .run_forever_with_control(interval, listener, control_hello.expect("control hello exists"),
+                        config_file.clone(),
+                        control_maintenance.take().expect("maintenance coordinator exists"),
                         || CONTROLLER_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst),
                         || requested.load(std::sync::atomic::Ordering::SeqCst),
                         |service| {

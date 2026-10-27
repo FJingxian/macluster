@@ -61,6 +61,7 @@ impl ControlClient {
                     "snapshot.upload.v1".into(),
                     "agent.compatibility.v1".into(),
                     "monitor.v1".into(),
+                    "maintenance.v1".into(),
                 ],
             },
         )?;

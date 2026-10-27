@@ -19,6 +19,7 @@ use macluster_core::{
 };
 use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
+    control::MaintenanceScope,
     identifiers::NodeId,
     types::{
         ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, Operation,
@@ -246,6 +247,8 @@ struct SnapshotRetry {
 
 struct RuntimeState {
     digest: String,
+    previous_digest: Option<String>,
+    reloaded_affected_nodes: std::collections::HashSet<String>,
     nodes: HashMap<String, NodeRuntime>,
     node_probe_pool: WorkerPool<WorkerCompletion>,
     control_pool: WorkerPool<WorkerCompletion>,
@@ -282,6 +285,8 @@ impl RuntimeState {
         let control_workers = CONTROL_WORKERS.min(configured_nodes);
         Ok(Self {
             digest: service.config.execution_digest().unwrap_or_default(),
+            previous_digest: None,
+            reloaded_affected_nodes: std::collections::HashSet::new(),
             nodes: service
                 .config
                 .nodes
@@ -358,6 +363,112 @@ impl RuntimeState {
             + self.snapshot_pool.pending
     }
 
+    fn maintenance_blockers<T: NodeTransport>(
+        &self,
+        service: &ControllerService<T>,
+        scope: &MaintenanceScope,
+    ) -> Result<Vec<String>, ControllerError> {
+        let mut blockers = Vec::new();
+        let in_scope = |node: Option<&NodeId>| match scope {
+            MaintenanceScope::Cluster => true,
+            MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
+        };
+        for job in service.storage.list_jobs(None)? {
+            let scoped = in_scope(job.node.as_ref());
+            let label = match job.state {
+                JobState::Starting | JobState::Running | JobState::Cancelling if scoped => {
+                    Some(format!(
+                        "job {} is {:?} on {}",
+                        job.id,
+                        job.state,
+                        job.node.as_ref().map_or("unknown", NodeId::as_str)
+                    ))
+                }
+                _ if (scoped || matches!(scope, MaintenanceScope::Cluster))
+                    && (job.snapshot_sync_pending || job.log_sync_pending) =>
+                {
+                    Some(format!("job {} output synchronization is pending", job.id))
+                }
+                _ => None,
+            };
+            if let Some(label) = label {
+                blockers.push(label);
+            }
+            if blockers.len() >= 32 {
+                return Ok(blockers);
+            }
+        }
+
+        for (node_id, node) in &self.nodes {
+            if !service.node_is_maintenance_scoped(node_id) {
+                continue;
+            }
+            if node.in_flight.is_some() {
+                blockers.push(format!(
+                    "node {node_id} has a controller operation in flight"
+                ));
+            } else if node.pending_start.is_some() {
+                blockers.push(format!("node {node_id} has a pending start operation"));
+            } else if node.status_fresh(Instant::now())
+                && node.status.as_ref().is_some_and(|status| status.occupied)
+            {
+                blockers.push(format!("node {node_id} still reports an active execution"));
+            } else if !node.status_fresh(Instant::now()) {
+                blockers.push(format!(
+                    "node {node_id} execution state is not freshly verified"
+                ));
+            }
+            if blockers.len() >= 32 {
+                break;
+            }
+        }
+        Ok(blockers)
+    }
+
+    fn apply_config_reload<T: NodeTransport>(
+        &mut self,
+        service: &ControllerService<T>,
+        old_digest: String,
+        scope: &MaintenanceScope,
+    ) {
+        let mut affected = match scope {
+            MaintenanceScope::Cluster => self
+                .nodes
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            MaintenanceScope::Nodes(nodes) => nodes.iter().map(ToString::to_string).collect(),
+        };
+        self.nodes.retain(|node_id, _| {
+            service.config.nodes.contains_key(node_id) && !affected.contains(node_id)
+        });
+        let now = Instant::now();
+        for node_id in service.config.nodes.keys() {
+            if !self.nodes.contains_key(node_id) {
+                self.nodes.insert(node_id.clone(), NodeRuntime::new(now));
+                affected.insert(node_id.clone());
+            }
+        }
+        self.previous_digest = Some(old_digest);
+        self.reloaded_affected_nodes = affected;
+        self.digest = service.config.execution_digest().unwrap_or_default();
+        if matches!(scope, MaintenanceScope::Cluster) {
+            self.share_ready = None;
+            self.next_share_probe = now;
+        }
+    }
+
+    fn tag_identity_current(&self, tag: &WorkTag, now: Instant) -> bool {
+        if tag.config_digest == self.digest {
+            return true;
+        }
+        tag.node_id.as_ref().is_some_and(|node_id| {
+            self.previous_digest.as_deref() == Some(tag.config_digest.as_str())
+                && !self.reloaded_affected_nodes.contains(node_id)
+                && now.saturating_duration_since(tag.started_at) <= MAX_WORK_RESULT_AGE
+        })
+    }
+
     fn tag<T: NodeTransport>(
         &self,
         service: &ControllerService<T>,
@@ -410,7 +521,7 @@ impl RuntimeState {
     ) -> Result<(), ControllerError> {
         let now = Instant::now();
         let tag = completion.tag;
-        let identity_current = tag.epoch == service.epoch && tag.config_digest == self.digest;
+        let identity_current = tag.epoch == service.epoch && self.tag_identity_current(&tag, now);
         match tag.kind {
             WorkKind::ShareHealth => {
                 if self.share_in_flight == Some(tag.operation_id) {
@@ -486,7 +597,7 @@ impl RuntimeState {
                 if !node_result_is_current(
                     &tag,
                     service.epoch,
-                    &self.digest,
+                    &tag.config_digest,
                     runtime.generation,
                     now,
                 ) {
@@ -735,6 +846,15 @@ impl RuntimeState {
                 continue;
             };
             if runtime.in_flight.is_some() || runtime.pending_start.is_some() {
+                continue;
+            }
+            if service.node_is_maintenance_scoped(id)
+                && runtime.status_fresh(now)
+                && runtime
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| !status.occupied)
+            {
                 continue;
             }
             let health_due = runtime.health_probe_due(now);
@@ -1259,7 +1379,7 @@ impl RuntimeState {
                     idle_since_unix_ms,
                     online,
                     storage_ready: self.share_ready(now) && node_storage_ready,
-                    drain_requested: false,
+                    drain_requested: service.node_is_maintenance_scoped(id),
                     occupied: busy,
                     interactive_pty,
                     namespaced_jobs,
@@ -1307,12 +1427,20 @@ pub(crate) fn run_forever_with_control<T: NodeTransport + 'static>(
     interval: Duration,
     listener: &mut crate::ControlListener<'_>,
     hello: ControllerHello,
+    config_path: std::path::PathBuf,
+    maintenance: crate::maintenance::MaintenanceCoordinator,
     shutdown_requested: impl FnMut() -> bool,
     requested: impl FnMut() -> bool,
     apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
 ) -> Result<(), ControllerError> {
     let storage = Storage::open(service.storage.root())?;
-    let api = crate::ControlApi::new(service.config.clone(), storage, hello);
+    let api = crate::ControlApi::new_with_maintenance(
+        service.config.clone(),
+        storage,
+        hello,
+        config_path,
+        maintenance,
+    );
     run_forever_with_control_inner(
         service,
         interval,
@@ -1358,6 +1486,9 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
     )?;
     let mut queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
     let mut next_maintenance_attempt = Instant::now();
+    if let Some((_, api)) = control.as_mut() {
+        service.set_maintenance_scope(api.maintenance_scope());
+    }
 
     loop {
         if shutdown_requested() {
@@ -1376,10 +1507,21 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
         runtime.poll_workers(service)?;
+        if let Some((_, api)) = control.as_mut() {
+            let scope = api.maintenance_scope();
+            service.set_maintenance_scope(scope.clone());
+            if let Some(scope) = scope {
+                let blockers = runtime.maintenance_blockers(service, &scope)?;
+                api.refresh_maintenance_blockers(blockers);
+            }
+        }
         if let Some((listener, api)) = control.as_mut() {
             let lifecycle = if reset_policy.is_some() || maintenance_active {
                 ControllerLifecycle::Paused
-            } else if !service.dispatch_enabled {
+            } else if !service.dispatch_enabled
+                || service.maintenance_recovery_blocked
+                || api.maintenance_recovery_required()
+            {
                 ControllerLifecycle::RecoveryPending
             } else {
                 ControllerLifecycle::Ready
@@ -1392,8 +1534,85 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                 };
                 match event {
                     crate::PendingControlEvent::Request(request) => {
-                        let result =
-                            api.handle(request.client_session(), request.request().clone());
+                        let control_request = request.request().clone();
+                        let result = if let Err(error) =
+                            api.validate_generation(control_request.expected_generation)
+                        {
+                            Err(error)
+                        } else if let macluster_protocol::control::ControlCommand::CompleteMaintenance {
+                            ticket,
+                            candidate_config_digest,
+                            candidate_journal_digest,
+                        } = control_request.command.clone()
+                        {
+                            let scope = api.maintenance_scope();
+                            let drain_ready = if let Some(scope) = scope.as_ref() {
+                                let blockers = runtime.maintenance_blockers(service, scope)?;
+                                api.refresh_maintenance_blockers(blockers.clone());
+                                blockers.is_empty()
+                            } else {
+                                false
+                            };
+                            if !drain_ready {
+                                Err(crate::control::maintenance_error(
+                                    "maintenance still has active jobs, output sync, or in-flight node operations",
+                                ))
+                            } else {
+                                match api.prepare_maintenance_completion(
+                                    &ticket,
+                                    &candidate_config_digest,
+                                    &candidate_journal_digest,
+                                ) {
+                                    Ok((next_config, scope)) => {
+                                        let old_digest = runtime.digest.clone();
+                                        match service.reload_quiescent_config(
+                                            next_config.clone(),
+                                            &scope,
+                                        ) {
+                                            Ok(()) => {
+                                                runtime.apply_config_reload(
+                                                    service,
+                                                    old_digest,
+                                                    &scope,
+                                                );
+                                                match api.finish_maintenance_completion(
+                                                    &ticket,
+                                                    next_config,
+                                                ) {
+                                                    Ok(()) => {
+                                                        service.set_maintenance_recovery_blocked(false);
+                                                        queue_names = service
+                                                            .config
+                                                            .queues
+                                                            .keys()
+                                                            .cloned()
+                                                            .collect();
+                                                        service.set_maintenance_scope(
+                                                            api.maintenance_scope(),
+                                                        );
+                                                        if let Err(error) =
+                                                            listener.set_hello(api.hello().clone())
+                                                        {
+                                                            eprintln!(
+                                                                "macluster: could not publish new controller generation: {error}"
+                                                            );
+                                                        }
+                                                        Ok(macluster_protocol::control::ControlPayload::Maintenance(None))
+                                                    }
+                                                    Err(error) => Err(error),
+                                                }
+                                            }
+                                            Err(error) => Err(crate::control::maintenance_error(
+                                                error.to_string(),
+                                            )),
+                                        }
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        } else {
+                            api.handle(request.client_session(), control_request)
+                        };
                         if let Err(error) = request.respond(result)
                             && !matches!(error, crate::IpcError::ClientDisconnected)
                         {
@@ -1401,6 +1620,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                 "macluster: could not respond to local controller request: {error}"
                             );
                         }
+                        service.set_maintenance_scope(api.maintenance_scope());
                     }
                     crate::PendingControlEvent::Disconnected(session) => api.disconnect(session),
                 }
@@ -1566,6 +1786,8 @@ mod tests {
     };
     use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
+    use macluster_core::scheduler::next_dispatch;
+    use macluster_protocol::control::MaintenanceScope;
     use macluster_protocol::{
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
         types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState},
@@ -2015,6 +2237,7 @@ scheduler = "fifo"
         )
         .unwrap();
         let job = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let job = service.storage.get_job(job.id).unwrap().unwrap();
 
         service.tick_with_storage_health(true).unwrap();
 
@@ -2436,6 +2659,138 @@ scheduler = "fifo"
         for state in [JobState::Starting, JobState::Running, JobState::Cancelling] {
             assert!(!maintenance_drain_complete(&[reset_test_job(state, false)]));
         }
+    }
+
+    #[test]
+    fn maintenance_ticket_waits_for_active_execution_and_output_sync_to_finish() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-maintenance-drain-blockers-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 2);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let submitted = submit_dispatch_test_job(&service.storage, &shared_root, Some("node-000"));
+        service
+            .storage
+            .reserve_job(submitted.id, NodeId::new("node-000").unwrap())
+            .unwrap();
+        service.storage.mark_running(submitted.id).unwrap();
+
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        service.set_maintenance_scope(Some(MaintenanceScope::Cluster));
+        for node in runtime.nodes.values_mut() {
+            node.status = Some(NodeStatusCache {
+                online: true,
+                occupied: false,
+                sampled_at: now,
+            });
+        }
+        let active = runtime
+            .maintenance_blockers(&service, &MaintenanceScope::Cluster)
+            .unwrap();
+        assert!(
+            active
+                .iter()
+                .any(|blocker| blocker.contains("job 1 is Running"))
+        );
+
+        service
+            .storage
+            .finish_job(submitted.id, JobState::Completed, Some(0), None)
+            .unwrap();
+        service
+            .storage
+            .set_log_sync_pending(submitted.id, true)
+            .unwrap();
+        let syncing = runtime
+            .maintenance_blockers(&service, &MaintenanceScope::Cluster)
+            .unwrap();
+        assert!(
+            syncing
+                .iter()
+                .any(|blocker| blocker.contains("output synchronization is pending"))
+        );
+
+        service
+            .storage
+            .set_log_sync_pending(submitted.id, false)
+            .unwrap();
+        assert!(
+            runtime
+                .maintenance_blockers(&service, &MaintenanceScope::Cluster)
+                .unwrap()
+                .is_empty()
+        );
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_maintenance_blocks_only_affected_nodes_from_dispatch() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-scoped-maintenance-dispatch-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 2);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let now = Instant::now();
+        runtime.share_ready = Some((true, now));
+        for node in runtime.nodes.values_mut() {
+            node.fenced = true;
+            node.status = Some(NodeStatusCache {
+                online: true,
+                occupied: false,
+                sampled_at: now,
+            });
+        }
+        service.set_maintenance_scope(Some(MaintenanceScope::Nodes(vec![
+            NodeId::new("node-000").unwrap(),
+        ])));
+        let availability = runtime.availability(&service, now);
+        assert!(
+            availability
+                .iter()
+                .find(|node| node.id.as_str() == "node-000")
+                .unwrap()
+                .drain_requested
+        );
+        assert!(
+            !availability
+                .iter()
+                .find(|node| node.id.as_str() == "node-001")
+                .unwrap()
+                .drain_requested
+        );
+
+        let job = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let job = service.storage.get_job(job.id).unwrap().unwrap();
+        let queue = service.config.queue_for_dispatch("mini01").unwrap();
+        let queue_id = QueueName::new("mini01").unwrap();
+        let dispatch = next_dispatch(&queue_id, &queue, &[job], &availability)
+            .expect("unaffected node should still receive work");
+        assert_eq!(dispatch.node_id.as_str(), "node-001");
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

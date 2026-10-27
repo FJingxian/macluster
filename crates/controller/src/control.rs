@@ -2,6 +2,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,7 +18,8 @@ use macluster_protocol::{
         AgentCompatibilityRecord, AgentCompatibilityState, ControlCommand, ControlError,
         ControlErrorCode, ControlPayload, ControlRequest, ControllerHello, ControllerLifecycle,
         JobPage, MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_JOB_PAGE, MAX_CONTROL_MONITOR_NODES,
-        MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, QueueSummary,
+        MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, MaintenanceScope,
+        MaintenanceTicket, QueueSummary,
     },
     framing::{ChunkAssembler, MAX_SNAPSHOT_BYTES},
     identifiers::{Id128, NodeId},
@@ -42,6 +45,8 @@ pub struct ControlApi {
     config: ClusterConfig,
     storage: Storage,
     hello: ControllerHello,
+    config_path: Option<PathBuf>,
+    maintenance: Option<crate::maintenance::MaintenanceCoordinator>,
     compatibility: Arc<CompatibilityCache>,
     compatibility_refresher: CompatibilityRefresher,
     monitor: MonitorHub,
@@ -51,6 +56,26 @@ pub struct ControlApi {
 
 impl ControlApi {
     pub fn new(config: ClusterConfig, storage: Storage, hello: ControllerHello) -> Self {
+        Self::new_inner(config, storage, hello, None, None)
+    }
+
+    pub fn new_with_maintenance(
+        config: ClusterConfig,
+        storage: Storage,
+        hello: ControllerHello,
+        config_path: PathBuf,
+        maintenance: crate::maintenance::MaintenanceCoordinator,
+    ) -> Self {
+        Self::new_inner(config, storage, hello, Some(config_path), Some(maintenance))
+    }
+
+    fn new_inner(
+        config: ClusterConfig,
+        storage: Storage,
+        hello: ControllerHello,
+        config_path: Option<PathBuf>,
+        maintenance: Option<crate::maintenance::MaintenanceCoordinator>,
+    ) -> Self {
         let compatibility = Arc::new(CompatibilityCache::new(hello.config_generation));
         let compatibility_refresher = CompatibilityRefresher::start(
             Arc::clone(&compatibility),
@@ -62,6 +87,8 @@ impl ControlApi {
             config,
             storage,
             hello,
+            config_path,
+            maintenance,
             compatibility,
             compatibility_refresher,
             monitor,
@@ -70,8 +97,115 @@ impl ControlApi {
         }
     }
 
+    pub fn maintenance_scope(&self) -> Option<MaintenanceScope> {
+        self.maintenance
+            .as_ref()
+            .and_then(|manager| manager.scope())
+    }
+
+    pub fn maintenance_recovery_required(&self) -> bool {
+        self.maintenance.as_ref().is_some_and(|manager| {
+            manager.startup_config_mismatch()
+                || manager.inspect().is_some_and(|status| {
+                    status.phase == macluster_protocol::control::MaintenancePhase::RecoveryRequired
+                })
+        })
+    }
+
+    pub fn refresh_maintenance_blockers(&mut self, blockers: Vec<String>) {
+        let Some(manager) = self.maintenance.as_mut() else {
+            return;
+        };
+        let Some(status) = manager.inspect() else {
+            return;
+        };
+        if let Err(error) = manager.update_blockers(&status.ticket, blockers) {
+            eprintln!("macluster: cannot update maintenance drain state: {error}");
+        }
+    }
+
+    pub fn prepare_maintenance_completion(
+        &mut self,
+        ticket: &MaintenanceTicket,
+        candidate_config_digest: &str,
+        candidate_journal_digest: &str,
+    ) -> Result<(ClusterConfig, MaintenanceScope), ControlError> {
+        let manager = self
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| maintenance_error("controller maintenance is not initialized"))?;
+        let status = manager
+            .inspect()
+            .filter(|status| status.ticket == *ticket)
+            .ok_or_else(|| maintenance_error("maintenance ticket is stale"))?;
+        if !matches!(
+            status.phase,
+            macluster_protocol::control::MaintenancePhase::Ready
+                | macluster_protocol::control::MaintenancePhase::RecoveryRequired
+        ) {
+            return Err(maintenance_error("maintenance is still draining"));
+        }
+        let config_path = self
+            .config_path
+            .as_ref()
+            .ok_or_else(|| maintenance_error("controller config path is unavailable"))?;
+        let bytes = fs::read(config_path).map_err(|error| maintenance_error(error.to_string()))?;
+        let actual_config_digest = macluster_protocol::framing::sha256_hex(&bytes)
+            .map_err(|error| maintenance_error(error.to_string()))?;
+        let actual_journal_digest = manager
+            .node_admin_journal_digest()
+            .map_err(|error| maintenance_error(error.to_string()))?;
+        let source = std::str::from_utf8(&bytes)
+            .map_err(|error| maintenance_error(format!("config is not UTF-8: {error}")))?;
+        let config = ClusterConfig::parse(source)
+            .map_err(|error| maintenance_error(format!("candidate config is invalid: {error}")))?;
+        crate::maintenance::validate_scope_config_change(&self.config, &config, &status.scope)
+            .map_err(maintenance_error)?;
+        manager
+            .prepare_complete(
+                ticket,
+                candidate_config_digest,
+                &actual_config_digest,
+                candidate_journal_digest,
+                &actual_journal_digest,
+            )
+            .map_err(maintenance_manager_error)?;
+        Ok((config, status.scope))
+    }
+
+    pub fn finish_maintenance_completion(
+        &mut self,
+        ticket: &MaintenanceTicket,
+        config: ClusterConfig,
+    ) -> Result<(), ControlError> {
+        let manager = self
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| maintenance_error("controller maintenance is not initialized"))?;
+        manager
+            .commit_complete(ticket)
+            .map_err(maintenance_manager_error)?;
+        self.config = config;
+        let generation = manager.generation();
+        self.hello.config_generation = generation;
+        self.compatibility
+            .set_generation(self.hello.config_generation);
+        self.compatibility_refresher = CompatibilityRefresher::start(
+            Arc::clone(&self.compatibility),
+            self.config.clone(),
+            self.hello.namespace.clone(),
+        );
+        self.monitor = MonitorHub::new(self.config.clone(), self.hello.namespace.clone());
+        self.last_monitor_job_counts_at = None;
+        Ok(())
+    }
+
     pub fn set_lifecycle(&mut self, lifecycle: ControllerLifecycle) {
         self.hello.lifecycle = lifecycle;
+    }
+
+    pub fn hello(&self) -> &ControllerHello {
+        &self.hello
     }
 
     pub fn handle(
@@ -79,10 +213,51 @@ impl ControlApi {
         client_session: Id128,
         request: ControlRequest,
     ) -> Result<ControlPayload, ControlError> {
+        self.validate_generation(request.expected_generation)?;
         self.expire_uploads();
         self.monitor.expire(Instant::now());
         match request.command {
             ControlCommand::Status => Ok(ControlPayload::Status(self.hello.clone())),
+            ControlCommand::BeginMaintenance {
+                operation_id,
+                scope,
+                journal_digest,
+            } => {
+                let manager = self.maintenance.as_mut().ok_or_else(|| {
+                    maintenance_error("controller maintenance is not initialized")
+                })?;
+                let configured_nodes = self
+                    .config
+                    .nodes
+                    .keys()
+                    .filter_map(|id| NodeId::new(id.clone()).ok())
+                    .collect::<std::collections::BTreeSet<_>>();
+                manager
+                    .begin(operation_id, scope, &journal_digest, &configured_nodes)
+                    .map_err(maintenance_manager_error)?;
+                if matches!(manager.scope(), Some(MaintenanceScope::Cluster)) {
+                    // A cluster-wide config/storage change must not leave a
+                    // partially uploaded script that can be finalized against
+                    // the reloaded controller state.
+                    self.uploads.clear();
+                }
+                Ok(ControlPayload::Maintenance(manager.inspect()))
+            }
+            ControlCommand::InspectMaintenance => Ok(ControlPayload::Maintenance(
+                self.maintenance
+                    .as_ref()
+                    .and_then(|manager| manager.inspect()),
+            )),
+            ControlCommand::AbortMaintenance { ticket } => {
+                let manager = self.maintenance.as_mut().ok_or_else(|| {
+                    maintenance_error("controller maintenance is not initialized")
+                })?;
+                manager.abort(&ticket).map_err(maintenance_manager_error)?;
+                Ok(ControlPayload::Maintenance(None))
+            }
+            ControlCommand::CompleteMaintenance { .. } => Err(maintenance_error(
+                "maintenance completion must be coordinated by the controller runtime",
+            )),
             ControlCommand::QueryAgentCompatibility { node_ids } => {
                 if node_ids.len() > MAX_CONTROL_COMPATIBILITY_NODES {
                     return Err(invalid_request("too many node compatibility entries"));
@@ -255,7 +430,7 @@ impl ControlApi {
                 size_bytes,
                 sha256,
             } => {
-                self.require_ready()?;
+                self.require_snapshot_upload_allowed()?;
                 if size_bytes > MAX_SNAPSHOT_BYTES {
                     return Err(invalid_request("script exceeds the 8 MiB limit"));
                 }
@@ -291,7 +466,7 @@ impl ControlApi {
                 offset,
                 bytes,
             } => {
-                self.require_ready()?;
+                self.require_snapshot_upload_allowed()?;
                 if bytes.len() > MAX_CONTROL_SNAPSHOT_CHUNK_BYTES {
                     return Err(invalid_request("script chunk exceeds 256 KiB"));
                 }
@@ -307,7 +482,7 @@ impl ControlApi {
                 Ok(ControlPayload::SnapshotProgress { offset })
             }
             ControlCommand::FinishSnapshot { upload_id } => {
-                self.require_ready()?;
+                self.require_snapshot_upload_allowed()?;
                 let upload = self
                     .uploads
                     .remove(&(client_session, upload_id))
@@ -324,7 +499,7 @@ impl ControlApi {
                 Ok(ControlPayload::SnapshotProgress { offset: 0 })
             }
             ControlCommand::Submit { request_id, spec } => {
-                self.require_ready()?;
+                self.require_submission_allowed(&spec)?;
                 let record = admit_submission(&self.storage, &self.config, request_id, spec)
                     .map_err(admission_error)?;
                 Ok(ControlPayload::Submission(record))
@@ -400,6 +575,20 @@ impl ControlApi {
         }
     }
 
+    pub(crate) fn validate_generation(
+        &self,
+        expected_generation: Option<u64>,
+    ) -> Result<(), ControlError> {
+        if expected_generation.is_some_and(|generation| generation != self.hello.config_generation)
+        {
+            return Err(ControlError {
+                code: ControlErrorCode::StaleGeneration,
+                message: "controller configuration changed; reconnect and retry".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, client_session: Id128) {
         self.uploads
             .retain(|(session, _), _| *session != client_session);
@@ -422,6 +611,68 @@ impl ControlApi {
                 ),
             })
         }
+    }
+
+    fn require_snapshot_upload_allowed(&self) -> Result<(), ControlError> {
+        self.require_ready()?;
+        if self
+            .maintenance_scope()
+            .is_some_and(|scope| matches!(scope, MaintenanceScope::Cluster))
+        {
+            return Err(maintenance_error(
+                "cluster maintenance is draining; retry script upload after it completes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_submission_allowed(
+        &self,
+        spec: &macluster_protocol::types::JobSpec,
+    ) -> Result<(), ControlError> {
+        self.require_ready()?;
+        let Some(scope) = self.maintenance_scope() else {
+            return Ok(());
+        };
+        let scoped_nodes = match scope {
+            MaintenanceScope::Cluster => {
+                return Err(maintenance_error(
+                    "cluster maintenance is draining; retry submission after it completes",
+                ));
+            }
+            MaintenanceScope::Nodes(nodes) => nodes,
+        };
+        let scoped = scoped_nodes
+            .iter()
+            .map(NodeId::as_str)
+            .collect::<HashSet<_>>();
+        if spec
+            .node
+            .as_ref()
+            .is_some_and(|node| scoped.contains(node.as_str()))
+        {
+            return Err(maintenance_error(
+                "the requested compute node is under maintenance; retry after it completes",
+            ));
+        }
+
+        // Keep a queue usable when it has an unaffected worker, while
+        // preventing new requests from piling up behind a queue whose only
+        // eligible nodes are being drained.
+        if self.config.queues.contains_key(spec.queue.as_str()) {
+            let available = self.config.queue_compute_nodes(spec.queue.as_str());
+            if !available.is_empty()
+                && available
+                    .iter()
+                    .all(|node_id| scoped.contains(node_id.as_str()))
+            {
+                return Err(maintenance_error(format!(
+                    "queue '{}' has no compute nodes outside maintenance; retry after it completes",
+                    spec.queue
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn expire_uploads(&mut self) {
@@ -483,6 +734,30 @@ fn conflict(message: impl Into<String>) -> ControlError {
     }
 }
 
+pub(crate) fn maintenance_error(message: impl Into<String>) -> ControlError {
+    ControlError {
+        code: ControlErrorCode::Maintenance,
+        message: message.into(),
+    }
+}
+
+fn maintenance_manager_error(error: crate::maintenance::MaintenanceError) -> ControlError {
+    let code = match &error {
+        crate::maintenance::MaintenanceError::Busy(_) => ControlErrorCode::Busy,
+        crate::maintenance::MaintenanceError::StaleTicket => ControlErrorCode::StaleGeneration,
+        crate::maintenance::MaintenanceError::CandidateChanged
+        | crate::maintenance::MaintenanceError::JournalChanged => ControlErrorCode::Conflict,
+        crate::maintenance::MaintenanceError::UnknownNode(_)
+        | crate::maintenance::MaintenanceError::DuplicateNode
+        | crate::maintenance::MaintenanceError::EmptyScope => ControlErrorCode::InvalidRequest,
+        _ => ControlErrorCode::Maintenance,
+    };
+    ControlError {
+        code,
+        message: error.to_string(),
+    }
+}
+
 fn admission_error(error: AdmissionError) -> ControlError {
     let code = match &error {
         AdmissionError::Storage(SubmitError::RequestConflict) => ControlErrorCode::Conflict,
@@ -523,9 +798,10 @@ mod tests {
     use macluster_protocol::{
         control::{
             AgentCompatibilityState, AgentCompatibilityUpdate, ControlRequest, ControllerLifecycle,
+            MaintenanceScope,
         },
-        identifiers::{ControllerUuid, Id128, NodeId, RequestId},
-        types::ControllerEpoch,
+        identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
+        types::{ControllerEpoch, JobMode, JobSpec},
     };
 
     use super::{ControlApi, ControlCommand, ControlErrorCode, ControlPayload};
@@ -568,6 +844,90 @@ mod tests {
             };
             ControlApi::new(config, storage, hello)
         }
+
+        fn maintenance_api(&self) -> (ControlApi, ClusterConfig, PathBuf, PathBuf) {
+            let config_text = format!(
+                "[cluster]\nname=\"compat\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-a83a-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
+                self.0.display(),
+                unsafe { libc::geteuid() }
+            );
+            let config = ClusterConfig::parse(&config_text).unwrap();
+            let config_path = self.0.join("config.toml");
+            fs::write(&config_path, config_text.as_bytes()).unwrap();
+            let state_dir = self.0.join("controller-state");
+            fs::create_dir_all(&state_dir).unwrap();
+            let config_digest =
+                macluster_protocol::framing::sha256_hex(config_text.as_bytes()).unwrap();
+            let binding_digest = "b".repeat(64);
+            let maintenance = crate::maintenance::MaintenanceCoordinator::open(
+                &state_dir,
+                &binding_digest,
+                &config_digest,
+            )
+            .unwrap();
+            let hello = macluster_protocol::control::ControllerHello {
+                protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+                binding_digest,
+                namespace: config.share_uuid.clone(),
+                uid: unsafe { libc::geteuid() },
+                build_id: "test".into(),
+                capabilities: vec!["maintenance.v1".into()],
+                controller_epoch: ControllerEpoch {
+                    controller_uuid: ControllerUuid::random(),
+                    epoch: 1,
+                },
+                config_generation: 0,
+                lifecycle: ControllerLifecycle::Ready,
+            };
+            let storage = Storage::open(&state_dir).unwrap();
+            (
+                ControlApi::new_with_maintenance(
+                    config.clone(),
+                    storage,
+                    hello,
+                    config_path.clone(),
+                    maintenance,
+                ),
+                config,
+                state_dir,
+                config_path,
+            )
+        }
+
+        fn job_spec(&self, config: &ClusterConfig, node: Option<NodeId>) -> JobSpec {
+            JobSpec {
+                storage_namespace: Some(Id128::parse(&config.share_uuid).unwrap()),
+                queue: QueueName::new("q").unwrap(),
+                node,
+                name: "maintenance admission".into(),
+                cwd: self.0.display().to_string(),
+                stdout_path: self.0.join("stdout.log").display().to_string(),
+                stderr_path: self.0.join("stderr.log").display().to_string(),
+                walltime_secs: None,
+                env: Default::default(),
+                mode: JobMode::Interactive,
+                snapshot: None,
+            }
+        }
+
+        fn begin_maintenance(&self, api: &mut ControlApi, scope: MaintenanceScope) {
+            let journal_digest = api
+                .maintenance
+                .as_ref()
+                .unwrap()
+                .node_admin_journal_digest()
+                .unwrap();
+            api.handle(
+                Id128::random(),
+                request(ControlCommand::BeginMaintenance {
+                    operation_id: Id128::random(),
+                    scope,
+                    journal_digest,
+                }),
+            )
+            .unwrap();
+            api.refresh_maintenance_blockers(Vec::new());
+        }
     }
 
     impl Drop for Fixture {
@@ -579,9 +939,22 @@ mod tests {
     fn request(command: ControlCommand) -> ControlRequest {
         ControlRequest {
             request_id: RequestId(Id128::random()),
-            expected_generation: Some(12),
+            expected_generation: None,
             command,
         }
+    }
+
+    #[test]
+    fn api_rejects_a_stale_generation_after_request_has_been_queued() {
+        let fixture = Fixture::new();
+        let mut api = fixture.api();
+        let mut request = request(ControlCommand::Status);
+        request.expected_generation = Some(api.hello.config_generation - 1);
+
+        let error = api.handle(Id128::random(), request).unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::StaleGeneration);
+        assert!(error.message.contains("reconnect"));
     }
 
     #[test]
@@ -691,6 +1064,68 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ControlErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn cluster_maintenance_blocks_new_snapshot_uploads_and_submissions() {
+        let fixture = Fixture::new();
+        let (mut api, config, _, _) = fixture.maintenance_api();
+        fixture.begin_maintenance(&mut api, MaintenanceScope::Cluster);
+
+        let error = api
+            .handle(
+                Id128::random(),
+                request(ControlCommand::BeginSnapshot {
+                    upload_id: Id128::random(),
+                    size_bytes: 1,
+                    sha256: macluster_protocol::framing::sha256_hex(b"x").unwrap(),
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Maintenance);
+
+        let error = api
+            .handle(
+                Id128::random(),
+                request(ControlCommand::Submit {
+                    request_id: RequestId(Id128::random()),
+                    spec: fixture.job_spec(&config, None),
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Maintenance);
+    }
+
+    #[test]
+    fn scoped_maintenance_blocks_only_jobs_that_require_scoped_nodes() {
+        let fixture = Fixture::new();
+        let (mut api, config, _, _) = fixture.maintenance_api();
+        fixture.begin_maintenance(
+            &mut api,
+            MaintenanceScope::Nodes(vec!["worker-a".parse().unwrap()]),
+        );
+
+        let error = api
+            .handle(
+                Id128::random(),
+                request(ControlCommand::Submit {
+                    request_id: RequestId(Id128::random()),
+                    spec: fixture.job_spec(&config, Some("worker-a".parse().unwrap())),
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Maintenance);
+
+        let response = api
+            .handle(
+                Id128::random(),
+                request(ControlCommand::Submit {
+                    request_id: RequestId(Id128::random()),
+                    spec: fixture.job_spec(&config, None),
+                }),
+            )
+            .unwrap();
+        assert!(matches!(response, ControlPayload::Submission(_)));
     }
 
     #[test]

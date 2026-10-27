@@ -62,6 +62,7 @@ pub struct ControlListener<'lock> {
     accept_thread: Option<JoinHandle<()>>,
     request_receiver: Receiver<PendingControlEvent>,
     runtime_signal: Arc<Mutex<Option<RuntimeSignal>>>,
+    hello: Arc<Mutex<ControllerHello>>,
     _instance: &'lock InstanceLock,
 }
 
@@ -154,9 +155,11 @@ impl<'lock> ControlListener<'lock> {
         let stopping = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let runtime_signal = Arc::new(Mutex::new(None));
+        let shared_hello = Arc::new(Mutex::new(hello));
         let thread_stopping = Arc::clone(&stopping);
         let thread_connections = Arc::clone(&active_connections);
         let thread_signal = Arc::clone(&runtime_signal);
+        let thread_hello = Arc::clone(&shared_hello);
         let thread_binding = binding.clone();
         let accept_thread = match thread::Builder::new()
             .name("macluster-control-accept".into())
@@ -164,7 +167,7 @@ impl<'lock> ControlListener<'lock> {
                 accept_loop(
                     listener,
                     thread_binding,
-                    hello,
+                    thread_hello,
                     request_sender,
                     thread_stopping,
                     thread_connections,
@@ -186,6 +189,7 @@ impl<'lock> ControlListener<'lock> {
             accept_thread: Some(accept_thread),
             request_receiver,
             runtime_signal,
+            hello: shared_hello,
             _instance: instance,
         })
     }
@@ -198,6 +202,25 @@ impl<'lock> ControlListener<'lock> {
         if let Ok(mut current) = self.runtime_signal.lock() {
             *current = Some(signal);
         }
+    }
+
+    /// Publish the current config generation/lifecycle for new local clients.
+    /// Existing streams keep their original hello and are rejected by the
+    /// generation fence after a successful config reload.
+    pub fn set_hello(&self, hello: ControllerHello) -> Result<(), IpcError> {
+        let mut current = self
+            .hello
+            .lock()
+            .map_err(|_| IpcError::Thread("controller hello mutex is poisoned".into()))?;
+        if hello.protocol_version != current.protocol_version
+            || hello.binding_digest != current.binding_digest
+            || hello.namespace != current.namespace
+            || hello.uid != current.uid
+        {
+            return Err(IpcError::InvalidHello);
+        }
+        *current = hello;
+        Ok(())
     }
 
     pub fn poll_request(&mut self) -> Option<PendingControlRequest> {
@@ -257,7 +280,7 @@ fn remove_stale_endpoint(path: &std::path::Path, expected_uid: u32) -> Result<()
 fn accept_loop(
     listener: UnixListener,
     binding: ServiceBinding,
-    hello: ControllerHello,
+    hello: Arc<Mutex<ControllerHello>>,
     request_sender: SyncSender<PendingControlEvent>,
     stopping: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
@@ -282,7 +305,7 @@ fn accept_loop(
 
         let connection_count = Arc::clone(&active_connections);
         let connection_binding = binding.clone();
-        let connection_hello = hello.clone();
+        let connection_hello = Arc::clone(&hello);
         let connection_requests = request_sender.clone();
         let connection_signal = Arc::clone(&runtime_signal);
         let spawn = thread::Builder::new()
@@ -335,7 +358,7 @@ fn reject_busy(mut stream: UnixStream) {
 fn serve_connection(
     mut stream: UnixStream,
     binding: &ServiceBinding,
-    controller_hello: &ControllerHello,
+    controller_hello: &Arc<Mutex<ControllerHello>>,
     request_sender: &SyncSender<PendingControlEvent>,
     runtime_signal: &Arc<Mutex<Option<RuntimeSignal>>>,
 ) {
@@ -352,12 +375,11 @@ fn serve_connection(
         let _ = write_frame(&mut stream, &HelloResponse::Rejected(error));
         return;
     }
-    if write_frame(
-        &mut stream,
-        &HelloResponse::Accepted(controller_hello.clone()),
-    )
-    .is_err()
-    {
+    let initial_hello = match controller_hello.lock() {
+        Ok(hello) => hello.clone(),
+        Err(_) => return,
+    };
+    if write_frame(&mut stream, &HelloResponse::Accepted(initial_hello)).is_err() {
         return;
     }
     let client_session = Id128::random();
@@ -384,9 +406,13 @@ fn serve_connection(
                 | ControlCommand::MonitorSnapshot { .. }
         );
         let request_id = request.request_id;
+        let current_generation = match controller_hello.lock() {
+            Ok(hello) => hello.config_generation,
+            Err(_) => return,
+        };
         if request
             .expected_generation
-            .is_some_and(|generation| generation != controller_hello.config_generation)
+            .is_some_and(|generation| generation != current_generation)
         {
             let response = ControlResponse {
                 request_id,

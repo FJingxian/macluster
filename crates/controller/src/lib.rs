@@ -4,6 +4,7 @@ pub mod compatibility;
 mod control;
 pub mod events;
 mod ipc;
+pub mod maintenance;
 pub mod monitor;
 mod runtime;
 pub mod ssh;
@@ -30,6 +31,7 @@ use macluster_core::{
     storage::{Storage, SubmitError},
 };
 use macluster_protocol::{
+    control::MaintenanceScope,
     identifiers::NodeId,
     types::{
         ControllerEpoch, ExecutionStatus, INTERACTIVE_PTY_FEATURE, JobMode, JobState, Operation,
@@ -58,10 +60,12 @@ pub struct ControllerService<T: NodeTransport> {
     pub(crate) fenced_nodes: HashSet<String>,
     pub(crate) idle_since: HashMap<String, u64>,
     pub(crate) dispatch_enabled: bool,
+    pub(crate) maintenance_recovery_blocked: bool,
     pub(crate) reset_barrier_active: bool,
     pub(crate) reset_barrier_context: Option<(PathBuf, PathBuf, PathBuf)>,
     pub(crate) maintenance_barrier_active: bool,
     pub(crate) maintenance_barrier_context: Option<(PathBuf, PathBuf, PathBuf)>,
+    pub(crate) maintenance_scope: Option<MaintenanceScope>,
 }
 
 impl<T: NodeTransport> ControllerService<T> {
@@ -79,10 +83,12 @@ impl<T: NodeTransport> ControllerService<T> {
             fenced_nodes: HashSet::new(),
             idle_since: HashMap::new(),
             dispatch_enabled: true,
+            maintenance_recovery_blocked: false,
             reset_barrier_active: false,
             reset_barrier_context: None,
             maintenance_barrier_active: false,
             maintenance_barrier_context: None,
+            maintenance_scope: None,
         })
     }
 
@@ -90,8 +96,82 @@ impl<T: NodeTransport> ControllerService<T> {
         self.dispatch_enabled = enabled;
     }
 
+    pub fn set_maintenance_recovery_blocked(&mut self, blocked: bool) {
+        self.maintenance_recovery_blocked = blocked;
+    }
+
     pub(crate) fn dispatch_allowed(&self) -> bool {
-        self.dispatch_enabled && !self.reset_barrier_active && !self.maintenance_barrier_active
+        self.dispatch_enabled
+            && !self.maintenance_recovery_blocked
+            && !self.reset_barrier_active
+            && !self.maintenance_barrier_active
+    }
+
+    pub fn set_maintenance_scope(&mut self, scope: Option<MaintenanceScope>) {
+        self.maintenance_scope = scope;
+    }
+
+    pub(crate) fn node_is_maintenance_scoped(&self, node_id: &str) -> bool {
+        match self.maintenance_scope.as_ref() {
+            Some(MaintenanceScope::Cluster) => true,
+            Some(MaintenanceScope::Nodes(nodes)) => {
+                nodes.iter().any(|node| node.as_str() == node_id)
+            }
+            None => false,
+        }
+    }
+
+    /// Commit a validated candidate config after the runtime has confirmed the
+    /// scoped drain, including in-flight worker operations. Unaffected nodes
+    /// retain their runtime state and continue serving queued work.
+    pub fn reload_quiescent_config(
+        &mut self,
+        config: ClusterConfig,
+        scope: &MaintenanceScope,
+    ) -> Result<(), ControllerError> {
+        crate::maintenance::validate_scope_config_change(&self.config, &config, scope)
+            .map_err(|error| io::Error::other(format!("unsafe scoped config reload: {error}")))?;
+        let affected = |node: Option<&NodeId>| match scope {
+            MaintenanceScope::Cluster => true,
+            MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
+        };
+        let jobs = self.storage.list_jobs(None)?;
+        if jobs.iter().any(|job| {
+            let scoped = affected(job.node.as_ref());
+            (scoped
+                && matches!(
+                    job.state,
+                    JobState::Starting | JobState::Running | JobState::Cancelling
+                ))
+                || (scoped && (job.snapshot_sync_pending || job.log_sync_pending))
+                || (matches!(scope, MaintenanceScope::Cluster)
+                    && (job.snapshot_sync_pending || job.log_sync_pending))
+        }) {
+            return Err(io::Error::other(
+                "cannot reload configuration while scoped jobs or output synchronization remain",
+            )
+            .into());
+        }
+        let affected_ids = self
+            .config
+            .nodes
+            .keys()
+            .chain(config.nodes.keys())
+            .filter(|id| match scope {
+                MaintenanceScope::Cluster => true,
+                MaintenanceScope::Nodes(nodes) => {
+                    nodes.iter().any(|node| node.as_str() == id.as_str())
+                }
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.config = config;
+        self.fenced_nodes
+            .retain(|node_id| !affected_ids.contains(node_id));
+        self.idle_since
+            .retain(|node_id, _| !affected_ids.contains(node_id));
+        self.maintenance_scope = None;
+        Ok(())
     }
 
     pub fn set_reset_barrier_context(
@@ -187,7 +267,7 @@ impl<T: NodeTransport> ControllerService<T> {
                             idle_since_unix_ms: 0,
                             online: false,
                             storage_ready: false,
-                            drain_requested: false,
+                            drain_requested: self.node_is_maintenance_scoped(id),
                             occupied: true,
                             interactive_pty: false,
                             namespaced_jobs: false,
@@ -251,7 +331,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     idle_since_unix_ms: idle_since,
                     online,
                     storage_ready: storage_ready && node_storage_ready,
-                    drain_requested: false,
+                    drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
                     namespaced_jobs,
@@ -263,7 +343,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     idle_since_unix_ms: 0,
                     online,
                     storage_ready,
-                    drain_requested: false,
+                    drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
                     namespaced_jobs,
@@ -533,6 +613,8 @@ impl<T: NodeTransport> ControllerService<T> {
         interval_secs: u64,
         listener: &mut ControlListener<'_>,
         hello: macluster_protocol::control::ControllerHello,
+        config_path: PathBuf,
+        maintenance: maintenance::MaintenanceCoordinator,
         shutdown_requested: impl FnMut() -> bool,
         requested: impl FnMut() -> bool,
         apply: impl FnMut(&mut Self) -> Result<bool, ControllerError>,
@@ -542,6 +624,8 @@ impl<T: NodeTransport> ControllerService<T> {
             Duration::from_secs(interval_secs.max(1)),
             listener,
             hello,
+            config_path,
+            maintenance,
             shutdown_requested,
             requested,
             apply,

@@ -28,9 +28,14 @@ use macluster_controller::transport::{ClusterTransport, NodeTransport};
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
+    service::ServiceBinding,
     storage::{ReadOnlyJobStore, Storage},
 };
 use macluster_protocol::{
+    control::{
+        ControlCommand, ControlErrorCode, ControlPayload, MaintenancePhase, MaintenanceScope,
+        MaintenanceTicket,
+    },
     framing::sha256_hex,
     identifiers::{Id128, NodeId, QueueName},
     types::{
@@ -39,6 +44,8 @@ use macluster_protocol::{
     },
 };
 use serde::{Deserialize, Serialize};
+
+use crate::control_client::{ControlClient, ControlClientError};
 
 pub(crate) type AppResult<T> = Result<T, (i32, String)>;
 
@@ -72,20 +79,164 @@ const MAINTENANCE_WAIT_LIMIT: Duration = Duration::from_secs(300);
 
 struct NodeMaintenanceGuard {
     _maintenance: Option<MaintenanceLock>,
-    _barrier_lock: File,
-    barrier_path: PathBuf,
+    _barrier_lock: Option<File>,
+    _client_lock: Option<File>,
+    barrier_path: Option<PathBuf>,
     controller_was_running: bool,
+    recovered: bool,
+    live: Option<LiveMaintenance>,
+}
+
+struct LiveMaintenance {
+    operation: String,
+    client: ControlClient,
+    ticket: MaintenanceTicket,
+    config_path: PathBuf,
+    state_path: PathBuf,
+    journal_path: PathBuf,
+    initial_config_digest: Option<String>,
+    initial_journal_digest: Option<String>,
+    client_state: MaintenanceClientState,
+    finished: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MaintenanceClientState {
+    version: u32,
+    binding_digest: String,
+    operation: String,
+    scope: MaintenanceScope,
+    operation_id: Id128,
+    #[serde(default)]
+    initial_config_digest: Option<String>,
+    #[serde(default)]
+    initial_journal_digest: Option<String>,
+    #[serde(default)]
+    candidate_config_digest: Option<String>,
+    #[serde(default)]
+    candidate_journal_digest: Option<String>,
 }
 
 impl Drop for NodeMaintenanceGuard {
     fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.barrier_path)
+        if let Some(barrier_path) = self.barrier_path.as_ref()
+            && let Err(error) = fs::remove_file(barrier_path)
             && error.kind() != io::ErrorKind::NotFound
         {
             eprintln!(
                 "macluster: could not remove maintenance barrier {}: {error}; rerun the interrupted cluster command to recover maintenance",
-                self.barrier_path.display()
+                barrier_path.display()
             );
+        }
+        if let Some(live) = self.live.as_ref()
+            && !live.finished
+        {
+            eprintln!(
+                "macluster: maintenance for '{}' remains active; rerun the same command to resume it",
+                live.operation
+            );
+        }
+    }
+}
+
+impl NodeMaintenanceGuard {
+    fn complete(&mut self) -> AppResult<()> {
+        let Some(live) = self.live.as_mut() else {
+            return Ok(());
+        };
+        let bytes = fs::read(&live.config_path).map_err(io_error)?;
+        let digest = sha256_hex(&bytes).map_err(|error| (1, error.to_string()))?;
+        let journal_bytes = match fs::read(&live.journal_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(io_error(error)),
+        };
+        let journal_digest = sha256_hex(&journal_bytes).map_err(|error| (1, error.to_string()))?;
+        let mut client_state = live.client_state.clone();
+        client_state.candidate_config_digest = Some(digest.clone());
+        client_state.candidate_journal_digest = Some(journal_digest.clone());
+        write_maintenance_client_state(&live.state_path, &client_state)?;
+        live.client_state = client_state;
+        let response = live
+            .client
+            .request(ControlCommand::CompleteMaintenance {
+                ticket: live.ticket.clone(),
+                candidate_config_digest: digest,
+                candidate_journal_digest: journal_digest,
+            })
+            .map_err(control_client_error)?;
+        if !matches!(response, ControlPayload::Maintenance(None)) {
+            return Err((
+                1,
+                "controller returned an invalid maintenance completion response".into(),
+            ));
+        }
+        remove_maintenance_client_state(&live.state_path)?;
+        live.finished = true;
+        Ok(())
+    }
+
+    fn abort_if_unchanged(&mut self) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        let current_config = fs::read(&live.config_path)
+            .ok()
+            .and_then(|bytes| sha256_hex(&bytes).ok());
+        let current_journal = fs::read(&live.journal_path)
+            .ok()
+            .and_then(|bytes| sha256_hex(&bytes).ok())
+            .or_else(|| {
+                (!live.journal_path.exists())
+                    .then(|| sha256_hex(&[]).expect("empty byte digest is infallible"))
+            });
+        let inputs_unchanged = maintenance_inputs_unchanged(
+            live.initial_config_digest.as_deref(),
+            live.initial_journal_digest.as_deref(),
+            current_config.as_deref(),
+            current_journal.as_deref(),
+        );
+        if inputs_unchanged {
+            match live.client.request(ControlCommand::AbortMaintenance {
+                ticket: live.ticket.clone(),
+            }) {
+                Ok(ControlPayload::Maintenance(None)) => {
+                    let _ = remove_maintenance_client_state(&live.state_path);
+                    live.finished = true;
+                }
+                Ok(_) => eprintln!(
+                    "macluster: controller returned an invalid maintenance abort response"
+                ),
+                Err(error) => {
+                    eprintln!("macluster: could not abort unchanged maintenance ticket: {error}")
+                }
+            }
+        }
+    }
+}
+
+fn finish_node_maintenance<T>(
+    mut guard: NodeMaintenanceGuard,
+    result: AppResult<T>,
+) -> AppResult<T> {
+    match result {
+        Ok(value) => {
+            guard.complete()?;
+            if guard.controller_was_running {
+                println!(
+                    "Restart the controller with `macluster controller run` after this command exits."
+                );
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            guard.abort_if_unchanged();
+            if guard.controller_was_running {
+                eprintln!(
+                    "The controller was stopped for maintenance. After resolving the error, run `macluster controller run` to resume scheduling."
+                );
+            }
+            Err(error)
         }
     }
 }
@@ -119,6 +270,463 @@ fn acquire_node_maintenance(
     operation: &str,
 ) -> AppResult<NodeMaintenanceGuard> {
     acquire_node_maintenance_with_confirmation(config_path, state_dir, operation, false)
+}
+
+fn acquire_node_maintenance_scoped(
+    config_path: &Path,
+    state_dir: &Path,
+    operation: &str,
+    scope: MaintenanceScope,
+) -> AppResult<NodeMaintenanceGuard> {
+    crate::init::reset::ensure_no_reset_in_progress(config_path, state_dir)?;
+    let config_path = config_path.canonicalize().map_err(io_error)?;
+    fs::create_dir_all(state_dir).map_err(io_error)?;
+    let state_dir = state_dir.canonicalize().map_err(io_error)?;
+    if let Some(guard) = try_acquire_live_maintenance(&config_path, &state_dir, operation, scope)? {
+        return Ok(guard);
+    }
+    acquire_node_maintenance(&config_path, &state_dir, operation)
+}
+
+fn try_acquire_live_maintenance(
+    config_path: &Path,
+    state_dir: &Path,
+    operation: &str,
+    mut scope: MaintenanceScope,
+) -> AppResult<Option<NodeMaintenanceGuard>> {
+    let binding = ServiceBinding::load(config_path, state_dir).map_err(|error| {
+        (
+            1,
+            format!("cannot resolve the controller service binding: {error}"),
+        )
+    })?;
+    let mut client = match ControlClient::connect(&binding, Duration::from_secs(1)) {
+        Ok(client) => client,
+        Err(_) => return Ok(None),
+    };
+    if !client
+        .hello()
+        .capabilities
+        .iter()
+        .any(|capability| capability == "maintenance.v1")
+    {
+        return Ok(None);
+    }
+    let client_lock = acquire_maintenance_client_lock(state_dir)?;
+    let config = read_config(config_path)?;
+    if let MaintenanceScope::Nodes(nodes) = &mut scope {
+        nodes.sort();
+        nodes.dedup();
+        if nodes.is_empty() {
+            return Err((1, "node maintenance scope cannot be empty".into()));
+        }
+        for node in nodes.iter() {
+            if !config.nodes.contains_key(node.as_str()) {
+                return Err((
+                    2,
+                    format!("maintenance scope refers to unconfigured node '{node}'"),
+                ));
+            }
+        }
+    }
+    let config_bytes = fs::read(config_path).map_err(io_error)?;
+    let current_config_digest =
+        sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
+    let journal_path = state_dir.join("node-admin.json");
+    let journal_bytes = match fs::read(&journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(io_error(error)),
+    };
+    let current_journal_digest =
+        sha256_hex(&journal_bytes).map_err(|error| (1, error.to_string()))?;
+    let state_path = state_dir.join("maintenance-client.json");
+    let state = match read_maintenance_client_state(&state_path)? {
+        Some(state)
+            if state.binding_digest == binding.binding_digest()
+                && state.operation == operation
+                && state.scope == scope =>
+        {
+            state
+        }
+        Some(_state) => {
+            let active = client
+                .request(ControlCommand::InspectMaintenance)
+                .map_err(control_client_error)?;
+            if let ControlPayload::Maintenance(Some(active)) = active {
+                return Err((
+                    1,
+                    format!(
+                        "controller maintenance {} for {:?} is still active; finish or rerun its original operation before starting '{operation}'",
+                        active.ticket.operation_id, active.scope
+                    ),
+                ));
+            }
+            remove_maintenance_client_state(&state_path)?;
+            MaintenanceClientState {
+                version: 1,
+                binding_digest: binding.binding_digest().to_owned(),
+                operation: operation.to_owned(),
+                scope: scope.clone(),
+                operation_id: Id128::random(),
+                initial_config_digest: Some(current_config_digest.clone()),
+                initial_journal_digest: Some(current_journal_digest.clone()),
+                candidate_config_digest: None,
+                candidate_journal_digest: None,
+            }
+        }
+        None => MaintenanceClientState {
+            version: 1,
+            binding_digest: binding.binding_digest().to_owned(),
+            operation: operation.to_owned(),
+            scope: scope.clone(),
+            operation_id: Id128::random(),
+            initial_config_digest: Some(current_config_digest.clone()),
+            initial_journal_digest: Some(current_journal_digest.clone()),
+            candidate_config_digest: None,
+            candidate_journal_digest: None,
+        },
+    };
+
+    if state.candidate_config_digest.as_deref() == Some(current_config_digest.as_str())
+        && state.candidate_journal_digest.as_deref() == Some(current_journal_digest.as_str())
+        && matches!(
+            client
+                .request(ControlCommand::InspectMaintenance)
+                .map_err(control_client_error)?,
+            ControlPayload::Maintenance(None)
+        )
+    {
+        remove_maintenance_client_state(&state_path)?;
+        eprintln!("Recovered completed controller maintenance for {operation}.");
+        return Ok(Some(NodeMaintenanceGuard {
+            _maintenance: None,
+            _barrier_lock: None,
+            _client_lock: Some(client_lock),
+            barrier_path: None,
+            controller_was_running: false,
+            recovered: true,
+            live: None,
+        }));
+    }
+
+    write_maintenance_client_state(&state_path, &state)?;
+    let begin = client.request(ControlCommand::BeginMaintenance {
+        operation_id: state.operation_id,
+        scope: scope.clone(),
+        journal_digest: current_journal_digest,
+    });
+    let ticket = match begin {
+        Ok(ControlPayload::Maintenance(Some(status))) => status.ticket,
+        Ok(_) => {
+            return Err((
+                1,
+                "controller returned an invalid maintenance ticket".into(),
+            ));
+        }
+        Err(error) => {
+            let active = client
+                .request(ControlCommand::InspectMaintenance)
+                .map_err(control_client_error)?;
+            match active {
+                ControlPayload::Maintenance(Some(status))
+                    if status.ticket.operation_id == state.operation_id
+                        && status.scope == scope =>
+                {
+                    status.ticket
+                }
+                _ => return Err(control_client_error(error)),
+            }
+        }
+    };
+    if wait_for_live_maintenance(
+        &mut client,
+        &ticket,
+        &scope,
+        operation,
+        config_path,
+        &journal_path,
+    )? {
+        remove_maintenance_client_state(&state_path)?;
+        eprintln!("Recovered interrupted controller maintenance for {operation}.");
+        return Ok(Some(NodeMaintenanceGuard {
+            _maintenance: None,
+            _barrier_lock: None,
+            _client_lock: Some(client_lock),
+            barrier_path: None,
+            controller_was_running: false,
+            recovered: true,
+            live: None,
+        }));
+    }
+    Ok(Some(NodeMaintenanceGuard {
+        _maintenance: None,
+        _barrier_lock: None,
+        _client_lock: Some(client_lock),
+        barrier_path: None,
+        controller_was_running: false,
+        recovered: false,
+        live: Some(LiveMaintenance {
+            operation: operation.to_owned(),
+            client,
+            ticket,
+            config_path: config_path.to_path_buf(),
+            state_path,
+            journal_path: state_dir.join("node-admin.json"),
+            initial_config_digest: state.initial_config_digest.clone(),
+            initial_journal_digest: state.initial_journal_digest.clone(),
+            client_state: state,
+            finished: false,
+        }),
+    }))
+}
+
+fn wait_for_live_maintenance(
+    client: &mut ControlClient,
+    ticket: &MaintenanceTicket,
+    scope: &MaintenanceScope,
+    operation: &str,
+    config_path: &Path,
+    journal_path: &Path,
+) -> AppResult<bool> {
+    let started = Instant::now();
+    let mut last_message = Instant::now();
+    loop {
+        match client
+            .request(ControlCommand::InspectMaintenance)
+            .map_err(control_client_error)?
+        {
+            ControlPayload::Maintenance(Some(status))
+                if status.ticket == *ticket && status.scope == *scope =>
+            {
+                match status.phase {
+                    MaintenancePhase::Ready => return Ok(false),
+                    MaintenancePhase::RecoveryRequired => {
+                        if status.blockers.is_empty() {
+                            if complete_maintenance_ticket(
+                                client,
+                                ticket,
+                                config_path,
+                                journal_path,
+                            )? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    MaintenancePhase::Applying => {
+                        if status.blockers.is_empty() {
+                            if complete_maintenance_ticket(
+                                client,
+                                ticket,
+                                config_path,
+                                journal_path,
+                            )? {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    MaintenancePhase::Draining => {
+                        if last_message.elapsed() >= Duration::from_secs(5) {
+                            let reason = status
+                                .blockers
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("waiting for scoped nodes to become idle");
+                            eprintln!("Waiting for controller maintenance {operation}: {reason}");
+                            last_message = Instant::now();
+                        }
+                    }
+                }
+            }
+            ControlPayload::Maintenance(None) => {
+                return Err((
+                    1,
+                    "controller maintenance ticket disappeared before the operation could start"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err((
+                    1,
+                    "controller returned an invalid maintenance status".into(),
+                ));
+            }
+        }
+        if started.elapsed() >= MAINTENANCE_WAIT_LIMIT {
+            return Err((
+                1,
+                format!(
+                    "controller maintenance did not drain within five minutes; ticket {} remains recorded, rerun '{operation}' to resume",
+                    ticket.operation_id
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn complete_maintenance_ticket(
+    client: &mut ControlClient,
+    ticket: &MaintenanceTicket,
+    config_path: &Path,
+    journal_path: &Path,
+) -> AppResult<bool> {
+    let config_bytes = fs::read(config_path).map_err(io_error)?;
+    let candidate_config_digest =
+        sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
+    let journal_bytes = match fs::read(journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(io_error(error)),
+    };
+    let candidate_journal_digest =
+        sha256_hex(&journal_bytes).map_err(|error| (1, error.to_string()))?;
+    let response = match client.request(ControlCommand::CompleteMaintenance {
+        ticket: ticket.clone(),
+        candidate_config_digest,
+        candidate_journal_digest,
+    }) {
+        Ok(response) => response,
+        Err(ControlClientError::Remote {
+            code: ControlErrorCode::Maintenance,
+            message,
+        }) if message.contains("still has active jobs") => return Ok(false),
+        Err(error) => return Err(control_client_error(error)),
+    };
+    if matches!(response, ControlPayload::Maintenance(None)) {
+        Ok(true)
+    } else {
+        Err((
+            1,
+            "controller returned an invalid maintenance recovery response".into(),
+        ))
+    }
+}
+
+fn control_client_error(error: ControlClientError) -> (i32, String) {
+    match error {
+        ControlClientError::Remote { message, .. } => (1, message),
+        other => (1, format!("controller maintenance request failed: {other}")),
+    }
+}
+
+pub(crate) fn acquire_maintenance_client_lock(state_dir: &Path) -> AppResult<File> {
+    let path = state_dir.join("maintenance-client.lock");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(&path).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err((
+            1,
+            format!(
+                "maintenance client lock {} has unsafe ownership or permissions",
+                path.display()
+            ),
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err((
+                1,
+                "another node maintenance command is preparing or applying an operation".into(),
+            ));
+        }
+        return Err((1, format!("cannot lock maintenance client state: {error}")));
+    }
+    Ok(file)
+}
+
+fn maintenance_inputs_unchanged(
+    initial_config: Option<&str>,
+    initial_journal: Option<&str>,
+    current_config: Option<&str>,
+    current_journal: Option<&str>,
+) -> bool {
+    matches!(
+        (initial_config, initial_journal, current_config, current_journal),
+        (Some(a), Some(b), Some(c), Some(d)) if a == c && b == d
+    )
+}
+
+fn read_maintenance_client_state(path: &Path) -> AppResult<Option<MaintenanceClientState>> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(error)),
+    };
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > 4096
+    {
+        return Err((
+            1,
+            "maintenance client state has unsafe ownership or permissions".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    let state: MaintenanceClientState = serde_json::from_slice(&bytes)
+        .map_err(|error| (1, format!("maintenance client state is invalid: {error}")))?;
+    if state.version != 1 {
+        return Err((1, "unsupported maintenance client state version".into()));
+    }
+    Ok(Some(state))
+}
+
+fn write_maintenance_client_state(path: &Path, state: &MaintenanceClientState) -> AppResult<()> {
+    let bytes = serde_json::to_vec(state).map_err(|error| (1, error.to_string()))?;
+    let temporary = path.with_file_name(format!(".maintenance-client-{}.tmp", Id128::random()));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(io_error)
+}
+
+fn remove_maintenance_client_state(path: &Path) -> AppResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            fs::remove_file(path).map_err(io_error)
+        }
+        Ok(_) => Err((
+            1,
+            "refusing to remove unsafe maintenance client state".into(),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 fn acquire_node_maintenance_with_confirmation(
@@ -196,9 +804,12 @@ fn acquire_node_maintenance_with(
     let barrier_lock = acquire_barrier_lock(&barrier_path, &config_path, &state_dir)?;
     let mut guard = NodeMaintenanceGuard {
         _maintenance: initial_maintenance,
-        _barrier_lock: barrier_lock,
-        barrier_path,
+        _barrier_lock: Some(barrier_lock),
+        _client_lock: None,
+        barrier_path: Some(barrier_path),
         controller_was_running: false,
+        recovered: false,
+        live: None,
     };
     if guard._maintenance.is_some() {
         ensure_maintenance_jobs_drained(&state_dir, operation, false)?;
@@ -1505,125 +2116,114 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             "run the Agent update as your normal cluster account, without sudo".into(),
         ));
     }
-    let maintenance = acquire_node_maintenance(config_path, state_dir, "Agent update")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    fs::create_dir_all(state_dir).map_err(io_error)?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
-    let old_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    let journal_path = state_dir.join("node-admin.json");
-    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
-    ensure_no_pending_admin_operation(&state)?;
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "Agent update",
+        MaintenanceScope::Cluster,
+    )?;
+    if maintenance.recovered {
+        return Ok(false);
+    }
+    let result = (|| -> AppResult<bool> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        fs::create_dir_all(state_dir).map_err(io_error)?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let old_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let journal_path = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        ensure_no_pending_admin_operation(&state)?;
 
-    let operation_key = "update:all";
-    let mut recovery = update_recovery(state.operations.get(operation_key), &old_digest)
-        .map_err(|error| (1, error))?;
-    if recovery == UpdateRecovery::AbandonUncommittedFailure {
-        let mut obsolete = state
-            .operations
-            .get(operation_key)
-            .expect("superseded update recovery has an operation")
-            .clone();
-        obsolete.phase = "ABORTED".into();
-        obsolete.detail = Some(
+        let operation_key = "update:all";
+        let mut recovery = update_recovery(state.operations.get(operation_key), &old_digest)
+            .map_err(|error| (1, error))?;
+        if recovery == UpdateRecovery::AbandonUncommittedFailure {
+            let mut obsolete = state
+                .operations
+                .get(operation_key)
+                .expect("superseded update recovery has an operation")
+                .clone();
+            obsolete.phase = "ABORTED".into();
+            obsolete.detail = Some(
             "failed update had no committed candidate config and was superseded by a later cluster config change; unreferenced staging files were preserved".into(),
         );
-        state.operations.insert(operation_key.to_owned(), obsolete);
-        save_admin_state(&journal_path, &state)?;
-        recovery = UpdateRecovery::Fresh;
-    }
-    if recovery == UpdateRecovery::Sync {
-        let mut operation = state
-            .operations
-            .get(operation_key)
-            .expect("sync recovery has an update operation")
-            .clone();
-        operation.phase = "SYNC_PENDING".into();
-        operation.detail = None;
+            state.operations.insert(operation_key.to_owned(), obsolete);
+            save_admin_state(&journal_path, &state)?;
+            recovery = UpdateRecovery::Fresh;
+        }
+        if recovery == UpdateRecovery::Sync {
+            let mut operation = state
+                .operations
+                .get(operation_key)
+                .expect("sync recovery has an update operation")
+                .clone();
+            operation.phase = "SYNC_PENDING".into();
+            operation.detail = None;
+            state
+                .operations
+                .insert(operation_key.to_owned(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            verify_registered_node_identities(&config).map_err(|(code, error)| {
+                (
+                    code,
+                    format!("cannot verify node identities before Agent update: {error}"),
+                )
+            })?;
+            finish_update_sync(
+                &mut state,
+                &journal_path,
+                operation_key,
+                operation,
+                &config,
+                &source,
+                state_dir,
+            )?;
+            println!("Recovered the all-node update and peer config synchronization.");
+            return Ok(maintenance.controller_was_running);
+        }
+
+        let mut operation = if recovery == UpdateRecovery::Stage {
+            state
+                .operations
+                .get(operation_key)
+                .expect("stage recovery has an update operation")
+                .clone()
+        } else {
+            NodeOperation {
+                id: Id128::random().to_string(),
+                action: "update".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
+                node_id: "all".into(),
+                endpoint: "cluster".into(),
+                machine_uuid: None,
+                phase: "UPDATE_STAGING".into(),
+                old_config_sha256: Some(old_digest.clone()),
+                candidate_config_sha256: None,
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(false),
+                detail: None,
+            }
+        };
+        operation.phase = "UPDATE_STAGING".into();
+        operation.old_config_sha256 = Some(old_digest.clone());
+        operation.candidate_config_sha256 = None;
+        operation.detail =
+            Some("staging and verifying the current Agent on every configured node".into());
         state
             .operations
             .insert(operation_key.to_owned(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        verify_registered_node_identities(&config).map_err(|(code, error)| {
-            (
-                code,
-                format!("cannot verify node identities before Agent update: {error}"),
-            )
-        })?;
-        finish_update_sync(
-            &mut state,
-            &journal_path,
-            operation_key,
-            operation,
-            &config,
-            &source,
-            state_dir,
-        )?;
-        println!("Recovered the all-node update and peer config synchronization.");
-        return Ok(maintenance.controller_was_running);
-    }
 
-    let mut operation = if recovery == UpdateRecovery::Stage {
-        state
-            .operations
-            .get(operation_key)
-            .expect("stage recovery has an update operation")
-            .clone()
-    } else {
-        NodeOperation {
-            id: Id128::random().to_string(),
-            action: "update".into(),
-            connection_endpoint: None,
-            remote_config_path: None,
-            node_id: "all".into(),
-            endpoint: "cluster".into(),
-            machine_uuid: None,
-            phase: "UPDATE_STAGING".into(),
-            old_config_sha256: Some(old_digest.clone()),
-            candidate_config_sha256: None,
-            managed_export: false,
-            managed_shares: BTreeSet::new(),
-            client_setup_attempted: Some(false),
-            detail: None,
-        }
-    };
-    operation.phase = "UPDATE_STAGING".into();
-    operation.old_config_sha256 = Some(old_digest.clone());
-    operation.candidate_config_sha256 = None;
-    operation.detail =
-        Some("staging and verifying the current Agent on every configured node".into());
-    state
-        .operations
-        .insert(operation_key.to_owned(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-
-    if let Err((code, error)) = verify_registered_node_identities(&config) {
-        operation.phase = "UPDATE_FAILED".into();
-        operation.detail = Some(error.clone());
-        state.operations.insert(operation_key.to_owned(), operation);
-        save_admin_state(&journal_path, &state)?;
-        return Err((
-            code,
-            format!(
-                "Agent update stopped because node identity verification failed: {error}. Correct the registered node identity, then rerun the requested command to resume the update."
-            ),
-        ));
-    }
-
-    let (candidate, candidate_config) = match stage_current_agents(
-        &config,
-        &source,
-        &operation.id,
-        AgentStagePurpose::Update,
-    ) {
-        Ok(candidate) => candidate,
-        Err((code, error)) => {
+        if let Err((code, error)) = verify_registered_node_identities(&config) {
             operation.phase = "UPDATE_FAILED".into();
             operation.detail = Some(error.clone());
             state.operations.insert(operation_key.to_owned(), operation);
@@ -1631,31 +2231,80 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             return Err((
                 code,
                 format!(
-                    "Agent update stopped before config activation: {error}. Rerun the requested command to resume."
+                    "Agent update stopped because node identity verification failed: {error}. Correct the registered node identity, then rerun the requested command to resume the update."
                 ),
             ));
         }
-    };
 
-    let current_source = fs::read(&config_path).map_err(io_error)?;
-    let current_digest = sha256_hex(&current_source).map_err(|error| (1, error.to_string()))?;
-    if current_digest != old_digest {
-        operation.phase = "UPDATE_FAILED".into();
-        operation.detail = Some("cluster config changed while Agent binaries were staged".into());
-        state.operations.insert(operation_key.to_owned(), operation);
-        save_admin_state(&journal_path, &state)?;
-        return Err((
+        let (candidate, candidate_config) = match stage_current_agents(
+            &config,
+            &source,
+            &operation.id,
+            AgentStagePurpose::Update,
+        ) {
+            Ok(candidate) => candidate,
+            Err((code, error)) => {
+                operation.phase = "UPDATE_FAILED".into();
+                operation.detail = Some(error.clone());
+                state.operations.insert(operation_key.to_owned(), operation);
+                save_admin_state(&journal_path, &state)?;
+                return Err((
+                    code,
+                    format!(
+                        "Agent update stopped before config activation: {error}. Rerun the requested command to resume."
+                    ),
+                ));
+            }
+        };
+
+        let current_source = fs::read(&config_path).map_err(io_error)?;
+        let current_digest = sha256_hex(&current_source).map_err(|error| (1, error.to_string()))?;
+        if current_digest != old_digest {
+            operation.phase = "UPDATE_FAILED".into();
+            operation.detail =
+                Some("cluster config changed while Agent binaries were staged".into());
+            state.operations.insert(operation_key.to_owned(), operation);
+            save_admin_state(&journal_path, &state)?;
+            return Err((
             1,
             "cluster config changed during Agent update; refusing to activate the staged paths. Inspect the node admin journal before retrying the requested command".into(),
         ));
-    }
+        }
 
-    let candidate_digest =
-        sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    operation.candidate_config_sha256 = Some(candidate_digest.clone());
-    if candidate == source {
+        let candidate_digest =
+            sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        operation.candidate_config_sha256 = Some(candidate_digest.clone());
+        if candidate == source {
+            operation.phase = "SYNC_PENDING".into();
+            operation.detail =
+                Some("verifying peer config copies for the active Agent paths".into());
+            state
+                .operations
+                .insert(operation_key.to_owned(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            finish_update_sync(
+                &mut state,
+                &journal_path,
+                operation_key,
+                operation,
+                &candidate_config,
+                &candidate,
+                state_dir,
+            )?;
+            println!("All configured nodes already use the current Agent.");
+            return Ok(maintenance.controller_was_running);
+        }
+
+        operation.phase = "UPDATE_COMMITTING".into();
+        operation.detail = Some("activating verified Agent paths in the cluster config".into());
+        state
+            .operations
+            .insert(operation_key.to_owned(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        backup_config(&config_path, &operation.id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
         operation.phase = "SYNC_PENDING".into();
-        operation.detail = Some("verifying peer config copies for the active Agent paths".into());
+        operation.detail = None;
         state
             .operations
             .insert(operation_key.to_owned(), operation.clone());
@@ -1669,38 +2318,13 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             &candidate,
             state_dir,
         )?;
-        println!("All configured nodes already use the current Agent.");
-        return Ok(maintenance.controller_was_running);
-    }
-
-    operation.phase = "UPDATE_COMMITTING".into();
-    operation.detail = Some("activating verified Agent paths in the cluster config".into());
-    state
-        .operations
-        .insert(operation_key.to_owned(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    backup_config(&config_path, &operation.id)?;
-    atomic_write(&config_path, candidate.as_bytes())?;
-    operation.phase = "SYNC_PENDING".into();
-    operation.detail = None;
-    state
-        .operations
-        .insert(operation_key.to_owned(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    finish_update_sync(
-        &mut state,
-        &journal_path,
-        operation_key,
-        operation,
-        &candidate_config,
-        &candidate,
-        state_dir,
-    )?;
-    println!(
-        "Updated Agent on {} configured node(s).",
-        config.nodes.len()
-    );
-    Ok(maintenance.controller_was_running)
+        println!(
+            "Updated Agent on {} configured node(s).",
+            config.nodes.len()
+        );
+        Ok(maintenance.controller_was_running)
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn finish_update_sync(
@@ -5439,115 +6063,126 @@ fn abort_pending_enrollment(
 }
 
 fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
-    let _maintenance = acquire_node_maintenance(config_path, state_dir, "mnode --remove share")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
-    let journal_path = state_dir.join("node-admin.json");
-    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
-    let key = format!("share:{share_id}");
-    let Some(mut operation) = state.operations.get(&key).cloned() else {
-        return Err((
-            2,
-            format!("no pending named-share operation exists for '{share_id}'"),
-        ));
-    };
-    if config.shares.contains_key(share_id) || operation.phase == "READY" {
-        return Err((
-            1,
-            format!(
-                "share {share_id} is already configured; `mnode -rm share:{share_id}` only cancels an incomplete setup"
-            ),
-        ));
-    }
-    if operation.phase == "ABORTED" {
-        println!("Pending named share {share_id} was already cancelled.");
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "mnode --remove share",
+        MaintenanceScope::Cluster,
+    )?;
+    if maintenance.recovered {
         return Ok(());
     }
-    if operation.action != "share" || operation.phase != "SETUP_PENDING" {
-        return Err((
-            1,
-            format!(
-                "share operation {} is in phase {}; rerun its original mnode add command or use `macluster init` to reset the cluster",
-                operation.id, operation.phase
-            ),
-        ));
-    }
-    let digest = sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    if operation.old_config_sha256.as_deref() != Some(digest.as_str()) {
-        return Err((
-            1,
-            format!(
-                "cluster config changed during setup of share {share_id}; inspect node-admin.json before cancelling"
-            ),
-        ));
-    }
-    let (endpoint_share_id, server_id, source_root, mount_root) =
-        parse_pending_named_share_endpoint(&operation.endpoint)?;
-    if endpoint_share_id != share_id || operation.node_id != server_id {
-        return Err((
-            1,
-            format!(
-                "share operation {} does not match the requested share or configured NFS server",
-                operation.id
-            ),
-        ));
-    }
-    let share_uuid = operation.machine_uuid.as_deref().ok_or_else(|| {
-        (
-            1,
-            format!("pending share {share_id} has no recorded share UUID"),
-        )
-    })?;
-    Id128::parse(share_uuid).map_err(|error| {
-        (
-            1,
-            format!("pending share {share_id} has an invalid share UUID: {error}"),
-        )
-    })?;
-    let pending_share = ShareConfig {
-        server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
-        source_root: source_root.clone(),
-        mount_root: mount_root.clone(),
-        share_uuid: share_uuid.to_owned(),
-    };
-    let replaced = replaced_child_shares(&config, &pending_share);
-    if !replaced.is_empty() {
-        return Err((
-            1,
-            format!(
-                "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster init` to reset safely",
-                replaced.into_iter().collect::<Vec<_>>().join(", ")
-            ),
-        ));
-    }
-    let server = config.nodes.get(&server_id).ok_or_else(|| {
-        (
-            1,
-            format!("NFS server {server_id} for pending share {share_id} is missing"),
-        )
-    })?;
-
-    // Validate every endpoint before removing any share resource. A pending
-    // share is cluster-wide, so its clients must still be the registered Macs.
-    for (node_id, node) in &config.nodes {
-        verify_registered_node_identity(node_id, node, &state)?;
-        check_remote_idle(node, node_id, &config_path)?;
-    }
-
-    let source = format!("{}:{}", server.host, source_root.display());
-    let mut clients = Vec::new();
-    for (node_id, node) in &config.nodes {
-        if node_id == &server_id {
-            continue;
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config =
+            ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
+        let journal_path = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        let key = format!("share:{share_id}");
+        let Some(mut operation) = state.operations.get(&key).cloned() else {
+            return Err((
+                2,
+                format!("no pending named-share operation exists for '{share_id}'"),
+            ));
+        };
+        if config.shares.contains_key(share_id) || operation.phase == "READY" {
+            return Err((
+                1,
+                format!(
+                    "share {share_id} is already configured; `mnode -rm share:{share_id}` only cancels an incomplete setup"
+                ),
+            ));
         }
-        let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
+        if operation.phase == "ABORTED" {
+            println!("Pending named share {share_id} was already cancelled.");
+            return Ok(());
+        }
+        if operation.action != "share" || operation.phase != "SETUP_PENDING" {
+            return Err((
+                1,
+                format!(
+                    "share operation {} is in phase {}; rerun its original mnode add command or use `macluster init` to reset the cluster",
+                    operation.id, operation.phase
+                ),
+            ));
+        }
+        let digest =
+            sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        if operation.old_config_sha256.as_deref() != Some(digest.as_str()) {
+            return Err((
+                1,
+                format!(
+                    "cluster config changed during setup of share {share_id}; inspect node-admin.json before cancelling"
+                ),
+            ));
+        }
+        let (endpoint_share_id, server_id, source_root, mount_root) =
+            parse_pending_named_share_endpoint(&operation.endpoint)?;
+        if endpoint_share_id != share_id || operation.node_id != server_id {
+            return Err((
+                1,
+                format!(
+                    "share operation {} does not match the requested share or configured NFS server",
+                    operation.id
+                ),
+            ));
+        }
+        let share_uuid = operation.machine_uuid.as_deref().ok_or_else(|| {
+            (
+                1,
+                format!("pending share {share_id} has no recorded share UUID"),
+            )
+        })?;
+        Id128::parse(share_uuid).map_err(|error| {
+            (
+                1,
+                format!("pending share {share_id} has an invalid share UUID: {error}"),
+            )
+        })?;
+        let pending_share = ShareConfig {
+            server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
+            source_root: source_root.clone(),
+            mount_root: mount_root.clone(),
+            share_uuid: share_uuid.to_owned(),
+        };
+        let replaced = replaced_child_shares(&config, &pending_share);
+        if !replaced.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster init` to reset safely",
+                    replaced.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        let server = config.nodes.get(&server_id).ok_or_else(|| {
+            (
+                1,
+                format!("NFS server {server_id} for pending share {share_id} is missing"),
+            )
+        })?;
+
+        // Validate every endpoint before removing any share resource. A pending
+        // share is cluster-wide, so its clients must still be the registered Macs.
+        for (node_id, node) in &config.nodes {
+            verify_registered_node_identity(node_id, node, &state)?;
+            check_remote_idle(node, node_id, &config_path)?;
+        }
+
+        let source = format!("{}:{}", server.host, source_root.display());
+        let mut clients = Vec::new();
+        for (node_id, node) in &config.nodes {
+            if node_id == &server_id {
+                continue;
+            }
+            let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
             (
                 1,
                 format!(
@@ -5555,104 +6190,110 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
                 ),
             )
         })?;
-        if !mounts.status.success() {
-            return Err((
-                1,
-                format!(
-                    "cannot inspect NFS mounts on {node_id} before cancelling {share_id}: {}",
-                    command_error("mount inspection failed", &mounts)
-                ),
-            ));
+            if !mounts.status.success() {
+                return Err((
+                    1,
+                    format!(
+                        "cannot inspect NFS mounts on {node_id} before cancelling {share_id}: {}",
+                        command_error("mount inspection failed", &mounts)
+                    ),
+                ));
+            }
+            let mount_text = String::from_utf8_lossy(&mounts.stdout);
+            let mounted =
+                pending_share_mount_present(&mount_text, &source, &mount_root.to_string_lossy())
+                    .map_err(|error| {
+                        (
+                            1,
+                            format!("cannot safely cancel share {share_id} on {node_id}: {error}"),
+                        )
+                    })?;
+            let request = mounted.then(|| ClientUnmountRequest {
+                source: source.clone(),
+                mount_root: mount_root.clone(),
+                share_uuid: share_uuid.to_owned(),
+                label: format!("pending NFS share {share_id}"),
+            });
+            clients.push((node_id.clone(), node.clone(), request));
         }
-        let mount_text = String::from_utf8_lossy(&mounts.stdout);
-        let mounted =
-            pending_share_mount_present(&mount_text, &source, &mount_root.to_string_lossy())
-                .map_err(|error| {
+
+        operation.detail = Some(
+            "cancelling pending named-share setup and removing exact managed resources".into(),
+        );
+        state.operations.insert(key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+
+        for (node_id, node, request) in &clients {
+            let requests = request.iter().cloned().collect::<Vec<_>>();
+            let aliases = if source_root != mount_root {
+                vec![(source_root.clone(), mount_root.clone())]
+            } else {
+                Vec::new()
+            };
+            let script = client_nfs_cleanup_batch_script(&requests, &aliases);
+            if requests.is_empty() && aliases.is_empty() {
+                continue;
+            }
+            run_pending_share_cleanup(
+                node,
+                &script,
+                &format!("remove exact pending NFS share {share_id} mount and alias on {node_id}"),
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!("cannot cancel pending share {share_id} on {node_id}: {error}"),
+                )
+            })?;
+        }
+
+        let export_requests = config
+            .nodes
+            .iter()
+            .filter(|(node_id, _)| node_id.as_str() != server_id)
+            .map(|(node_id, node)| NfsExportRequest {
+                root: source_root.to_string_lossy().into_owned(),
+                client_ip: node.host.to_string(),
+                share_uuid: share_uuid.to_owned(),
+                node_id: node_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if !export_requests.is_empty() {
+            remove_managed_nfs_exports(server, &export_requests, &operation.id).map_err(
+                |error| {
                     (
                         1,
-                        format!("cannot safely cancel share {share_id} on {node_id}: {error}"),
-                    )
-                })?;
-        let request = mounted.then(|| ClientUnmountRequest {
-            source: source.clone(),
-            mount_root: mount_root.clone(),
-            share_uuid: share_uuid.to_owned(),
-            label: format!("pending NFS share {share_id}"),
-        });
-        clients.push((node_id.clone(), node.clone(), request));
-    }
-
-    operation.detail =
-        Some("cancelling pending named-share setup and removing exact managed resources".into());
-    state.operations.insert(key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-
-    for (node_id, node, request) in &clients {
-        let requests = request.iter().cloned().collect::<Vec<_>>();
-        let aliases = if source_root != mount_root {
-            vec![(source_root.clone(), mount_root.clone())]
-        } else {
-            Vec::new()
-        };
-        let script = client_nfs_cleanup_batch_script(&requests, &aliases);
-        if requests.is_empty() && aliases.is_empty() {
-            continue;
-        }
-        run_pending_share_cleanup(
-            node,
-            &script,
-            &format!("remove exact pending NFS share {share_id} mount and alias on {node_id}"),
-        )
-        .map_err(|error| {
-            (
-                1,
-                format!("cannot cancel pending share {share_id} on {node_id}: {error}"),
-            )
-        })?;
-    }
-
-    let export_requests = config
-        .nodes
-        .iter()
-        .filter(|(node_id, _)| node_id.as_str() != server_id)
-        .map(|(node_id, node)| NfsExportRequest {
-            root: source_root.to_string_lossy().into_owned(),
-            client_ip: node.host.to_string(),
-            share_uuid: share_uuid.to_owned(),
-            node_id: node_id.clone(),
-        })
-        .collect::<Vec<_>>();
-    if !export_requests.is_empty() {
-        remove_managed_nfs_exports(server, &export_requests, &operation.id).map_err(|error| {
-            (
-                1,
-                format!("cannot remove pending NFS exports for share {share_id}: {error}"),
-            )
-        })?;
-    }
-
-    if source_root != mount_root {
-        remove_pending_share_alias(server, &mount_root, &source_root, share_id)?;
-        for (node_id, node, _) in &clients {
-            remove_pending_share_alias(node, &source_root, &mount_root, share_id).map_err(
-                |(_, error)| {
-                    (
-                        1,
-                        format!("cannot remove pending share alias on {node_id}: {error}"),
+                        format!("cannot remove pending NFS exports for share {share_id}: {error}"),
                     )
                 },
             )?;
         }
-    }
-    remove_pending_share_marker(server, &source_root, share_uuid, share_id)?;
 
-    operation.phase = "ABORTED".into();
-    operation.detail = Some("pending named-share setup was explicitly cancelled".into());
-    state.operations.insert(key, operation);
-    save_admin_state(&journal_path, &state)?;
-    println!("Cancelled pending named share {share_id}; exact managed NFS resources were removed.");
-    println!("Restart the controller to resume scheduling.");
-    Ok(())
+        if source_root != mount_root {
+            remove_pending_share_alias(server, &mount_root, &source_root, share_id)?;
+            for (node_id, node, _) in &clients {
+                remove_pending_share_alias(node, &source_root, &mount_root, share_id).map_err(
+                    |(_, error)| {
+                        (
+                            1,
+                            format!("cannot remove pending share alias on {node_id}: {error}"),
+                        )
+                    },
+                )?;
+            }
+        }
+        remove_pending_share_marker(server, &source_root, share_uuid, share_id)?;
+
+        operation.phase = "ABORTED".into();
+        operation.detail = Some("pending named-share setup was explicitly cancelled".into());
+        state.operations.insert(key, operation);
+        save_admin_state(&journal_path, &state)?;
+        println!(
+            "Cancelled pending named share {share_id}; exact managed NFS resources were removed."
+        );
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn parse_pending_named_share_endpoint(
@@ -5965,430 +6606,452 @@ fn remove_node(
         let connection = removal_connection_from_state(node_id, node, connect, &initial_state)?;
         validate_removal_address(node_id, &connection, &local_ipv4_addresses()?)?;
     }
-    let _maintenance = acquire_node_maintenance(config_path, state_dir, "mnode --remove")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    fs::create_dir_all(state_dir).map_err(io_error)?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
-    let journal_path = state_dir.join("node-admin.json");
-    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
-    let operation_key = format!("remove:{node_id}");
-    if !config.nodes.contains_key(node_id) {
-        if let Some(mut operation) = state.operations.get(&operation_key).cloned() {
-            if operation.phase == "REMOVED" {
-                println!("Node {node_id} has already been removed.");
-                return Ok(());
+    let maintenance_scope = if initial_config.nodes.contains_key(node_id) {
+        MaintenanceScope::Nodes(vec![
+            NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
+        ])
+    } else {
+        MaintenanceScope::Cluster
+    };
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "mnode --remove",
+        maintenance_scope,
+    )?;
+    if maintenance.recovered {
+        return Ok(());
+    }
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        fs::create_dir_all(state_dir).map_err(io_error)?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config =
+            ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
+        let journal_path = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        let operation_key = format!("remove:{node_id}");
+        if !config.nodes.contains_key(node_id) {
+            if let Some(mut operation) = state.operations.get(&operation_key).cloned() {
+                if operation.phase == "REMOVED" {
+                    println!("Node {node_id} has already been removed.");
+                    return Ok(());
+                }
+                let current_digest =
+                    sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+                if matches!(
+                    operation.phase.as_str(),
+                    "REMOVAL_COMMITTING" | "SYNC_PENDING"
+                ) && operation.candidate_config_sha256.as_deref()
+                    == Some(current_digest.as_str())
+                {
+                    let final_config = ClusterConfig::parse(&config_source)
+                        .map_err(|error| (2, error.to_string()))?;
+                    operation.phase = "SYNC_PENDING".into();
+                    operation.detail = None;
+                    state
+                        .operations
+                        .insert(operation_key.clone(), operation.clone());
+                    save_admin_state(&journal_path, &state)?;
+                    if let Err(error) = sync_remote_configs(
+                        &final_config,
+                        &config_source,
+                        state_dir,
+                        &operation.id,
+                        None,
+                    ) {
+                        operation.detail = Some(error.clone());
+                        state
+                            .operations
+                            .insert(operation_key.clone(), operation.clone());
+                        save_admin_state(&journal_path, &state)?;
+                        return Err((
+                            1,
+                            format!(
+                                "node {node_id} is removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm {node_id}` to resume."
+                            ),
+                        ));
+                    }
+                    operation.phase = "REMOVED".into();
+                    operation.detail = None;
+                    state.operations.insert(operation_key, operation);
+                    save_admin_state(&journal_path, &state)?;
+                    println!(
+                        "Recovered the completed removal and peer config sync for node {node_id}."
+                    );
+                    return Ok(());
+                }
             }
-            let current_digest =
-                sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-            if matches!(
-                operation.phase.as_str(),
-                "REMOVAL_COMMITTING" | "SYNC_PENDING"
-            ) && operation.candidate_config_sha256.as_deref() == Some(current_digest.as_str())
+            if let Some(operation) = state
+                .operations
+                .values()
+                .find(|operation| operation.action == "add" && operation.node_id == node_id)
             {
-                let final_config =
-                    ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
-                operation.phase = "SYNC_PENDING".into();
-                operation.detail = None;
-                state
+                match operation.phase.as_str() {
+                    "ABORTED" => {
+                        println!(
+                            "Enrollment for {node_id} was already cancelled; its ID remains reserved."
+                        );
+                        return Ok(());
+                    }
+                    "SETUP_PENDING" | "CANDIDATE_INSTALLED" | "ADD_COMMITTING" => {
+                        let current_digest = sha256_hex(config_source.as_bytes())
+                            .map_err(|error| (1, error.to_string()))?;
+                        if operation.old_config_sha256.as_deref() != Some(current_digest.as_str()) {
+                            return Err((
+                                1,
+                                format!(
+                                    "cluster config changed during enrollment of {node_id}; refusing to cancel it automatically"
+                                ),
+                            ));
+                        }
+                        if abort_pending_enrollment(&mut state, &journal_path, &config, node_id)? {
+                            return Ok(());
+                        }
+                        return Err((
+                            1,
+                            format!(
+                                "node {node_id} is reserved by a pending enrollment but is not schedulable; rerun its original mnode --add command or inspect the node admin journal"
+                            ),
+                        ));
+                    }
+                    "SYNC_PENDING" => {
+                        return Err((
+                            1,
+                            format!(
+                                "the enrollment of {node_id} was committed locally but its node config is missing; inspect the config and node-admin journal before cancelling"
+                            ),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            return Err((2, format!("node '{node_id}' is not configured")));
+        }
+        if config
+            .login_node
+            .as_ref()
+            .is_some_and(|login| login.as_str() == node_id)
+        {
+            return Err((
+            1,
+            "cannot remove the configured login node; reinitialize the cluster with the intended login Mac first".into(),
+        ));
+        }
+        if config.storage_server.as_str() == node_id {
+            return Err((
+                1,
+                "cannot remove the configured NFS storage server; migrate storage first".into(),
+            ));
+        }
+        let served_shares: Vec<_> = config
+            .shares
+            .iter()
+            .filter(|(_, share)| share.server.as_str() == node_id)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if !served_shares.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "cannot remove node {node_id}; it serves additional NFS share(s): {}",
+                    served_shares.join(", ")
+                ),
+            ));
+        }
+        let node = config
+            .nodes
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| (2, format!("node '{node_id}' is not configured")))?;
+        let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
+        let blockers = storage
+            .jobs_preventing_node_removal(node_id)
+            .map_err(|error| (1, error.to_string()))?;
+        if !blockers.is_empty() {
+            let details = blockers
+                .iter()
+                .map(|job| format!("{}:{:?}", job.id, job.state))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err((
+                1,
+                format!("cannot remove {node_id}; local jobs still reference it: {details}"),
+            ));
+        }
+        let connection_node = removal_connection_from_state(node_id, &node, connect, &state)?;
+        validate_removal_address(node_id, &connection_node, &local_ipv4_addresses()?)?;
+        let machine_uuid = remote_machine_uuid(&connection_node)
+            .map_err(|(_, error)| removal_connection_error(node_id, &connection_node, error))?;
+        validate_removal_identity(
+            node_id,
+            &node,
+            state.machine_uuids.get(node_id).map(String::as_str),
+            &machine_uuid,
+        )?;
+        check_remote_idle(&connection_node, node_id, &config_path)?;
+        state.machine_uuids.insert(node_id.to_owned(), machine_uuid);
+
+        state.reserved_node_ids.insert(node_id.to_owned());
+        let mut operation = state
+            .operations
+            .get(&operation_key)
+            .cloned()
+            .unwrap_or_else(|| {
+                let add_record = state
                     .operations
-                    .insert(operation_key.clone(), operation.clone());
-                save_admin_state(&journal_path, &state)?;
-                if let Err(error) = sync_remote_configs(
-                    &final_config,
-                    &config_source,
-                    state_dir,
-                    &operation.id,
-                    None,
-                ) {
+                    .values()
+                    .find(|record| record.action == "add" && record.node_id == node_id);
+                NodeOperation {
+                    id: Id128::random().to_string(),
+                    action: "remove".into(),
+                    connection_endpoint: None,
+                    remote_config_path: node.remote_config.clone(),
+                    node_id: node_id.to_owned(),
+                    endpoint: format!(
+                        "{}@{}:{}",
+                        if node.transport == Transport::Local {
+                            "local"
+                        } else {
+                            node.ssh_user.as_deref().unwrap_or("unknown")
+                        },
+                        node.host,
+                        node.ssh_port.unwrap_or(22)
+                    ),
+                    machine_uuid: state.machine_uuids.get(node_id).cloned(),
+                    phase: "REMOVAL_PENDING".into(),
+                    old_config_sha256: sha256_hex(config_source.as_bytes()).ok(),
+                    candidate_config_sha256: None,
+                    managed_export: add_record.is_some_and(|record| record.managed_export),
+                    managed_shares: add_record
+                        .map(|record| record.managed_shares.clone())
+                        .unwrap_or_default(),
+                    client_setup_attempted: add_record
+                        .and_then(|record| record.client_setup_attempted),
+                    detail: None,
+                }
+            });
+        if operation.remote_config_path.is_none() {
+            operation.remote_config_path = node.remote_config.clone();
+        }
+        if connection_node.transport == Transport::Ssh {
+            operation.connection_endpoint = Some(format!(
+                "{}@{}:{}",
+                connection_node.ssh_user.as_deref().unwrap_or("unknown"),
+                connection_node.host,
+                connection_node.ssh_port.unwrap_or(22)
+            ));
+        }
+        let current_digest =
+            sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let matches_old = operation.old_config_sha256.as_deref() == Some(current_digest.as_str());
+        let matches_pending_candidate =
+            operation.candidate_config_sha256.as_deref() == Some(current_digest.as_str());
+        if !matches_old && !matches_pending_candidate {
+            return Err((
+            1,
+            "cluster config changed since this node removal began; refusing to overwrite it. Inspect the config and node-admin journal before retrying".into(),
+        ));
+        }
+        if matches_pending_candidate && !matches_old {
+            operation.old_config_sha256 = Some(current_digest.clone());
+        }
+        operation.phase = "REMOVAL_PENDING".into();
+        operation.detail = Some("node removal is pending; checking queue and NFS state".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        if config
+            .queues
+            .values()
+            .any(|queue| queue.nodes.iter().any(|id| id == node_id))
+        {
+            let detached = detach_node_from_queues(&config_source, &config, node_id)?;
+            operation.candidate_config_sha256 =
+                Some(sha256_hex(detached.as_bytes()).map_err(|error| (1, error.to_string()))?);
+            operation.detail =
+                Some("node is being detached from scheduling; NFS cleanup remains".into());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            backup_config(&config_path, &operation.id)?;
+            atomic_write(&config_path, detached.as_bytes())?;
+            operation.old_config_sha256 = operation.candidate_config_sha256.clone();
+            operation.detail = Some("node is detached from scheduling; NFS cleanup remains".into());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+        }
+
+        if let Err((_, error)) = cleanup_client_nfs_resources(&config, node_id, &connection_node) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "{node_id} is detached from queues but client NFS cleanup is pending: {error}. Rerun `mnode -rm {node_id}`."
+                ),
+            ));
+        }
+
+        let mut export_requests_by_server: BTreeMap<
+            String,
+            Vec<(Option<String>, NfsExportRequest)>,
+        > = BTreeMap::new();
+        export_requests_by_server
+            .entry(config.storage_server.as_str().to_owned())
+            .or_default()
+            .push((
+                None,
+                NfsExportRequest {
+                    root: config.primary_source_root().to_string_lossy().into_owned(),
+                    client_ip: node.host.to_string(),
+                    share_uuid: config.share_uuid.clone(),
+                    node_id: node_id.to_owned(),
+                },
+            ));
+        for (share_id, share) in &config.shares {
+            export_requests_by_server
+                .entry(share.server.as_str().to_owned())
+                .or_default()
+                .push((
+                    Some(share_id.clone()),
+                    NfsExportRequest {
+                        root: share.source_root.to_string_lossy().into_owned(),
+                        client_ip: node.host.to_string(),
+                        share_uuid: share.share_uuid.clone(),
+                        node_id: node_id.to_owned(),
+                    },
+                ));
+        }
+        let mut removed_export = false;
+        let mut still_authorized = false;
+        let mut removed_share_exports = Vec::new();
+        for (server_id, labelled_requests) in export_requests_by_server {
+            let export_server = &config.nodes[&server_id];
+            let requests = labelled_requests
+                .iter()
+                .map(|(_, request)| request.clone())
+                .collect::<Vec<_>>();
+            let statuses = match remove_managed_nfs_exports(export_server, &requests, &operation.id)
+            {
+                Ok(statuses) => statuses,
+                Err(error) => {
                     operation.detail = Some(error.clone());
                     state
                         .operations
                         .insert(operation_key.clone(), operation.clone());
                     save_admin_state(&journal_path, &state)?;
+                    let subject = labelled_requests
+                        .iter()
+                        .find_map(|(share_id, _)| share_id.as_deref())
+                        .map_or_else(
+                            || "primary NFS export".to_owned(),
+                            |id| format!("share {id}"),
+                        );
                     return Err((
                         1,
                         format!(
-                            "node {node_id} is removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm {node_id}` to resume."
+                            "{node_id} is detached from queues but cleanup of {subject} on {} is pending: {error}. Rerun `mnode -rm {node_id}`.",
+                            export_server.host
                         ),
                     ));
                 }
-                operation.phase = "REMOVED".into();
-                operation.detail = None;
-                state.operations.insert(operation_key, operation);
-                save_admin_state(&journal_path, &state)?;
-                println!(
-                    "Recovered the completed removal and peer config sync for node {node_id}."
-                );
-                println!("Restart the controller to apply the configuration change.");
-                return Ok(());
-            }
-        }
-        if let Some(operation) = state
-            .operations
-            .values()
-            .find(|operation| operation.action == "add" && operation.node_id == node_id)
-        {
-            match operation.phase.as_str() {
-                "ABORTED" => {
-                    println!(
-                        "Enrollment for {node_id} was already cancelled; its ID remains reserved."
-                    );
-                    return Ok(());
-                }
-                "SETUP_PENDING" | "CANDIDATE_INSTALLED" | "ADD_COMMITTING" => {
-                    let current_digest = sha256_hex(config_source.as_bytes())
-                        .map_err(|error| (1, error.to_string()))?;
-                    if operation.old_config_sha256.as_deref() != Some(current_digest.as_str()) {
-                        return Err((
-                            1,
-                            format!(
-                                "cluster config changed during enrollment of {node_id}; refusing to cancel it automatically"
-                            ),
-                        ));
+            };
+            for ((share_id, _), (removed, is_still_authorized)) in
+                labelled_requests.iter().zip(statuses)
+            {
+                if let Some(share_id) = share_id {
+                    if removed {
+                        removed_share_exports.push(share_id.clone());
                     }
-                    if abort_pending_enrollment(&mut state, &journal_path, &config, node_id)? {
-                        return Ok(());
-                    }
-                    return Err((
-                        1,
-                        format!(
-                            "node {node_id} is reserved by a pending enrollment but is not schedulable; rerun its original mnode --add command or inspect the node admin journal"
-                        ),
-                    ));
+                } else {
+                    removed_export = removed;
+                    still_authorized = is_still_authorized;
                 }
-                "SYNC_PENDING" => {
-                    return Err((
-                        1,
-                        format!(
-                            "the enrollment of {node_id} was committed locally but its node config is missing; inspect the config and node-admin journal before cancelling"
-                        ),
-                    ));
-                }
-                _ => {}
             }
         }
-        return Err((2, format!("node '{node_id}' is not configured")));
-    }
-    if config
-        .login_node
-        .as_ref()
-        .is_some_and(|login| login.as_str() == node_id)
-    {
-        return Err((
-            1,
-            "cannot remove the configured login node; reinitialize the cluster with the intended login Mac first".into(),
-        ));
-    }
-    if config.storage_server.as_str() == node_id {
-        return Err((
-            1,
-            "cannot remove the configured NFS storage server; migrate storage first".into(),
-        ));
-    }
-    let served_shares: Vec<_> = config
-        .shares
-        .iter()
-        .filter(|(_, share)| share.server.as_str() == node_id)
-        .map(|(id, _)| id.as_str())
-        .collect();
-    if !served_shares.is_empty() {
-        return Err((
-            1,
-            format!(
-                "cannot remove node {node_id}; it serves additional NFS share(s): {}",
-                served_shares.join(", ")
-            ),
-        ));
-    }
-    let node = config
-        .nodes
-        .get(node_id)
-        .cloned()
-        .ok_or_else(|| (2, format!("node '{node_id}' is not configured")))?;
-    let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
-    let blockers = storage
-        .jobs_preventing_node_removal(node_id)
-        .map_err(|error| (1, error.to_string()))?;
-    if !blockers.is_empty() {
-        let details = blockers
-            .iter()
-            .map(|job| format!("{}:{:?}", job.id, job.state))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err((
-            1,
-            format!("cannot remove {node_id}; local jobs still reference it: {details}"),
-        ));
-    }
-    let connection_node = removal_connection_from_state(node_id, &node, connect, &state)?;
-    validate_removal_address(node_id, &connection_node, &local_ipv4_addresses()?)?;
-    let machine_uuid = remote_machine_uuid(&connection_node)
-        .map_err(|(_, error)| removal_connection_error(node_id, &connection_node, error))?;
-    validate_removal_identity(
-        node_id,
-        &node,
-        state.machine_uuids.get(node_id).map(String::as_str),
-        &machine_uuid,
-    )?;
-    check_remote_idle(&connection_node, node_id, &config_path)?;
-    state.machine_uuids.insert(node_id.to_owned(), machine_uuid);
 
-    state.reserved_node_ids.insert(node_id.to_owned());
-    let mut operation = state
-        .operations
-        .get(&operation_key)
-        .cloned()
-        .unwrap_or_else(|| {
-            let add_record = state
-                .operations
-                .values()
-                .find(|record| record.action == "add" && record.node_id == node_id);
-            NodeOperation {
-                id: Id128::random().to_string(),
-                action: "remove".into(),
-                connection_endpoint: None,
-                remote_config_path: node.remote_config.clone(),
-                node_id: node_id.to_owned(),
-                endpoint: format!(
-                    "{}@{}:{}",
-                    if node.transport == Transport::Local {
-                        "local"
-                    } else {
-                        node.ssh_user.as_deref().unwrap_or("unknown")
-                    },
-                    node.host,
-                    node.ssh_port.unwrap_or(22)
-                ),
-                machine_uuid: state.machine_uuids.get(node_id).cloned(),
-                phase: "REMOVAL_PENDING".into(),
-                old_config_sha256: sha256_hex(config_source.as_bytes()).ok(),
-                candidate_config_sha256: None,
-                managed_export: add_record.is_some_and(|record| record.managed_export),
-                managed_shares: add_record
-                    .map(|record| record.managed_shares.clone())
-                    .unwrap_or_default(),
-                client_setup_attempted: add_record.and_then(|record| record.client_setup_attempted),
-                detail: None,
-            }
-        });
-    if operation.remote_config_path.is_none() {
-        operation.remote_config_path = node.remote_config.clone();
-    }
-    if connection_node.transport == Transport::Ssh {
-        operation.connection_endpoint = Some(format!(
-            "{}@{}:{}",
-            connection_node.ssh_user.as_deref().unwrap_or("unknown"),
-            connection_node.host,
-            connection_node.ssh_port.unwrap_or(22)
-        ));
-    }
-    let current_digest =
-        sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    let matches_old = operation.old_config_sha256.as_deref() == Some(current_digest.as_str());
-    let matches_pending_candidate =
-        operation.candidate_config_sha256.as_deref() == Some(current_digest.as_str());
-    if !matches_old && !matches_pending_candidate {
-        return Err((
-            1,
-            "cluster config changed since this node removal began; refusing to overwrite it. Inspect the config and node-admin journal before retrying".into(),
-        ));
-    }
-    if matches_pending_candidate && !matches_old {
-        operation.old_config_sha256 = Some(current_digest.clone());
-    }
-    operation.phase = "REMOVAL_PENDING".into();
-    operation.detail = Some("node removal is pending; checking queue and NFS state".into());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    if config
-        .queues
-        .values()
-        .any(|queue| queue.nodes.iter().any(|id| id == node_id))
-    {
-        let detached = detach_node_from_queues(&config_source, &config, node_id)?;
-        operation.candidate_config_sha256 =
-            Some(sha256_hex(detached.as_bytes()).map_err(|error| (1, error.to_string()))?);
-        operation.detail =
-            Some("node is being detached from scheduling; NFS cleanup remains".into());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&journal_path, &state)?;
-        backup_config(&config_path, &operation.id)?;
-        atomic_write(&config_path, detached.as_bytes())?;
-        operation.old_config_sha256 = operation.candidate_config_sha256.clone();
-        operation.detail = Some("node is detached from scheduling; NFS cleanup remains".into());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&journal_path, &state)?;
-    }
-
-    if let Err((_, error)) = cleanup_client_nfs_resources(&config, node_id, &connection_node) {
-        operation.detail = Some(error.clone());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&journal_path, &state)?;
-        return Err((
-            1,
-            format!(
-                "{node_id} is detached from queues but client NFS cleanup is pending: {error}. Rerun `mnode -rm {node_id}`."
-            ),
-        ));
-    }
-
-    let mut export_requests_by_server: BTreeMap<String, Vec<(Option<String>, NfsExportRequest)>> =
-        BTreeMap::new();
-    export_requests_by_server
-        .entry(config.storage_server.as_str().to_owned())
-        .or_default()
-        .push((
-            None,
-            NfsExportRequest {
-                root: config.primary_source_root().to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: config.share_uuid.clone(),
-                node_id: node_id.to_owned(),
-            },
-        ));
-    for (share_id, share) in &config.shares {
-        export_requests_by_server
-            .entry(share.server.as_str().to_owned())
-            .or_default()
-            .push((
-                Some(share_id.clone()),
-                NfsExportRequest {
-                    root: share.source_root.to_string_lossy().into_owned(),
-                    client_ip: node.host.to_string(),
-                    share_uuid: share.share_uuid.clone(),
-                    node_id: node_id.to_owned(),
-                },
-            ));
-    }
-    let mut removed_export = false;
-    let mut still_authorized = false;
-    let mut removed_share_exports = Vec::new();
-    for (server_id, labelled_requests) in export_requests_by_server {
-        let export_server = &config.nodes[&server_id];
-        let requests = labelled_requests
-            .iter()
-            .map(|(_, request)| request.clone())
-            .collect::<Vec<_>>();
-        let statuses = match remove_managed_nfs_exports(export_server, &requests, &operation.id) {
-            Ok(statuses) => statuses,
-            Err(error) => {
-                operation.detail = Some(error.clone());
-                state
-                    .operations
-                    .insert(operation_key.clone(), operation.clone());
-                save_admin_state(&journal_path, &state)?;
-                let subject = labelled_requests
-                    .iter()
-                    .find_map(|(share_id, _)| share_id.as_deref())
-                    .map_or_else(
-                        || "primary NFS export".to_owned(),
-                        |id| format!("share {id}"),
-                    );
-                return Err((
-                    1,
-                    format!(
-                        "{node_id} is detached from queues but cleanup of {subject} on {} is pending: {error}. Rerun `mnode -rm {node_id}`.",
-                        export_server.host
-                    ),
-                ));
-            }
-        };
-        for ((share_id, _), (removed, is_still_authorized)) in
-            labelled_requests.iter().zip(statuses)
+        let current_source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let current_digest =
+            sha256_hex(current_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        if operation.old_config_sha256.as_deref() != Some(current_digest.as_str())
+            && operation.candidate_config_sha256.as_deref() != Some(current_digest.as_str())
         {
-            if let Some(share_id) = share_id {
-                if removed {
-                    removed_share_exports.push(share_id.clone());
-                }
-            } else {
-                removed_export = removed;
-                still_authorized = is_still_authorized;
-            }
-        }
-    }
-
-    let current_source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let current_digest =
-        sha256_hex(current_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    if operation.old_config_sha256.as_deref() != Some(current_digest.as_str())
-        && operation.candidate_config_sha256.as_deref() != Some(current_digest.as_str())
-    {
-        return Err((
+            return Err((
             1,
             "cluster config changed during node removal; refusing to overwrite it. Inspect the config and node-admin journal before retrying".into(),
         ));
-    }
-    let current_config =
-        ClusterConfig::parse(&current_source).map_err(|error| (2, error.to_string()))?;
-    let final_source = remove_node_from_config(&current_source, &current_config, node_id)?;
-    backup_config(&config_path, &operation.id)?;
-    operation.old_config_sha256 = Some(current_digest);
-    operation.phase = "REMOVAL_COMMITTING".into();
-    operation.candidate_config_sha256 =
-        Some(sha256_hex(final_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    atomic_write(&config_path, final_source.as_bytes())?;
-    let final_config =
-        ClusterConfig::parse(&final_source).map_err(|error| (2, error.to_string()))?;
-    operation.phase = "SYNC_PENDING".into();
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    if let Err(error) =
-        sync_remote_configs(&final_config, &final_source, state_dir, &operation.id, None)
-    {
-        operation.detail = Some(error.clone());
+        }
+        let current_config =
+            ClusterConfig::parse(&current_source).map_err(|error| (2, error.to_string()))?;
+        let final_source = remove_node_from_config(&current_source, &current_config, node_id)?;
+        backup_config(&config_path, &operation.id)?;
+        operation.old_config_sha256 = Some(current_digest);
+        operation.phase = "REMOVAL_COMMITTING".into();
+        operation.candidate_config_sha256 =
+            Some(sha256_hex(final_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((
-            1,
-            format!(
-                "node {node_id} was removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm {node_id}` to resume."
-            ),
-        ));
-    }
-    operation.phase = "REMOVED".into();
-    operation.detail = None;
-    state.operations.insert(operation_key, operation);
-    save_admin_state(&journal_path, &state)?;
-    println!("Removed node {node_id} from the local cluster configuration.");
-    if removed_export {
-        println!("Removed its macluster-managed NFS export entry.");
-    } else if still_authorized {
-        println!(
-            "Warning: an operator-managed NFS export still authorizes {}; it was left unchanged.",
-            node.host
-        );
-    }
-    if !removed_share_exports.is_empty() {
-        println!(
-            "Removed managed client exports for share(s): {}.",
-            removed_share_exports.join(", ")
-        );
-    }
-    println!("Restart the controller to apply the configuration change.");
-    Ok(())
+        atomic_write(&config_path, final_source.as_bytes())?;
+        let final_config =
+            ClusterConfig::parse(&final_source).map_err(|error| (2, error.to_string()))?;
+        operation.phase = "SYNC_PENDING".into();
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        if let Err(error) =
+            sync_remote_configs(&final_config, &final_source, state_dir, &operation.id, None)
+        {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "node {node_id} was removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm {node_id}` to resume."
+                ),
+            ));
+        }
+        operation.phase = "REMOVED".into();
+        operation.detail = None;
+        state.operations.insert(operation_key, operation);
+        save_admin_state(&journal_path, &state)?;
+        println!("Removed node {node_id} from the local cluster configuration.");
+        if removed_export {
+            println!("Removed its macluster-managed NFS export entry.");
+        } else if still_authorized {
+            println!(
+                "Warning: an operator-managed NFS export still authorizes {}; it was left unchanged.",
+                node.host
+            );
+        }
+        if !removed_share_exports.is_empty() {
+            println!(
+                "Removed managed client exports for share(s): {}.",
+                removed_share_exports.join(", ")
+            );
+        }
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn detach_node_from_queues(
@@ -7157,322 +7820,335 @@ fn register_named_share(
     requested_source: &str,
     requested_mount_root: Option<&str>,
 ) -> AppResult<()> {
-    let _maintenance = acquire_node_maintenance(config_path, state_dir, "named-share setup")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let source_text = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&source_text).map_err(|error| (2, error.to_string()))?;
-    let server_id = config
-        .nodes
-        .iter()
-        .find(|(id, node)| id.as_str() == server_key || node.host == server_key)
-        .map(|(id, _)| id.clone())
-        .ok_or_else(|| {
-            (
-                2,
-                format!("share server '{server_key}' is not a registered node"),
-            )
-        })?;
-    if let Some(queue) = selected_queue
-        && !config.queues.contains_key(queue)
-    {
-        return Err((2, format!("queue '{queue}' is not configured")));
-    }
-    let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
-    let server = config.nodes.get(&server_id).expect("server was located");
-    let server_facts = read_remote_facts(server)?;
-    for (node_id, node) in &config.nodes {
-        let facts = read_remote_facts(node).map_err(|(_, error)| {
-            (
-                1,
-                format!("cannot verify execution account on share client {node_id}: {error}"),
-            )
-        })?;
-        if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
-            return Err((
-                2,
-                format!(
-                    "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
-                    facts.uid, facts.gid, server_facts.uid, server_facts.gid
-                ),
-            ));
-        }
-    }
-    let home = checked_remote_path(&server_facts.home)?;
-    let source_root = resolve_share_source(requested_source, &home)?;
-    let mount_root = named_share_mount_root(share_id, requested_mount_root);
-    validate_share_alias_paths(&source_root, &mount_root)?;
-    let journal_path = state_dir.join("node-admin.json");
-    fs::create_dir_all(state_dir).map_err(io_error)?;
-    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
-    let operation_key = format!("share:{share_id}");
-    let endpoint_key =
-        named_share_operation_endpoint(share_id, &server_id, &source_root, &mount_root);
-    if let Some(existing) = config.shares.get(share_id) {
-        if !named_share_request_matches(existing, &server_id, &source_root, &mount_root) {
-            return Err((
-                2,
-                format!(
-                    "share ID '{share_id}' is already configured for a different server, source path, or mount path"
-                ),
-            ));
-        }
-        return repair_named_share(
-            &config_path,
-            state_dir,
-            &config,
-            &source_text,
-            share_id,
-            existing,
-            &mut state,
-            &journal_path,
-        );
-    }
-    let marker_uuid = match state.operations.get(&operation_key) {
-        Some(existing)
-            if named_share_operation_matches(
-                &existing,
-                share_id,
-                &server_id,
-                &source_root,
-                &mount_root,
-            ) && existing.phase != "READY" =>
-        {
-            existing
-                .machine_uuid
-                .clone()
-                .ok_or_else(|| (1, "share operation journal has no UUID".into()))?
-        }
-        Some(existing) if existing.phase != "READY" => {
-            return Err((
-                1,
-                format!(
-                    "share {share_id} has an incomplete operation for a different server, source path, or mount path; inspect node-admin journal {}",
-                    existing.id
-                ),
-            ));
-        }
-        _ => Id128::random().to_string(),
-    };
-    let share = macluster_core::config::ShareConfig {
-        server: NodeId::new(server_id.clone()).map_err(|error| (2, error.to_string()))?,
-        source_root: source_root.clone(),
-        mount_root: mount_root.clone(),
-        share_uuid: marker_uuid.clone(),
-    };
-    let queued_source = queue_candidate_with_node(&config, &source_text, queue_name, &server_id)?;
-    let candidate = append_share_config(&queued_source, share_id, &share)?;
-    let _preliminary_candidate_config =
-        ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
-    // Reject alias conflicts before recording an operation, writing a source
-    // marker, or exporting anything. Replacing child shares has its own checks
-    // because their managed alias directories are removed during migration.
-    if replaced_child_shares(&config, &share).is_empty() {
-        preflight_server_alias(server, &source_root, &mount_root)?;
-    }
-    preflight_share_clients(&config, &share)?;
-    for (node_id, node) in &config.nodes {
-        check_remote_idle(node, node_id, &config_path)?;
-    }
-
-    let old_digest = sha256_hex(source_text.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    let mut operation = match state.operations.get(&operation_key).cloned() {
-        Some(existing) if existing.machine_uuid.as_deref() == Some(marker_uuid.as_str()) => {
-            existing
-        }
-        Some(existing) if existing.phase != "READY" => {
-            return Err((
-                1,
-                format!(
-                    "share {share_id} has an incomplete prior operation {}; rerun its original mnode command using the same server and source path",
-                    existing.id
-                ),
-            ));
-        }
-        _ => NodeOperation {
-            id: Id128::random().to_string(),
-            action: "share".into(),
-            connection_endpoint: None,
-            remote_config_path: None,
-            node_id: server_id.clone(),
-            endpoint: endpoint_key,
-            machine_uuid: Some(marker_uuid.clone()),
-            phase: "SETUP_PENDING".into(),
-            old_config_sha256: Some(old_digest.clone()),
-            candidate_config_sha256: Some(
-                sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?,
-            ),
-            managed_export: false,
-            managed_shares: BTreeSet::new(),
-            client_setup_attempted: Some(false),
-            detail: None,
-        },
-    };
-    if operation.old_config_sha256.as_deref() != Some(old_digest.as_str()) {
-        return Err((
-            1,
-            format!(
-                "cluster config changed while share {share_id} was being prepared; refusing to overwrite it"
-            ),
-        ));
-    }
-    operation.phase = "SETUP_PENDING".into();
-    operation.detail = Some("share source, exports and client mounts are being prepared".into());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-
-    let (staged_source, staged_config) = stage_current_agents(
-        &config,
-        &source_text,
-        &operation.id,
-        AgentStagePurpose::Share,
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "named-share setup",
+        MaintenanceScope::Cluster,
     )?;
-    let queued_source =
-        queue_candidate_with_node(&staged_config, &staged_source, queue_name, &server_id)?;
-    let candidate = append_share_config(&queued_source, share_id, &share)?;
-    let candidate_config =
-        ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
-    operation.candidate_config_sha256 =
-        Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    let staged_server = candidate_config
-        .nodes
-        .get(&server_id)
-        .expect("share server remains in candidate config");
-    if staged_server.transport == Transport::Ssh {
-        let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
-        claim_enrollment_agent(
-            staged_server,
-            &server_id,
-            &config_path,
-            &config.share_uuid,
-            handoff,
-        )
-        .map_err(|error| (1, error))?;
+    if maintenance.recovered {
+        return Ok(());
     }
-    migrate_child_shares(&config, &share, &operation.id)?;
-    prepare_share_source(staged_server, &source_root, &marker_uuid)?;
-    let export_requests = config
-        .nodes
-        .iter()
-        .filter(|(node_id, _)| node_id.as_str() != server_id)
-        .map(|(node_id, node)| NfsExportRequest {
-            root: source_root.to_string_lossy().into_owned(),
-            client_ip: node.host.to_string(),
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source_text = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source_text).map_err(|error| (2, error.to_string()))?;
+        let server_id = config
+            .nodes
+            .iter()
+            .find(|(id, node)| id.as_str() == server_key || node.host == server_key)
+            .map(|(id, _)| id.clone())
+            .ok_or_else(|| {
+                (
+                    2,
+                    format!("share server '{server_key}' is not a registered node"),
+                )
+            })?;
+        if let Some(queue) = selected_queue
+            && !config.queues.contains_key(queue)
+        {
+            return Err((2, format!("queue '{queue}' is not configured")));
+        }
+        let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
+        let server = config.nodes.get(&server_id).expect("server was located");
+        let server_facts = read_remote_facts(server)?;
+        for (node_id, node) in &config.nodes {
+            let facts = read_remote_facts(node).map_err(|(_, error)| {
+                (
+                    1,
+                    format!("cannot verify execution account on share client {node_id}: {error}"),
+                )
+            })?;
+            if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
+                return Err((
+                    2,
+                    format!(
+                        "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
+                        facts.uid, facts.gid, server_facts.uid, server_facts.gid
+                    ),
+                ));
+            }
+        }
+        let home = checked_remote_path(&server_facts.home)?;
+        let source_root = resolve_share_source(requested_source, &home)?;
+        let mount_root = named_share_mount_root(share_id, requested_mount_root);
+        validate_share_alias_paths(&source_root, &mount_root)?;
+        let journal_path = state_dir.join("node-admin.json");
+        fs::create_dir_all(state_dir).map_err(io_error)?;
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        let operation_key = format!("share:{share_id}");
+        let endpoint_key =
+            named_share_operation_endpoint(share_id, &server_id, &source_root, &mount_root);
+        if let Some(existing) = config.shares.get(share_id) {
+            if !named_share_request_matches(existing, &server_id, &source_root, &mount_root) {
+                return Err((
+                    2,
+                    format!(
+                        "share ID '{share_id}' is already configured for a different server, source path, or mount path"
+                    ),
+                ));
+            }
+            return repair_named_share(
+                &config_path,
+                state_dir,
+                &config,
+                &source_text,
+                share_id,
+                existing,
+                &mut state,
+                &journal_path,
+            );
+        }
+        let marker_uuid = match state.operations.get(&operation_key) {
+            Some(existing)
+                if named_share_operation_matches(
+                    &existing,
+                    share_id,
+                    &server_id,
+                    &source_root,
+                    &mount_root,
+                ) && existing.phase != "READY" =>
+            {
+                existing
+                    .machine_uuid
+                    .clone()
+                    .ok_or_else(|| (1, "share operation journal has no UUID".into()))?
+            }
+            Some(existing) if existing.phase != "READY" => {
+                return Err((
+                    1,
+                    format!(
+                        "share {share_id} has an incomplete operation for a different server, source path, or mount path; inspect node-admin journal {}",
+                        existing.id
+                    ),
+                ));
+            }
+            _ => Id128::random().to_string(),
+        };
+        let share = macluster_core::config::ShareConfig {
+            server: NodeId::new(server_id.clone()).map_err(|error| (2, error.to_string()))?,
+            source_root: source_root.clone(),
+            mount_root: mount_root.clone(),
             share_uuid: marker_uuid.clone(),
-            node_id: node_id.clone(),
-        })
-        .collect::<Vec<_>>();
-    let (managed, export_result) = ensure_nfs_exports(server, &export_requests, &operation.id);
-    operation.managed_export |= managed.iter().any(|managed| *managed);
-    if let Err(error) = export_result {
-        operation.detail = Some(error.clone());
+        };
+        let queued_source =
+            queue_candidate_with_node(&config, &source_text, queue_name, &server_id)?;
+        let candidate = append_share_config(&queued_source, share_id, &share)?;
+        let _preliminary_candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        // Reject alias conflicts before recording an operation, writing a source
+        // marker, or exporting anything. Replacing child shares has its own checks
+        // because their managed alias directories are removed during migration.
+        if replaced_child_shares(&config, &share).is_empty() {
+            preflight_server_alias(server, &source_root, &mount_root)?;
+        }
+        preflight_share_clients(&config, &share)?;
+        for (node_id, node) in &config.nodes {
+            check_remote_idle(node, node_id, &config_path)?;
+        }
+
+        let old_digest =
+            sha256_hex(source_text.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let mut operation = match state.operations.get(&operation_key).cloned() {
+            Some(existing) if existing.machine_uuid.as_deref() == Some(marker_uuid.as_str()) => {
+                existing
+            }
+            Some(existing) if existing.phase != "READY" => {
+                return Err((
+                    1,
+                    format!(
+                        "share {share_id} has an incomplete prior operation {}; rerun its original mnode command using the same server and source path",
+                        existing.id
+                    ),
+                ));
+            }
+            _ => NodeOperation {
+                id: Id128::random().to_string(),
+                action: "share".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
+                node_id: server_id.clone(),
+                endpoint: endpoint_key,
+                machine_uuid: Some(marker_uuid.clone()),
+                phase: "SETUP_PENDING".into(),
+                old_config_sha256: Some(old_digest.clone()),
+                candidate_config_sha256: Some(
+                    sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?,
+                ),
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(false),
+                detail: None,
+            },
+        };
+        if operation.old_config_sha256.as_deref() != Some(old_digest.as_str()) {
+            return Err((
+                1,
+                format!(
+                    "cluster config changed while share {share_id} was being prepared; refusing to overwrite it"
+                ),
+            ));
+        }
+        operation.phase = "SETUP_PENDING".into();
+        operation.detail =
+            Some("share source, exports and client mounts are being prepared".into());
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((1, error));
-    }
-    prepare_server_alias(server, &source_root, &mount_root)?;
-    for (node_id, node) in &config.nodes {
-        if node_id == &server_id {
-            continue;
-        }
-        mount_share_candidate(node, server, &source_root, &mount_root).map_err(|error| {
-            (
-                1,
-                format!("could not mount share {share_id} on {node_id}: {error}"),
-            )
-        })?;
-    }
-    verify_named_share_mount(
-        server,
-        &server_id,
-        &server_id,
-        &server.host,
-        &source_root,
-        &mount_root,
-        &marker_uuid,
-    )?;
-    for (node_id, node) in &config.nodes {
-        if node_id != &server_id {
-            verify_named_share_mount(
-                node,
-                node_id,
-                &server_id,
-                &server.host,
-                &source_root,
-                &mount_root,
-                &marker_uuid,
-            )?;
-        }
-    }
-    let current = fs::read(&config_path).map_err(io_error)?;
-    let current_digest = sha256_hex(&current).map_err(|error| (1, error.to_string()))?;
-    if current_digest != old_digest {
-        return Err((
-            1,
-            "cluster config changed during share preparation; no config was overwritten".into(),
-        ));
-    }
-    backup_config(&config_path, &operation.id)?;
-    operation.phase = "ADD_COMMITTING".into();
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    atomic_write(&config_path, candidate.as_bytes())?;
-    for child_id in replaced_child_shares(&config, &share) {
-        if let Some(child) = state.operations.get_mut(&format!("share:{child_id}")) {
-            child.phase = "ABORTED".into();
-            child.detail = Some(format!("superseded by parent share {share_id}"));
-        }
-    }
-    operation.phase = "SYNC_PENDING".into();
-    operation.detail = None;
-    operation.candidate_config_sha256 =
-        Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    if let Err(error) = sync_remote_configs(
-        &candidate_config,
-        &candidate,
-        state_dir,
-        &operation.id,
-        None,
-    ) {
-        operation.detail = Some(error.clone());
-        state.operations.insert(operation_key.clone(), operation);
+
+        let (staged_source, staged_config) = stage_current_agents(
+            &config,
+            &source_text,
+            &operation.id,
+            AgentStagePurpose::Share,
+        )?;
+        let queued_source =
+            queue_candidate_with_node(&staged_config, &staged_source, queue_name, &server_id)?;
+        let candidate = append_share_config(&queued_source, share_id, &share)?;
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        operation.candidate_config_sha256 =
+            Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((
-            1,
-            format!(
-                "share {share_id} is committed locally, but peer config sync is pending: {error}. Rerun the same mnode add command to resume."
-            ),
-        ));
-    }
-    operation.phase = "READY".into();
-    operation.detail = None;
-    state.operations.insert(operation_key, operation);
-    save_admin_state(&journal_path, &state)?;
-    println!(
-        "NFS share {share_id} is available at {} on every configured node.",
-        mount_root.display()
-    );
-    println!("Restart the controller to apply the configuration change.");
-    Ok(())
+        let staged_server = candidate_config
+            .nodes
+            .get(&server_id)
+            .expect("share server remains in candidate config");
+        if staged_server.transport == Transport::Ssh {
+            let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+            claim_enrollment_agent(
+                staged_server,
+                &server_id,
+                &config_path,
+                &config.share_uuid,
+                handoff,
+            )
+            .map_err(|error| (1, error))?;
+        }
+        migrate_child_shares(&config, &share, &operation.id)?;
+        prepare_share_source(staged_server, &source_root, &marker_uuid)?;
+        let export_requests = config
+            .nodes
+            .iter()
+            .filter(|(node_id, _)| node_id.as_str() != server_id)
+            .map(|(node_id, node)| NfsExportRequest {
+                root: source_root.to_string_lossy().into_owned(),
+                client_ip: node.host.to_string(),
+                share_uuid: marker_uuid.clone(),
+                node_id: node_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (managed, export_result) = ensure_nfs_exports(server, &export_requests, &operation.id);
+        operation.managed_export |= managed.iter().any(|managed| *managed);
+        if let Err(error) = export_result {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((1, error));
+        }
+        prepare_server_alias(server, &source_root, &mount_root)?;
+        for (node_id, node) in &config.nodes {
+            if node_id == &server_id {
+                continue;
+            }
+            mount_share_candidate(node, server, &source_root, &mount_root).map_err(|error| {
+                (
+                    1,
+                    format!("could not mount share {share_id} on {node_id}: {error}"),
+                )
+            })?;
+        }
+        verify_named_share_mount(
+            server,
+            &server_id,
+            &server_id,
+            &server.host,
+            &source_root,
+            &mount_root,
+            &marker_uuid,
+        )?;
+        for (node_id, node) in &config.nodes {
+            if node_id != &server_id {
+                verify_named_share_mount(
+                    node,
+                    node_id,
+                    &server_id,
+                    &server.host,
+                    &source_root,
+                    &mount_root,
+                    &marker_uuid,
+                )?;
+            }
+        }
+        let current = fs::read(&config_path).map_err(io_error)?;
+        let current_digest = sha256_hex(&current).map_err(|error| (1, error.to_string()))?;
+        if current_digest != old_digest {
+            return Err((
+                1,
+                "cluster config changed during share preparation; no config was overwritten".into(),
+            ));
+        }
+        backup_config(&config_path, &operation.id)?;
+        operation.phase = "ADD_COMMITTING".into();
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        for child_id in replaced_child_shares(&config, &share) {
+            if let Some(child) = state.operations.get_mut(&format!("share:{child_id}")) {
+                child.phase = "ABORTED".into();
+                child.detail = Some(format!("superseded by parent share {share_id}"));
+            }
+        }
+        operation.phase = "SYNC_PENDING".into();
+        operation.detail = None;
+        operation.candidate_config_sha256 =
+            Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        if let Err(error) = sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation.id,
+            None,
+        ) {
+            operation.detail = Some(error.clone());
+            state.operations.insert(operation_key.clone(), operation);
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "share {share_id} is committed locally, but peer config sync is pending: {error}. Rerun the same mnode add command to resume."
+                ),
+            ));
+        }
+        operation.phase = "READY".into();
+        operation.detail = None;
+        state.operations.insert(operation_key, operation);
+        save_admin_state(&journal_path, &state)?;
+        println!(
+            "NFS share {share_id} is available at {} on every configured node.",
+            mount_root.display()
+        );
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn repair_named_share(
@@ -8879,274 +9555,286 @@ fn add_local_node(
     explicit_host: Option<Ipv4Addr>,
     defer_queue_for_share: bool,
 ) -> AppResult<()> {
-    let _maintenance = acquire_node_maintenance(config_path, state_dir, "local node enrollment")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    fs::create_dir_all(state_dir).map_err(io_error)?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
-    let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
-    if !config.queues.contains_key(queue_name) {
-        return Err((2, format!("queue '{queue_name}' is not configured")));
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "local node enrollment",
+        MaintenanceScope::Cluster,
+    )?;
+    if maintenance.recovered {
+        return Ok(());
     }
-    let host = resolve_local_host(&config, explicit_host)?;
-    let machine_uuid = local_platform_uuid()?;
-    let execution_uid = unsafe { libc::geteuid() };
-    let journal_path = state_dir.join("node-admin.json");
-    let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
-    let operation_key = format!("add-local:{machine_uuid}");
-    if let Some(previous) = state
-        .operations
-        .get(&operation_key)
-        .filter(|operation| operation.phase == "ABORTED")
-    {
-        state.reserved_node_ids.insert(previous.node_id.clone());
-    }
-    let pending_node_id = state
-        .operations
-        .get(&operation_key)
-        .filter(|operation| !matches!(operation.phase.as_str(), "READY" | "ABORTED"))
-        .map(|operation| operation.node_id.clone());
-    let existing_id = find_local_machine_registration(&config, &host, &machine_uuid)?;
-    let binary_path = std::env::current_exe().map_err(io_error)?;
-    let binary = normalize_binary_path(&binary_path)?;
-    let node_id = if let Some(id) = existing_id.as_deref() {
-        if let Some(existing) = config.nodes.get(id) {
-            if existing.transport != Transport::Local {
-                check_remote_idle(existing, id, &config_path)?;
-            }
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        fs::create_dir_all(state_dir).map_err(io_error)?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
+        if !config.queues.contains_key(queue_name) {
+            return Err((2, format!("queue '{queue_name}' is not configured")));
         }
-        id.to_owned()
-    } else if let Some(id) = pending_node_id {
-        id
-    } else {
-        let mut reserved = state.reserved_node_ids.clone();
-        reserved.extend(config.nodes.keys().cloned());
-        if let Ok(storage) = Storage::open(state_dir) {
-            for job in storage
-                .list_jobs(None)
-                .map_err(|error| (1, error.to_string()))?
-            {
-                if let Some(node) = job.node {
-                    reserved.insert(node.to_string());
-                }
-                if let Some(node) = job.spec.node {
-                    reserved.insert(node.to_string());
+        let host = resolve_local_host(&config, explicit_host)?;
+        let machine_uuid = local_platform_uuid()?;
+        let execution_uid = unsafe { libc::geteuid() };
+        let journal_path = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        let operation_key = format!("add-local:{machine_uuid}");
+        if let Some(previous) = state
+            .operations
+            .get(&operation_key)
+            .filter(|operation| operation.phase == "ABORTED")
+        {
+            state.reserved_node_ids.insert(previous.node_id.clone());
+        }
+        let pending_node_id = state
+            .operations
+            .get(&operation_key)
+            .filter(|operation| !matches!(operation.phase.as_str(), "READY" | "ABORTED"))
+            .map(|operation| operation.node_id.clone());
+        let existing_id = find_local_machine_registration(&config, &host, &machine_uuid)?;
+        let binary_path = std::env::current_exe().map_err(io_error)?;
+        let binary = normalize_binary_path(&binary_path)?;
+        let node_id = if let Some(id) = existing_id.as_deref() {
+            if let Some(existing) = config.nodes.get(id) {
+                if existing.transport != Transport::Local {
+                    check_remote_idle(existing, id, &config_path)?;
                 }
             }
+            id.to_owned()
+        } else if let Some(id) = pending_node_id {
+            id
+        } else {
+            let mut reserved = state.reserved_node_ids.clone();
+            reserved.extend(config.nodes.keys().cloned());
+            if let Ok(storage) = Storage::open(state_dir) {
+                for job in storage
+                    .list_jobs(None)
+                    .map_err(|error| (1, error.to_string()))?
+                {
+                    if let Some(node) = job.node {
+                        reserved.insert(node.to_string());
+                    }
+                    if let Some(node) = job.spec.node {
+                        reserved.insert(node.to_string());
+                    }
+                }
+            }
+            allocate_node_id(queue_name, &reserved)?
+        };
+        for (existing_id, node) in &config.nodes {
+            check_remote_idle(node, existing_id, &config_path)?;
         }
-        allocate_node_id(queue_name, &reserved)?
-    };
-    for (existing_id, node) in &config.nodes {
-        check_remote_idle(node, existing_id, &config_path)?;
-    }
-    let storage_node = config
-        .nodes
-        .get(config.storage_server.as_str())
-        .expect("storage server is configured");
-    let storage_facts = read_remote_facts(storage_node)?;
-    let local_gid = unsafe { libc::getegid() };
-    if execution_uid != storage_facts.uid || local_gid != storage_facts.gid {
-        return Err((
-            2,
-            format!(
-                "login node UID/GID is {execution_uid}/{local_gid}, but shared storage requires {}/{}",
-                storage_facts.uid, storage_facts.gid
-            ),
-        ));
-    }
-    let local_node = NodeConfig {
-        host: host.to_string(),
-        transport: Transport::Local,
-        remote_binary: binary.clone(),
-        ssh_user: None,
-        ssh_port: None,
-        ssh_identity_file: None,
-        remote_config: Some(config_path.to_string_lossy().into_owned()),
-        machine_uuid: Some(machine_uuid.clone()),
-        execution_uid: Some(execution_uid),
-    };
-    let digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    let mut operation = state
-        .operations
-        .get(&operation_key)
-        .filter(|operation| should_resume_add_operation(&operation.phase))
-        .cloned()
-        .unwrap_or_else(|| NodeOperation {
-            id: Id128::random().to_string(),
-            action: "add".into(),
-            connection_endpoint: None,
-            remote_config_path: None,
-            node_id: node_id.clone(),
-            endpoint: format!("local@{host}:22"),
+        let storage_node = config
+            .nodes
+            .get(config.storage_server.as_str())
+            .expect("storage server is configured");
+        let storage_facts = read_remote_facts(storage_node)?;
+        let local_gid = unsafe { libc::getegid() };
+        if execution_uid != storage_facts.uid || local_gid != storage_facts.gid {
+            return Err((
+                2,
+                format!(
+                    "login node UID/GID is {execution_uid}/{local_gid}, but shared storage requires {}/{}",
+                    storage_facts.uid, storage_facts.gid
+                ),
+            ));
+        }
+        let local_node = NodeConfig {
+            host: host.to_string(),
+            transport: Transport::Local,
+            remote_binary: binary.clone(),
+            ssh_user: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            remote_config: Some(config_path.to_string_lossy().into_owned()),
             machine_uuid: Some(machine_uuid.clone()),
-            phase: "SETUP_PENDING".into(),
-            old_config_sha256: Some(digest.clone()),
-            candidate_config_sha256: None,
-            managed_export: false,
-            managed_shares: BTreeSet::new(),
-            client_setup_attempted: Some(false),
-            detail: None,
-        });
-    operation.node_id = node_id.clone();
-    if operation
-        .old_config_sha256
-        .as_deref()
-        .is_some_and(|old| old != digest)
-    {
-        return Err((
+            execution_uid: Some(execution_uid),
+        };
+        let digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let mut operation = state
+            .operations
+            .get(&operation_key)
+            .filter(|operation| should_resume_add_operation(&operation.phase))
+            .cloned()
+            .unwrap_or_else(|| NodeOperation {
+                id: Id128::random().to_string(),
+                action: "add".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
+                node_id: node_id.clone(),
+                endpoint: format!("local@{host}:22"),
+                machine_uuid: Some(machine_uuid.clone()),
+                phase: "SETUP_PENDING".into(),
+                old_config_sha256: Some(digest.clone()),
+                candidate_config_sha256: None,
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(false),
+                detail: None,
+            });
+        operation.node_id = node_id.clone();
+        if operation
+            .old_config_sha256
+            .as_deref()
+            .is_some_and(|old| old != digest)
+        {
+            return Err((
             1,
             "cluster config changed during local enrollment; inspect the node admin journal before retrying".into(),
         ));
-    }
-    operation.phase = "SETUP_PENDING".into();
-    operation.old_config_sha256 = Some(digest.clone());
-    operation.candidate_config_sha256 = None;
-    operation.detail = Some("agent binaries are being staged before config activation".into());
-    state
-        .machine_uuids
-        .insert(node_id.clone(), machine_uuid.clone());
-    state.reserved_node_ids.insert(node_id.clone());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    let (staged_source, staged_config) = stage_current_agents(
-        &config,
-        &source,
-        &operation.id,
-        // The target's power helper is installed later in the same privileged
-        // client batch as its primary/named mounts. Existing nodes only need
-        // binary staging here; installing their helper here could prompt twice
-        // on the primary storage server during this enrollment.
-        AgentStagePurpose::Share,
-    )?;
-    let local_node = NodeConfig {
-        remote_binary: binary,
-        ..local_node
-    };
-    let existing_power_setups = if defer_queue_for_share {
-        BTreeMap::new()
-    } else {
-        prepare_power_helpers_for_nodes(&staged_config, &operation.id, Some(&machine_uuid))
-    };
-    let power_setup = if defer_queue_for_share {
-        None
-    } else {
-        match prepare_power_helper(
-            &local_node,
-            execution_uid,
-            std::env::consts::ARCH,
-            &operation.id,
-        ) {
-            Ok(setup) => setup,
-            Err(error) => {
-                eprintln!("Power sampler setup for local node {node_id} was skipped: {error}");
-                None
-            }
         }
-    };
-    operation.client_setup_attempted = Some(true);
-    operation.detail = Some("client NFS resources are being configured".into());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    if let Err(error) = configure_node_nfs_resources(
-        &config,
-        &node_id,
-        &local_node,
-        &operation.id,
-        &mut operation.managed_export,
-        &mut operation.managed_shares,
-        power_setup,
-        existing_power_setups,
-    ) {
-        operation.detail = Some(error.clone());
+        operation.phase = "SETUP_PENDING".into();
+        operation.old_config_sha256 = Some(digest.clone());
+        operation.candidate_config_sha256 = None;
+        operation.detail = Some("agent binaries are being staged before config activation".into());
+        state
+            .machine_uuids
+            .insert(node_id.clone(), machine_uuid.clone());
+        state.reserved_node_ids.insert(node_id.clone());
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((1, error));
-    }
-    if let Err((_, error)) = verify_login_share(&config_path) {
-        operation.detail = Some(error.clone());
+        let (staged_source, staged_config) = stage_current_agents(
+            &config,
+            &source,
+            &operation.id,
+            // The target's power helper is installed later in the same privileged
+            // client batch as its primary/named mounts. Existing nodes only need
+            // binary staging here; installing their helper here could prompt twice
+            // on the primary storage server during this enrollment.
+            AgentStagePurpose::Share,
+        )?;
+        let local_node = NodeConfig {
+            remote_binary: binary,
+            ..local_node
+        };
+        let existing_power_setups = if defer_queue_for_share {
+            BTreeMap::new()
+        } else {
+            prepare_power_helpers_for_nodes(&staged_config, &operation.id, Some(&machine_uuid))
+        };
+        let power_setup = if defer_queue_for_share {
+            None
+        } else {
+            match prepare_power_helper(
+                &local_node,
+                execution_uid,
+                std::env::consts::ARCH,
+                &operation.id,
+            ) {
+                Ok(setup) => setup,
+                Err(error) => {
+                    eprintln!("Power sampler setup for local node {node_id} was skipped: {error}");
+                    None
+                }
+            }
+        };
+        operation.client_setup_attempted = Some(true);
+        operation.detail = Some("client NFS resources are being configured".into());
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((
-            1,
-            format!(
-                "login node must see the primary shared directory before enrollment can complete: {error}"
-            ),
-        ));
-    }
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    let candidate = local_config_candidate(
-        &staged_config,
-        &staged_source,
-        &node_id,
-        queue_name,
-        !defer_queue_for_share,
-        &local_node,
-    )?;
-    let candidate_config =
-        ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
-    operation.phase = "ADD_COMMITTING".into();
-    operation.candidate_config_sha256 =
-        Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    operation.detail = Some("local node config is being committed".into());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    backup_config(&config_path, &operation.id)?;
-    atomic_write(&config_path, candidate.as_bytes())?;
-    operation.phase = "SYNC_PENDING".into();
-    operation.detail = None;
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&journal_path, &state)?;
-    if let Err(error) = sync_remote_configs(
-        &candidate_config,
-        &candidate,
-        state_dir,
-        &operation.id,
-        Some(&node_id),
-    ) {
-        operation.detail = Some(error.clone());
-        state.operations.insert(operation_key.clone(), operation);
+        if let Err(error) = configure_node_nfs_resources(
+            &config,
+            &node_id,
+            &local_node,
+            &operation.id,
+            &mut operation.managed_export,
+            &mut operation.managed_shares,
+            power_setup,
+            existing_power_setups,
+        ) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((1, error));
+        }
+        if let Err((_, error)) = verify_login_share(&config_path) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "login node must see the primary shared directory before enrollment can complete: {error}"
+                ),
+            ));
+        }
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        return Err((
-            1,
-            format!(
-                "local node {node_id} is configured, but peer config sync is pending: {error}. Rerun `mnode -a local` to resume."
-            ),
-        ));
-    }
-    operation.phase = "READY".into();
-    operation.detail = None;
-    state.operations.insert(operation_key, operation);
-    save_admin_state(&journal_path, &state)?;
-    if defer_queue_for_share {
-        println!(
-            "Prepared local node {node_id}; it remains outside all queues until its requested NFS share commits."
-        );
-    } else {
-        println!("Local login node {node_id} is ready at {host} and stays outside compute queues.");
-    }
-    println!("Restart the controller to apply the configuration change.");
-    Ok(())
+        let candidate = local_config_candidate(
+            &staged_config,
+            &staged_source,
+            &node_id,
+            queue_name,
+            !defer_queue_for_share,
+            &local_node,
+        )?;
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        operation.phase = "ADD_COMMITTING".into();
+        operation.candidate_config_sha256 =
+            Some(sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?);
+        operation.detail = Some("local node config is being committed".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        backup_config(&config_path, &operation.id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        operation.phase = "SYNC_PENDING".into();
+        operation.detail = None;
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        if let Err(error) = sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation.id,
+            Some(&node_id),
+        ) {
+            operation.detail = Some(error.clone());
+            state.operations.insert(operation_key.clone(), operation);
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "local node {node_id} is configured, but peer config sync is pending: {error}. Rerun `mnode -a local` to resume."
+                ),
+            ));
+        }
+        operation.phase = "READY".into();
+        operation.detail = None;
+        state.operations.insert(operation_key, operation);
+        save_admin_state(&journal_path, &state)?;
+        if defer_queue_for_share {
+            println!(
+                "Prepared local node {node_id}; it remains outside all queues until its requested NFS share commits."
+            );
+        } else {
+            println!(
+                "Local login node {node_id} is ready at {host} and stays outside compute queues."
+            );
+        }
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn local_config_candidate(
@@ -9424,541 +10112,597 @@ fn add_ssh_node(
     selected_queue: Option<&str>,
     defer_queue_for_share: bool,
 ) -> AppResult<()> {
-    let _maintenance = acquire_node_maintenance(config_path, state_dir, "node enrollment")?;
-    MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cluster config/state directory binding failed: {error}"),
-        )
-    })?;
-    fs::create_dir_all(state_dir).map_err(io_error)?;
-    let config_path = config_path.canonicalize().map_err(io_error)?;
-    let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
-    let config = ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
-    let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
-    if !config.queues.contains_key(queue_name) {
-        return Err((2, format!("queue '{queue_name}' is not configured")));
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "node enrollment",
+        MaintenanceScope::Cluster,
+    )?;
+    if maintenance.recovered {
+        return Ok(());
     }
-    let endpoint_text = endpoint.canonical();
-    let mut operation_key = format!("add:{endpoint_text}");
-    let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
-    let jobs = storage
-        .list_jobs(None)
-        .map_err(|error| (1, error.to_string()))?;
-    let mut state = read_admin_state(&state_dir.join("node-admin.json"), &config_path, state_dir)?;
-    if let Some((existing_id, existing_node)) = config
-        .nodes
-        .iter()
-        .find(|(_, node)| node.host == endpoint.host.to_string())
-    {
-        if !existing_ssh_endpoint_matches(existing_node, &endpoint) {
-            return Err((
-                2,
-                format!(
-                    "host {} is already registered with a different transport, SSH user, or port; use its configured identity",
-                    endpoint.host
-                ),
-            ));
-        }
-        let configured_digest =
-            sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-        let combined_pending_key = if defer_queue_for_share {
-            let pending =
-                pending_combined_ssh_add(&state, existing_id, &endpoint, &configured_digest)?;
-            if pending.is_none() {
-                // An ordinary share retry must not refresh setup or enroll a
-                // deliberately deferred node into the queue.
-                return Ok(());
-            }
-            pending
-        } else {
-            None
-        };
-        let machine_uuid = remote_machine_uuid(existing_node)?;
-        if [
-            existing_node.machine_uuid.as_deref(),
-            state.machine_uuids.get(existing_id).map(String::as_str),
-            combined_pending_key
-                .as_ref()
-                .and_then(|key| state.operations[key].machine_uuid.as_deref()),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|known| !known.eq_ignore_ascii_case(&machine_uuid))
-        {
-            return Err((
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
                 1,
-                format!(
-                    "host {} now reports a different machine UUID; refusing to reuse node {existing_id}",
-                    endpoint.host
-                ),
-            ));
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        fs::create_dir_all(state_dir).map_err(io_error)?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config =
+            ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
+        let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
+        if !config.queues.contains_key(queue_name) {
+            return Err((2, format!("queue '{queue_name}' is not configured")));
         }
-        if combined_pending_key.is_some() {
-            let facts = read_remote_facts(existing_node)?;
-            if existing_node
-                .execution_uid
-                .is_some_and(|expected| expected != facts.uid)
-            {
+        let endpoint_text = endpoint.canonical();
+        let mut operation_key = format!("add:{endpoint_text}");
+        let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
+        let jobs = storage
+            .list_jobs(None)
+            .map_err(|error| (1, error.to_string()))?;
+        let mut state =
+            read_admin_state(&state_dir.join("node-admin.json"), &config_path, state_dir)?;
+        if let Some((existing_id, existing_node)) = config
+            .nodes
+            .iter()
+            .find(|(_, node)| node.host == endpoint.host.to_string())
+        {
+            if !existing_ssh_endpoint_matches(existing_node, &endpoint) {
                 return Err((
-                    1,
-                    format!("node {existing_id} execution UID changed; refusing enrollment sync"),
-                ));
-            }
-        }
-        state
-            .machine_uuids
-            .insert(existing_id.clone(), machine_uuid.clone());
-        state.reserved_node_ids.insert(existing_id.clone());
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        let queue_operation_key = format!("queue:{existing_id}:{queue_name}");
-        let is_queue_member = config
-            .queues
-            .get(queue_name)
-            .is_some_and(|queue| queue.nodes.iter().any(|member| member == existing_id));
-        let pending_key = combined_pending_key.as_deref().or_else(|| {
-            is_queue_member
-                .then(|| {
-                    [operation_key.as_str(), queue_operation_key.as_str()]
-                        .into_iter()
-                        .find(|key| {
-                            state.operations.get(*key).is_some_and(|operation| {
-                                operation.node_id == *existing_id
-                                    && matches!(
-                                        operation.phase.as_str(),
-                                        "ADD_COMMITTING" | "SYNC_PENDING"
-                                    )
-                            })
-                        })
-                })
-                .flatten()
-        });
-        if let Some(key) = pending_key {
-            let operation = state
-                .operations
-                .get(key)
-                .cloned()
-                .expect("pending key was found in operation journal");
-            if operation.candidate_config_sha256.as_deref() != Some(configured_digest.as_str()) {
-                return Err((
-                    1,
+                    2,
                     format!(
-                        "node {existing_id} is present but its operation journal does not match the active config; inspect the node-admin journal"
+                        "host {} is already registered with a different transport, SSH user, or port; use its configured identity",
+                        endpoint.host
                     ),
                 ));
             }
-            let key = key.to_owned();
-            resume_existing_ssh_add_sync(
-                &mut state,
-                &state_dir.join("node-admin.json"),
-                &key,
-                &endpoint,
-                |operation| {
-                    sync_remote_configs(
-                        &config,
-                        &config_source,
-                        state_dir,
-                        &operation.id,
-                        Some(existing_id),
-                    )
-                },
-            )?;
-        }
-        if defer_queue_for_share {
-            return Ok(());
-        }
-        if is_queue_member {
-            let facts = read_remote_facts(existing_node)?;
-            if facts.os != "Darwin" {
-                return Err((2, format!("{} is not macOS", endpoint.host)));
-            }
-            if existing_node
-                .execution_uid
-                .is_some_and(|expected| expected != facts.uid)
+            let configured_digest =
+                sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+            let combined_pending_key = if defer_queue_for_share {
+                let pending =
+                    pending_combined_ssh_add(&state, existing_id, &endpoint, &configured_digest)?;
+                if pending.is_none() {
+                    // An ordinary share retry must not refresh setup or enroll a
+                    // deliberately deferred node into the queue.
+                    return Ok(());
+                }
+                pending
+            } else {
+                None
+            };
+            let machine_uuid = remote_machine_uuid(existing_node)?;
+            if [
+                existing_node.machine_uuid.as_deref(),
+                state.machine_uuids.get(existing_id).map(String::as_str),
+                combined_pending_key
+                    .as_ref()
+                    .and_then(|key| state.operations[key].machine_uuid.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|known| !known.eq_ignore_ascii_case(&machine_uuid))
             {
                 return Err((
                     1,
-                    format!("node {existing_id} execution UID changed; refusing power setup"),
+                    format!(
+                        "host {} now reports a different machine UUID; refusing to reuse node {existing_id}",
+                        endpoint.host
+                    ),
                 ));
             }
-            ensure_agent_capabilities(existing_node).map_err(|(_, error)| {
-                (
-                    1,
-                    format!("cannot refresh node {existing_id} capabilities: {error}"),
-                )
-            })?;
-            let operation_id = state
-                .operations
-                .get(&operation_key)
-                .map(|operation| operation.id.clone())
-                .unwrap_or_else(|| Id128::random().to_string());
-            check_remote_idle(existing_node, existing_id, &config_path)?;
-            let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
-            claim_enrollment_agent(
-                existing_node,
-                existing_id,
-                &config_path,
-                &config.share_uuid,
-                handoff,
-            )
-            .map_err(|error| (1, error))?;
-            ensure_power_helper(existing_node, facts.uid, &facts.arch, &operation_id).map_err(
-                |error| {
+            if combined_pending_key.is_some() {
+                let facts = read_remote_facts(existing_node)?;
+                if existing_node
+                    .execution_uid
+                    .is_some_and(|expected| expected != facts.uid)
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "node {existing_id} execution UID changed; refusing enrollment sync"
+                        ),
+                    ));
+                }
+            }
+            state
+                .machine_uuids
+                .insert(existing_id.clone(), machine_uuid.clone());
+            state.reserved_node_ids.insert(existing_id.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            let queue_operation_key = format!("queue:{existing_id}:{queue_name}");
+            let is_queue_member = config
+                .queues
+                .get(queue_name)
+                .is_some_and(|queue| queue.nodes.iter().any(|member| member == existing_id));
+            let pending_key = combined_pending_key.as_deref().or_else(|| {
+                is_queue_member
+                    .then(|| {
+                        [operation_key.as_str(), queue_operation_key.as_str()]
+                            .into_iter()
+                            .find(|key| {
+                                state.operations.get(*key).is_some_and(|operation| {
+                                    operation.node_id == *existing_id
+                                        && matches!(
+                                            operation.phase.as_str(),
+                                            "ADD_COMMITTING" | "SYNC_PENDING"
+                                        )
+                                })
+                            })
+                    })
+                    .flatten()
+            });
+            if let Some(key) = pending_key {
+                let operation = state
+                    .operations
+                    .get(key)
+                    .cloned()
+                    .expect("pending key was found in operation journal");
+                if operation.candidate_config_sha256.as_deref() != Some(configured_digest.as_str())
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "node {existing_id} is present but its operation journal does not match the active config; inspect the node-admin journal"
+                        ),
+                    ));
+                }
+                let key = key.to_owned();
+                resume_existing_ssh_add_sync(
+                    &mut state,
+                    &state_dir.join("node-admin.json"),
+                    &key,
+                    &endpoint,
+                    |operation| {
+                        sync_remote_configs(
+                            &config,
+                            &config_source,
+                            state_dir,
+                            &operation.id,
+                            Some(existing_id),
+                        )
+                    },
+                )?;
+            }
+            if defer_queue_for_share {
+                return Ok(());
+            }
+            if is_queue_member {
+                let facts = read_remote_facts(existing_node)?;
+                if facts.os != "Darwin" {
+                    return Err((2, format!("{} is not macOS", endpoint.host)));
+                }
+                if existing_node
+                    .execution_uid
+                    .is_some_and(|expected| expected != facts.uid)
+                {
+                    return Err((
+                        1,
+                        format!("node {existing_id} execution UID changed; refusing power setup"),
+                    ));
+                }
+                ensure_agent_capabilities(existing_node).map_err(|(_, error)| {
                     (
                         1,
-                        format!("cannot set up power sampler on {existing_id}: {error}"),
+                        format!("cannot refresh node {existing_id} capabilities: {error}"),
                     )
-                },
-            )?;
-            println!("Node {existing_id} is already enrolled in queue {queue_name}.");
-            println!("Power sampler verified on {}.", existing_node.host);
-            return Ok(());
+                })?;
+                let operation_id = state
+                    .operations
+                    .get(&operation_key)
+                    .map(|operation| operation.id.clone())
+                    .unwrap_or_else(|| Id128::random().to_string());
+                check_remote_idle(existing_node, existing_id, &config_path)?;
+                let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+                claim_enrollment_agent(
+                    existing_node,
+                    existing_id,
+                    &config_path,
+                    &config.share_uuid,
+                    handoff,
+                )
+                .map_err(|error| (1, error))?;
+                ensure_power_helper(existing_node, facts.uid, &facts.arch, &operation_id).map_err(
+                    |error| {
+                        (
+                            1,
+                            format!("cannot set up power sampler on {existing_id}: {error}"),
+                        )
+                    },
+                )?;
+                println!("Node {existing_id} is already enrolled in queue {queue_name}.");
+                println!("Power sampler verified on {}.", existing_node.host);
+                return Ok(());
+            }
+            return add_existing_ssh_node_to_queue(
+                &config_path,
+                state_dir,
+                &config_source,
+                &config,
+                existing_id,
+                queue_name,
+                &machine_uuid,
+                &mut state,
+            );
         }
-        return add_existing_ssh_node_to_queue(
-            &config_path,
-            state_dir,
-            &config_source,
-            &config,
-            existing_id,
-            queue_name,
-            &machine_uuid,
-            &mut state,
-        );
-    }
-    for job in jobs {
-        if let Some(node) = job.node {
-            state.reserved_node_ids.insert(node.to_string());
+        for job in jobs {
+            if let Some(node) = job.node {
+                state.reserved_node_ids.insert(node.to_string());
+            }
+            if let Some(node) = job.spec.node {
+                state.reserved_node_ids.insert(node.to_string());
+            }
         }
-        if let Some(node) = job.spec.node {
-            state.reserved_node_ids.insert(node.to_string());
+        for id in config.nodes.keys() {
+            state.reserved_node_ids.insert(id.clone());
         }
-    }
-    for id in config.nodes.keys() {
-        state.reserved_node_ids.insert(id.clone());
-    }
 
-    let active_node_ids = config.nodes.keys().cloned().collect();
-    let pending = pending_add_operation_for_endpoint(&state, &active_node_ids, &endpoint_text);
-    let mut operation = if let Some((pending_key, pending_operation)) = pending {
-        operation_key = pending_key;
-        Some(pending_operation)
-    } else {
-        let mut operation = state.operations.get(&operation_key).cloned();
-        if operation.as_ref().is_some_and(|operation| {
-            matches!(operation.phase.as_str(), "READY" | "ABORTED")
-                && !config.nodes.contains_key(&operation.node_id)
-        }) {
-            operation_key = format!("add:{endpoint_text}:{}", Id128::random());
-            operation = None;
+        let active_node_ids = config.nodes.keys().cloned().collect();
+        let pending = pending_add_operation_for_endpoint(&state, &active_node_ids, &endpoint_text);
+        let mut operation = if let Some((pending_key, pending_operation)) = pending {
+            operation_key = pending_key;
+            Some(pending_operation)
+        } else {
+            let mut operation = state.operations.get(&operation_key).cloned();
+            if operation.as_ref().is_some_and(|operation| {
+                matches!(operation.phase.as_str(), "READY" | "ABORTED")
+                    && !config.nodes.contains_key(&operation.node_id)
+            }) {
+                operation_key = format!("add:{endpoint_text}:{}", Id128::random());
+                operation = None;
+            }
+            operation
+        };
+        if let Some(previous) = operation.as_ref() {
+            if previous.phase == "READY" && config.nodes.contains_key(&previous.node_id) {
+                println!("Node {} is already enrolled and ready.", previous.node_id);
+                return Ok(());
+            }
         }
-        operation
-    };
-    if let Some(previous) = operation.as_ref() {
-        if previous.phase == "READY" && config.nodes.contains_key(&previous.node_id) {
-            println!("Node {} is already enrolled and ready.", previous.node_id);
-            return Ok(());
-        }
-    }
-    let node_id = if let Some(operation) = operation.as_ref() {
-        operation.node_id.clone()
-    } else {
-        allocate_node_id(queue_name, &state.reserved_node_ids)?
-    };
-    state.reserved_node_ids.insert(node_id.clone());
-    let id = operation
-        .as_ref()
-        .map(|operation| operation.id.clone())
-        .unwrap_or_else(|| Id128::random().to_string());
+        let node_id = if let Some(operation) = operation.as_ref() {
+            operation.node_id.clone()
+        } else {
+            allocate_node_id(queue_name, &state.reserved_node_ids)?
+        };
+        state.reserved_node_ids.insert(node_id.clone());
+        let id = operation
+            .as_ref()
+            .map(|operation| operation.id.clone())
+            .unwrap_or_else(|| Id128::random().to_string());
 
-    let mut remote = endpoint.node_config("/usr/local/bin/macluster".into(), None);
-    crate::ssh_bootstrap::ensure_ssh_access(&mut remote, &endpoint.ssh_identity_endpoint())
-        .map_err(|error| {
-            (
+        let mut remote = endpoint.node_config("/usr/local/bin/macluster".into(), None);
+        crate::ssh_bootstrap::ensure_ssh_access(&mut remote, &endpoint.ssh_identity_endpoint())
+            .map_err(|error| {
+                (
+                    1,
+                    format!("SSH setup failed for {}: {error}", endpoint.host),
+                )
+            })?;
+        let facts = read_remote_facts(&remote)?;
+        if facts.os != "Darwin" {
+            return Err((2, format!("{} is not macOS", endpoint.host)));
+        }
+        let machine_uuid = remote_machine_uuid(&remote)?;
+        let storage_host = &config
+            .nodes
+            .get(config.storage_server.as_str())
+            .expect("storage server is configured")
+            .host;
+        let client_ip = remote_route_ipv4(&remote, storage_host)?;
+        if client_ip != endpoint.host {
+            return Err((
                 1,
-                format!("SSH setup failed for {}: {error}", endpoint.host),
-            )
-        })?;
-    let facts = read_remote_facts(&remote)?;
-    if facts.os != "Darwin" {
-        return Err((2, format!("{} is not macOS", endpoint.host)));
-    }
-    let machine_uuid = remote_machine_uuid(&remote)?;
-    let storage_host = &config
-        .nodes
-        .get(config.storage_server.as_str())
-        .expect("storage server is configured")
-        .host;
-    let client_ip = remote_route_ipv4(&remote, storage_host)?;
-    if client_ip != endpoint.host {
-        return Err((
-            1,
-            format!(
-                "SSH endpoint {} routes to the NFS server from {client_ip}; this version requires the endpoint and actual NFS client IP to match",
-                endpoint.host
-            ),
-        ));
-    }
-    if operation
-        .as_ref()
-        .and_then(|operation| operation.machine_uuid.as_deref())
-        .is_some_and(|recorded| recorded != machine_uuid)
-    {
-        return Err((
-            1,
-            format!(
-                "endpoint {} now reports machine UUID {machine_uuid}, different from the pending enrollment identity; refusing to reuse its node ID",
-                endpoint.host
-            ),
-        ));
-    }
-    for (existing_id, existing_node) in &config.nodes {
-        let identity = remote_machine_uuid(existing_node).map_err(|(_, error)| {
-            (
-                1,
-                format!("cannot verify existing node {existing_id} identity: {error}"),
-            )
-        })?;
-        if state
-            .machine_uuids
-            .get(existing_id)
-            .is_some_and(|known| known != &identity)
+                format!(
+                    "SSH endpoint {} routes to the NFS server from {client_ip}; this version requires the endpoint and actual NFS client IP to match",
+                    endpoint.host
+                ),
+            ));
+        }
+        if operation
+            .as_ref()
+            .and_then(|operation| operation.machine_uuid.as_deref())
+            .is_some_and(|recorded| recorded != machine_uuid)
         {
             return Err((
                 1,
                 format!(
-                    "node {existing_id} reports machine UUID {identity}, different from its recorded identity; refusing enrollment"
+                    "endpoint {} now reports machine UUID {machine_uuid}, different from the pending enrollment identity; refusing to reuse its node ID",
+                    endpoint.host
                 ),
             ));
         }
-        if identity == machine_uuid {
+        for (existing_id, existing_node) in &config.nodes {
+            let identity = remote_machine_uuid(existing_node).map_err(|(_, error)| {
+                (
+                    1,
+                    format!("cannot verify existing node {existing_id} identity: {error}"),
+                )
+            })?;
+            if state
+                .machine_uuids
+                .get(existing_id)
+                .is_some_and(|known| known != &identity)
+            {
+                return Err((
+                    1,
+                    format!(
+                        "node {existing_id} reports machine UUID {identity}, different from its recorded identity; refusing enrollment"
+                    ),
+                ));
+            }
+            if identity == machine_uuid {
+                return Err((
+                    2,
+                    format!("machine {machine_uuid} is already registered as {existing_id}"),
+                ));
+            }
+            state.machine_uuids.insert(existing_id.clone(), identity);
+        }
+        let superseded_pending = if operation.is_some() {
+            abort_duplicate_pristine_adds(&mut state, &endpoint_text, &node_id, &machine_uuid)
+        } else {
+            0
+        };
+        if superseded_pending > 0 {
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            eprintln!(
+                "Consolidated {superseded_pending} duplicate pending enrollment record(s) for {}; resuming {node_id}. Superseded node IDs remain reserved.",
+                endpoint.canonical()
+            );
+        }
+        let storage_node = config
+            .nodes
+            .get(config.storage_server.as_str())
+            .expect("storage server is configured");
+        let storage_facts = read_remote_facts(storage_node)?;
+        if facts.uid != storage_facts.uid || facts.gid != storage_facts.gid {
             return Err((
                 2,
-                format!("machine {machine_uuid} is already registered as {existing_id}"),
+                format!(
+                    "UID/GID mismatch: candidate is {}/{}, storage account must match",
+                    facts.uid, facts.gid
+                ),
             ));
         }
-        state.machine_uuids.insert(existing_id.clone(), identity);
-    }
-    let superseded_pending = if operation.is_some() {
-        abort_duplicate_pristine_adds(&mut state, &endpoint_text, &node_id, &machine_uuid)
-    } else {
-        0
-    };
-    if superseded_pending > 0 {
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        eprintln!(
-            "Consolidated {superseded_pending} duplicate pending enrollment record(s) for {}; resuming {node_id}. Superseded node IDs remain reserved.",
-            endpoint.canonical()
-        );
-    }
-    let storage_node = config
-        .nodes
-        .get(config.storage_server.as_str())
-        .expect("storage server is configured");
-    let storage_facts = read_remote_facts(storage_node)?;
-    if facts.uid != storage_facts.uid || facts.gid != storage_facts.gid {
-        return Err((
-            2,
-            format!(
-                "UID/GID mismatch: candidate is {}/{}, storage account must match",
-                facts.uid, facts.gid
-            ),
-        ));
-    }
-    verify_storage_root(
-        storage_node,
-        config.primary_source_root(),
-        &config.share_uuid,
-        storage_facts.uid,
-        storage_facts.gid,
-    )?;
-    state
-        .machine_uuids
-        .insert(node_id.clone(), machine_uuid.clone());
-    if operation.is_none() {
-        operation = Some(NodeOperation {
-            id,
-            action: "add".into(),
-            connection_endpoint: None,
-            remote_config_path: None,
-            node_id: node_id.clone(),
-            endpoint: endpoint_text,
-            machine_uuid: Some(machine_uuid.clone()),
-            phase: "SETUP_PENDING".into(),
-            old_config_sha256: Some(
-                sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?,
-            ),
-            candidate_config_sha256: None,
-            managed_export: false,
-            managed_shares: BTreeSet::new(),
-            client_setup_attempted: Some(false),
-            detail: None,
-        });
-    }
-    let operation = operation.as_mut().expect("operation was initialized");
-    operation.machine_uuid = Some(machine_uuid.clone());
-    operation.phase = "SETUP_PENDING".into();
-    operation.detail =
-        Some("enrollment is incomplete; rerun the same mnode --add command to resume".into());
-    if operation.old_config_sha256.is_none() {
-        operation.old_config_sha256 =
-            Some(sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    }
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-
-    for (existing_id, existing_node) in &config.nodes {
-        check_remote_idle(existing_node, existing_id, &config_path)?;
-    }
-    let (staged_source, staged_config) = stage_current_agents(
-        &config,
-        &config_source,
-        &operation.id,
-        // The candidate node gets its helper together with its mount setup
-        // below. Avoid a separate helper sudo on existing storage nodes.
-        AgentStagePurpose::Share,
-    )?;
-    let config_source = staged_source;
-    let config = staged_config;
-    let binary = select_local_binary(&facts.arch)?;
-    let binary_kb = fs::metadata(&binary)
-        .map_err(io_error)?
-        .len()
-        .div_ceil(1024);
-    let required_kb = binary_kb.saturating_mul(2).saturating_add(50_000);
-    if facts.free_kb < required_kb {
-        return Err((
-            1,
-            format!(
-                "node {} has {} KiB free, but enrollment needs about {} KiB",
-                endpoint.host, facts.free_kb, required_kb
-            ),
-        ));
-    }
-    let remote_home = checked_remote_path(&facts.home)?;
-    let binary_digest = local_sha256(&binary)?;
-    let remote_binary = format!(
-        "{remote_home}/.local/share/macluster/clusters/{}/bin/{binary_digest}/macluster",
-        config.share_uuid
-    );
-    // Keep this machine's own login configuration and older enrollment
-    // snapshots separate from the compute Agent configuration we manage.
-    let remote_config = remote_agent_config_path(&remote_home, &config.share_uuid, &machine_uuid);
-    let mut node_config = endpoint.node_config(remote_binary.clone(), Some(remote_config.clone()));
-    node_config.ssh_identity_file = remote.ssh_identity_file.clone();
-    node_config.machine_uuid = Some(machine_uuid.clone());
-    node_config.execution_uid = Some(facts.uid);
-    ensure_remote_binary(&node_config, &binary, &facts.version, &operation.id)?;
-    ensure_agent_capabilities(&node_config)?;
-    let candidate_source = config_path_candidate(
-        &config,
-        &config_source,
-        &node_id,
-        queue_name,
-        !defer_queue_for_share,
-        &endpoint,
-        &remote_binary,
-        &remote_config,
-        node_config.ssh_identity_file.as_deref(),
-        &machine_uuid,
-        facts.uid,
-    )?;
-    operation.remote_config_path = Some(remote_config.clone());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    ensure_remote_config(
-        &node_config,
-        &remote_config,
-        &candidate_source,
-        &operation.id,
-        state_dir,
-    )?;
-    let candidate_config =
-        ClusterConfig::parse(&candidate_source).map_err(|error| (2, error.to_string()))?;
-    let candidate_node_id = NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
-    let mut candidate_transport =
-        ClusterTransport::new_with_namespace(PathBuf::from("/dev/null"), config.share_uuid.clone());
-    candidate_transport.timeout = Duration::from_secs(12);
-    let bridge = candidate_transport
-        .call(&candidate_node_id, &node_config, Operation::Ping)
-        .map_err(|error| (1, format!("candidate agent bridge check failed: {error}")))?;
-    if bridge != ResponseBody::Pong {
-        return Err((
-            1,
-            "candidate agent bridge returned an unexpected response".into(),
-        ));
-    }
-    check_remote_idle(&node_config, &node_id, &config_path)?;
-    if let Err((_, error)) = verify_login_share(&config_path) {
-        operation.detail = Some(
-            "login node does not currently see the configured NFS export and share marker".into(),
-        );
+        verify_storage_root(
+            storage_node,
+            config.primary_source_root(),
+            &config.share_uuid,
+            storage_facts.uid,
+            storage_facts.gid,
+        )?;
+        state
+            .machine_uuids
+            .insert(node_id.clone(), machine_uuid.clone());
+        if operation.is_none() {
+            operation = Some(NodeOperation {
+                id,
+                action: "add".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
+                node_id: node_id.clone(),
+                endpoint: endpoint_text,
+                machine_uuid: Some(machine_uuid.clone()),
+                phase: "SETUP_PENDING".into(),
+                old_config_sha256: Some(
+                    sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?,
+                ),
+                candidate_config_sha256: None,
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(false),
+                detail: None,
+            });
+        }
+        let operation = operation.as_mut().expect("operation was initialized");
+        operation.machine_uuid = Some(machine_uuid.clone());
+        operation.phase = "SETUP_PENDING".into();
+        operation.detail =
+            Some("enrollment is incomplete; rerun the same mnode --add command to resume".into());
+        if operation.old_config_sha256.is_none() {
+            operation.old_config_sha256 =
+                Some(sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
+        }
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((
-            1,
-            format!(
-                "login node must have the configured NFS share mounted and verified before enrolling another node: {error}"
-            ),
-        ));
-    }
-    let candidate_digest =
-        sha256_hex(candidate_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
-    operation.phase = "CANDIDATE_INSTALLED".into();
-    operation.candidate_config_sha256 = Some(candidate_digest);
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
 
-    let existing_power_setups =
-        prepare_power_helpers_for_nodes(&config, &operation.id, Some(&machine_uuid));
-    let power_setup =
-        match prepare_power_helper(&node_config, facts.uid, &facts.arch, &operation.id) {
-            Ok(setup) => setup,
-            Err(error) => {
-                eprintln!("Power sampler setup for {node_id} was skipped: {error}");
-                None
+        for (existing_id, existing_node) in &config.nodes {
+            check_remote_idle(existing_node, existing_id, &config_path)?;
+        }
+        let (staged_source, staged_config) = stage_current_agents(
+            &config,
+            &config_source,
+            &operation.id,
+            // The candidate node gets its helper together with its mount setup
+            // below. Avoid a separate helper sudo on existing storage nodes.
+            AgentStagePurpose::Share,
+        )?;
+        let config_source = staged_source;
+        let config = staged_config;
+        let binary = select_local_binary(&facts.arch)?;
+        let binary_kb = fs::metadata(&binary)
+            .map_err(io_error)?
+            .len()
+            .div_ceil(1024);
+        let required_kb = binary_kb.saturating_mul(2).saturating_add(50_000);
+        if facts.free_kb < required_kb {
+            return Err((
+                1,
+                format!(
+                    "node {} has {} KiB free, but enrollment needs about {} KiB",
+                    endpoint.host, facts.free_kb, required_kb
+                ),
+            ));
+        }
+        let remote_home = checked_remote_path(&facts.home)?;
+        let binary_digest = local_sha256(&binary)?;
+        let remote_binary = format!(
+            "{remote_home}/.local/share/macluster/clusters/{}/bin/{binary_digest}/macluster",
+            config.share_uuid
+        );
+        // Keep this machine's own login configuration and older enrollment
+        // snapshots separate from the compute Agent configuration we manage.
+        let remote_config =
+            remote_agent_config_path(&remote_home, &config.share_uuid, &machine_uuid);
+        let mut node_config =
+            endpoint.node_config(remote_binary.clone(), Some(remote_config.clone()));
+        node_config.ssh_identity_file = remote.ssh_identity_file.clone();
+        node_config.machine_uuid = Some(machine_uuid.clone());
+        node_config.execution_uid = Some(facts.uid);
+        ensure_remote_binary(&node_config, &binary, &facts.version, &operation.id)?;
+        ensure_agent_capabilities(&node_config)?;
+        let candidate_source = config_path_candidate(
+            &config,
+            &config_source,
+            &node_id,
+            queue_name,
+            !defer_queue_for_share,
+            &endpoint,
+            &remote_binary,
+            &remote_config,
+            node_config.ssh_identity_file.as_deref(),
+            &machine_uuid,
+            facts.uid,
+        )?;
+        operation.remote_config_path = Some(remote_config.clone());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+        ensure_remote_config(
+            &node_config,
+            &remote_config,
+            &candidate_source,
+            &operation.id,
+            state_dir,
+        )?;
+        let candidate_config =
+            ClusterConfig::parse(&candidate_source).map_err(|error| (2, error.to_string()))?;
+        let candidate_node_id =
+            NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
+        let mut candidate_transport = ClusterTransport::new_with_namespace(
+            PathBuf::from("/dev/null"),
+            config.share_uuid.clone(),
+        );
+        candidate_transport.timeout = Duration::from_secs(12);
+        let bridge = candidate_transport
+            .call(&candidate_node_id, &node_config, Operation::Ping)
+            .map_err(|error| (1, format!("candidate agent bridge check failed: {error}")))?;
+        if bridge != ResponseBody::Pong {
+            return Err((
+                1,
+                "candidate agent bridge returned an unexpected response".into(),
+            ));
+        }
+        check_remote_idle(&node_config, &node_id, &config_path)?;
+        if let Err((_, error)) = verify_login_share(&config_path) {
+            operation.detail = Some(
+                "login node does not currently see the configured NFS export and share marker"
+                    .into(),
+            );
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            return Err((
+                1,
+                format!(
+                    "login node must have the configured NFS share mounted and verified before enrolling another node: {error}"
+                ),
+            ));
+        }
+        let candidate_digest =
+            sha256_hex(candidate_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        operation.phase = "CANDIDATE_INSTALLED".into();
+        operation.candidate_config_sha256 = Some(candidate_digest);
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+
+        let existing_power_setups =
+            prepare_power_helpers_for_nodes(&config, &operation.id, Some(&machine_uuid));
+        let power_setup =
+            match prepare_power_helper(&node_config, facts.uid, &facts.arch, &operation.id) {
+                Ok(setup) => setup,
+                Err(error) => {
+                    eprintln!("Power sampler setup for {node_id} was skipped: {error}");
+                    None
+                }
+            };
+        operation.client_setup_attempted = Some(true);
+        operation.detail = Some("client NFS resources are being configured".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+        let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+        if let Err(detail) = configure_node_nfs_resources_with_claim(
+            &config,
+            &node_id,
+            &node_config,
+            &operation.id,
+            &mut operation.managed_export,
+            &mut operation.managed_shares,
+            power_setup,
+            existing_power_setups,
+            Some(handoff),
+        ) {
+            operation.phase = "SETUP_PENDING".into();
+            operation.detail = Some(detail.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            return Err((1, detail));
+        }
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+        let check = match remote_node_check(&node_config, &node_id) {
+            Ok(check) => check,
+            Err((_, error)) => {
+                operation.phase = "SETUP_PENDING".into();
+                operation.detail = Some(error.clone());
+                state
+                    .operations
+                    .insert(operation_key.clone(), operation.clone());
+                save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+                return Err((1, error));
             }
         };
-    operation.client_setup_attempted = Some(true);
-    operation.detail = Some("client NFS resources are being configured".into());
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
-    if let Err(detail) = configure_node_nfs_resources_with_claim(
-        &config,
-        &node_id,
-        &node_config,
-        &operation.id,
-        &mut operation.managed_export,
-        &mut operation.managed_shares,
-        power_setup,
-        existing_power_setups,
-        Some(handoff),
-    ) {
-        operation.phase = "SETUP_PENDING".into();
-        operation.detail = Some(detail.clone());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((1, detail));
-    }
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    let check = match remote_node_check(&node_config, &node_id) {
-        Ok(check) => check,
-        Err((_, error)) => {
+        if check.machine_uuid.as_deref() != Some(machine_uuid.as_str()) {
+            operation.phase = "SETUP_PENDING".into();
+            operation.detail = Some("remote machine identity changed during enrollment".into());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            return Err((
+                1,
+                "remote machine identity changed during enrollment".into(),
+            ));
+        }
+        if !check.shared_storage_ready {
+            operation.phase = "SETUP_PENDING".into();
+            operation.detail = Some("remote NFS marker or mount source did not match".into());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            return Err((
+                1,
+                "candidate mounted NFS but share marker/source verification failed".into(),
+            ));
+        }
+        if let Err((_, error)) =
+            verify_cross_node_write(&config.shared_root, &node_config, &operation.id)
+        {
             operation.phase = "SETUP_PENDING".into();
             operation.detail = Some(error.clone());
             state
@@ -9967,104 +10711,70 @@ fn add_ssh_node(
             save_admin_state(&state_dir.join("node-admin.json"), &state)?;
             return Err((1, error));
         }
-    };
-    if check.machine_uuid.as_deref() != Some(machine_uuid.as_str()) {
-        operation.phase = "SETUP_PENDING".into();
-        operation.detail = Some("remote machine identity changed during enrollment".into());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((
-            1,
-            "remote machine identity changed during enrollment".into(),
-        ));
-    }
-    if !check.shared_storage_ready {
-        operation.phase = "SETUP_PENDING".into();
-        operation.detail = Some("remote NFS marker or mount source did not match".into());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((
-            1,
-            "candidate mounted NFS but share marker/source verification failed".into(),
-        ));
-    }
-    if let Err((_, error)) =
-        verify_cross_node_write(&config.shared_root, &node_config, &operation.id)
-    {
-        operation.phase = "SETUP_PENDING".into();
-        operation.detail = Some(error.clone());
-        state
-            .operations
-            .insert(operation_key.clone(), operation.clone());
-        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((1, error));
-    }
 
-    let current_bytes = fs::read(&config_path).map_err(io_error)?;
-    let current_digest = sha256_hex(&current_bytes).map_err(|error| (1, error.to_string()))?;
-    if operation.old_config_sha256.as_deref() != Some(current_digest.as_str()) {
-        return Err((
-            1,
-            "cluster config changed during node enrollment; no local config was overwritten".into(),
-        ));
-    }
-    backup_config(&config_path, &operation.id)?;
-    operation.phase = "ADD_COMMITTING".into();
-    operation.candidate_config_sha256 =
-        Some(sha256_hex(candidate_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    atomic_write(&config_path, candidate_source.as_bytes())?;
-    operation.phase = "SYNC_PENDING".into();
-    operation.detail = None;
-    state
-        .operations
-        .insert(operation_key.clone(), operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    if let Err(error) = sync_remote_configs(
-        &candidate_config,
-        &candidate_source,
-        state_dir,
-        &operation.id,
-        Some(&node_id),
-    ) {
-        operation.detail = Some(error.clone());
+        let current_bytes = fs::read(&config_path).map_err(io_error)?;
+        let current_digest = sha256_hex(&current_bytes).map_err(|error| (1, error.to_string()))?;
+        if operation.old_config_sha256.as_deref() != Some(current_digest.as_str()) {
+            return Err((
+                1,
+                "cluster config changed during node enrollment; no local config was overwritten"
+                    .into(),
+            ));
+        }
+        backup_config(&config_path, &operation.id)?;
+        operation.phase = "ADD_COMMITTING".into();
+        operation.candidate_config_sha256 =
+            Some(sha256_hex(candidate_source.as_bytes()).map_err(|error| (1, error.to_string()))?);
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        return Err((
-            1,
-            format!(
-                "node {node_id} was added locally, but peer config sync is pending: {error}. Rerun the same `mnode -a {}` command to resume.",
-                endpoint.canonical()
-            ),
-        ));
-    }
-    operation.phase = "READY".into();
-    operation.detail = None;
-    state.operations.insert(operation_key, operation.clone());
-    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    if defer_queue_for_share {
+        atomic_write(&config_path, candidate_source.as_bytes())?;
+        operation.phase = "SYNC_PENDING".into();
+        operation.detail = None;
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+        if let Err(error) = sync_remote_configs(
+            &candidate_config,
+            &candidate_source,
+            state_dir,
+            &operation.id,
+            Some(&node_id),
+        ) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            return Err((
+                1,
+                format!(
+                    "node {node_id} was added locally, but peer config sync is pending: {error}. Rerun the same `mnode -a {}` command to resume.",
+                    endpoint.canonical()
+                ),
+            ));
+        }
+        operation.phase = "READY".into();
+        operation.detail = None;
+        state.operations.insert(operation_key, operation.clone());
+        save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+        if defer_queue_for_share {
+            println!(
+                "Prepared node {node_id}; it remains outside all queues until its requested NFS share commits."
+            );
+        } else {
+            println!("Added node {node_id} to queue {queue_name}.");
+        }
+        println!("Machine UUID: {machine_uuid}");
+        println!("Remote config: {remote_config}");
         println!(
-            "Prepared node {node_id}; it remains outside all queues until its requested NFS share commits."
+            "NFS mount is active for this session; configure a persistent mount separately if required."
         );
-    } else {
-        println!("Added node {node_id} to queue {queue_name}.");
-    }
-    println!("Machine UUID: {machine_uuid}");
-    println!("Remote config: {remote_config}");
-    println!("Restart the controller to begin scheduling on this node.");
-    println!(
-        "NFS mount is active for this session; configure a persistent mount separately if required."
-    );
-    Ok(())
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn add_existing_ssh_node_to_queue(
@@ -10187,7 +10897,6 @@ fn add_existing_ssh_node_to_queue(
     state.operations.insert(operation_key, operation);
     save_admin_state(&journal_path, state)?;
     println!("Node {node_id} joined queue {queue_name}.");
-    println!("Restart the controller to apply the configuration change.");
     Ok(())
 }
 
@@ -10197,30 +10906,31 @@ mod tests {
         Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
         ClientMountRequest, ClientUnmountRequest, ClusterConfig, NFS_DAEMON_PATH,
         NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
-        ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds, acquire_node_maintenance,
-        acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
-        admin_shell_command, agent_update_recovery_pending, append_client_mount_marker_check,
-        candidate_admin_script, classify_configured_agents, cleanup_node_from_endpoint,
-        client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
-        client_nfs_cleanup_plan, client_share_alias_script, config_path_candidate,
-        controller_command_matches, dispatch_sync_pending, ensure_controller_recovery_clean,
+        ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds,
+        acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
+        acquire_node_maintenance_with_confirmation_using, admin_shell_command,
+        agent_update_recovery_pending, append_client_mount_marker_check, candidate_admin_script,
+        classify_configured_agents, cleanup_node_from_endpoint, client_mount_batch_script,
+        client_mount_status_awk_script, client_nfs_cleanup_batch_script, client_nfs_cleanup_plan,
+        client_share_alias_script, config_path_candidate, controller_command_matches,
+        dispatch_sync_pending, ensure_controller_recovery_clean,
         ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
-        inspect_configured_agent_build, list_nodes, local_config_candidate, managed_binary_digest,
-        migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
-        named_share_mount_status, named_share_operation_endpoint, named_share_operation_matches,
-        named_share_request_matches, nfs_exports_read_command,
-        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
-        nfs_exports_update_script_for_expected, nfs_mount_source, node_admin_recovery_pending,
-        node_nfs_mappings, normalize_binary_path, parse_action, parse_agent_build_probe,
-        parse_nfs_exports_update_baseline, pending_add_may_have_client_state,
-        pending_add_operation_for_endpoint, pending_combined_ssh_add,
-        pending_local_share_retry_node, pending_managed_export_cleanup_plan, pending_share_mapping,
-        plan_ensure_nfs_exports, plan_remove_nfs_exports, power_helper_install_script,
-        power_launch_daemon_plist, preferred_local_host, queue_candidate_with_node,
-        read_admin_state, remote_execution_status, reset_admin_operations,
-        reset_node_from_endpoint, resume_existing_ssh_add_sync, save_admin_state,
-        should_resume_add_operation, shutdown_confirmation_accepted, update_recovery,
-        validate_pending_node_identity, validate_storage_root_access,
+        inspect_configured_agent_build, list_nodes, local_config_candidate,
+        maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
+        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
+        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
+        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
+        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
+        node_admin_recovery_pending, node_nfs_mappings, normalize_binary_path, parse_action,
+        parse_agent_build_probe, parse_nfs_exports_update_baseline,
+        pending_add_may_have_client_state, pending_add_operation_for_endpoint,
+        pending_combined_ssh_add, pending_local_share_retry_node,
+        pending_managed_export_cleanup_plan, pending_share_mapping, plan_ensure_nfs_exports,
+        plan_remove_nfs_exports, power_helper_install_script, power_launch_daemon_plist,
+        preferred_local_host, queue_candidate_with_node, read_admin_state, remote_execution_status,
+        reset_admin_operations, reset_node_from_endpoint, resume_existing_ssh_add_sync,
+        save_admin_state, should_resume_add_operation, shutdown_confirmation_accepted,
+        update_recovery, validate_pending_node_identity, validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -10240,6 +10950,50 @@ mod tests {
 
     fn test_exports_path() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-exports-{}.test", Id128::random()))
+    }
+
+    #[test]
+    fn interrupted_maintenance_can_abort_only_when_original_config_and_journal_are_unchanged() {
+        let config_before = "config-before";
+        let journal_before = "journal-before";
+        assert!(maintenance_inputs_unchanged(
+            Some(config_before),
+            Some(journal_before),
+            Some(config_before),
+            Some(journal_before)
+        ));
+        assert!(!maintenance_inputs_unchanged(
+            Some(config_before),
+            Some(journal_before),
+            Some("config-candidate"),
+            Some("journal-before")
+        ));
+        assert!(!maintenance_inputs_unchanged(
+            Some(config_before),
+            Some(journal_before),
+            Some(config_before),
+            Some("journal-changed")
+        ));
+        assert!(!maintenance_inputs_unchanged(
+            None,
+            None,
+            Some(config_before),
+            Some(journal_before)
+        ));
+    }
+
+    #[test]
+    fn maintenance_client_lock_serializes_frontend_operations() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "macluster-maintenance-client-lock-{}",
+            Id128::random()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let first = acquire_maintenance_client_lock(&state_dir).unwrap();
+        assert!(acquire_maintenance_client_lock(&state_dir).is_err());
+        drop(first);
+        assert!(acquire_maintenance_client_lock(&state_dir).is_ok());
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

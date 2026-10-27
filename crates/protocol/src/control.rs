@@ -34,6 +34,37 @@ pub enum ControllerLifecycle {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "scope", content = "nodes", rename_all = "snake_case")]
+pub enum MaintenanceScope {
+    Cluster,
+    Nodes(Vec<NodeId>),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenancePhase {
+    Draining,
+    Ready,
+    Applying,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MaintenanceTicket {
+    pub operation_id: Id128,
+    pub token: Id128,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MaintenanceStatus {
+    pub ticket: MaintenanceTicket,
+    pub scope: MaintenanceScope,
+    pub phase: MaintenancePhase,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ControllerHello {
     pub protocol_version: u16,
     pub binding_digest: String,
@@ -77,6 +108,20 @@ pub enum HelloResponse {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlCommand {
     Status,
+    BeginMaintenance {
+        operation_id: Id128,
+        scope: MaintenanceScope,
+        journal_digest: String,
+    },
+    InspectMaintenance,
+    CompleteMaintenance {
+        ticket: MaintenanceTicket,
+        candidate_config_digest: String,
+        candidate_journal_digest: String,
+    },
+    AbortMaintenance {
+        ticket: MaintenanceTicket,
+    },
     QueryAgentCompatibility {
         node_ids: Vec<NodeId>,
     },
@@ -135,6 +180,7 @@ pub enum ControlCommand {
 #[serde(tag = "payload", content = "value", rename_all = "snake_case")]
 pub enum ControlPayload {
     Status(ControllerHello),
+    Maintenance(Option<MaintenanceStatus>),
     AgentCompatibility(Vec<AgentCompatibilityRecord>),
     MonitorSnapshot(MonitorSnapshot),
     MonitorSubscribed,

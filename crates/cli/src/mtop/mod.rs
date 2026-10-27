@@ -217,7 +217,6 @@ pub fn run_interactive(
             .unwrap_or_else(|| "all queues".into()),
     );
     state.no_color = no_color;
-    state.status_message = Some("Agent validation: CHECKING all configured nodes".into());
     state.job_store_error = Some("reading local task database".into());
     state.nodes = identities
         .iter()
@@ -330,11 +329,6 @@ pub fn run_interactive(
                             post_action = Some(MtopPostAction::CheckBuilds(compatibility));
                             break;
                         }
-                        status_message = Some(format!(
-                            "Agent validation complete: {} current, {} unknown/offline",
-                            compatibility.current.len(),
-                            compatibility.unknown.len()
-                        ));
                         post_action = Some(MtopPostAction::CheckBuilds(compatibility));
                     }
                     Ok(Err(error)) => {

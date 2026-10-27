@@ -2,6 +2,7 @@
 
 mod app;
 pub mod arguments;
+mod control_client;
 mod embedded_power;
 mod init;
 mod mtop;

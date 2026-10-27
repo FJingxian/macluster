@@ -1,8 +1,11 @@
 //! Login-node reconciliation and whole-node FIFO dispatch.
 
+mod ipc;
 mod runtime;
 pub mod transport;
 pub mod wake;
+
+pub use ipc::{ControlListener, IpcError, PendingControlRequest};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -674,10 +677,14 @@ fn primary_nfs_mount_matches(
     mount_output.lines().any(|line| line.starts_with(&expected))
 }
 
-pub struct InstanceLock(fs::File);
+pub struct InstanceLock {
+    file: fs::File,
+    state_dir: PathBuf,
+}
 impl InstanceLock {
     pub fn acquire(state_dir: &Path) -> Result<Self, io::Error> {
         fs::create_dir_all(state_dir)?;
+        let state_dir = state_dir.canonicalize()?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -688,13 +695,17 @@ impl InstanceLock {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(file))
+        Ok(Self { file, state_dir })
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 }
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }

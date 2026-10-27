@@ -262,6 +262,7 @@ fn run_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<String, String> {
         "-oConnectionAttempts=1",
     ]);
     node.add_ssh_identity_args(&mut command);
+    super::ssh::add_control_args(node, &mut command);
     let mut child = command
         .arg(&node.host)
         .arg(PROCESS_COMMAND)

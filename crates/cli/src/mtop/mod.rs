@@ -2,6 +2,7 @@ mod jobs;
 mod model;
 mod processes;
 mod sampler;
+mod ssh;
 mod terminal;
 mod ui;
 
@@ -12,6 +13,7 @@ mod ui_tests;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    fs,
     path::PathBuf,
     sync::{Once, mpsc},
     thread,
@@ -43,11 +45,22 @@ const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) enum MtopPostAction {
     CheckBuilds(crate::node_admin::AgentBuildCompatibility),
     RecoverMaintenance,
+    UpdateDeferred,
 }
 
 enum StartupValidation {
+    AddressMigration,
     Builds(crate::node_admin::AgentBuildCompatibility),
     RecoverMaintenance,
+    UpdateDeferred,
+}
+
+fn should_defer_startup_update(
+    recovery_pending: bool,
+    update_required: bool,
+    work_pending: bool,
+) -> bool {
+    work_pending && (recovery_pending || update_required)
 }
 
 fn now_unix_ms() -> u64 {
@@ -108,7 +121,7 @@ pub(crate) fn sample_one_shot(
     let deadline = Instant::now() + ONE_SHOT_DEADLINE;
     let mut results = HashMap::new();
     while results.len() < targets.len() && Instant::now() < deadline {
-        schedule_round(&mut round, &target_lookup, &mut sampler);
+        schedule_round(&mut round, &target_lookup, &mut sampler, false);
         for result in sampler.poll() {
             results.insert(result.id, result.result);
         }
@@ -145,6 +158,7 @@ pub fn run_interactive(
     config_path: PathBuf,
     selected_queue: Option<String>,
     no_color: bool,
+    address_migration_deferred: bool,
 ) -> Result<Option<MtopPostAction>, String> {
     static PANIC_HOOK: Once = Once::new();
     PANIC_HOOK.call_once(install_panic_restore_hook);
@@ -161,7 +175,7 @@ pub fn run_interactive(
         machine_uuid: local_node.and_then(|node| node.machine_uuid.clone()),
     };
     let configured = configured_node_identities(&config);
-    let identities = display_node_identities(&login, &configured, queue_filter);
+    let mut identities = display_node_identities(&login, &configured, queue_filter);
     let mut targets = Vec::with_capacity(identities.len());
     let mut process_targets_by_id = HashMap::new();
     for identity in &identities {
@@ -194,7 +208,7 @@ pub fn run_interactive(
         process_targets_by_id.insert(identity.id.clone(), process_target);
         targets.push((identity.id.clone(), target));
     }
-    let targets_by_id: HashMap<_, _> = targets.iter().cloned().collect();
+    let mut targets_by_id: HashMap<_, _> = targets.iter().cloned().collect();
     let target_ids: Vec<_> = targets.iter().map(|(id, _)| id.clone()).collect();
 
     let mut state = AppState::empty(
@@ -227,10 +241,11 @@ pub fn run_interactive(
     let mut caches: BTreeMap<String, NodeMetricCache> = BTreeMap::new();
     let mut histories: BTreeMap<String, CpuHistory> = BTreeMap::new();
     let mut auto_round: Option<VecDeque<String>> = Some(target_ids.iter().cloned().collect());
+    let mut initial_auto_round = true;
     let mut manual_round: Option<VecDeque<String>> = None;
     let mut next_sample = Instant::now() + SAMPLE_INTERVAL;
     let mut status_message: Option<String> = None;
-    let (validation_tx, validation_rx) = mpsc::sync_channel(1);
+    let (validation_tx, validation_rx) = mpsc::sync_channel::<Result<StartupValidation, String>>(1);
     let validation_config = config.clone();
     let validation_state_dir = state_dir.clone();
     let validation_config_path = config_path.clone();
@@ -238,6 +253,11 @@ pub fn run_interactive(
         .name("mtop-agent-validation".into())
         .spawn(move || {
             let result = (|| {
+                if address_migration_deferred
+                    || crate::node_admin::address_migration_pending(&validation_state_dir)
+                {
+                    return Ok(StartupValidation::AddressMigration);
+                }
                 let node_recovery = crate::node_admin::node_admin_recovery_pending(
                     &validation_config_path,
                     &validation_state_dir,
@@ -247,19 +267,32 @@ pub fn run_interactive(
                     &validation_state_dir,
                 )?;
                 if node_recovery || update_recovery {
+                    let work_pending =
+                        crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
+                    if should_defer_startup_update(true, false, work_pending) {
+                        return Ok(StartupValidation::UpdateDeferred);
+                    }
                     return Ok(StartupValidation::RecoverMaintenance);
                 }
-                crate::node_admin::configured_agent_build_compatibility_cached(
+                let compatibility = crate::node_admin::configured_agent_build_compatibility_cached(
                     &validation_config,
                     &validation_state_dir.join("mtop-cache"),
                 )
-                .map(StartupValidation::Builds)
-                .map_err(|(_, error)| error)
+                .map_err(|(_, error)| error)?;
+                if compatibility.requires_update() {
+                    let work_pending =
+                        crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
+                    if should_defer_startup_update(false, true, work_pending) {
+                        return Ok(StartupValidation::UpdateDeferred);
+                    }
+                }
+                Ok(StartupValidation::Builds(compatibility))
             })();
             let _ = validation_tx.send(result);
         })
         .map_err(|error| format!("could not start background Agent validation: {error}"))?;
     let mut validation_finished = false;
+    let mut address_migration_waiting = false;
     let mut post_action = None;
     let mut last_draw = Instant::now() - REDRAW_INTERVAL;
     let mut next_age_tick = Instant::now() + Duration::from_secs(1);
@@ -272,6 +305,10 @@ pub fn run_interactive(
             let now = Instant::now();
             if !validation_finished {
                 match validation_rx.try_recv() {
+                    Ok(Ok(StartupValidation::AddressMigration)) => {
+                        validation_finished = true;
+                        status_message = Some("Node address recovery needs attention; Agent updates are deferred and monitoring remains available".into());
+                    }
                     Ok(Ok(StartupValidation::RecoverMaintenance)) => {
                         validation_finished = true;
                         state.status_message = Some(
@@ -279,6 +316,13 @@ pub fn run_interactive(
                         );
                         post_action = Some(MtopPostAction::RecoverMaintenance);
                         break;
+                    }
+                    Ok(Ok(StartupValidation::UpdateDeferred)) => {
+                        validation_finished = true;
+                        status_message = Some(
+                            "Agent update deferred while active tasks or output synchronization remain".into(),
+                        );
+                        post_action = Some(MtopPostAction::UpdateDeferred);
                     }
                     Ok(Ok(StartupValidation::Builds(compatibility))) => {
                         validation_finished = true;
@@ -309,13 +353,14 @@ pub fn run_interactive(
                 state.refresh_requested = false;
                 enqueue_manual_refresh(&mut manual_round, &target_ids);
                 auto_round = None;
+                initial_auto_round = false;
                 next_sample = now + SAMPLE_INTERVAL;
                 status_message = Some("refresh requested".into());
                 dirty = true;
             }
 
             if let Some(round) = &mut manual_round {
-                schedule_round(round, &targets_by_id, &mut sampler);
+                schedule_round(round, &targets_by_id, &mut sampler, false);
                 if round.is_empty() {
                     manual_round = None;
                     status_message = Some("refresh scheduled".into());
@@ -330,9 +375,10 @@ pub fn run_interactive(
                     next_sample = now + SAMPLE_INTERVAL;
                 }
                 if let Some(round) = &mut auto_round {
-                    schedule_round(round, &targets_by_id, &mut sampler);
+                    schedule_round(round, &targets_by_id, &mut sampler, initial_auto_round);
                     if round.is_empty() {
                         auto_round = None;
+                        initial_auto_round = false;
                     }
                 }
             }
@@ -341,6 +387,9 @@ pub fn run_interactive(
                 let request_latency = completed
                     .received_at
                     .saturating_duration_since(completed.started_at);
+                state
+                    .sample_latency
+                    .insert(completed.id.clone(), request_latency);
                 match completed.result {
                     Ok(mut snapshot) => {
                         if let Some(age_ms) = snapshot.power_age_ms.as_mut() {
@@ -350,11 +399,13 @@ pub fn run_interactive(
                         }
                         let cache = caches.entry(completed.id.clone()).or_default();
                         cache.apply_success(snapshot.clone(), completed.received_at);
-                        histories.entry(completed.id).or_default().record(
-                            completed.received_at,
-                            snapshot.cpu_percent,
-                            snapshot.cpu_max_percent,
-                        );
+                        if completed.final_result {
+                            histories.entry(completed.id).or_default().record(
+                                completed.received_at,
+                                snapshot.cpu_percent,
+                                snapshot.cpu_max_percent,
+                            );
+                        }
                     }
                     Err(error) => {
                         caches
@@ -426,6 +477,42 @@ pub fn run_interactive(
 
             let now = Instant::now();
             if now >= next_age_tick {
+                let migrating = crate::node_admin::address_migration_pending(&state_dir);
+                if migrating && !address_migration_waiting {
+                    address_migration_waiting = true;
+                    status_message = Some(
+                        "Node addresses changed; migration will finish when active tasks stop"
+                            .into(),
+                    );
+                } else if !migrating && address_migration_waiting {
+                    address_migration_waiting = false;
+                    if let Ok(source) = fs::read_to_string(&config_path)
+                        && let Ok(current) = ClusterConfig::parse(&source)
+                    {
+                        for identity in &mut identities {
+                            let node = current.nodes.get(&identity.id).or_else(|| {
+                                matches!(identity.role, NodeRole::Login)
+                                    .then(|| {
+                                        current
+                                            .nodes
+                                            .values()
+                                            .find(|node| node.transport == Transport::Local)
+                                    })
+                                    .flatten()
+                            });
+                            if let Some(node) = node {
+                                identity.host = node.host.clone();
+                                targets_by_id
+                                    .insert(identity.id.clone(), SampleTarget::for_node(node));
+                                process_targets_by_id
+                                    .insert(identity.id.clone(), ProcessTarget::for_node(node));
+                            }
+                        }
+                    }
+                    status_message = Some(
+                        "Node address migration completed; monitoring current endpoints".into(),
+                    );
+                }
                 dirty = true;
                 next_age_tick = now + Duration::from_secs(1);
             }
@@ -566,6 +653,7 @@ fn schedule_round(
     round: &mut VecDeque<String>,
     targets: &HashMap<String, SampleTarget>,
     sampler: &mut MetricSampler,
+    initial: bool,
 ) {
     let tries = round.len();
     for _ in 0..tries {
@@ -575,10 +663,15 @@ fn schedule_round(
         let Some(id) = round.pop_front() else {
             break;
         };
-        if let Some(target) = targets.get(&id)
-            && !sampler.request(id.clone(), target.clone())
-        {
-            round.push_back(id);
+        if let Some(target) = targets.get(&id) {
+            let accepted = if initial {
+                sampler.request_initial(id.clone(), target.clone())
+            } else {
+                sampler.request(id.clone(), target.clone())
+            };
+            if !accepted {
+                round.push_back(id);
+            }
         }
     }
 }

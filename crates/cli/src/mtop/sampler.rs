@@ -37,12 +37,14 @@ pub struct SampleResult {
     pub started_at: Instant,
     pub received_at: Instant,
     pub result: Result<MetricSnapshot, String>,
+    pub final_result: bool,
 }
 
 struct SampleTask {
     id: String,
     target: SampleTarget,
     started_at: Instant,
+    initial: bool,
 }
 
 type SampleFn = dyn Fn(&SampleTarget, &AtomicBool) -> Result<MetricSnapshot, String> + Send + Sync;
@@ -94,6 +96,19 @@ impl MetricSampler {
     /// Submit one node request. In-flight node IDs are deduplicated, and the
     /// bounded queue never contains more work than there are workers.
     pub fn request(&mut self, id: impl Into<String>, target: SampleTarget) -> bool {
+        self.request_with_phase(id, target, false)
+    }
+
+    pub fn request_initial(&mut self, id: impl Into<String>, target: SampleTarget) -> bool {
+        self.request_with_phase(id, target, true)
+    }
+
+    fn request_with_phase(
+        &mut self,
+        id: impl Into<String>,
+        target: SampleTarget,
+        initial: bool,
+    ) -> bool {
         let id = id.into();
         if !self.has_capacity() || self.inflight.contains(&id) {
             return false;
@@ -102,6 +117,7 @@ impl MetricSampler {
             id: id.clone(),
             target,
             started_at: Instant::now(),
+            initial,
         };
         if self.task_sender.send(task).is_err() {
             return false;
@@ -115,7 +131,9 @@ impl MetricSampler {
         loop {
             match self.result_receiver.try_recv() {
                 Ok(result) => {
-                    self.inflight.remove(&result.id);
+                    if result.final_result {
+                        self.inflight.remove(&result.id);
+                    }
                     completed.push(result);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -143,13 +161,41 @@ fn worker_loop(
             Err(_) => return,
         };
         let Ok(task) = task else { return };
+        if task.initial {
+            if let Ok((snapshot, progressive)) = sample_initial_target(&task.target, &stop) {
+                let _ = results.send(SampleResult {
+                    id: task.id.clone(),
+                    started_at: task.started_at,
+                    received_at: Instant::now(),
+                    result: Ok(snapshot),
+                    final_result: !progressive,
+                });
+                if !progressive {
+                    continue;
+                }
+            }
+        }
         let result = sample(&task.target, &stop);
         let _ = results.send(SampleResult {
             id: task.id,
             started_at: task.started_at,
             received_at: Instant::now(),
             result,
+            final_result: true,
         });
+    }
+}
+
+fn sample_initial_target(
+    target: &SampleTarget,
+    stop: &AtomicBool,
+) -> Result<(MetricSnapshot, bool), String> {
+    if stop.load(Ordering::SeqCst) {
+        return Err("metric sample cancelled".into());
+    }
+    match target {
+        SampleTarget::Local => Ok((macluster_metrics::sample_local_fast(), true)),
+        SampleTarget::Node(node) => sample_remote_phase(node, stop, true),
     }
 }
 
@@ -164,6 +210,14 @@ fn sample_target(target: &SampleTarget, stop: &AtomicBool) -> Result<MetricSnaps
 }
 
 fn sample_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<MetricSnapshot, String> {
+    sample_remote_phase(node, stop, false).map(|(snapshot, _)| snapshot)
+}
+
+fn sample_remote_phase(
+    node: &NodeConfig,
+    stop: &AtomicBool,
+    initial: bool,
+) -> Result<(MetricSnapshot, bool), String> {
     let mut command = process::Command::new("/usr/bin/ssh");
     command.args([
         "-T",
@@ -174,10 +228,14 @@ fn sample_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<MetricSnapshot,
         "-oConnectionAttempts=1",
     ]);
     node.add_ssh_identity_args(&mut command);
+    super::ssh::add_control_args(node, &mut command);
     command.arg(&node.host).arg(&node.remote_binary);
     node.add_remote_config_args(&mut command);
+    command.arg("internal").arg("metrics").arg("--json");
+    if initial {
+        command.arg("--fast");
+    }
     let mut child = command
-        .args(["internal", "metrics", "--json"])
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
@@ -207,14 +265,36 @@ fn sample_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<MetricSnapshot,
             detail
         });
     }
-    let mut snapshot = decode_remote_metrics(&output.stdout)?;
+    let (mut snapshot, progressive) = if initial {
+        decode_remote_initial_metrics(&output.stdout)?
+    } else {
+        (decode_remote_metrics(&output.stdout)?, false)
+    };
     if let Some(reason) = snapshot.errors.get_mut("power")
         && reason == "no supported non-interactive power sampler was found"
     {
         *reason = "remote agent predates power sampling; rerun mnode -a for this node to update it"
             .into();
     }
-    Ok(snapshot)
+    Ok((snapshot, progressive))
+}
+
+fn decode_remote_initial_metrics(output: &[u8]) -> Result<(MetricSnapshot, bool), String> {
+    let value: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|error| format!("remote initial metric response was invalid JSON: {error}"))?;
+    if value
+        .get("sample_phase")
+        .and_then(serde_json::Value::as_str)
+        == Some("initial")
+    {
+        let snapshot = serde_json::from_value(value.get("snapshot").cloned().ok_or_else(|| {
+            "remote initial metric response did not include a snapshot".to_owned()
+        })?)
+        .map_err(|error| format!("remote initial metric response was invalid JSON: {error}"))?;
+        Ok((snapshot, true))
+    } else {
+        Ok((decode_remote_metrics(output)?, false))
+    }
 }
 
 fn decode_remote_metrics(output: &[u8]) -> Result<MetricSnapshot, String> {

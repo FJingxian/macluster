@@ -67,6 +67,14 @@ fn tui_requires_both_terminals_and_no_one_shot_mode() {
 }
 
 #[test]
+fn mtop_defers_recovery_or_required_update_only_while_work_is_pending() {
+    assert!(super::should_defer_startup_update(true, false, true));
+    assert!(super::should_defer_startup_update(false, true, true));
+    assert!(!super::should_defer_startup_update(false, false, true));
+    assert!(!super::should_defer_startup_update(true, false, false));
+}
+
+#[test]
 fn renderer_handles_wide_medium_compact_and_small_terminals() {
     for (width, height, expected) in [
         (160, 40, LayoutMode::Wide),

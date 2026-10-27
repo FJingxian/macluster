@@ -1004,6 +1004,26 @@ impl ResetPlan {
                                 ),
                             ));
                         }
+                        if operation.action == "remove" {
+                            let connection = node_admin::pending_removal_connection(
+                                &operation.node_id,
+                                &self.nodes[&operation.node_id],
+                                operation.connection_endpoint.as_deref(),
+                                known_uuids.get(&operation.node_id).map(String::as_str),
+                            )?;
+                            self.nodes
+                                .insert(operation.node_id.clone(), connection.clone());
+                            for mount in &mut self.mounts {
+                                if mount.node_id == operation.node_id {
+                                    mount.node = connection.clone();
+                                }
+                            }
+                            for alias in &mut self.aliases {
+                                if alias.server_id == operation.node_id {
+                                    alias.server = connection.clone();
+                                }
+                            }
+                        }
                         continue;
                     }
                     let expected_uuid = operation
@@ -1023,10 +1043,21 @@ impl ResetPlan {
                             ),
                         ));
                     }
-                    let node = node_admin::reset_node_from_endpoint(
+                    let export_client = node_admin::reset_node_from_endpoint(
                         &operation.endpoint,
                         Some(expected_uuid),
                     )?;
+                    let mut node = if operation.action == "remove" {
+                        node_admin::pending_removal_connection(
+                            &operation.node_id,
+                            &export_client,
+                            operation.connection_endpoint.as_deref(),
+                            known_uuids.get(&operation.node_id).map(String::as_str),
+                        )?
+                    } else {
+                        export_client.clone()
+                    };
+                    node.remote_config = operation.remote_config_path.clone();
                     if node.transport == Transport::Local {
                         let actual = node_admin::local_platform_uuid()?;
                         if !node
@@ -1051,7 +1082,7 @@ impl ResetPlan {
                         let exports = node_admin::pending_managed_export_cleanup_plan(
                             config,
                             &operation.node_id,
-                            &node.host,
+                            &export_client.host,
                         );
                         for (server_id, requests) in exports {
                             let server = config.nodes.get(&server_id).ok_or_else(|| {
@@ -1070,7 +1101,7 @@ impl ResetPlan {
                                     &request.share_uuid,
                                     Path::new(&request.root),
                                     &request.node_id,
-                                    &node,
+                                    &export_client,
                                 );
                             }
                         }
@@ -1307,7 +1338,7 @@ impl ResetPlan {
                     .clone()
                     .unwrap_or_else(|| format!("{home}/.config/macluster/config.toml"))
             } else {
-                pending_remote_config_path(&home, share_uuid)?
+                pending_agent_config_path(&home, share_uuid, node)?
             };
             let path = node_admin::checked_remote_path(&path)?;
             let backup = format!("{path}.macluster-reset-{reset_id}.bak");
@@ -1317,19 +1348,35 @@ impl ResetPlan {
                 path,
                 backup,
             });
-            let (agent_state_path, agent_archive_path) = remote_agent_state_paths(&home, reset_id)?;
-            self.remote_agent_states.push(RemoteAgentStateSpec {
-                node_id: node_id.clone(),
-                node: node.clone(),
-                path: agent_state_path,
-                archive: agent_archive_path,
-                // An uncommitted enrollment was never visible to the active
-                // controller, so no scheduler log publisher can be running
-                // there. Avoid invoking a possibly unstaged agent binary.
-                stop_publisher: active,
-            });
+            if let Some(state) =
+                Self::remote_agent_state_spec(active, node_id, node, &home, reset_id)?
+            {
+                self.remote_agent_states.push(state);
+            }
         }
         Ok(())
+    }
+
+    fn remote_agent_state_spec(
+        active: bool,
+        node_id: &str,
+        node: &NodeConfig,
+        home: &str,
+        reset_id: &str,
+    ) -> AppResult<Option<RemoteAgentStateSpec>> {
+        // Pending enrollments never ran this cluster's jobs. The account-global
+        // Agent store may belong to another live cluster and is not our resource.
+        if !active {
+            return Ok(None);
+        }
+        let (path, archive) = remote_agent_state_paths(home, reset_id)?;
+        Ok(Some(RemoteAgentStateSpec {
+            node_id: node_id.to_owned(),
+            node: node.clone(),
+            path,
+            archive,
+            stop_publisher: true,
+        }))
     }
 
     fn preflight_remote_agent_states(&self) -> AppResult<()> {
@@ -1914,6 +1961,8 @@ fn cleanup_batches<'a>(
 
 fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) -> AppResult<()> {
     quiesce_publishers(journal, plan, path)?;
+    let original_config = ClusterConfig::parse(&journal.old_config)
+        .map_err(|error| (1, format!("saved old config is invalid: {error}")))?;
     for (_, batch) in cleanup_batches(journal, plan) {
         let node = batch.node;
         let node_id = batch
@@ -1973,6 +2022,29 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                     privileged_script.push_str(&reset_mount_unmount_step(
                         &format!("{}:{}", mount.server_host, mount.source_root.display()),
                         &mount.mount_root,
+                    ));
+                }
+            }
+            for mount in &batch.mounts {
+                if mount.mount_root != original_config.shared_root {
+                    continue;
+                }
+                let probe = node_admin::primary_restore_probe(
+                    &mount.mount_root,
+                    &original_config.share_uuid,
+                );
+                let present = node_admin::ssh_output(node, &probe, None)?;
+                if present.status.success() {
+                    has_privileged_changes = true;
+                    admin_actions.push("restore preserved local primary data");
+                    privileged_script.push_str(&node_admin::primary_restore_script(
+                        &mount.mount_root,
+                        &original_config.share_uuid,
+                    ));
+                } else if present.status.code() != Some(1) {
+                    return Err((
+                        1,
+                        format!("cannot inspect preserved primary directory on {node_id}"),
                     ));
                 }
             }
@@ -2097,23 +2169,11 @@ fn quiesce_publishers(
     journal_path: &Path,
 ) -> AppResult<()> {
     let old = ClusterConfig::parse(&journal.old_config).map_err(|error| (1, error.to_string()))?;
+    // Ask the namespace-aware Agent to archive before issuing any shutdown
+    // command. Unsupported old binaries must preserve their state untouched.
+    archive_remote_agent_states(journal, plan, journal_path)?;
     for state in &plan.remote_agent_states {
-        if let Some(command) = remote_publisher_stop_command(state, &old.share_uuid, &journal.id) {
-            plan.verify_node(&state.node_id, &state.node)?;
-            let output = node_admin::ssh_output(&state.node, &command, None)?;
-            if !output.status.success() {
-                return Err((
-                    1,
-                    format!(
-                        "cannot stop log publication on {} before reset; update its agent or resolve the reported blocker, then retry: {}",
-                        state.node_id,
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                ));
-            }
-        }
         journal.mark_completed(format!("log-sync-stopped:{}", state.node_id));
-        save_journal(journal_path, journal, false)?;
     }
     quiesce_local_publisher(journal, &old.share_uuid)?;
     journal.mark_completed("log-sync-stopped:local");
@@ -2147,6 +2207,29 @@ fn pending_remote_config_path(home: &str, share_uuid: &str) -> AppResult<String>
         .to_string_lossy()
         .into_owned();
     node_admin::checked_remote_path(&path)
+}
+
+fn pending_agent_config_path(home: &str, share_uuid: &str, node: &NodeConfig) -> AppResult<String> {
+    let Some(recorded) = node.remote_config.as_deref() else {
+        return pending_remote_config_path(home, share_uuid);
+    };
+    let uuid = node
+        .machine_uuid
+        .as_deref()
+        .ok_or_else(|| (1, "pending Agent config has no machine UUID".into()))?;
+    Id128::parse(uuid).map_err(|error| {
+        (
+            1,
+            format!("pending Agent has an invalid machine UUID: {error}"),
+        )
+    })?;
+    let expected = node_admin::remote_agent_config_path(home, share_uuid, uuid);
+    let legacy = pending_remote_config_path(home, share_uuid)?;
+    let legacy_default = format!("{home}/.config/macluster/config.toml");
+    if recorded != expected && recorded != legacy && recorded != legacy_default {
+        return Err((1, "pending Agent config path does not match its cluster and machine identity; preserving it".into()));
+    }
+    node_admin::checked_remote_path(recorded)
 }
 
 fn quiesce_local_publisher(journal: &ResetJournal, share_uuid: &str) -> AppResult<()> {
@@ -2252,9 +2335,39 @@ fn archive_remote_agent_states(
             continue;
         }
         plan.verify_node(&state.node_id, &state.node)?;
-        let script = remote_agent_state_archive_script(&state.path, &state.archive);
-        let output = node_admin::ssh_output(&state.node, &script, None)?;
-        if !output.status.success() {
+        let old = ClusterConfig::parse(&journal.old_config)
+            .map_err(|error| (1, format!("saved old config is invalid: {error}")))?;
+        let command = remote_agent_state_archive_command(
+            state,
+            &old.share_uuid,
+            journal.discard_terminal_sync,
+        );
+        let mut output = node_admin::ssh_output(&state.node, &command, None)?;
+        if archive_command_is_owned_busy(&output) {
+            // Busy is returned only after complete namespace provenance was
+            // established. The current Agent rechecks that proof under its
+            // state lock before it writes a publisher shutdown barrier.
+            if let Some(stop) = remote_publisher_stop_command(state, &old.share_uuid, &journal.id) {
+                let stopped = node_admin::ssh_output(&state.node, &stop, None)?;
+                if !stopped.status.success() {
+                    return Err((
+                        1,
+                        format!(
+                            "cannot stop log publication on {} before reset: {}",
+                            state.node_id,
+                            String::from_utf8_lossy(&stopped.stderr).trim()
+                        ),
+                    ));
+                }
+                output = node_admin::ssh_output(&state.node, &command, None)?;
+            }
+        }
+        if archive_command_is_unsupported(&output) {
+            eprintln!(
+                "Preserving Agent state on {}: its installed binary does not support namespace-aware archival; update it before archiving this state.",
+                state.node_id
+            );
+        } else if !output.status.success() {
             return Err((
                 1,
                 format!(
@@ -2263,6 +2376,17 @@ fn archive_remote_agent_states(
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
             ));
+        } else {
+            let outcome = serde_json::from_slice(&output.stdout).map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "invalid Agent archive response from {}: {error}",
+                        state.node_id
+                    ),
+                )
+            })?;
+            report_agent_archive_outcome(outcome, &state.node_id);
         }
         journal.mark_completed(step);
         save_journal(journal_path, journal, false)?;
@@ -2297,7 +2421,7 @@ fn remote_agent_state_preflight_script(source: &str, archive: &str) -> String {
          if [ -L \"$source\" ] || [ -L \"$archive\" ]; then echo 'agent state or archive path is a symlink' >&2; exit 1; fi\n\
          if [ -e \"$source\" ] && [ ! -d \"$source\" ]; then echo 'agent state path is not a directory' >&2; exit 1; fi\n\
          if [ -e \"$archive\" ] && [ ! -d \"$archive\" ]; then echo 'agent state archive path is not a directory' >&2; exit 1; fi\n\
-         if [ -e \"$source\" ] && [ -e \"$archive\" ]; then echo 'both live and archived agent state exist' >&2; exit 1; fi\n"
+"
     )
 }
 
@@ -2322,25 +2446,44 @@ fn preflight_local_agent_state(source: &Path, archive_dir: &Path) -> AppResult<(
     Ok(())
 }
 
-fn remote_agent_state_archive_script(source: &str, archive: &str) -> String {
-    let parent = Path::new(archive)
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_string_lossy();
-    let source = node_admin::shell_quote(source);
-    let archive = node_admin::shell_quote(archive);
-    let parent = node_admin::shell_quote(&parent);
+fn remote_agent_state_archive_command(
+    state: &RemoteAgentStateSpec,
+    share_uuid: &str,
+    discard_terminal_sync: bool,
+) -> String {
     format!(
-        "set -eu\nsource={source}\narchive={archive}\nparent={parent}\n\
-         if [ -L \"$source\" ] || [ -L \"$archive\" ]; then echo 'agent state or archive path is a symlink' >&2; exit 1; fi\n\
-         if [ -e \"$source\" ] && [ ! -d \"$source\" ]; then echo 'agent state path is not a directory' >&2; exit 1; fi\n\
-         if [ -e \"$archive\" ]; then\n\
-           if [ -e \"$source\" ]; then echo 'both live and archived agent state exist' >&2; exit 1; fi\n\
-           if [ ! -d \"$archive\" ]; then echo 'agent state archive path is not a directory' >&2; exit 1; fi\n\
-           exit 0\n\
-         fi\n\
-         if [ -e \"$source\" ]; then /bin/mkdir -p \"$parent\"; /bin/mv \"$source\" \"$archive\"; fi\n"
+        "{} --state-dir {} internal archive-agent-state --share-id {} --archive {}{}",
+        node_admin::shell_quote(&state.node.remote_binary),
+        node_admin::shell_quote(&state.path),
+        node_admin::shell_quote(share_uuid),
+        node_admin::shell_quote(&state.archive),
+        if discard_terminal_sync {
+            " --discard-terminal-sync"
+        } else {
+            ""
+        },
     )
+}
+
+fn archive_command_is_owned_busy(output: &std::process::Output) -> bool {
+    output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && String::from_utf8_lossy(&output.stderr).trim()
+            == format!("macluster: {}", macluster_agent::AgentError::Busy)
+}
+
+fn archive_command_is_unsupported(output: &std::process::Output) -> bool {
+    output.status.code() == Some(2)
+        && output.stdout.is_empty()
+        && String::from_utf8_lossy(&output.stderr).trim() == "macluster: unknown internal command"
+}
+
+fn report_agent_archive_outcome(outcome: macluster_agent::admin::ArchiveOutcome, location: &str) {
+    if outcome == macluster_agent::admin::ArchiveOutcome::PreservedForeign {
+        eprintln!(
+            "Preserving Agent state on {location}: its namespace is foreign, mixed, or unproven."
+        );
+    }
 }
 
 fn remote_move_exact_config(remote: &RemoteConfigSpec, bytes: &[u8]) -> AppResult<()> {
@@ -2733,24 +2876,16 @@ fn archive_old_cluster(journal: &mut ResetJournal, path: &Path) -> AppResult<()>
     if !journal.is_completed("archive:local-agent-state") {
         let local_agent_state = local_agent_state_path(journal);
         let archived_agent_state = archive_dir.join("agent-local-state");
-        let script = remote_agent_state_archive_script(
-            &local_agent_state.to_string_lossy(),
-            &archived_agent_state.to_string_lossy(),
-        );
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(script)
-            .output()
-            .map_err(|error| (1, format!("cannot archive local agent state: {error}")))?;
-        if !output.status.success() {
-            return Err((
-                1,
-                format!(
-                    "cannot archive local agent state: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
-        }
+        let old = ClusterConfig::parse(&journal.old_config)
+            .map_err(|error| (1, format!("saved old config is invalid: {error}")))?;
+        let outcome = macluster_agent::admin::archive_idle_namespace(
+            &local_agent_state,
+            &archived_agent_state,
+            &old.share_uuid,
+            journal.discard_terminal_sync,
+        )
+        .map_err(|error| (1, format!("cannot archive local agent state: {error}")))?;
+        report_agent_archive_outcome(outcome, "this account");
         journal.mark_completed("archive:local-agent-state");
         save_journal(path, journal, false)?;
     }
@@ -3350,7 +3485,8 @@ mod tests {
         let config = root.join("config.toml");
         let state = root.join("controller");
         let archive = root.join("archive");
-        let old_config = b"old cluster config\n";
+        let old_source = test_config_source("old", "00000000-0000-4000-8000-000000000001");
+        let old_config = old_source.as_bytes();
         fs::write(&config, old_config).unwrap();
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join("controller.sqlite3"), b"old controller state").unwrap();
@@ -4022,6 +4158,8 @@ mod tests {
         let operation = crate::node_admin::ResetAdminOperation {
             id: "failed-share".into(),
             action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "login-01".into(),
             endpoint: format!(
                 "share:project:login-01:{}:{}",
@@ -4309,6 +4447,33 @@ mod tests {
     }
 
     #[test]
+    fn reset_uses_recorded_agent_path_and_refuses_another_machine_path() {
+        let uuid = "00000000-0000-4000-8000-000000000123";
+        let config = test_config("test", uuid);
+        let mut node = config.nodes["login-01"].clone();
+        let expected = crate::node_admin::remote_agent_config_path(
+            "/Users/worker",
+            uuid,
+            node.machine_uuid.as_deref().unwrap(),
+        );
+        node.remote_config = Some(expected.clone());
+        assert_eq!(
+            super::pending_agent_config_path("/Users/worker", uuid, &node).unwrap(),
+            expected
+        );
+        node.remote_config = Some(expected.replace(
+            node.machine_uuid.as_deref().unwrap(),
+            "00000000-0000-4000-8000-000000000099",
+        ));
+        assert!(super::pending_agent_config_path("/Users/worker", uuid, &node).is_err());
+        node.remote_config = None;
+        assert_eq!(
+            super::pending_agent_config_path("/Users/worker", uuid, &node).unwrap(),
+            pending_remote_config_path("/Users/worker", uuid).unwrap()
+        );
+    }
+
+    #[test]
     fn reset_skips_agent_command_for_uncommitted_pending_nodes() {
         use macluster_core::config::NodeConfig;
 
@@ -4339,6 +4504,60 @@ mod tests {
             .is_none()
         );
 
+        let spec = ResetPlan::remote_agent_state_spec(
+            false,
+            "pending",
+            &state.node,
+            "/Users/worker",
+            "00000000-0000-4000-8000-000000000124",
+        )
+        .unwrap();
+        assert!(
+            spec.is_none(),
+            "pending B must never schedule archival of account-global A state"
+        );
+        let root =
+            std::env::temp_dir().join(format!("macluster-pending-reset-{}", Id128::random()));
+        let foreign_live = root.join("agent");
+        write_owned_idle_agent_state(&foreign_live, "00000000-0000-4000-8000-000000000001");
+        let before = fs::read(foreign_live.join("agent-state.json")).unwrap();
+        let pending = ResetPlan::remote_agent_state_spec(
+            false,
+            "pending-b",
+            &state.node,
+            root.to_str().unwrap(),
+            "00000000-0000-4000-8000-000000000124",
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert_eq!(
+            fs::read(foreign_live.join("agent-state.json")).unwrap(),
+            before
+        );
+        assert!(
+            !root
+                .join("Library/Application Support/macluster/macluster-archive")
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+        let owned_spec = ResetPlan::remote_agent_state_spec(
+            true,
+            "pending",
+            &state.node,
+            "/Users/worker",
+            "00000000-0000-4000-8000-000000000124",
+        )
+        .unwrap()
+        .unwrap();
+        let archive_command = super::remote_agent_state_archive_command(
+            &owned_spec,
+            "00000000-0000-4000-8000-000000000123",
+            true,
+        );
+        assert!(archive_command.contains("internal archive-agent-state --share-id"));
+        assert!(archive_command.ends_with(" --discard-terminal-sync"));
+        assert!(!archive_command.contains("/bin/mv"));
+
         state.stop_publisher = true;
         let command = remote_publisher_stop_command(
             &state,
@@ -4357,6 +4576,8 @@ mod tests {
         let operation = crate::node_admin::ResetAdminOperation {
             id: "pending-add".into(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "pending".into(),
             endpoint: "local@192.0.2.9:22".into(),
             machine_uuid: Some(machine_uuid),
@@ -4405,6 +4626,8 @@ mod tests {
         let operation = crate::node_admin::ResetAdminOperation {
             id: "pending-add".into(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "pending".into(),
             endpoint: "local@192.0.2.9:22".into(),
             machine_uuid: Some(machine_uuid),
@@ -4446,6 +4669,8 @@ mod tests {
         let operation = crate::node_admin::ResetAdminOperation {
             id: "operation-1".into(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "mini01-a".into(),
             endpoint: "operator@192.168.2.1:22".into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
@@ -4581,69 +4806,135 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn write_owned_idle_agent_state(path: &Path, namespace: &str) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(
+            path.join("agent-state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "owner_namespace": namespace,
+                "controller": {
+                    "controller_uuid": "00000000-0000-4000-8000-000000000099",
+                    "epoch": 1
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn remote_agent_state_archive_preserves_files_and_is_restartable() {
-        let root = std::env::temp_dir().join(format!(
-            "macluster-reset-agent-state-{}-{}",
-            std::process::id(),
-            macluster_protocol::identifiers::Id128::random()
-        ));
-        let live = root.join("path with spaces/agent");
-        let archive = root.join("path with spaces/macluster-archive/agent-state");
-        fs::create_dir_all(&live).unwrap();
-        fs::write(live.join("agent-state.json"), b"old controller state").unwrap();
-        fs::create_dir_all(live.join("jobs/3")).unwrap();
-        fs::write(live.join("jobs/3/script.sh"), b"old script").unwrap();
-
-        let script = super::remote_agent_state_archive_script(
-            &live.to_string_lossy(),
-            &archive.to_string_lossy(),
-        );
-        let output = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!live.exists());
+    fn agent_archive_uses_namespace_proof_and_preserves_foreign_or_unknown_state() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-reset-agent-state-{}", Id128::random()));
+        let namespace = "00000000-0000-4000-8000-000000000001";
+        let foreign = "00000000-0000-4000-8000-000000000002";
+        let live = root.join("agent");
+        let archive = root.join("archive");
+        write_owned_idle_agent_state(&live, foreign);
+        let original = fs::read(live.join("agent-state.json")).unwrap();
         assert_eq!(
-            fs::read(archive.join("agent-state.json")).unwrap(),
-            b"old controller state"
+            macluster_agent::admin::archive_idle_namespace(&live, &archive, namespace, false)
+                .unwrap(),
+            macluster_agent::admin::ArchiveOutcome::PreservedForeign
         );
+        assert_eq!(fs::read(live.join("agent-state.json")).unwrap(), original);
+        assert!(!archive.exists());
+        fs::write(live.join("agent-state.json"), b"{}").unwrap();
         assert_eq!(
-            fs::read(archive.join("jobs/3/script.sh")).unwrap(),
-            b"old script"
+            macluster_agent::admin::archive_idle_namespace(&live, &archive, namespace, true)
+                .unwrap(),
+            macluster_agent::admin::ArchiveOutcome::PreservedForeign
         );
-
-        let retry = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .unwrap();
-        assert!(
-            retry.status.success(),
-            "{}",
-            String::from_utf8_lossy(&retry.stderr)
-        );
+        assert!(!archive.exists());
+        write_owned_idle_agent_state(&live, namespace);
         assert_eq!(
-            fs::read(archive.join("agent-state.json")).unwrap(),
-            b"old controller state"
+            macluster_agent::admin::archive_idle_namespace(&live, &archive, namespace, false)
+                .unwrap(),
+            macluster_agent::admin::ArchiveOutcome::Archived
         );
-
-        fs::create_dir_all(&live).unwrap();
-        fs::write(live.join("new-state.json"), b"new state").unwrap();
-        let conflict = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .unwrap();
-        assert!(!conflict.status.success());
-        assert_eq!(fs::read(live.join("new-state.json")).unwrap(), b"new state");
+        assert!(archive.join("agent-state.json").exists());
+        assert_eq!(
+            macluster_agent::admin::archive_idle_namespace(&live, &archive, namespace, false)
+                .unwrap(),
+            macluster_agent::admin::ArchiveOutcome::Absent
+        );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reset_publisher_quiesce_preserves_foreign_mixed_and_unknown_agent_state() {
+        let namespace = "00000000-0000-4000-8000-000000000001";
+        for kind in ["foreign", "mixed", "unknown", "foreign-shutdown"] {
+            let root =
+                std::env::temp_dir().join(format!("macluster-reset-quiesce-{}", Id128::random()));
+            let live = root.join("agent");
+            let owner = if kind == "mixed" {
+                namespace
+            } else {
+                "00000000-0000-4000-8000-000000000002"
+            };
+            write_owned_idle_agent_state(&live, owner);
+            if kind == "unknown" {
+                fs::write(live.join("agent-state.json"), b"{}").unwrap();
+            } else if kind == "mixed" {
+                fs::create_dir_all(live.join("jobs/77")).unwrap();
+                fs::write(live.join("jobs/77/script.sh"), b"unknown namespace").unwrap();
+            } else if kind == "foreign-shutdown" {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(live.join("agent-state.json")).unwrap())
+                        .unwrap();
+                value["log_sync_shutdown"] =
+                    serde_json::json!("00000000-0000-4000-8000-000000000088");
+                fs::write(
+                    live.join("agent-state.json"),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+            }
+            let before = fs::read(live.join("agent-state.json")).unwrap();
+            let mut saved = journal();
+            saved.id = "00000000-0000-4000-8000-000000000077".into();
+            saved.local_agent_state = Some(live.to_string_lossy().into_owned());
+            super::quiesce_local_publisher(&saved, namespace).unwrap();
+            assert_eq!(
+                fs::read(live.join("agent-state.json")).unwrap(),
+                before,
+                "{kind} publisher shutdown barrier must remain unchanged"
+            );
+            assert_eq!(
+                macluster_agent::admin::archive_idle_namespace(
+                    &live,
+                    &root.join("archive"),
+                    namespace,
+                    true
+                )
+                .unwrap(),
+                macluster_agent::admin::ArchiveOutcome::PreservedForeign
+            );
+            assert_eq!(fs::read(live.join("agent-state.json")).unwrap(), before);
+            assert!(!root.join("archive").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn archive_command_fallback_only_accepts_exact_old_internal_command_error() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: Vec::new(),
+            stderr: b"macluster: unknown internal command\n".to_vec(),
+        };
+        assert!(super::archive_command_is_unsupported(&output));
+        output.stderr = b"ssh: unknown internal command\n".to_vec();
+        assert!(!super::archive_command_is_unsupported(&output));
+        output.stderr = b"macluster: unknown internal command\n".to_vec();
+        output.status = std::process::ExitStatus::from_raw(1 << 8);
+        assert!(!super::archive_command_is_unsupported(&output));
+        output.stderr = format!("macluster: {}", macluster_agent::AgentError::Busy).into_bytes();
+        assert!(super::archive_command_is_owned_busy(&output));
+        output.stderr = b"I/O error: connection closed".to_vec();
+        assert!(!super::archive_command_is_owned_busy(&output));
     }
 
     #[test]
@@ -4658,16 +4949,13 @@ mod tests {
         let state = root.join("controller");
         let local_agent_state = root.join("agent");
         let archive = root.join("archive");
-        let old_config = b"old cluster config\n";
+        let old_source = test_config_source("old", "00000000-0000-4000-8000-000000000001");
+        let old_config = old_source.as_bytes();
         fs::write(&config, old_config).unwrap();
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join("jobs.db"), b"old jobs").unwrap();
-        fs::create_dir_all(&local_agent_state).unwrap();
-        fs::write(
-            local_agent_state.join("agent-state.json"),
-            b"old agent state",
-        )
-        .unwrap();
+        write_owned_idle_agent_state(&local_agent_state, "00000000-0000-4000-8000-000000000001");
+        let agent_bytes = fs::read(local_agent_state.join("agent-state.json")).unwrap();
         let binding = super::binding_path(&config);
         fs::write(&binding, format!("{}\n", state.display())).unwrap();
 
@@ -4690,7 +4978,9 @@ mod tests {
         assert_eq!(transition, ArchiveTransition::CompletedUninitialized);
         assert!(!config.exists());
         assert!(!state.exists());
-        assert!(!local_agent_state.exists());
+        // The Agent leaves a fenced tombstone so an old controller cannot
+        // resume against the account-global location after reset.
+        assert!(local_agent_state.exists());
         assert!(!binding.exists());
         assert!(!journal_file.exists());
         assert_eq!(fs::read(archive.join("config.toml")).unwrap(), old_config);
@@ -4700,7 +4990,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(archive.join("agent-local-state/agent-state.json")).unwrap(),
-            b"old agent state"
+            agent_bytes
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -4716,7 +5006,8 @@ mod tests {
         let config = root.join("config.toml");
         let state = root.join("controller");
         let archive = root.join("archive");
-        let old_config = b"old cluster config\n";
+        let old_source = test_config_source("old", "00000000-0000-4000-8000-000000000001");
+        let old_config = old_source.as_bytes();
         fs::write(&config, old_config).unwrap();
         fs::create_dir_all(&state).unwrap();
 
@@ -4743,6 +5034,104 @@ mod tests {
     }
 
     #[test]
+    fn reset_moved_node_uses_saved_connection_but_original_export_address() {
+        for configured in [true, false] {
+            let mut config = test_config("test", "00000000-0000-4000-8000-000000000001");
+            let server = config.nodes["login-01"].clone();
+            let mut worker = server.clone();
+            worker.transport = super::Transport::Ssh;
+            worker.host = "192.0.2.10".into();
+            worker.ssh_user = Some("operator".into());
+            worker.ssh_port = Some(22);
+            worker.remote_config = Some(crate::node_admin::remote_agent_config_path(
+                "/Users/operator",
+                &config.share_uuid,
+                worker.machine_uuid.as_deref().unwrap(),
+            ));
+            if configured {
+                config.nodes.insert("worker".into(), worker.clone());
+            }
+            let mut plan = ResetPlan {
+                nodes: config.nodes.clone(),
+                active_nodes: Default::default(),
+                known_uuids: Default::default(),
+                mounts: Vec::new(),
+                exports: BTreeMap::new(),
+                markers: BTreeMap::new(),
+                aliases: Vec::new(),
+                remote_configs: Vec::new(),
+                remote_agent_states: Vec::new(),
+            };
+            plan.add_share(
+                "login-01",
+                &server,
+                &config.shared_root,
+                &config.shared_root,
+                &config.share_uuid,
+                "primary",
+            );
+            if configured {
+                plan.aliases.push(super::AliasSpec {
+                    server_id: "worker".into(),
+                    server: worker.clone(),
+                    source_root: "/Users/operator/software".into(),
+                    mount_root: "/Users/Shared/software".into(),
+                    committed: true,
+                });
+            }
+            let operation = crate::node_admin::ResetAdminOperation {
+                id: "moved-worker".into(),
+                action: "remove".into(),
+                node_id: "worker".into(),
+                endpoint: "operator@192.0.2.10:22".into(),
+                connection_endpoint: Some("operator@192.0.2.20:2222".into()),
+                remote_config_path: worker.remote_config.clone(),
+                machine_uuid: worker.machine_uuid.clone(),
+                phase: if configured {
+                    "REMOVAL_PENDING"
+                } else {
+                    "SYNC_PENDING"
+                }
+                .into(),
+                old_config_sha256: Some(
+                    if configured {
+                        "config-digest"
+                    } else {
+                        "old-config"
+                    }
+                    .into(),
+                ),
+                candidate_config_sha256: (!configured).then(|| "config-digest".into()),
+                client_setup_may_have_run: false,
+            };
+            plan.add_pending_admin_resources(
+                &config,
+                vec![operation],
+                &BTreeMap::new(),
+                "config-digest",
+            )
+            .unwrap();
+            assert_eq!(plan.nodes["worker"].host, "192.0.2.20");
+            assert_eq!(plan.nodes["worker"].ssh_port, Some(2222));
+            assert_eq!(plan.nodes["worker"].remote_config, worker.remote_config);
+            let mounts: Vec<_> = plan
+                .mounts
+                .iter()
+                .filter(|mount| mount.node_id == "worker")
+                .collect();
+            assert_eq!(mounts.len(), 1);
+            assert_eq!(mounts[0].node.host, "192.0.2.20");
+            assert_eq!(plan.exports["login-01"].specs[0].client_ip, "192.0.2.10");
+            assert!(
+                plan.aliases
+                    .iter()
+                    .filter(|alias| alias.server_id == "worker")
+                    .all(|alias| alias.server.host == "192.0.2.20")
+            );
+        }
+    }
+
+    #[test]
     fn reset_journals_without_mode_keep_the_legacy_rebuild_behavior() {
         let mut value = serde_json::to_value(journal()).unwrap();
         value
@@ -4757,9 +5146,12 @@ mod tests {
     }
 
     fn test_config(name: &str, uuid: &str) -> macluster_core::config::ClusterConfig {
-        let source = format!(
+        macluster_core::config::ClusterConfig::parse(&test_config_source(name, uuid)).unwrap()
+    }
+
+    fn test_config_source(name: &str, uuid: &str) -> String {
+        format!(
             "[cluster]\nname = \"{name}\"\nlogin_node = \"login-01\"\ndefault_queue = \"default\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"{uuid}\"\nstorage_server = \"login-01\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"login-01\"]\nscheduler = \"fifo\"\n\n[nodes.login-01]\nhost = \"192.168.2.2\"\ntransport = \"local\"\nremote_binary = \"/usr/local/bin/macluster\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n"
-        );
-        macluster_core::config::ClusterConfig::parse(&source).unwrap()
+        )
     }
 }

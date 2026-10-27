@@ -1,5 +1,13 @@
 //! SSH based enrollment and removal of compute nodes.
 
+mod addresses;
+mod primary_reuse;
+
+pub(crate) use addresses::{
+    address_migration_has_active_jobs, address_migration_pending, prepare_node_address_migration,
+    refresh_node_addresses, watch_node_addresses,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
@@ -19,14 +27,14 @@ use macluster_controller::transport::{ClusterTransport, NodeTransport, SshTransp
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
-    storage::Storage,
+    storage::{ReadOnlyJobStore, Storage},
 };
 use macluster_protocol::{
     framing::sha256_hex,
     identifiers::{Id128, NodeId, QueueName},
     types::{
-        ExecutionStatus, METRICS_FAN_SPEED_FEATURE, NodeHealth, Operation, ProtocolError,
-        ResponseBody, RuntimePhase,
+        ControllerEpoch, ExecutionStatus, METRICS_FAN_SPEED_FEATURE, NodeHealth, Operation,
+        ProtocolError, ResponseBody, RuntimePhase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -85,6 +93,9 @@ pub fn ensure_no_node_maintenance_in_progress(
     config_path: &Path,
     state_dir: &Path,
 ) -> Result<(), String> {
+    if address_migration_pending(state_dir) {
+        return Err("node address/NFS migration is pending; rerun the command to complete migration before submitting work".into());
+    }
     let config_path = config_path
         .canonicalize()
         .map_err(|error| format!("cannot resolve cluster config: {error}"))?;
@@ -661,8 +672,8 @@ fn ensure_maintenance_jobs_drained(
                 macluster_protocol::types::JobState::Starting
                     | macluster_protocol::types::JobState::Running
                     | macluster_protocol::types::JobState::Cancelling
-            ) || job.snapshot_sync_pending
-                || job.log_sync_pending
+            ) || operation != addresses::MAINTENANCE_OPERATION
+                && (job.snapshot_sync_pending || job.log_sync_pending)
         })
         .map(|job| format!("job {} ({:?})", job.id, job.state))
         .collect();
@@ -793,7 +804,10 @@ struct AddOptions {
 enum Action {
     Add(AddOptions),
     List,
-    Remove(String),
+    Remove {
+        target: String,
+        connect: Option<NodeEndpoint>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -823,6 +837,10 @@ struct AdminState {
 struct NodeOperation {
     id: String,
     action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connection_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_config_path: Option<String>,
     node_id: String,
     endpoint: String,
     machine_uuid: Option<String>,
@@ -841,6 +859,8 @@ struct NodeOperation {
 pub(crate) struct ResetAdminOperation {
     pub(crate) id: String,
     pub(crate) action: String,
+    pub(crate) connection_endpoint: Option<String>,
+    pub(crate) remote_config_path: Option<String>,
     pub(crate) node_id: String,
     pub(crate) endpoint: String,
     pub(crate) machine_uuid: Option<String>,
@@ -874,6 +894,7 @@ struct CapabilityReport {
 }
 
 const REQUIRED_AGENT_FEATURES: &[&str] = &[
+    "agent.idle-handoff.v1",
     "config.local-transport.v1",
     "config.named-shares.v1",
     "agent.node-health.v1",
@@ -898,11 +919,11 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     match action {
         Action::List => list_nodes(&config_path, &state_dir),
         Action::Add(options) => add_node(&config_path, &state_dir, options),
-        Action::Remove(target) => {
+        Action::Remove { target, connect } => {
             if let Some(share_id) = target.strip_prefix("share:") {
                 remove_pending_share(&config_path, &state_dir, share_id)
             } else {
-                remove_node(&config_path, &state_dir, &target)
+                remove_node(&config_path, &state_dir, &target, connect.as_ref())
             }
         }
     }
@@ -977,6 +998,15 @@ pub(crate) fn agent_update_recovery_pending(
     }))
 }
 
+pub(crate) fn agent_update_blocked_by_work(state_dir: &Path) -> Result<bool, String> {
+    if !state_dir.join("controller.sqlite3").is_file() {
+        return Ok(false);
+    }
+    ReadOnlyJobStore::open(state_dir)
+        .and_then(|store| store.has_maintenance_work())
+        .map_err(|error| format!("cannot inspect active jobs or output synchronization: {error}"))
+}
+
 pub(crate) fn node_admin_recovery_pending(
     config_path: &Path,
     state_dir: &Path,
@@ -1001,6 +1031,7 @@ enum UpdateRecovery {
     Fresh,
     Stage,
     Sync,
+    AbandonUncommittedFailure,
 }
 
 fn update_recovery(
@@ -1030,6 +1061,15 @@ fn update_recovery(
         }
         "SYNC_PENDING" if operation.candidate_config_sha256.as_deref() == Some(current_digest) => {
             Ok(UpdateRecovery::Sync)
+        }
+        "UPDATE_FAILED"
+            if operation.candidate_config_sha256.is_none()
+                && operation.old_config_sha256.as_deref() != Some(current_digest) =>
+        {
+            // No candidate config was activated. A later, independently
+            // committed config change supersedes this failed staging attempt;
+            // preserve the journal as aborted and stage a fresh update.
+            Ok(UpdateRecovery::AbandonUncommittedFailure)
         }
         phase => Err(format!(
             "all-node update {} is in phase {phase}, but the active config matches neither its old nor candidate digest; inspect {} before retrying",
@@ -1465,8 +1505,22 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
     ensure_no_pending_admin_operation(&state)?;
 
     let operation_key = "update:all";
-    let recovery = update_recovery(state.operations.get(operation_key), &old_digest)
+    let mut recovery = update_recovery(state.operations.get(operation_key), &old_digest)
         .map_err(|error| (1, error))?;
+    if recovery == UpdateRecovery::AbandonUncommittedFailure {
+        let mut obsolete = state
+            .operations
+            .get(operation_key)
+            .expect("superseded update recovery has an operation")
+            .clone();
+        obsolete.phase = "ABORTED".into();
+        obsolete.detail = Some(
+            "failed update had no committed candidate config and was superseded by a later cluster config change; unreferenced staging files were preserved".into(),
+        );
+        state.operations.insert(operation_key.to_owned(), obsolete);
+        save_admin_state(&journal_path, &state)?;
+        recovery = UpdateRecovery::Fresh;
+    }
     if recovery == UpdateRecovery::Sync {
         let mut operation = state
             .operations
@@ -1508,6 +1562,8 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
         NodeOperation {
             id: Id128::random().to_string(),
             action: "update".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "all".into(),
             endpoint: "cluster".into(),
             machine_uuid: None,
@@ -1787,16 +1843,42 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
             }))
         }
         "-rm" | "--remove" => {
-            if inline.is_some() || args.len() != 2 {
+            if inline.is_some() || !matches!(args.len(), 2 | 4) {
                 return Err((
                     2,
-                    format!("{key} requires exactly one node ID or pending share ID"),
+                    format!(
+                        "{key} requires a node ID or pending share ID, optionally followed by --connect USER@IPv4[:PORT]"
+                    ),
                 ));
             }
             let value = args[1].clone();
             let identifier = value.strip_prefix("share:").unwrap_or(&value);
             NodeId::new(identifier.to_owned()).map_err(|error| (2, error.to_string()))?;
-            Ok(Action::Remove(value))
+            let connect = if args.len() == 4 {
+                if args[2] != "--connect" {
+                    return Err((2, format!("unknown mnode remove option '{}'", args[2])));
+                }
+                if value.starts_with("share:") {
+                    return Err((
+                        2,
+                        "--connect is only supported when removing a configured node".into(),
+                    ));
+                }
+                let endpoint = NodeEndpoint::parse(&args[3]).map_err(|error| (2, error))?;
+                if endpoint.source_path.is_some() {
+                    return Err((
+                        2,
+                        "--connect accepts USER@IPv4[:PORT], without a source path".into(),
+                    ));
+                }
+                Some(endpoint)
+            } else {
+                None
+            };
+            Ok(Action::Remove {
+                target: value,
+                connect,
+            })
         }
         _ => Err((2, format!("unknown mnode option '{key}'"))),
     }
@@ -1804,7 +1886,7 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
 
 fn print_help() {
     println!(
-        "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID | --remove NODE_ID | share:SHARE_ID\n\nSSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues. local adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources. Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
+        "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nSSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues. local adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share. `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources. Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
     );
 }
 
@@ -2435,6 +2517,8 @@ pub(crate) fn reset_admin_operations(
             ResetAdminOperation {
                 id: operation.id,
                 action: operation.action,
+                connection_endpoint: operation.connection_endpoint,
+                remote_config_path: operation.remote_config_path,
                 node_id: operation.node_id,
                 endpoint: operation.endpoint,
                 machine_uuid: operation.machine_uuid,
@@ -2615,17 +2699,7 @@ pub(crate) fn prepare_power_helper(
     if execution_uid == 0 {
         return Err("the cluster execution account must not be root".into());
     }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let helper = executable
-        .parent()
-        .ok_or_else(|| "macluster executable has no parent directory".to_owned())?
-        .join("macluster-power");
-    if !helper.is_file() {
-        return Err(format!(
-            "{} is missing; build with `cargo build --release --locked --workspace`",
-            helper.display()
-        ));
-    }
+    let helper = crate::embedded_power::ExtractedHelper::new()?;
     let wanted_arch = match remote_arch {
         "arm64" | "aarch64" => "arm64",
         "x86_64" => "x86_64",
@@ -2633,7 +2707,7 @@ pub(crate) fn prepare_power_helper(
     };
     let architectures = Command::new("/usr/bin/lipo")
         .args(["-archs"])
-        .arg(&helper)
+        .arg(helper.path())
         .output()
         .map_err(|error| format!("cannot inspect macluster-power architecture: {error}"))?;
     if !architectures.status.success()
@@ -2645,7 +2719,7 @@ pub(crate) fn prepare_power_helper(
             "macluster-power does not contain the {wanted_arch} architecture"
         ));
     }
-    let digest = local_sha256(&helper).map_err(|(_, error)| error)?;
+    let digest = crate::embedded_power::digest()?;
     let plist = power_launch_daemon_plist(execution_uid);
     let installed_digest = ssh_output(
         node,
@@ -2694,9 +2768,9 @@ pub(crate) fn prepare_power_helper(
         return Err(format!("could not stage LaunchDaemon plist: {error}"));
     }
     let stage_result = (|| -> AppResult<PowerHelperSetup> {
-        scp_to_node(node, &helper, &staged_binary)?;
+        scp_to_node(node, helper.path(), &staged_binary)?;
         scp_to_node(node, &local_plist, &staged_plist)?;
-        let script = power_helper_install_script(&staged_binary, &staged_plist);
+        let script = power_helper_install_script(&staged_binary, &staged_plist, &digest);
         Ok(PowerHelperSetup {
             script,
             staged_binary: staged_binary.clone(),
@@ -2784,11 +2858,12 @@ fn prepare_power_helpers_for_nodes(
     setups
 }
 
-fn power_helper_install_script(staged_binary: &str, staged_plist: &str) -> String {
+fn power_helper_install_script(staged_binary: &str, staged_plist: &str, digest: &str) -> String {
     let staged_binary = shell_quote(staged_binary);
     let staged_plist = shell_quote(staged_plist);
+    let digest = shell_quote(digest);
     format!(
-        "set -e\n/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons\n/usr/bin/install -o root -g wheel -m 755 {staged_binary} {POWER_HELPER_PATH}\n/usr/bin/install -o root -g wheel -m 644 {staged_plist} {POWER_LAUNCHD_PATH}\n/bin/launchctl bootout system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1 || true\n/bin/rm -f {staged_binary} {staged_plist}\n/bin/launchctl bootstrap system {POWER_LAUNCHD_PATH}\n/bin/launchctl kickstart -k system/{POWER_LAUNCHD_LABEL}\n"
+        "set -e\nif [ ! -f {staged_binary} ] || [ -L {staged_binary} ]; then echo 'power helper staging file is not a regular file' >&2; exit 1; fi\nactual=$(/usr/bin/shasum -a 256 {staged_binary})\nif [ \"${{actual%% *}}\" != {digest} ]; then echo 'power helper checksum mismatch; installation cancelled' >&2; exit 1; fi\n/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons\n/usr/bin/install -o root -g wheel -m 755 {staged_binary} {POWER_HELPER_PATH}\n/usr/bin/install -o root -g wheel -m 644 {staged_plist} {POWER_LAUNCHD_PATH}\n/bin/launchctl bootout system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1 || true\n/bin/rm -f {staged_binary} {staged_plist}\n/bin/launchctl bootstrap system {POWER_LAUNCHD_PATH}\n/bin/launchctl kickstart -k system/{POWER_LAUNCHD_LABEL}\n"
     )
 }
 
@@ -2899,6 +2974,11 @@ fn client_nfs_cleanup_batch_script(
                 shell_quote(&request.mount_root.to_string_lossy())
             ));
             script.push_str("fi\n");
+        }
+        for request in requests {
+            let probe = primary_restore_probe(&request.mount_root, &request.share_uuid);
+            let restore = primary_restore_script(&request.mount_root, &request.share_uuid);
+            script.push_str(&format!("if ( {probe} ); then\n{restore}\nfi\n"));
         }
     }
     for (alias, target) in aliases {
@@ -3345,68 +3425,184 @@ fn ensure_remote_binary(
     Ok(())
 }
 
-fn ensure_remote_config(node: &NodeConfig, path: &str, candidate: &str) -> AppResult<()> {
-    let test = ssh_output(node, &shell_join(&["test", "-f", path]), None)?;
-    if test.status.success() {
-        let current = ssh_output(node, &shell_join(&["/bin/cat", path]), None)?;
-        if !current.status.success() {
-            return Err((
-                1,
-                command_error("could not read existing remote cluster config", &current),
-            ));
-        }
-        if current.stdout != candidate.as_bytes() {
-            return Err((
-                1,
-                format!(
-                    "remote cluster config {path} already exists with different content; refusing to overwrite it"
-                ),
-            ));
-        }
-        return Ok(());
+fn ensure_remote_config(
+    node: &NodeConfig,
+    path: &str,
+    candidate: &str,
+    operation_id: &str,
+    state_dir: &Path,
+) -> AppResult<()> {
+    ensure_remote_config_with_idle_check(
+        node,
+        path,
+        candidate,
+        operation_id,
+        state_dir,
+        check_remote_idle,
+    )
+}
+
+pub(crate) fn remote_agent_config_path(
+    home: &str,
+    cluster_uuid: &str,
+    machine_uuid: &str,
+) -> String {
+    format!("{home}/.config/macluster/clusters/{cluster_uuid}/agents/{machine_uuid}/config.toml")
+}
+
+fn enrollment_config_node_id(config: &ClusterConfig, node: &NodeConfig) -> AppResult<String> {
+    let uuid = node
+        .machine_uuid
+        .as_deref()
+        .ok_or_else(|| (1, "enrollment requires a verified machine UUID".into()))?;
+    let matches = config
+        .nodes
+        .iter()
+        .filter(|(_, configured)| {
+            configured
+                .machine_uuid
+                .as_deref()
+                .is_some_and(|known| known.eq_ignore_ascii_case(uuid))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1
+        || node.execution_uid.is_none()
+        || matches[0].1.execution_uid != node.execution_uid
+    {
+        return Err((1, "existing remote cluster config does not unambiguously identify this machine UUID and execution UID; refusing to replace it".into()));
     }
-    let parent = Path::new(path)
-        .parent()
-        .ok_or_else(|| (1, "remote config path has no parent".into()))?;
-    remote_run(
+    Ok(matches[0].0.clone())
+}
+
+fn ensure_remote_config_with_idle_check(
+    node: &NodeConfig,
+    path: &str,
+    candidate: &str,
+    operation_id: &str,
+    state_dir: &Path,
+    mut check_idle: impl FnMut(&NodeConfig, &str, &Path) -> AppResult<()>,
+) -> AppResult<()> {
+    let candidate = compatible_agent_config(candidate)?;
+    let expected = ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+    enrollment_config_node_id(&expected, node)?;
+    if !safe_absolute_remote_path(path) {
+        return Err((2, "remote config path is not a safe absolute path".into()));
+    }
+    let quoted = shell_quote(path);
+    let current = ssh_output(
         node,
         &format!(
-            "{} && {}",
-            shell_join(&["/bin/mkdir", "-p", &parent.to_string_lossy()]),
-            shell_join(&["/bin/chmod", "700", &parent.to_string_lossy()])
+            "if [ -L {quoted} ]; then exit 2; elif [ -f {quoted} ]; then /bin/cat {quoted}; elif [ -e {quoted} ]; then exit 3; else exit 4; fi"
         ),
         None,
     )?;
-    let local_temp =
-        std::env::temp_dir().join(format!("macluster-config-{}.toml", Id128::random()));
-    let write_result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&local_temp)?;
-        file.write_all(candidate.as_bytes())?;
-        file.sync_all()
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&local_temp);
-        return Err(io_error(error));
-    }
-    let remote_temp = format!("{path}.tmp-{}", Id128::random());
-    let result = (|| {
-        scp_to_node(node, &local_temp, &remote_temp)?;
+    let mut sync_operation = operation_id.to_owned();
+    let mut enrollment_baseline = "absent".to_owned();
+    if current.status.success() {
+        let existing =
+            ClusterConfig::parse(&String::from_utf8_lossy(&current.stdout)).map_err(|error| {
+                (
+                    1,
+                    format!("remote cluster config {path} is invalid; preserving it: {error}"),
+                )
+            })?;
+        if !remote_config_belongs_to_cluster(&existing, &expected, None) {
+            return Err((
+                1,
+                format!(
+                    "remote cluster config {path} belongs to another cluster or storage namespace; preserving it"
+                ),
+            ));
+        }
+        let existing_node_id = enrollment_config_node_id(&existing, node)?;
+        let compatible = compatible_agent_config(&String::from_utf8_lossy(&current.stdout))?;
+        if ClusterConfig::parse(&compatible).map_err(|error| (2, error.to_string()))? == expected {
+            return Ok(());
+        }
+        let mut connection = node.clone();
+        connection.remote_config = Some(path.to_owned());
+        check_idle(&connection, &existing_node_id, Path::new(path)).map_err(|(_, error)| {
+            (1, format!("cannot refresh existing remote config {path} until this node is idle and its output is synchronized: {error}"))
+        })?;
+        // An interrupted enrollment may be retried after another binary
+        // upgrade. Retain each previous config without reusing its backup name.
+        let digest = sha256_hex(&current.stdout).map_err(|error| (1, error.to_string()))?;
+        sync_operation = format!("{operation_id}-enroll-{}", &digest[..16]);
+        enrollment_baseline = digest;
+    } else if current.status.code() == Some(4) {
+        let parent = Path::new(path)
+            .parent()
+            .ok_or_else(|| (2, "remote config path has no parent".into()))?;
         remote_run(
             node,
             &format!(
                 "{} && {}",
-                shell_join(&["/bin/chmod", "600", &remote_temp]),
-                shell_join(&["/bin/mv", "-f", &remote_temp, path])
+                shell_join(&["/bin/mkdir", "-p", &parent.to_string_lossy()]),
+                shell_join(&["/bin/chmod", "700", &parent.to_string_lossy()])
             ),
             None,
-        )
-    })();
-    let _ = fs::remove_file(local_temp);
-    result.map(|_| ())
+        )?;
+    } else {
+        return Err((
+            1,
+            command_error(
+                "remote cluster config is not a readable regular file; preserving it",
+                &current,
+            ),
+        ));
+    }
+    sync_one_remote_config(
+        node,
+        path,
+        &candidate,
+        &expected,
+        &sync_operation,
+        state_dir,
+        None,
+        Some(&enrollment_baseline),
+    )
+}
+
+fn remote_config_belongs_to_cluster(
+    existing: &ClusterConfig,
+    expected: &ClusterConfig,
+    previous: Option<&ClusterConfig>,
+) -> bool {
+    let old_host = existing
+        .nodes
+        .get(existing.storage_server.as_str())
+        .map(|node| &node.host);
+    let new_host = expected
+        .nodes
+        .get(expected.storage_server.as_str())
+        .map(|node| &node.host);
+    let same_storage_machine = existing
+        .nodes
+        .get(existing.storage_server.as_str())
+        .zip(expected.nodes.get(expected.storage_server.as_str()))
+        .is_some_and(|(old, new)| {
+            old.machine_uuid
+                .as_deref()
+                .zip(new.machine_uuid.as_deref())
+                .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new))
+                && old.execution_uid.is_some()
+                && old.execution_uid == new.execution_uid
+        });
+    existing.name == expected.name
+        && existing.share_uuid == expected.share_uuid
+        && existing.shared_root == expected.shared_root
+        && existing.primary_source_root() == expected.primary_source_root()
+        && existing.login_node == expected.login_node
+        && existing.storage_server == expected.storage_server
+        && (old_host == new_host
+            || same_storage_machine
+            || previous.is_some_and(|config| {
+                config
+                    .execution_digest()
+                    .ok()
+                    .zip(existing.execution_digest().ok())
+                    .is_some_and(|(wanted, actual)| wanted == actual)
+            }))
 }
 
 pub(crate) fn sync_remote_configs(
@@ -3440,6 +3636,8 @@ pub(crate) fn sync_remote_configs(
                 config,
                 operation_id,
                 state_dir,
+                None,
+                None,
             )
         })();
         if let Err((_, error)) = result {
@@ -3485,6 +3683,8 @@ fn sync_one_remote_config(
     expected_config: &ClusterConfig,
     operation_id: &str,
     state_dir: &Path,
+    previous_config: Option<&ClusterConfig>,
+    enrollment_baseline: Option<&str>,
 ) -> AppResult<()> {
     if !safe_absolute_remote_path(destination) {
         return Err((
@@ -3493,12 +3693,26 @@ fn sync_one_remote_config(
         ));
     }
     let exists = ssh_output(node, &shell_join(&["test", "-f", destination]), None)?;
+    if enrollment_baseline.is_some_and(|digest| (digest == "absent") == exists.status.success()) {
+        return Err((
+            1,
+            "remote config changed while checking enrollment; rerun mnode -a".into(),
+        ));
+    }
     if exists.status.success() {
         let current = ssh_output(node, &shell_join(&["/bin/cat", destination]), None)?;
         if !current.status.success() {
             return Err((
                 1,
                 command_error("cannot read existing remote config", &current),
+            ));
+        }
+        if let Some(expected) = enrollment_baseline
+            && sha256_hex(&current.stdout).map_err(|error| (1, error.to_string()))? != expected
+        {
+            return Err((
+                1,
+                "remote config changed while checking enrollment; rerun mnode -a".into(),
             ));
         }
         if current.stdout == candidate.as_bytes() {
@@ -3513,22 +3727,7 @@ fn sync_one_remote_config(
                     ),
                 )
             })?;
-        let old_storage_host = existing
-            .nodes
-            .get(existing.storage_server.as_str())
-            .map(|node| node.host.as_str());
-        let new_storage_host = expected_config
-            .nodes
-            .get(expected_config.storage_server.as_str())
-            .map(|node| node.host.as_str());
-        if existing.name != expected_config.name
-            || existing.share_uuid != expected_config.share_uuid
-            || existing.shared_root != expected_config.shared_root
-            || existing.primary_source_root() != expected_config.primary_source_root()
-            || existing.login_node != expected_config.login_node
-            || existing.storage_server != expected_config.storage_server
-            || old_storage_host != new_storage_host
-        {
+        if !remote_config_belongs_to_cluster(&existing, expected_config, previous_config) {
             return Err((
                 1,
                 format!(
@@ -3592,15 +3791,41 @@ fn sync_one_remote_config(
     let remote_temp = format!("{destination}.macluster-{operation_id}.tmp");
     let result = (|| {
         scp_to_node(node, &local_temp, &remote_temp)?;
-        remote_run(
-            node,
-            &format!(
-                "{} && {}",
-                shell_join(&["/bin/chmod", "600", &remote_temp]),
-                shell_join(&["/bin/mv", "-f", &remote_temp, destination])
-            ),
-            None,
-        )?;
+        if let Some(baseline) = enrollment_baseline {
+            if node.transport == Transport::Local {
+                commit_enrollment_config(
+                    Path::new(destination),
+                    Path::new(&remote_temp),
+                    baseline,
+                )?;
+            } else {
+                remote_run(
+                    node,
+                    &shell_join(&[
+                        &node.remote_binary,
+                        "internal",
+                        "commit-enrollment-config",
+                        "--destination",
+                        destination,
+                        "--staged",
+                        &remote_temp,
+                        "--baseline",
+                        baseline,
+                    ]),
+                    None,
+                )?;
+            }
+        } else {
+            remote_run(
+                node,
+                &format!(
+                    "{} && {}",
+                    shell_join(&["/bin/chmod", "600", &remote_temp]),
+                    shell_join(&["/bin/mv", "-f", &remote_temp, destination])
+                ),
+                None,
+            )?;
+        }
         let installed = ssh_output(node, &shell_join(&["/bin/cat", destination]), None)?;
         if !installed.status.success() || installed.stdout != candidate.as_bytes() {
             return Err((
@@ -3612,6 +3837,63 @@ fn sync_one_remote_config(
     })();
     let _ = fs::remove_file(local_temp);
     result
+}
+
+pub(crate) fn commit_enrollment_config(
+    destination: &Path,
+    staged: &Path,
+    baseline: &str,
+) -> AppResult<()> {
+    if destination
+        .canonicalize()
+        .ok()
+        .zip(staged.canonicalize().ok())
+        .is_some_and(|(destination, staged)| destination == staged)
+    {
+        return Err((
+            2,
+            "staged enrollment config must be a different file".into(),
+        ));
+    }
+    let _lock = MaintenanceLock::exclusive_for_creation(destination).map_err(|error| (1,
+        format!("remote config is in use by a controller or another command; stop that controller before retrying enrollment: {error}")))?;
+    let current = match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Some(fs::read(destination).map_err(io_error)?)
+        }
+        Ok(_) => {
+            return Err((
+                1,
+                "remote config is no longer a regular file; preserving it".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    let actual = current
+        .as_ref()
+        .map(|bytes| sha256_hex(bytes))
+        .transpose()
+        .map_err(|error| (1, error.to_string()))?;
+    if actual.as_deref().unwrap_or("absent") != baseline {
+        return Err((
+            1,
+            "remote config changed during enrollment; preserving it; rerun mnode -a".into(),
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(staged)
+        .map_err(io_error)?;
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err((1, "staged enrollment config is not a regular file".into()));
+    }
+    let mut candidate = String::new();
+    file.read_to_string(&mut candidate).map_err(io_error)?;
+    ClusterConfig::parse(&candidate).map_err(|error| (1, error.to_string()))?;
+    atomic_write(destination, candidate.as_bytes())?;
+    fs::remove_file(staged).map_err(io_error)
 }
 
 fn local_sha256(path: &Path) -> AppResult<String> {
@@ -3720,6 +4002,7 @@ fn scp_to_node(node: &NodeConfig, local_path: &Path, remote_path: &str) -> AppRe
         return Ok(());
     }
     let mut command = Command::new("/usr/bin/scp");
+    node.add_pinned_host_key_args(&mut command);
     command.args(["-q", "-P"]);
     command.arg(node.ssh_port.unwrap_or(22).to_string());
     for option in [
@@ -5512,7 +5795,159 @@ fn remove_pending_share_marker(
     .map_err(|error| (1, error))
 }
 
-fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult<()> {
+fn removal_connection_node(
+    node_id: &str,
+    registered: &NodeConfig,
+    connect: Option<&NodeEndpoint>,
+    saved_endpoint: Option<&str>,
+    recorded_uuid: Option<&str>,
+) -> AppResult<NodeConfig> {
+    if registered.transport != Transport::Ssh {
+        if connect.is_some() {
+            return Err((2, "--connect requires a registered SSH node".into()));
+        }
+        return Ok(registered.clone());
+    }
+    let saved = if connect.is_none() {
+        saved_endpoint
+            .map(NodeEndpoint::parse)
+            .transpose()
+            .map_err(|error| (1, format!("cannot resume removal of {node_id}: {error}")))?
+    } else {
+        None
+    };
+    let Some(endpoint) = connect.or(saved.as_ref()) else {
+        return Ok(registered.clone());
+    };
+    if registered.ssh_user.as_deref() != Some(endpoint.user.as_str()) {
+        return Err((
+            2,
+            format!("--connect must use the registered SSH account for {node_id}"),
+        ));
+    }
+    let mut connection = registered.clone();
+    connection.host = endpoint.host.to_string();
+    connection.ssh_port = Some(endpoint.port);
+    if (connection.host != registered.host
+        || connection.ssh_port.unwrap_or(22) != registered.ssh_port.unwrap_or(22))
+        && registered.machine_uuid.is_none()
+        && recorded_uuid.is_none()
+    {
+        return Err((
+            1,
+            format!(
+                "cannot redirect removal of {node_id}; no registered machine UUID is available to verify its new address"
+            ),
+        ));
+    }
+    Ok(connection)
+}
+
+fn validate_removal_address(
+    node_id: &str,
+    node: &NodeConfig,
+    local_addresses: &[Ipv4Addr],
+) -> AppResult<()> {
+    if node.transport == Transport::Ssh
+        && node
+            .host
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|host| host.is_loopback() || local_addresses.contains(&host))
+    {
+        return Err((
+            1,
+            format!(
+                "cannot remove {node_id}: its SSH address {} now belongs to this login Mac. The node address has changed; rerun `mnode -rm {node_id} --connect {}@CURRENT_IP:{}`. The destination machine UUID will be verified before cleanup; SSH host-key verification remains enabled",
+                node.host,
+                node.ssh_user.as_deref().unwrap_or("USER"),
+                node.ssh_port.unwrap_or(22)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_removal_identity(
+    node_id: &str,
+    node: &NodeConfig,
+    recorded_uuid: Option<&str>,
+    actual_uuid: &str,
+) -> AppResult<()> {
+    for expected in [node.machine_uuid.as_deref(), recorded_uuid]
+        .into_iter()
+        .flatten()
+    {
+        validate_pending_node_identity(node_id, Some(expected), actual_uuid)
+            .map_err(|error| (1, error))?;
+    }
+    Ok(())
+}
+
+fn removal_connection_error(node_id: &str, node: &NodeConfig, error: String) -> (i32, String) {
+    let lower = error.to_ascii_lowercase();
+    let advice = if lower.contains("remote host identification has changed")
+        || lower.contains("host key verification failed")
+        || lower.contains("host key is known")
+    {
+        "SSH host-key verification failed. Check whether the node IP was reassigned; keep existing known_hosts entries until you have verified the destination fingerprint."
+    } else {
+        "The registered node could not be reached or authenticated. Check its current address and SSH access."
+    };
+    (
+        1,
+        format!(
+            "cannot verify removal destination for {node_id} at {}: {advice} If its address changed, use `mnode -rm {node_id} --connect {}@CURRENT_IP:{}`. No remote cleanup was performed.\n{error}",
+            node.host,
+            node.ssh_user.as_deref().unwrap_or("USER"),
+            node.ssh_port.unwrap_or(22)
+        ),
+    )
+}
+
+fn removal_connection_from_state(
+    node_id: &str,
+    node: &NodeConfig,
+    connect: Option<&NodeEndpoint>,
+    state: &AdminState,
+) -> AppResult<NodeConfig> {
+    let saved_endpoint = state
+        .operations
+        .get(&format!("remove:{node_id}"))
+        .filter(|operation| operation.action == "remove")
+        .and_then(|operation| operation.connection_endpoint.as_deref());
+    removal_connection_node(
+        node_id,
+        node,
+        connect,
+        saved_endpoint,
+        state.machine_uuids.get(node_id).map(String::as_str),
+    )
+}
+
+pub(crate) fn pending_removal_connection(
+    node_id: &str,
+    node: &NodeConfig,
+    endpoint: Option<&str>,
+    recorded_uuid: Option<&str>,
+) -> AppResult<NodeConfig> {
+    removal_connection_node(node_id, node, None, endpoint, recorded_uuid)
+}
+
+fn remove_node(
+    config_path: &Path,
+    state_dir: &Path,
+    node_id: &str,
+    connect: Option<&NodeEndpoint>,
+) -> AppResult<()> {
+    // Reject a stale address that now identifies this Mac before asking to
+    // stop the controller or creating any maintenance state. Recheck under lock.
+    let initial_config = read_config(config_path)?;
+    if let Some(node) = initial_config.nodes.get(node_id) {
+        let initial_state =
+            read_admin_state(&state_dir.join("node-admin.json"), config_path, state_dir)?;
+        let connection = removal_connection_from_state(node_id, node, connect, &initial_state)?;
+        validate_removal_address(node_id, &connection, &local_ipv4_addresses()?)?;
+    }
     let _maintenance = acquire_node_maintenance(config_path, state_dir, "mnode --remove")?;
     MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
         (
@@ -5675,20 +6110,17 @@ fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult
             format!("cannot remove {node_id}; local jobs still reference it: {details}"),
         ));
     }
-    check_remote_idle(&node, node_id, &config_path)?;
-    let machine_uuid = remote_machine_uuid(&node)?;
-    if state
-        .machine_uuids
-        .get(node_id)
-        .is_some_and(|known| known != &machine_uuid)
-    {
-        return Err((
-            1,
-            format!(
-                "node {node_id} reports machine UUID {machine_uuid}, different from its recorded identity; refusing removal"
-            ),
-        ));
-    }
+    let connection_node = removal_connection_from_state(node_id, &node, connect, &state)?;
+    validate_removal_address(node_id, &connection_node, &local_ipv4_addresses()?)?;
+    let machine_uuid = remote_machine_uuid(&connection_node)
+        .map_err(|(_, error)| removal_connection_error(node_id, &connection_node, error))?;
+    validate_removal_identity(
+        node_id,
+        &node,
+        state.machine_uuids.get(node_id).map(String::as_str),
+        &machine_uuid,
+    )?;
+    check_remote_idle(&connection_node, node_id, &config_path)?;
     state.machine_uuids.insert(node_id.to_owned(), machine_uuid);
 
     state.reserved_node_ids.insert(node_id.to_owned());
@@ -5704,17 +6136,19 @@ fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult
             NodeOperation {
                 id: Id128::random().to_string(),
                 action: "remove".into(),
+                connection_endpoint: None,
+                remote_config_path: node.remote_config.clone(),
                 node_id: node_id.to_owned(),
-                endpoint: add_record
-                    .map(|record| record.endpoint.clone())
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{}@{}:{}",
-                            node.ssh_user.as_deref().unwrap_or("unknown"),
-                            node.host,
-                            node.ssh_port.unwrap_or(22)
-                        )
-                    }),
+                endpoint: format!(
+                    "{}@{}:{}",
+                    if node.transport == Transport::Local {
+                        "local"
+                    } else {
+                        node.ssh_user.as_deref().unwrap_or("unknown")
+                    },
+                    node.host,
+                    node.ssh_port.unwrap_or(22)
+                ),
                 machine_uuid: state.machine_uuids.get(node_id).cloned(),
                 phase: "REMOVAL_PENDING".into(),
                 old_config_sha256: sha256_hex(config_source.as_bytes()).ok(),
@@ -5727,6 +6161,17 @@ fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult
                 detail: None,
             }
         });
+    if operation.remote_config_path.is_none() {
+        operation.remote_config_path = node.remote_config.clone();
+    }
+    if connection_node.transport == Transport::Ssh {
+        operation.connection_endpoint = Some(format!(
+            "{}@{}:{}",
+            connection_node.ssh_user.as_deref().unwrap_or("unknown"),
+            connection_node.host,
+            connection_node.ssh_port.unwrap_or(22)
+        ));
+    }
     let current_digest =
         sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
     let matches_old = operation.old_config_sha256.as_deref() == Some(current_digest.as_str());
@@ -5771,7 +6216,7 @@ fn remove_node(config_path: &Path, state_dir: &Path, node_id: &str) -> AppResult
         save_admin_state(&journal_path, &state)?;
     }
 
-    if let Err((_, error)) = cleanup_client_nfs_resources(&config, node_id, &node) {
+    if let Err((_, error)) = cleanup_client_nfs_resources(&config, node_id, &connection_node) {
         operation.detail = Some(error.clone());
         state
             .operations
@@ -5972,6 +6417,79 @@ pub(crate) fn check_remote_idle(
         ));
     }
     Ok(())
+}
+
+fn enrollment_controller_epoch(state_dir: &Path) -> Result<ControllerEpoch, String> {
+    Storage::open(state_dir)
+        .and_then(|storage| storage.begin_controller_epoch())
+        .map_err(|error| format!("cannot prepare node handoff identity: {error}"))
+}
+
+fn migration_controller_epoch(state_dir: &Path) -> Result<ControllerEpoch, String> {
+    let storage = Storage::open(state_dir)
+        .map_err(|error| format!("cannot inspect node handoff identity: {error}"))?;
+    if let Some(controller) = storage
+        .current_controller_epoch()
+        .map_err(|error| format!("cannot inspect node handoff identity: {error}"))?
+    {
+        return Ok(controller);
+    }
+    storage
+        .begin_controller_epoch()
+        .map_err(|error| format!("cannot prepare node handoff identity: {error}"))
+}
+
+fn claim_enrollment_agent(
+    node: &NodeConfig,
+    node_id: &str,
+    config_path: &Path,
+    namespace: &str,
+    controller: ControllerEpoch,
+) -> Result<(), String> {
+    if node.transport == Transport::Local {
+        let actual = local_platform_uuid().map_err(|(_, error)| error)?;
+        macluster_agent::validate_node_identity(node, &actual, unsafe { libc::geteuid() })?;
+        return macluster_agent::admin::claim_idle(
+            &macluster_agent::default_state_dir(),
+            controller,
+            namespace,
+        )
+        .map_err(|error| error.to_string());
+    }
+    let selected_config = node
+        .remote_config
+        .as_deref()
+        .unwrap_or_else(|| config_path.to_str().unwrap_or("/dev/null"));
+    let command = shell_join(&[
+        &node.remote_binary,
+        "--config",
+        selected_config,
+        "internal",
+        "claim-agent",
+        "--node",
+        node_id,
+        "--controller",
+        &controller.controller_uuid.to_string(),
+        "--epoch",
+        &controller.epoch.to_string(),
+    ]);
+    let output = ssh_output(node, &command, None).map_err(|(_, error)| error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(
+            "cannot hand this idle node to the current controller",
+            &output,
+        ))
+    }
+}
+
+pub(crate) fn primary_restore_probe(root: &Path, namespace: &str) -> String {
+    primary_reuse::presence_probe(root, namespace)
+}
+
+pub(crate) fn primary_restore_script(root: &Path, namespace: &str) -> String {
+    primary_reuse::restore_script(root, namespace)
 }
 
 pub(crate) fn remote_execution_status(
@@ -6394,6 +6912,67 @@ fn existing_ssh_endpoint_matches(existing: &NodeConfig, endpoint: &NodeEndpoint)
         && existing.ssh_port.unwrap_or(22) == endpoint.port
 }
 
+fn pending_combined_ssh_add(
+    state: &AdminState,
+    node_id: &str,
+    endpoint: &NodeEndpoint,
+    configured_digest: &str,
+) -> AppResult<Option<String>> {
+    let mut pending = state.operations.iter().filter(|(key, operation)| {
+        key.starts_with("add:")
+            && operation.action == "add"
+            && operation.node_id == node_id
+            && should_resume_add_operation(&operation.phase)
+    });
+    let Some((key, operation)) = pending.next() else {
+        return Ok(None);
+    };
+    if pending.next().is_some()
+        || operation.endpoint != endpoint.canonical()
+        || !matches!(operation.phase.as_str(), "ADD_COMMITTING" | "SYNC_PENDING")
+        || operation.candidate_config_sha256.as_deref() != Some(configured_digest)
+    {
+        return Err((
+            1,
+            format!(
+                "node {node_id} has an incomplete enrollment that does not match this command or the active config; rerun the original enrollment command or inspect the node-admin journal before adding a share"
+            ),
+        ));
+    }
+    Ok(Some(key.clone()))
+}
+
+fn resume_existing_ssh_add_sync(
+    state: &mut AdminState,
+    journal_path: &Path,
+    key: &str,
+    endpoint: &NodeEndpoint,
+    mut sync: impl FnMut(&NodeOperation) -> Result<(), String>,
+) -> AppResult<()> {
+    let mut operation = state.operations[key].clone();
+    operation.phase = "SYNC_PENDING".into();
+    operation.detail = None;
+    state.operations.insert(key.to_owned(), operation.clone());
+    save_admin_state(journal_path, state)?;
+    if let Err(error) = sync(&operation) {
+        operation.detail = Some(error.clone());
+        let node_id = operation.node_id.clone();
+        state.operations.insert(key.to_owned(), operation);
+        save_admin_state(journal_path, state)?;
+        return Err((
+            1,
+            format!(
+                "node {node_id} is configured locally, but peer config sync is pending: {error}. Rerun the same `mnode -a {}` command to resume.",
+                endpoint.canonical()
+            ),
+        ));
+    }
+    operation.phase = "READY".into();
+    operation.detail = None;
+    state.operations.insert(key.to_owned(), operation);
+    save_admin_state(journal_path, state)
+}
+
 fn pending_local_share_retry_node(
     config: &ClusterConfig,
     operation: Option<&NodeOperation>,
@@ -6434,34 +7013,13 @@ fn add_node(config_path: &Path, state_dir: &Path, options: AddOptions) -> AppRes
     match options.target {
         AddTarget::Ssh(endpoint) => {
             let source_path = endpoint.source_path.clone();
-            let current_config = read_config(config_path)?;
-            let configured = current_config
-                .nodes
-                .iter()
-                .find(|(_, node)| node.host == endpoint.host.to_string())
-                .map(|(id, _)| id.clone());
-            if configured.is_none() || source_path.is_none() {
-                add_ssh_node(
-                    config_path,
-                    state_dir,
-                    endpoint.clone(),
-                    options.queue.as_deref(),
-                    source_path.is_some(),
-                )?;
-            }
-            if let Some(existing_id) = configured.as_deref()
-                && source_path.is_some()
-            {
-                let existing = &current_config.nodes[existing_id];
-                if !existing_ssh_endpoint_matches(existing, &endpoint) {
-                    return Err((
-                        2,
-                        format!(
-                            "node {existing_id} is already registered with a different SSH user or port; use its configured identity to add a share"
-                        ),
-                    ));
-                }
-            }
+            add_ssh_node(
+                config_path,
+                state_dir,
+                endpoint.clone(),
+                options.queue.as_deref(),
+                source_path.is_some(),
+            )?;
             if let Some(source_path) = source_path {
                 register_named_share(
                     config_path,
@@ -6713,6 +7271,8 @@ fn register_named_share(
         _ => NodeOperation {
             id: Id128::random().to_string(),
             action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: server_id.clone(),
             endpoint: endpoint_key,
             machine_uuid: Some(marker_uuid.clone()),
@@ -6763,6 +7323,17 @@ fn register_named_share(
         .nodes
         .get(&server_id)
         .expect("share server remains in candidate config");
+    if staged_server.transport == Transport::Ssh {
+        let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+        claim_enrollment_agent(
+            staged_server,
+            &server_id,
+            &config_path,
+            &config.share_uuid,
+            handoff,
+        )
+        .map_err(|error| (1, error))?;
+    }
     migrate_child_shares(&config, &share, &operation.id)?;
     prepare_share_source(staged_server, &source_root, &marker_uuid)?;
     let export_requests = config
@@ -6937,6 +7508,8 @@ fn repair_named_share(
     let mut operation = pending.cloned().unwrap_or_else(|| NodeOperation {
         id: Id128::random().to_string(),
         action: "share".into(),
+        connection_endpoint: None,
+        remote_config_path: None,
         node_id: server_id.into(),
         endpoint: named_share_operation_endpoint(
             share_id,
@@ -7767,7 +8340,18 @@ fn run_client_mount_batch(
     power_script: Option<&str>,
     purpose: &str,
 ) -> Result<(), String> {
+    run_client_mount_batch_with_preparation(node, requests, "", power_script, purpose)
+}
+
+fn run_client_mount_batch_with_preparation(
+    node: &NodeConfig,
+    requests: &[ClientMountRequest],
+    preparation: &str,
+    power_script: Option<&str>,
+    purpose: &str,
+) -> Result<(), String> {
     let mount_script = client_mount_batch_script(requests);
+    let mount_script = mount_script.map(|mounts| format!("{preparation}\n{mounts}"));
     let Some(script) = candidate_admin_script(power_script, mount_script.as_deref()) else {
         return Ok(());
     };
@@ -7906,20 +8490,68 @@ fn configure_node_nfs_resources(
     managed_export: &mut bool,
     managed_shares: &mut BTreeSet<String>,
     power_setup: Option<PowerHelperSetup>,
+    existing_power_setups: BTreeMap<String, PowerHelperSetup>,
+) -> Result<(), String> {
+    configure_node_nfs_resources_with_claim(
+        config,
+        node_id,
+        node,
+        operation_id,
+        managed_export,
+        managed_shares,
+        power_setup,
+        existing_power_setups,
+        None,
+    )
+}
+
+fn configure_node_nfs_resources_with_claim(
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+    operation_id: &str,
+    managed_export: &mut bool,
+    managed_shares: &mut BTreeSet<String>,
+    power_setup: Option<PowerHelperSetup>,
     mut existing_power_setups: BTreeMap<String, PowerHelperSetup>,
+    claim: Option<ControllerEpoch>,
 ) -> Result<(), String> {
     let result = (|| -> Result<(), String> {
         let mut export_entries = Vec::new();
         let mut mount_requests = Vec::new();
+        let mut primary_preparation = String::new();
         let storage_id = config.storage_server.as_str();
         let storage = &config.nodes[storage_id];
         if node_id != storage_id {
-            let request = candidate_mount_command(
+            let request = match candidate_mount_command(
                 node,
                 storage,
                 config.primary_source_root(),
                 &config.shared_root,
-            )?;
+            ) {
+                Ok(request) => request,
+                Err(error)
+                    if claim.is_some()
+                        && (error.contains("not empty and is not mounted")
+                            || error.contains("already mounted from")) =>
+                {
+                    let plan = primary_reuse::plan(
+                        node,
+                        storage,
+                        config.primary_source_root(),
+                        &config.shared_root,
+                        &config.share_uuid,
+                        operation_id,
+                    )?;
+                    primary_preparation = plan.preparation;
+                    eprintln!(
+                        "Previous local shared data will be preserved at {}",
+                        plan.backup_path.display()
+                    );
+                    Some(plan.request)
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(request) = request {
                 mount_requests.push(request);
             }
@@ -7967,6 +8599,17 @@ fn configure_node_nfs_resources(
             }
         }
 
+        if let Some(controller) = claim {
+            // All mount planning and consent above are read-only. Claim under
+            // the Agent lock before exports, unmounts, or local data change.
+            claim_enrollment_agent(
+                node,
+                node_id,
+                Path::new("/dev/null"),
+                &config.share_uuid,
+                controller,
+            )?;
+        }
         for (server_id, requests) in group_nfs_export_requests(export_entries) {
             let server = config
                 .nodes
@@ -8018,11 +8661,16 @@ fn configure_node_nfs_resources(
 
         let power_script = power_setup.as_ref().map(|setup| setup.script.as_str());
         if !mount_requests.is_empty() || power_script.is_some() {
-            run_client_mount_batch(
+            run_client_mount_batch_with_preparation(
                 node,
                 &mount_requests,
+                &primary_preparation,
                 power_script,
-                "configure primary and named NFS mounts and the mtop power sampler",
+                if power_script.is_some() {
+                    "configure primary and named NFS mounts and the mtop power sampler"
+                } else {
+                    "configure primary and named NFS mounts"
+                },
             )?;
         }
 
@@ -8306,6 +8954,8 @@ fn add_local_node(
         .unwrap_or_else(|| NodeOperation {
             id: Id128::random().to_string(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: node_id.clone(),
             endpoint: format!("local@{host}:22"),
             machine_uuid: Some(machine_uuid.clone()),
@@ -8784,11 +9434,31 @@ fn add_ssh_node(
                 ),
             ));
         }
+        let configured_digest =
+            sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let combined_pending_key = if defer_queue_for_share {
+            let pending =
+                pending_combined_ssh_add(&state, existing_id, &endpoint, &configured_digest)?;
+            if pending.is_none() {
+                // An ordinary share retry must not refresh setup or enroll a
+                // deliberately deferred node into the queue.
+                return Ok(());
+            }
+            pending
+        } else {
+            None
+        };
         let machine_uuid = remote_machine_uuid(existing_node)?;
-        if state
-            .machine_uuids
-            .get(existing_id)
-            .is_some_and(|known| known != &machine_uuid)
+        if [
+            existing_node.machine_uuid.as_deref(),
+            state.machine_uuids.get(existing_id).map(String::as_str),
+            combined_pending_key
+                .as_ref()
+                .and_then(|key| state.operations[key].machine_uuid.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|known| !known.eq_ignore_ascii_case(&machine_uuid))
         {
             return Err((
                 1,
@@ -8798,35 +9468,47 @@ fn add_ssh_node(
                 ),
             ));
         }
+        if combined_pending_key.is_some() {
+            let facts = read_remote_facts(existing_node)?;
+            if existing_node
+                .execution_uid
+                .is_some_and(|expected| expected != facts.uid)
+            {
+                return Err((
+                    1,
+                    format!("node {existing_id} execution UID changed; refusing enrollment sync"),
+                ));
+            }
+        }
         state
             .machine_uuids
             .insert(existing_id.clone(), machine_uuid.clone());
         state.reserved_node_ids.insert(existing_id.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        let configured_digest =
-            sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
         let queue_operation_key = format!("queue:{existing_id}:{queue_name}");
         let is_queue_member = config
             .queues
             .get(queue_name)
             .is_some_and(|queue| queue.nodes.iter().any(|member| member == existing_id));
-        let pending_key = is_queue_member
-            .then(|| {
-                [operation_key.as_str(), queue_operation_key.as_str()]
-                    .into_iter()
-                    .find(|key| {
-                        state.operations.get(*key).is_some_and(|operation| {
-                            operation.node_id == *existing_id
-                                && matches!(
-                                    operation.phase.as_str(),
-                                    "ADD_COMMITTING" | "SYNC_PENDING"
-                                )
+        let pending_key = combined_pending_key.as_deref().or_else(|| {
+            is_queue_member
+                .then(|| {
+                    [operation_key.as_str(), queue_operation_key.as_str()]
+                        .into_iter()
+                        .find(|key| {
+                            state.operations.get(*key).is_some_and(|operation| {
+                                operation.node_id == *existing_id
+                                    && matches!(
+                                        operation.phase.as_str(),
+                                        "ADD_COMMITTING" | "SYNC_PENDING"
+                                    )
+                            })
                         })
-                    })
-            })
-            .flatten();
+                })
+                .flatten()
+        });
         if let Some(key) = pending_key {
-            let mut operation = state
+            let operation = state
                 .operations
                 .get(key)
                 .cloned()
@@ -8839,32 +9521,25 @@ fn add_ssh_node(
                     ),
                 ));
             }
-            operation.phase = "SYNC_PENDING".into();
-            operation.detail = None;
-            state.operations.insert(key.to_owned(), operation.clone());
-            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-            if let Err(error) = sync_remote_configs(
-                &config,
-                &config_source,
-                state_dir,
-                &operation.id,
-                Some(existing_id),
-            ) {
-                operation.detail = Some(error.clone());
-                state.operations.insert(key.to_owned(), operation);
-                save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-                return Err((
-                    1,
-                    format!(
-                        "node {existing_id} is configured locally, but peer config sync is pending: {error}. Rerun the same `mnode -a {}` command to resume.",
-                        endpoint.canonical()
-                    ),
-                ));
-            }
-            operation.phase = "READY".into();
-            operation.detail = None;
-            state.operations.insert(key.to_owned(), operation);
-            save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+            let key = key.to_owned();
+            resume_existing_ssh_add_sync(
+                &mut state,
+                &state_dir.join("node-admin.json"),
+                &key,
+                &endpoint,
+                |operation| {
+                    sync_remote_configs(
+                        &config,
+                        &config_source,
+                        state_dir,
+                        &operation.id,
+                        Some(existing_id),
+                    )
+                },
+            )?;
+        }
+        if defer_queue_for_share {
+            return Ok(());
         }
         if is_queue_member {
             let facts = read_remote_facts(existing_node)?;
@@ -8891,6 +9566,16 @@ fn add_ssh_node(
                 .get(&operation_key)
                 .map(|operation| operation.id.clone())
                 .unwrap_or_else(|| Id128::random().to_string());
+            check_remote_idle(existing_node, existing_id, &config_path)?;
+            let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+            claim_enrollment_agent(
+                existing_node,
+                existing_id,
+                &config_path,
+                &config.share_uuid,
+                handoff,
+            )
+            .map_err(|error| (1, error))?;
             ensure_power_helper(existing_node, facts.uid, &facts.arch, &operation_id).map_err(
                 |error| {
                     (
@@ -9067,6 +9752,8 @@ fn add_ssh_node(
         operation = Some(NodeOperation {
             id,
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: node_id.clone(),
             endpoint: endpoint_text,
             machine_uuid: Some(machine_uuid.clone()),
@@ -9129,10 +9816,9 @@ fn add_ssh_node(
         "{remote_home}/.local/share/macluster/clusters/{}/bin/{binary_digest}/macluster",
         config.share_uuid
     );
-    let remote_config = format!(
-        "{remote_home}/.config/macluster/clusters/{}/config.toml",
-        config.share_uuid
-    );
+    // Keep this machine's own login configuration and older enrollment
+    // snapshots separate from the compute Agent configuration we manage.
+    let remote_config = remote_agent_config_path(&remote_home, &config.share_uuid, &machine_uuid);
     let mut node_config = endpoint.node_config(remote_binary.clone(), Some(remote_config.clone()));
     node_config.ssh_identity_file = remote.ssh_identity_file.clone();
     node_config.machine_uuid = Some(machine_uuid.clone());
@@ -9152,7 +9838,18 @@ fn add_ssh_node(
         &machine_uuid,
         facts.uid,
     )?;
-    ensure_remote_config(&node_config, &remote_config, &candidate_source)?;
+    operation.remote_config_path = Some(remote_config.clone());
+    state
+        .operations
+        .insert(operation_key.clone(), operation.clone());
+    save_admin_state(&state_dir.join("node-admin.json"), &state)?;
+    ensure_remote_config(
+        &node_config,
+        &remote_config,
+        &candidate_source,
+        &operation.id,
+        state_dir,
+    )?;
     let candidate_config =
         ClusterConfig::parse(&candidate_source).map_err(|error| (2, error.to_string()))?;
     let candidate_node_id = NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
@@ -9208,7 +9905,8 @@ fn add_ssh_node(
         .operations
         .insert(operation_key.clone(), operation.clone());
     save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-    if let Err(detail) = configure_node_nfs_resources(
+    let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+    if let Err(detail) = configure_node_nfs_resources_with_claim(
         &config,
         &node_id,
         &node_config,
@@ -9217,6 +9915,7 @@ fn add_ssh_node(
         &mut operation.managed_shares,
         power_setup,
         existing_power_setups,
+        Some(handoff),
     ) {
         operation.phase = "SETUP_PENDING".into();
         operation.detail = Some(detail.clone());
@@ -9354,6 +10053,13 @@ fn add_existing_ssh_node_to_queue(
     for (id, node) in &config.nodes {
         check_remote_idle(node, id, config_path)?;
     }
+    let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
+    let node = config
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| (2, "node is not configured".into()))?;
+    claim_enrollment_agent(node, node_id, config_path, &config.share_uuid, handoff)
+        .map_err(|error| (1, error))?;
     let operation_key = format!("queue:{node_id}:{queue_name}");
     let old_digest =
         sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
@@ -9384,6 +10090,8 @@ fn add_existing_ssh_node_to_queue(
         _ => NodeOperation {
             id: Id128::random().to_string(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: node_id.to_owned(),
             endpoint: format!("queue:{queue_name}"),
             machine_uuid: Some(machine_uuid.to_owned()),
@@ -9459,7 +10167,7 @@ fn add_existing_ssh_node_to_queue(
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AdminState, AgentBuildState, AgentStagePurpose, ClientMountRequest,
+        Action, AdminState, AgentBuildState, AgentStagePurpose, AppResult, ClientMountRequest,
         ClientUnmountRequest, ClusterConfig, NFS_DAEMON_PATH, NamedShareMountStatus, NodeEndpoint,
         NodeListRow, NodeNfsMapping, NodeOperation, ShareConfig, UpdateRecovery,
         abort_duplicate_pristine_adds, acquire_node_maintenance, acquire_node_maintenance_with,
@@ -9471,20 +10179,21 @@ mod tests {
         dispatch_sync_pending, ensure_controller_recovery_clean,
         ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
         inspect_configured_agent_build, list_nodes, local_config_candidate, managed_binary_digest,
-        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
-        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
-        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
-        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
-        node_admin_recovery_pending, node_nfs_mappings, normalize_binary_path, parse_action,
-        parse_agent_build_probe, parse_nfs_exports_update_baseline,
-        pending_add_may_have_client_state, pending_add_operation_for_endpoint,
+        migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
+        named_share_mount_status, named_share_operation_endpoint, named_share_operation_matches,
+        named_share_request_matches, nfs_exports_read_command,
+        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
+        nfs_exports_update_script_for_expected, nfs_mount_source, node_admin_recovery_pending,
+        node_nfs_mappings, normalize_binary_path, parse_action, parse_agent_build_probe,
+        parse_nfs_exports_update_baseline, pending_add_may_have_client_state,
+        pending_add_operation_for_endpoint, pending_combined_ssh_add,
         pending_local_share_retry_node, pending_managed_export_cleanup_plan, pending_share_mapping,
         plan_ensure_nfs_exports, plan_remove_nfs_exports, power_helper_install_script,
         power_launch_daemon_plist, preferred_local_host, queue_candidate_with_node,
         read_admin_state, remote_execution_status, reset_admin_operations,
-        reset_node_from_endpoint, save_admin_state, should_resume_add_operation,
-        shutdown_confirmation_accepted, update_recovery, validate_pending_node_identity,
-        validate_storage_root_access,
+        reset_node_from_endpoint, resume_existing_ssh_add_sync, save_admin_state,
+        should_resume_add_operation, shutdown_confirmation_accepted, update_recovery,
+        validate_pending_node_identity, validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -9534,6 +10243,18 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups["storage-a"].len(), 2);
         assert_eq!(groups["storage-b"].len(), 1);
+    }
+
+    #[test]
+    fn migration_reuses_the_running_controller_epoch_instead_of_fencing_it() {
+        let state =
+            std::env::temp_dir().join(format!("macluster-migration-epoch-{}", Id128::random()));
+        let storage = Storage::open(&state).unwrap();
+        let first = storage.begin_controller_epoch().unwrap();
+        assert_eq!(migration_controller_epoch(&state).unwrap(), first);
+        assert_eq!(storage.current_controller_epoch().unwrap(), Some(first));
+        drop(storage);
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]
@@ -10023,6 +10744,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let mut operation = NodeOperation {
             id: "pending".into(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "worker".into(),
             endpoint: "operator@192.0.2.2:22".into(),
             machine_uuid: None,
@@ -10063,6 +10786,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let operation = |id: &str, endpoint: &str, attempted| NodeOperation {
             id: id.into(),
             action: "add".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: id.into(),
             endpoint: endpoint.into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
@@ -10086,6 +10811,13 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             "legacy".into(),
             operation("legacy", "operator@192.0.2.4:22", None),
         );
+        state
+            .operations
+            .get_mut("attempted")
+            .unwrap()
+            .remote_config_path = Some(
+            "/Users/operator/.config/macluster/clusters/cluster/agents/machine/config.toml".into(),
+        );
         save_admin_state(&journal_path, &state).unwrap();
 
         let operations = reset_admin_operations(&config_path, &state_dir).unwrap();
@@ -10097,6 +10829,11 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(by_id["attempted"].client_setup_may_have_run);
         assert!(!by_id["not-attempted"].client_setup_may_have_run);
         assert!(by_id["legacy"].client_setup_may_have_run);
+        assert_eq!(
+            by_id["attempted"].remote_config_path.as_deref(),
+            Some("/Users/operator/.config/macluster/clusters/cluster/agents/machine/config.toml")
+        );
+        assert!(by_id["legacy"].remote_config_path.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -10856,6 +11593,206 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         node
     }
 
+    fn enrollment_config_fixture() -> (PathBuf, PathBuf, NodeConfig, String) {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nshared_root=\"/tmp/shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"worker\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/old/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n";
+        fs::write(&path, source).unwrap();
+        let mut node = local_share_test_node();
+        node.machine_uuid = Some("01234567-89ab-cdef-0123-456789abcdef".into());
+        node.execution_uid = Some(501);
+        (root, path, node, source.into())
+    }
+
+    #[test]
+    fn enrollment_accepts_equivalent_existing_remote_configuration() {
+        let (root, path, node, source) = enrollment_config_fixture();
+        let result = super::ensure_remote_config(
+            &node,
+            path.to_str().unwrap(),
+            &format!("{source}\n# enrollment retry\n"),
+            "test-retry",
+            &root,
+        );
+        let retained = fs::read_to_string(&path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(retained, source);
+    }
+
+    #[test]
+    fn enrollment_refreshes_stale_config_and_preserves_each_retry_backup() {
+        let (root, path, node, source) = enrollment_config_fixture();
+        let unrelated = root.join("old-login-config.toml");
+        fs::write(&unrelated, "original standalone cluster").unwrap();
+        let mut before = source.clone();
+        for binary in ["/new/macluster", "/newer/macluster"] {
+            let candidate = source.replace("/old/macluster", binary);
+            let mut checked = false;
+            super::ensure_remote_config_with_idle_check(
+                &node,
+                path.to_str().unwrap(),
+                &candidate,
+                "same-operation",
+                &root,
+                |connection, id, config_path| {
+                    assert_eq!(id, "worker");
+                    assert_eq!(connection.remote_config.as_deref(), path.to_str());
+                    assert_eq!(config_path, path);
+                    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+                    checked = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(checked);
+            let digest = sha256_hex(before.as_bytes()).unwrap();
+            let backup = format!(
+                "{}.macluster-same-operation-enroll-{}.bak",
+                path.display(),
+                &digest[..16]
+            );
+            assert_eq!(fs::read_to_string(backup).unwrap(), before);
+            before = super::compatible_agent_config(&candidate).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        }
+        assert_eq!(
+            fs::read_to_string(unrelated).unwrap(),
+            "original standalone cluster"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enrollment_preserves_busy_nodes_and_pending_output() {
+        for blocker in ["running task", "pending output synchronization"] {
+            let (root, path, node, source) = enrollment_config_fixture();
+            let candidate = source.replace("/old/macluster", "/new/macluster");
+            let result = super::ensure_remote_config_with_idle_check(
+                &node,
+                path.to_str().unwrap(),
+                &candidate,
+                "blocked",
+                &root,
+                |_, _, _| Err((1, blocker.into())),
+            );
+            assert!(result.unwrap_err().1.contains(blocker));
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn enrollment_accepts_old_storage_address_only_for_the_same_storage_machine() {
+        let (root, path, node, source) = enrollment_config_fixture();
+        let moved = source.replace("192.0.2.2", "192.0.2.20");
+        super::ensure_remote_config_with_idle_check(
+            &node,
+            path.to_str().unwrap(),
+            &moved,
+            "moved",
+            &root,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            super::compatible_agent_config(&moved).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enrollment_detects_config_changes_during_idle_verification() {
+        let (root, path, node, source) = enrollment_config_fixture();
+        let changed = format!("{source}\n# another administrator changed this file\n");
+        let candidate = source.replace("/old/macluster", "/new/macluster");
+        let result = super::ensure_remote_config_with_idle_check(
+            &node,
+            path.to_str().unwrap(),
+            &candidate,
+            "concurrent",
+            &root,
+            |_, _, _| {
+                fs::write(&path, &changed).unwrap();
+                Ok(())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .1
+                .contains("changed while checking enrollment")
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enrollment_uses_a_machine_scoped_config_and_preserves_old_login_configuration() {
+        let (root, _path, node, source) = enrollment_config_fixture();
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        let legacy = root.join(format!(".config/macluster/clusters/{uuid}/config.toml"));
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let old_login = source.replace(uuid, "00000000-0000-4000-8000-000000000099");
+        fs::write(&legacy, &old_login).unwrap();
+        let destination = super::remote_agent_config_path(
+            root.to_str().unwrap(),
+            uuid,
+            node.machine_uuid.as_deref().unwrap(),
+        );
+        assert_ne!(std::path::Path::new(&destination), legacy);
+        super::ensure_remote_config_with_idle_check(
+            &node,
+            &destination,
+            &source,
+            "fresh-agent",
+            &root,
+            |_, _, _| panic!("the new Agent config does not replace an existing config"),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), old_login);
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            super::compatible_agent_config(&source).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enrollment_preserves_foreign_cluster_machine_and_account_configs() {
+        for (old, new) in [
+            (
+                "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000099",
+            ),
+            (
+                "01234567-89ab-cdef-0123-456789abcdef",
+                "01234567-89ab-cdef-0123-456789abcdee",
+            ),
+            ("execution_uid=501", "execution_uid=502"),
+            ("shared_root=\"/tmp/shared\"", "shared_root=\"/tmp/other\""),
+        ] {
+            let (root, path, node, source) = enrollment_config_fixture();
+            let previous = source.replace(old, new);
+            fs::write(&path, &previous).unwrap();
+            let result = super::ensure_remote_config_with_idle_check(
+                &node,
+                path.to_str().unwrap(),
+                &source,
+                "foreign",
+                &root,
+                |_, _, _| panic!("foreign config must not be used for execution checks"),
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), previous);
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn matching_local_marker_does_not_substitute_for_a_client_nfs_mount() {
         let root = test_exports_path();
@@ -11087,8 +12024,187 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let args = ["-rm", "share:volumes_data"].map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::Remove(target)) if target == "share:volumes_data"
+            Ok(Action::Remove { target, connect: None }) if target == "share:volumes_data"
         ));
+    }
+
+    #[test]
+    fn removal_accepts_an_explicit_connection_for_a_moved_node() {
+        let args = ["-rm", "default-a", "--connect", "operator@192.0.2.10"].map(str::to_owned);
+        assert!(
+            parse_action(&args).is_ok(),
+            "removal must allow the registered Mac to be reached at its current address"
+        );
+    }
+
+    #[test]
+    fn removal_rejects_connection_paths_and_share_overrides() {
+        for args in [
+            [
+                "-rm",
+                "default-a",
+                "--connect",
+                "operator@192.0.2.10:/tmp/share",
+            ],
+            ["-rm", "share:tools", "--connect", "operator@192.0.2.10"],
+        ] {
+            assert!(parse_action(&args.map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn removal_connection_preserves_agent_identity_and_resumes_saved_address() {
+        let mut node = NodeEndpoint::parse("operator@192.0.2.10")
+            .unwrap()
+            .node_config(
+                "/Users/operator/agent".into(),
+                Some("/Users/operator/config.toml".into()),
+            );
+        node.machine_uuid = Some("00000000-0000-4000-8000-000000000001".into());
+        node.ssh_identity_file = Some("/Users/operator/.ssh/original-key".into());
+        let endpoint = NodeEndpoint::parse("operator@192.0.2.20:2222").unwrap();
+        let moved =
+            super::removal_connection_node("worker", &node, Some(&endpoint), None, None).unwrap();
+        assert_eq!(moved.host, "192.0.2.20");
+        assert_eq!(moved.ssh_port, Some(2222));
+        assert_eq!(moved.remote_binary, "/Users/operator/agent");
+        assert_eq!(
+            moved.remote_config.as_deref(),
+            Some("/Users/operator/config.toml")
+        );
+        assert_eq!(
+            moved.ssh_identity_file.as_deref(),
+            Some("/Users/operator/.ssh/original-key")
+        );
+        assert_eq!(node.host, "192.0.2.10");
+        let resumed = super::removal_connection_node(
+            "worker",
+            &node,
+            None,
+            Some("operator@192.0.2.20:2222"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resumed.host, "192.0.2.20");
+        assert_eq!(resumed.ssh_port, Some(2222));
+    }
+
+    #[test]
+    fn removal_redirect_requires_a_registered_identity_and_same_account() {
+        let node = NodeEndpoint::parse("operator@192.0.2.10")
+            .unwrap()
+            .node_config("/agent".into(), None);
+        let moved = NodeEndpoint::parse("operator@192.0.2.20").unwrap();
+        assert!(super::removal_connection_node("worker", &node, Some(&moved), None, None).is_err());
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        assert!(
+            super::removal_connection_node("worker", &node, Some(&moved), None, Some(uuid)).is_ok()
+        );
+        let other_user = NodeEndpoint::parse("other@192.0.2.20").unwrap();
+        assert!(
+            super::removal_connection_node("worker", &node, Some(&other_user), None, Some(uuid))
+                .is_err()
+        );
+        let mut local = node;
+        local.transport = Transport::Local;
+        assert!(
+            super::removal_connection_node("worker", &local, Some(&moved), None, Some(uuid))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removal_identity_must_match_both_config_and_journal() {
+        let mut node = NodeEndpoint::parse("operator@192.0.2.20")
+            .unwrap()
+            .node_config("/agent".into(), None);
+        let expected = "01234567-89ab-cdef-0123-456789abcdef";
+        let different = "00000000-0000-4000-8000-000000000001";
+        node.machine_uuid = Some(expected.into());
+        assert!(
+            super::validate_removal_identity(
+                "worker",
+                &node,
+                Some(expected),
+                &expected.to_uppercase()
+            )
+            .is_ok()
+        );
+        assert!(
+            super::validate_removal_identity("worker", &node, Some(expected), different).is_err()
+        );
+        assert!(
+            super::validate_removal_identity("worker", &node, Some(different), expected).is_err()
+        );
+    }
+
+    #[test]
+    fn removal_connection_survives_journal_reload_without_changing_export_endpoint() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        fs::write(&config, "# test identity").unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let journal = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal, &config, &state_dir).unwrap();
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        let mut node = NodeEndpoint::parse("operator@192.0.2.10")
+            .unwrap()
+            .node_config("/agent".into(), None);
+        node.machine_uuid = Some(uuid.into());
+        state.operations.insert(
+            "remove:worker".into(),
+            NodeOperation {
+                id: Id128::random().to_string(),
+                action: "remove".into(),
+                node_id: "worker".into(),
+                endpoint: "operator@192.0.2.10:22".into(),
+                connection_endpoint: Some("operator@192.0.2.20:2222".into()),
+                remote_config_path: None,
+                machine_uuid: Some(uuid.into()),
+                phase: "REMOVAL_PENDING".into(),
+                old_config_sha256: None,
+                candidate_config_sha256: None,
+                managed_export: true,
+                managed_shares: Default::default(),
+                client_setup_attempted: None,
+                detail: None,
+            },
+        );
+        save_admin_state(&journal, &state).unwrap();
+        let resumed = read_admin_state(&journal, &config, &state_dir).unwrap();
+        let connection =
+            super::removal_connection_from_state("worker", &node, None, &resumed).unwrap();
+        assert_eq!(connection.host, "192.0.2.20");
+        assert_eq!(connection.ssh_port, Some(2222));
+        let reset_ops = reset_admin_operations(&config, &state_dir).unwrap();
+        assert_eq!(reset_ops[0].endpoint, "operator@192.0.2.10:22");
+        assert_eq!(
+            reset_ops[0].connection_endpoint.as_deref(),
+            Some("operator@192.0.2.20:2222")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removal_stale_local_address_is_rejected_before_any_state_is_created() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let state = root.join("state");
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/unused\"\n[nodes.worker]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\nssh_user=\"operator\"\nremote_binary=\"/must-not-execute\"\n";
+        let source = source.replace("[nodes.worker]", "machine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]");
+        fs::write(&config, &source).unwrap();
+        let error = super::remove_node(&config, &state, "worker", None).unwrap_err();
+        assert!(error.1.contains("belongs to this login Mac"), "{error:?}");
+        assert!(error.1.contains("--connect"), "{error:?}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), source);
+        assert!(
+            !state.exists(),
+            "a rejected destination must not create maintenance or job state"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11222,6 +12338,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             super::NodeOperation {
                 id: "pending-share-cancel-test".into(),
                 action: "share".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
                 node_id: "storage".into(),
                 endpoint: format!(
                     "share:tools:storage:{}:{}",
@@ -11356,6 +12474,8 @@ remote_binary = "/usr/local/bin/macluster"
             NodeOperation {
                 id: format!("operation-{node_id}"),
                 action: "add".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
                 node_id: node_id.into(),
                 endpoint: "operator@192.0.2.1:22".into(),
                 machine_uuid: Some(machine_uuid.into()),
@@ -11828,6 +12948,8 @@ ssh_port = 22
         let legacy = NodeOperation {
             id: "old-share-op".into(),
             action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "login".into(),
             endpoint: "share:tools:/Users/Shared/tools".into(),
             machine_uuid: None,
@@ -11933,7 +13055,8 @@ ssh_port = 22
 
     #[test]
     fn power_helper_install_script_creates_system_directories_before_installing() {
-        let script = power_helper_install_script("/tmp/power.bin", "/tmp/power.plist");
+        let script =
+            power_helper_install_script("/tmp/power.bin", "/tmp/power.plist", "fixture-digest");
         let create_directory = script
             .find("/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons")
             .expect("prepare the privileged helper directory");
@@ -11942,6 +13065,46 @@ ssh_port = 22
             .expect("install the privileged helper");
         assert!(create_directory < install_helper);
         assert!(!script.contains("sudo"));
+    }
+
+    #[test]
+    fn power_helper_install_rejects_corrupt_staging_before_privileged_changes() {
+        let helper = crate::embedded_power::ExtractedHelper::new().unwrap();
+        fs::write(helper.path(), b"damaged helper").unwrap();
+        let script = power_helper_install_script(
+            &helper.path().to_string_lossy(),
+            "/unused/plist",
+            &crate::embedded_power::digest().unwrap(),
+        );
+        // Execute only the validation prefix, never a system installation.
+        let validation = script.split("/bin/mkdir").next().unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(validation)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("checksum mismatch"));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn power_helper_setup_stages_embedded_payload_without_a_companion_binary() {
+        use super::{cleanup_power_helper_stage, local_sha256, prepare_power_helper};
+        use std::path::Path;
+        let node = local_share_test_node();
+        let operation = Id128::random().to_string();
+        // Different peer UID guarantees a new staged plist; never install it.
+        let setup = prepare_power_helper(&node, 606060, std::env::consts::ARCH, &operation)
+            .unwrap()
+            .expect("stage a helper for the test peer UID");
+        let staged_digest = local_sha256(Path::new(&setup.staged_binary)).unwrap();
+        let plist = fs::read_to_string(&setup.staged_plist).unwrap();
+        cleanup_power_helper_stage(&node, &setup);
+        assert_eq!(staged_digest, crate::embedded_power::digest().unwrap());
+        assert!(plist.contains("<string>606060</string>"));
+        assert!(!Path::new(&setup.staged_binary).exists());
+        assert!(!Path::new(&setup.staged_plist).exists());
     }
 
     fn execute_candidate_admin_batch(
@@ -12039,6 +13202,8 @@ execution_uid = 501
         let operation = NodeOperation {
             id: "legacy-share-op".into(),
             action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "login".into(),
             endpoint: "share:analysis:/Users/operator/mamba/envs/analysis".into(),
             machine_uuid: Some("00000000-0000-4000-8000-000000000002".into()),
@@ -12103,6 +13268,8 @@ execution_uid = 501
         let operation = NodeOperation {
             id: "pending-share-op".into(),
             action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "login".into(),
             endpoint: "legacy-share-endpoint".into(),
             machine_uuid: None,
@@ -12132,6 +13299,8 @@ execution_uid = 501
         NodeOperation {
             id: "test-update".into(),
             action: "update".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
             node_id: "all".into(),
             endpoint: "cluster".into(),
             machine_uuid: None,
@@ -12154,6 +13323,21 @@ execution_uid = 501
             UpdateRecovery::Stage
         );
         assert!(update_recovery(Some(&operation), "other").is_err());
+    }
+
+    #[test]
+    fn superseded_failed_update_without_candidate_is_abandoned_safely() {
+        let mut operation = update_operation("UPDATE_FAILED", "old", "candidate");
+        operation.candidate_config_sha256 = None;
+        assert_eq!(
+            update_recovery(Some(&operation), "new-config").unwrap(),
+            UpdateRecovery::AbandonUncommittedFailure
+        );
+        operation.candidate_config_sha256 = Some("candidate".into());
+        assert!(update_recovery(Some(&operation), "new-config").is_err());
+        operation.phase = "UPDATE_STAGING".into();
+        operation.candidate_config_sha256 = None;
+        assert!(update_recovery(Some(&operation), "new-config").is_err());
     }
 
     #[test]
@@ -12222,6 +13406,8 @@ execution_uid = 501
             NodeOperation {
                 id: "pending-add".into(),
                 action: "add".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
                 node_id: "worker".into(),
                 endpoint: "operator@192.0.2.2:22".into(),
                 machine_uuid: None,
@@ -12481,6 +13667,134 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         assert!(existing_ssh_endpoint_matches(&configured, &endpoint));
         let different_port = NodeEndpoint::parse("operator@192.168.2.1:2222").unwrap();
         assert!(!existing_ssh_endpoint_matches(&configured, &different_port));
+        let different_user = NodeEndpoint::parse("other@192.168.2.1").unwrap();
+        assert!(!existing_ssh_endpoint_matches(&configured, &different_user));
+    }
+
+    fn combined_ssh_add_fixture(phase: &str) -> (NodeEndpoint, String, AdminState) {
+        let endpoint = NodeEndpoint::parse("operator@192.0.2.10:/Users/Shared/tools").unwrap();
+        let key = format!("add:{}", endpoint.canonical());
+        let mut operation = update_operation(phase, "old", "enrolled-config");
+        operation.id = "original-enrollment".into();
+        operation.action = "add".into();
+        operation.node_id = "arm-b".into();
+        operation.endpoint = endpoint.canonical();
+        operation.machine_uuid = Some("original-machine".into());
+        let state = AdminState {
+            version: 1,
+            config_path: "/tmp/config.toml".into(),
+            state_dir: "/tmp/state".into(),
+            reserved_node_ids: BTreeSet::from(["arm-b".into()]),
+            machine_uuids: BTreeMap::from([("arm-b".into(), "original-machine".into())]),
+            operations: BTreeMap::from([(key.clone(), operation)]),
+        };
+        (endpoint, key, state)
+    }
+
+    #[test]
+    fn combined_ssh_retry_syncs_deferred_enrollment_before_changing_shares() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-combined-retry-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let journal_path = root.join("node-admin.json");
+        let (endpoint, key, mut state) = combined_ssh_add_fixture("ADD_COMMITTING");
+        let mut events = Vec::new();
+        let mut run_combined_retry = |state: &mut AdminState, fail_sync: bool| -> AppResult<()> {
+            let pending = pending_combined_ssh_add(state, "arm-b", &endpoint, "enrolled-config")?;
+            if let Some(key) = pending {
+                resume_existing_ssh_add_sync(state, &journal_path, &key, &endpoint, |operation| {
+                    assert_eq!(operation.id, "original-enrollment");
+                    assert_eq!(operation.phase, "SYNC_PENDING");
+                    events.push("enrollment-sync");
+                    if fail_sync {
+                        Err("second peer unavailable after first peer synced".into())
+                    } else {
+                        Ok(())
+                    }
+                })?;
+            }
+            events.push("share");
+            Ok(())
+        };
+
+        assert!(run_combined_retry(&mut state, true).is_err());
+        assert_eq!(state.operations[&key].phase, "SYNC_PENDING");
+        assert!(
+            state.operations[&key]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("second peer")
+        );
+        let persisted: AdminState =
+            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        assert_eq!(persisted.operations[&key].phase, "SYNC_PENDING");
+        run_combined_retry(&mut state, false).unwrap();
+        // A share failure after enrollment can retry with a changed share config
+        // without reopening or refreshing the completed enrollment.
+        assert!(
+            pending_combined_ssh_add(&state, "arm-b", &endpoint, "share-config")
+                .unwrap()
+                .is_none()
+        );
+        run_combined_retry(&mut state, false).unwrap();
+        drop(run_combined_retry);
+        assert_eq!(
+            events,
+            ["enrollment-sync", "enrollment-sync", "share", "share"]
+        );
+        assert_eq!(state.operations[&key].phase, "READY");
+        assert_eq!(state.operations.len(), 1);
+        assert_eq!(state.reserved_node_ids, BTreeSet::from(["arm-b".into()]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn combined_ssh_retry_rejects_changed_pending_endpoint_or_config() {
+        let (endpoint, key, mut state) = combined_ssh_add_fixture("SYNC_PENDING");
+        for changed in [
+            "other@192.0.2.10:/Users/Shared/tools",
+            "operator@192.0.2.10:2222:/Users/Shared/tools",
+            "operator@192.0.2.10:/Users/Shared/other",
+        ] {
+            assert!(
+                pending_combined_ssh_add(
+                    &state,
+                    "arm-b",
+                    &NodeEndpoint::parse(changed).unwrap(),
+                    "enrolled-config",
+                )
+                .is_err()
+            );
+        }
+        assert!(pending_combined_ssh_add(&state, "arm-b", &endpoint, "changed-config").is_err());
+        let mut duplicate = state.operations[&key].clone();
+        duplicate.id = "duplicate-enrollment".into();
+        state
+            .operations
+            .insert(format!("{key}:duplicate"), duplicate);
+        assert!(pending_combined_ssh_add(&state, "arm-b", &endpoint, "enrolled-config").is_err());
+    }
+
+    #[test]
+    fn combined_ssh_share_retry_does_not_resume_ready_enrollment_or_queue_update() {
+        let (endpoint, key, mut state) = combined_ssh_add_fixture("READY");
+        assert!(
+            pending_combined_ssh_add(&state, "arm-b", &endpoint, "share-config")
+                .unwrap()
+                .is_none()
+        );
+        let mut queue_update = state.operations[&key].clone();
+        queue_update.phase = "SYNC_PENDING".into();
+        queue_update.endpoint = "queue:arm".into();
+        state
+            .operations
+            .insert("queue:arm-b:arm".into(), queue_update);
+        assert!(
+            pending_combined_ssh_add(&state, "arm-b", &endpoint, "share-config")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

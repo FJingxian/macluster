@@ -2,6 +2,7 @@
 
 mod app;
 pub mod arguments;
+mod embedded_power;
 mod init;
 mod mtop;
 mod node_admin;

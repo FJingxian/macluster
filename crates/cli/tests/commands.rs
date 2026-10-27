@@ -100,6 +100,126 @@ fn capabilities_report_primary_storage_source_support() {
 }
 
 #[test]
+fn standalone_binary_includes_its_power_helper() {
+    let (root, _shared, _config) = fixture();
+    let standalone = root.join("download");
+    fs::create_dir(&standalone).unwrap();
+    let binary = standalone.join("macluster");
+    fs::copy(env!("CARGO_BIN_EXE_macluster"), &binary).unwrap();
+    assert!(!standalone.join("macluster-power").exists());
+    let output = Command::new(&binary)
+        .args(["internal", "power-helper", "--version"])
+        .output()
+        .unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("macluster-power {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn enrollment_config_commit_honors_controller_lock_and_original_digest() {
+    use macluster_core::maintenance::MaintenanceLock;
+    let (root, _shared, config) = fixture();
+    let before = fs::read(&config).unwrap();
+    let baseline = sha256_hex(&before).unwrap();
+    let candidate = [before.as_slice(), b"\n# refreshed enrollment\n"].concat();
+    let staged = root.join("staged-config.toml");
+    fs::write(&staged, &candidate).unwrap();
+    let commit = |baseline: &str| {
+        Command::new(env!("CARGO_BIN_EXE_macluster"))
+            .args(["internal", "commit-enrollment-config", "--destination"])
+            .arg(&config)
+            .arg("--staged")
+            .arg(&staged)
+            .arg("--baseline")
+            .arg(baseline)
+            .output()
+            .unwrap()
+    };
+    let lock = MaintenanceLock::shared(&config).unwrap();
+    let blocked = commit(&baseline);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("in use by a controller"));
+    assert_eq!(fs::read(&config).unwrap(), before);
+    drop(lock);
+    let modified = [before.as_slice(), b"\n# concurrent edit\n"].concat();
+    fs::write(&config, &modified).unwrap();
+    let blocked = commit(&baseline);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("changed during enrollment"));
+    assert_eq!(fs::read(&config).unwrap(), modified);
+    assert!(staged.is_file());
+    let success = commit(&sha256_hex(&modified).unwrap());
+    assert!(
+        success.status.success(),
+        "{}",
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert_eq!(fs::read(&config).unwrap(), candidate);
+    assert!(!staged.exists());
+    // A malformed internal request must never delete the active config.
+    let same = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .args(["internal", "commit-enrollment-config", "--destination"])
+        .arg(&config)
+        .arg("--staged")
+        .arg(&config)
+        .arg("--baseline")
+        .arg(sha256_hex(&candidate).unwrap())
+        .output()
+        .unwrap();
+    assert!(!same.status.success());
+    assert_eq!(fs::read(&config).unwrap(), candidate);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn user_installer_accepts_only_the_main_binary() {
+    let (root, _shared, _config) = fixture();
+    let download = root.join("download");
+    fs::create_dir(&download).unwrap();
+    let binary = download.join("macluster");
+    fs::copy(env!("CARGO_BIN_EXE_macluster"), &binary).unwrap();
+    let prefix = root.join("installed");
+    let installer =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/scripts/install-user.sh");
+    let output = Command::new("/bin/sh")
+        .arg(installer)
+        .arg(&binary)
+        .arg(&prefix)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!prefix.join("macluster-power").exists());
+    for alias in ["msub", "mjob", "mqueue", "mkill", "mtop", "mnode"] {
+        assert_eq!(
+            fs::read_link(prefix.join(alias)).unwrap(),
+            PathBuf::from("macluster")
+        );
+    }
+    let output = Command::new(prefix.join("macluster"))
+        .args(["internal", "power-helper", "--version"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn init_refuses_to_overwrite_an_existing_config_without_reset() {
     let (root, _shared, config) = fixture();
     let original = fs::read(&config).unwrap();
@@ -303,6 +423,196 @@ fn existing_init_offers_reset_and_declining_preserves_the_cluster() {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn broken_address_migration_fixture() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, shared, config) = fixture();
+    let identity = Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .unwrap();
+    assert!(identity.status.success());
+    let text = String::from_utf8(identity.stdout).unwrap();
+    let uuid = text
+        .lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .unwrap()
+        .rsplit_once('=')
+        .unwrap()
+        .1
+        .trim()
+        .trim_matches('"');
+    let source = fs::read_to_string(&config).unwrap();
+    let source = source.replace(
+        "transport = \"ssh\"",
+        &format!(
+            "transport = \"local\"\nmachine_uuid = \"{uuid}\"\nexecution_uid = {}",
+            unsafe { libc::geteuid() }
+        ),
+    );
+    fs::write(&config, source).unwrap();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    let journal = state.join("node-address-migration.json");
+    fs::write(&journal, b"{interrupted address migration").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    (root, shared, config, state)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn broken_address_migration_keeps_status_and_pending_cancellation_available() {
+    use macluster_protocol::identifiers::RequestId;
+    let (root, shared, config, state) = broken_address_migration_fixture();
+    let storage = Storage::open(&state).unwrap();
+    let snapshot = storage.stage_snapshot(b"echo queued\n").unwrap();
+    let spec = serde_json::from_value(serde_json::json!({
+        "queue":"mini01", "node":null, "name":"recovery", "cwd":shared,
+        "stdout_path":"", "stderr_path":"", "walltime_secs":null,
+        "env":{}, "snapshot":snapshot, "mode":"batch"
+    }))
+    .unwrap();
+    let job = storage.submit_once(RequestId::random(), spec).unwrap();
+    for args in [
+        vec!["mjob", "--json"],
+        vec!["mqueue", "--json"],
+        vec!["mnode", "-l"],
+        vec!["mtop", "--json"],
+        vec!["mkill", "1"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        storage.get_job(job.id).unwrap().unwrap().state,
+        JobState::Cancelled
+    );
+    assert_eq!(
+        fs::read(state.join("node-address-migration.json")).unwrap(),
+        b"{interrupted address migration"
+    );
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn broken_address_migration_does_not_block_init_confirmation_or_allow_submission() {
+    let (root, _shared, config, state) = broken_address_migration_fixture();
+    let before = fs::read(&config).unwrap();
+    let (status, output) = init_in_pty(&config, &state, b"n\n");
+    assert!(!status.success());
+    assert!(output.contains("Reset existing cluster"), "{output}");
+    assert!(output.contains("cluster reset cancelled"), "{output}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["msub", "echo blocked"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid address recovery record"));
+    let storage = Storage::open(&state).unwrap();
+    let snapshot = storage.stage_snapshot(b"sleep 60\n").unwrap();
+    let spec = serde_json::from_value(serde_json::json!({
+        "queue":"mini01", "node":null, "name":"active recovery blocker", "cwd":root.join("shared"),
+        "stdout_path":"", "stderr_path":"", "walltime_secs":null,
+        "env":{}, "snapshot":snapshot, "mode":"batch"
+    }))
+    .unwrap();
+    let job = storage
+        .submit_once(macluster_protocol::identifiers::RequestId::random(), spec)
+        .unwrap();
+    storage
+        .reserve_job(
+            job.id,
+            macluster_protocol::identifiers::NodeId::new("mini01-a").unwrap(),
+        )
+        .unwrap();
+    storage.mark_running(job.id).unwrap();
+    let (status, output) = init_in_pty_with_args(&config, &state, &["--force".into()], b"y\n");
+    assert!(!status.success());
+    assert!(output.contains("reset is paused because jobs"), "{output}");
+    assert_eq!(
+        storage.get_job(job.id).unwrap().unwrap().state,
+        JobState::Running
+    );
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert_eq!(
+        fs::read(state.join("node-address-migration.json")).unwrap(),
+        b"{interrupted address migration"
+    );
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn stale_address_migration_keeps_queries_and_init_available() {
+    let (root, _shared, config, state) = broken_address_migration_fixture();
+    let source = fs::read_to_string(&config).unwrap();
+    let record = serde_json::json!({
+        "operation_id":"11111111-1111-4111-8111-111111111111",
+        "config_path":config.canonicalize().unwrap(), "state_dir":state.canonicalize().unwrap(),
+        "old_source":source, "candidate_source":source, "phase":"PLANNED", "completed":[]
+    });
+    let journal = state.join("node-address-migration.json");
+    fs::write(&journal, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(
+        &config,
+        format!("{source}\n# changed after migration planning\n"),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mqueue", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (status, output) = init_in_pty(&config, &state, b"n\n");
+    assert!(!status.success());
+    assert!(output.contains("Reset existing cluster"), "{output}");
+    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["msub", "echo blocked"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cluster config changed during node address migration")
+    );
+    assert_eq!(
+        fs::read(&journal).unwrap(),
+        serde_json::to_vec(&record).unwrap()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn confirming_reset_from_init_still_blocks_on_active_jobs() {
     for input in [b"y\n".as_slice(), b"Y\n".as_slice()] {
@@ -443,6 +753,14 @@ fn noninteractive_init_requires_explicit_terminal_confirmation() {
     ));
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.toml");
+    let interfaces = Command::new("/sbin/ifconfig").output().unwrap();
+    let host = String::from_utf8_lossy(&interfaces.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("inet "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|value| value.parse::<std::net::Ipv4Addr>().ok())
+        .find(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
+        .expect("init needs a local cluster interface");
     let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
         .arg("--config")
         .arg(&config)
@@ -455,14 +773,18 @@ fn noninteractive_init_requires_explicit_terminal_confirmation() {
             "--queue",
             "q",
             "--host",
-            "192.168.2.2",
+            &host.to_string(),
             "--shared-root",
         ])
         .arg(root.join("shared"))
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal confirmation"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("terminal confirmation"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !config.exists(),
         "noninteractive init must not create cluster config"
@@ -1484,6 +1806,31 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
         "{stderr}"
     );
     assert!(!stderr.contains("Stop it for Agent update"), "{stderr}");
+
+    let inspection = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "mjob",
+        ])
+        .output()
+        .expect("run mjob while the stale Agent update is blocked by an active job");
+    assert!(
+        inspection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&inspection.stderr).contains("Agent update is deferred"),
+        "{}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    let listing = String::from_utf8_lossy(&inspection.stdout);
+    assert!(listing.contains("JOBID"), "{listing}");
+    assert!(listing.contains("Running"), "{listing}");
+
     let storage = Storage::open(&state).unwrap();
     let jobs = storage.list_jobs(None).unwrap();
     assert_eq!(jobs.len(), 1);

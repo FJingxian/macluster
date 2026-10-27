@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
     env,
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
@@ -89,8 +90,82 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let command = command.expect("argv0 alias or parsed subcommand is present");
 
     let (global, args) = take_global_options(args, command == "submit")?;
+    let mut address_migration_deferred = false;
+    if is_macluster_executable() && should_refresh_node_addresses(&command, &args) {
+        let config_path = resolved_config_path(global.config.as_deref());
+        let state_dir = state_root(global.state_dir.as_deref())?;
+        let can_defer = can_defer_agent_update_for_work(&command, &args);
+        // Recovery/status commands remain usable when a migration journal is
+        // unreadable. Existing valid journals are resumed below when the
+        // cluster is idle; active work keeps the old endpoints available for
+        // inspection until the controller can safely migrate them.
+        let preparation = if can_defer && crate::node_admin::address_migration_pending(&state_dir) {
+            Ok(true)
+        } else {
+            crate::node_admin::prepare_node_address_migration(&config_path, &state_dir)
+        };
+        let pending = match preparation {
+            Ok(pending) => pending,
+            Err((_, error)) if can_defer => {
+                eprintln!(
+                    "Node address discovery needs attention: {error}. Continuing with `{command}`; automatic Agent updates are deferred."
+                );
+                address_migration_deferred = true;
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        if pending {
+            if can_defer {
+                match crate::node_admin::address_migration_has_active_jobs(&state_dir) {
+                    Ok(active_jobs) => {
+                        address_migration_deferred =
+                            should_defer_address_migration(can_defer, active_jobs);
+                        if address_migration_deferred {
+                            eprintln!(
+                                "Node address/NFS migration is pending while jobs are active. Continuing with `{command}` using the current configuration; it will retry automatically when the cluster is idle."
+                            );
+                        }
+                    }
+                    Err((_, error)) => {
+                        address_migration_deferred = true;
+                        eprintln!(
+                            "Cannot verify whether jobs are active: {error}. Continuing with `{command}` using the current configuration; migration progress is preserved."
+                        );
+                    }
+                }
+            }
+        }
+        if address_migration_deferred && command == "submit" {
+            return Err((1, "New node addresses were verified; submissions are paused until active tasks finish and the controller completes address/NFS migration. Existing tasks and output are preserved.".into()));
+        }
+        let stopped = if pending && !address_migration_deferred {
+            match crate::node_admin::refresh_node_addresses(&config_path, &state_dir, false) {
+                Ok(stopped) => stopped,
+                Err((_, error)) if can_defer => {
+                    address_migration_deferred = true;
+                    eprintln!(
+                        "Node address/NFS migration could not finish yet: {error}. Continuing with `{command}`; migration progress is preserved."
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if stopped && command == "submit" {
+            return Err((1, "Node addresses and NFS mappings were updated. Restart `macluster controller run`, then resubmit the command.".into()));
+        }
+        if stopped && command != "controller" {
+            eprintln!(
+                "Node address migration stopped the controller; run `macluster controller run` to resume scheduling."
+            );
+        }
+    }
     let defer_mtop_preflight = command == "top" && top_will_use_tui(&args);
     if should_preflight_agent_update(&command, &args)
+        && !address_migration_deferred
         && is_macluster_executable()
         && !defer_mtop_preflight
     {
@@ -101,7 +176,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "job" => job(global, &args),
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
-        "top" => top(global, &args),
+        "top" => top(global, &args, address_migration_deferred),
         "controller" => controller(global, &args),
         "init" => crate::init::run(
             resolved_config_path(global.config.as_deref()),
@@ -116,6 +191,20 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    // Init owns reset/recovery and stages any artifacts needed by a new cluster.
+    // Updating the old cluster first can block the very operation repairing it.
+    if command == "init" {
+        return false;
+    }
+    // Removing a moved or unreachable node must not first update that node
+    // through the stale endpoint. Removal performs its own identity and idle checks.
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-rm" | "--remove"))
+    {
+        return false;
+    }
     let help_requested = if command == "submit" {
         submit_help_requested(args)
     } else {
@@ -123,6 +212,26 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
             .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     };
     !matches!(command, "internal" | "agent") && !help_requested
+}
+
+fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
+    if matches!(command, "internal" | "agent" | "init") {
+        return false;
+    }
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-rm" | "--remove"))
+    {
+        return false;
+    }
+    if command == "submit" {
+        !submit_help_requested(args)
+    } else {
+        !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    }
 }
 
 fn top_will_use_tui(args: &[String]) -> bool {
@@ -150,6 +259,18 @@ fn should_block_agent_update_for_pending_node_recovery(
     recovery_pending
         && update_required
         && !should_defer_agent_update_for_node_recovery(command, recovery_pending)
+}
+
+fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
+    matches!(command, "job" | "queue" | "kill" | "top")
+        || command == "node"
+            && args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+}
+
+fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
+    can_defer && active_jobs
 }
 
 fn is_macluster_executable() -> bool {
@@ -249,6 +370,21 @@ fn preflight_agent_update_with_compatibility(
             },
         )?;
     let update_required = recovery_pending || compatibility.requires_update();
+    if update_required
+        && can_defer_agent_update_for_work(command, args)
+        && crate::node_admin::agent_update_blocked_by_work(&state_dir).map_err(|error| {
+            (
+                1,
+                format!("cannot determine whether Agent update is safe: {error}"),
+            )
+        })?
+    {
+        eprintln!(
+            "Agent update is deferred while active tasks or output synchronization remain; continuing with `{}`. Retry after the work drains to resume the automatic update.",
+            command
+        );
+        return Ok(());
+    }
     if should_block_agent_update_for_pending_node_recovery(
         command,
         node_recovery_pending,
@@ -815,6 +951,7 @@ fn build_submission(
         }
     }
 
+    let _path_resolver = SubmissionPathResolverGuard::enter(config);
     let shared_root = config.shared_root.canonicalize().map_err(|error| {
         (
             1,
@@ -1214,14 +1351,14 @@ fn validate_active_environment(config: &ClusterConfig, raw_prefix: &Path) -> App
         )
     })?;
     let mut matched = None;
-    for (visible_root, mount_root) in shared_path_mappings(config) {
-        let Ok(visible_root) = visible_root.canonicalize() else {
+    for mapping in submission_path_mappings(config) {
+        let Some(visible_root) = mapping.canonical_visible_root else {
             continue;
         };
         let Ok(relative) = prefix.strip_prefix(&visible_root) else {
             continue;
         };
-        matched = Some((visible_root, mount_root.join(relative)));
+        matched = Some((visible_root, mapping.target_root.join(relative)));
         break;
     }
     let Some((share_root, mount_prefix)) = matched else {
@@ -1333,6 +1470,117 @@ fn shared_path_mappings(config: &ClusterConfig) -> Vec<(PathBuf, PathBuf)> {
     mappings
 }
 
+#[derive(Clone)]
+struct SharedPathMapping {
+    visible_root: PathBuf,
+    canonical_visible_root: Option<PathBuf>,
+    canonical_error: Option<String>,
+    target_root: PathBuf,
+}
+
+struct SubmissionPathResolver {
+    mappings: Vec<SharedPathMapping>,
+    mapped_paths: RefCell<HashMap<PathBuf, Option<PathBuf>>>,
+    invocation_paths: RefCell<HashMap<PathBuf, Option<PathBuf>>>,
+}
+
+impl SubmissionPathResolver {
+    fn new(config: &ClusterConfig) -> Self {
+        let mappings = shared_path_mappings(config)
+            .into_iter()
+            .map(|(visible_root, target_root)| {
+                let canonical = visible_root.canonicalize();
+                SharedPathMapping {
+                    canonical_visible_root: canonical.as_ref().ok().cloned(),
+                    canonical_error: canonical.err().map(|error| error.to_string()),
+                    visible_root,
+                    target_root,
+                }
+            })
+            .collect();
+        Self {
+            mappings,
+            mapped_paths: RefCell::new(HashMap::new()),
+            invocation_paths: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn remap(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(cached) = self.mapped_paths.borrow().get(path) {
+            return cached.clone();
+        }
+        let mapped = canonicalize_with_missing_suffix(path)
+            .and_then(|resolved| self.remap_canonical(&resolved));
+        self.mapped_paths
+            .borrow_mut()
+            .insert(path.to_path_buf(), mapped.clone());
+        mapped
+    }
+
+    fn remap_canonical(&self, resolved_path: &Path) -> Option<PathBuf> {
+        self.mappings.iter().find_map(|mapping| {
+            let root = mapping.canonical_visible_root.as_ref()?;
+            let relative = resolved_path.strip_prefix(root).ok()?;
+            Some(if relative.as_os_str().is_empty() {
+                mapping.target_root.clone()
+            } else {
+                mapping.target_root.join(relative)
+            })
+        })
+    }
+
+    fn remap_invocation(&self, path: &Path) -> Option<PathBuf> {
+        if let Some(cached) = self.invocation_paths.borrow().get(path) {
+            return cached.clone();
+        }
+        let mapped = canonicalize_parent_preserving_leaf(path)
+            .and_then(|resolved| self.remap_canonical(&resolved));
+        self.invocation_paths
+            .borrow_mut()
+            .insert(path.to_path_buf(), mapped.clone());
+        mapped
+    }
+
+    fn mappings(&self) -> &[SharedPathMapping] {
+        &self.mappings
+    }
+}
+
+fn submission_path_mappings(config: &ClusterConfig) -> Vec<SharedPathMapping> {
+    SUBMISSION_PATH_RESOLVER.with(|cell| {
+        if let Some(resolver) = cell.borrow().as_ref() {
+            resolver.mappings().to_vec()
+        } else {
+            SubmissionPathResolver::new(config).mappings
+        }
+    })
+}
+
+thread_local! {
+    static SUBMISSION_PATH_RESOLVER: RefCell<Option<SubmissionPathResolver>> = const { RefCell::new(None) };
+}
+
+struct SubmissionPathResolverGuard {
+    previous: Option<SubmissionPathResolver>,
+}
+
+impl SubmissionPathResolverGuard {
+    fn enter(config: &ClusterConfig) -> Self {
+        let resolver = SubmissionPathResolver::new(config);
+        let previous = SUBMISSION_PATH_RESOLVER.with(|cell| cell.replace(Some(resolver)));
+        Self { previous }
+    }
+}
+
+impl Drop for SubmissionPathResolverGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SUBMISSION_PATH_RESOLVER.with(|cell| {
+            cell.replace(previous);
+        });
+    }
+}
+
 fn canonicalize_with_missing_suffix(path: &Path) -> Option<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1354,20 +1602,13 @@ fn canonicalize_with_missing_suffix(path: &Path) -> Option<PathBuf> {
 }
 
 fn remap_shared_path(config: &ClusterConfig, path: &Path) -> Option<PathBuf> {
-    let resolved_path = canonicalize_with_missing_suffix(path)?;
-    for (visible_root, target_root) in shared_path_mappings(config) {
-        let Ok(visible_root) = visible_root.canonicalize() else {
-            continue;
-        };
-        if let Ok(relative) = resolved_path.strip_prefix(&visible_root) {
-            return Some(if relative.as_os_str().is_empty() {
-                target_root
-            } else {
-                target_root.join(relative)
-            });
+    SUBMISSION_PATH_RESOLVER.with(|cell| {
+        if let Some(resolver) = cell.borrow().as_ref() {
+            resolver.remap(path)
+        } else {
+            SubmissionPathResolver::new(config).remap(path)
         }
-    }
-    None
+    })
 }
 
 // Resolve parent-directory aliases while retaining the final filename. Compiler
@@ -1379,20 +1620,13 @@ fn canonicalize_parent_preserving_leaf(path: &Path) -> Option<PathBuf> {
 }
 
 fn remap_shared_invocation_path(config: &ClusterConfig, path: &Path) -> Option<PathBuf> {
-    let invocation_path = canonicalize_parent_preserving_leaf(path)?;
-    for (visible_root, target_root) in shared_path_mappings(config) {
-        let Ok(visible_root) = visible_root.canonicalize() else {
-            continue;
-        };
-        if let Ok(relative) = invocation_path.strip_prefix(&visible_root) {
-            return Some(if relative.as_os_str().is_empty() {
-                target_root
-            } else {
-                target_root.join(relative)
-            });
+    SUBMISSION_PATH_RESOLVER.with(|cell| {
+        if let Some(resolver) = cell.borrow().as_ref() {
+            resolver.remap_invocation(path)
+        } else {
+            SubmissionPathResolver::new(config).remap_invocation(path)
         }
-    }
-    None
+    })
 }
 
 const COMPILER_EXECUTABLE_VARIABLES: &[&str] = &[
@@ -2339,18 +2573,26 @@ fn validate_shared_output_path(
         )
     })?;
     let normalized = canonical_parent.join(file_name);
-    for (visible_root, target_root) in shared_path_mappings(config) {
-        let canonical_root = visible_root.canonicalize().map_err(|error| {
+    for mapping in submission_path_mappings(config) {
+        let canonical_root = mapping.canonical_visible_root.ok_or_else(|| {
             (
                 2,
                 format!(
-                    "shared output root {} is unavailable: {error}",
-                    visible_root.display()
+                    "shared output root {} is unavailable: {}",
+                    mapping.visible_root.display(),
+                    mapping
+                        .canonical_error
+                        .as_deref()
+                        .unwrap_or("could not resolve path")
                 ),
             )
         })?;
         if let Ok(relative) = normalized.strip_prefix(canonical_root) {
-            return Ok(target_root.join(relative).to_string_lossy().into_owned());
+            return Ok(mapping
+                .target_root
+                .join(relative)
+                .to_string_lossy()
+                .into_owned());
         }
     }
     Err((
@@ -2976,7 +3218,7 @@ fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     }
 }
 
-fn top(global: GlobalOptions, args: &[String]) -> AppResult<()> {
+fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool) -> AppResult<()> {
     let config = load_config(global.config.as_deref()).map_err(config_error)?;
     let mut once = false;
     let mut json = false;
@@ -3026,12 +3268,16 @@ fn top(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     ) {
         let post_action = crate::mtop::run_interactive(
             config,
-            state_dir,
+            state_dir.clone(),
             resolved_config_path(global.config.as_deref()),
             selected_queue.map(|queue| queue.to_string()),
             env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+            address_migration_deferred,
         )
         .map_err(|error| (1, error))?;
+        if address_migration_deferred || crate::node_admin::address_migration_pending(&state_dir) {
+            return Ok(());
+        }
         return match post_action {
             Some(crate::mtop::MtopPostAction::CheckBuilds(compatibility))
                 if is_macluster_executable() =>
@@ -3046,6 +3292,7 @@ fn top(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             Some(crate::mtop::MtopPostAction::RecoverMaintenance) if is_macluster_executable() => {
                 preflight_agent_update("top", args, &global)
             }
+            Some(crate::mtop::MtopPostAction::UpdateDeferred) => Ok(()),
             None if is_macluster_executable() => preflight_agent_update("top", args, &global),
             _ => Ok(()),
         };
@@ -3120,7 +3367,7 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             }
             let config_file = resolved_config_path(global.config.as_deref());
             crate::init::reset::ensure_no_reset_in_progress(&config_file, &state_dir)?;
-            let _maintenance = MaintenanceLock::shared(&config_file).map_err(|error| {
+            let maintenance_lock = MaintenanceLock::shared(&config_file).map_err(|error| {
                 (
                     1,
                     format!("cannot lock cluster config for controller: {error}"),
@@ -3149,6 +3396,39 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 macluster_controller::transport::ClusterTransport::new(config_file.clone()),
             )
             .map_err(|error| (1, error.to_string()))?;
+            if let Some((_, login)) = config
+                .nodes
+                .iter()
+                .find(|(id, node)| config.is_login_node(id) && node.transport == Transport::Local)
+            {
+                let state = macluster_agent::default_state_dir();
+                let owner = macluster_agent::admin::current_controller(&state)
+                    .map_err(|error| (1, error.to_string()))?;
+                let namespace = macluster_agent::admin::owner_namespace(&state)
+                    .map_err(|error| (1, error.to_string()))?;
+                let same_owner = owner
+                    .is_some_and(|owner| owner.controller_uuid == service.epoch().controller_uuid)
+                    && namespace
+                        .as_deref()
+                        .is_none_or(|namespace| namespace == config.share_uuid);
+                if !same_owner {
+                    macluster_agent::validate_node_identity(
+                        login,
+                        &local_machine_uuid().map_err(|error| (1, error))?,
+                        unsafe { libc::geteuid() },
+                    )
+                    .map_err(|error| (1, error))?;
+                    macluster_agent::admin::claim_idle(&state, service.epoch(), &config.share_uuid)
+                        .map_err(|error| {
+                            (
+                                1,
+                                format!(
+                                    "cannot hand the local login Agent to this controller: {error}"
+                                ),
+                            )
+                        })?;
+                }
+            }
             let barrier_config = config_file
                 .canonicalize()
                 .map_err(|error| (1, format!("cannot resolve cluster config: {error}")))?;
@@ -3164,7 +3444,9 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             );
             let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir)
                 .map_err(|error| (1, error))?;
-            service.set_dispatch_enabled(!sync_pending);
+            service.set_dispatch_enabled(
+                !sync_pending && !crate::node_admin::address_migration_pending(&state_dir),
+            );
             if sync_pending {
                 eprintln!(
                     "macluster: peer config synchronization is pending; controller will reconcile status and cancellations but will not dispatch new jobs"
@@ -3180,8 +3462,34 @@ fn controller(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 );
                 Ok(())
             } else {
+                let watcher = crate::node_admin::watch_node_addresses(
+                    config_file.clone(),
+                    state_dir.clone(),
+                )?;
+                let pending = watcher.pending_flag();
+                let requested = std::sync::Arc::clone(&pending);
+                let mut maintenance_lock = Some(maintenance_lock);
                 service
-                    .run_forever(interval)
+                    .run_forever_with_idle_maintenance(interval,
+                        || requested.load(std::sync::atomic::Ordering::SeqCst),
+                        |service| {
+                            drop(maintenance_lock.take());
+                            let result = crate::node_admin::refresh_node_addresses(&config_file, &state_dir, true);
+                            maintenance_lock = Some(MaintenanceLock::shared(&config_file)?);
+                            match result {
+                                Ok(_) => {
+                                    let next = load_config(global.config.as_deref()).map_err(|error| io::Error::other(error.to_string()))?;
+                                    service.apply_idle_address_config(next)?;
+                                    service.set_dispatch_enabled(!crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?);
+                                    pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    Ok(true)
+                                }
+                                Err((_, error)) => {
+                                    eprintln!("macluster: address migration needs attention: {error}. If administrator authorization is required, run a foreground macluster command to resume it.");
+                                    Ok(false)
+                                }
+                            }
+                        })
                     .map_err(|error| (1, error.to_string()))
             }
         }
@@ -3754,6 +4062,95 @@ fn now_unix_ms() -> u64 {
 
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
+        Some("claim-agent") => {
+            let node_id = option_value(args, "--node")?
+                .ok_or_else(|| (2, "claim-agent requires --node".into()))?;
+            let uuid = option_value(args, "--controller")?
+                .ok_or_else(|| (2, "claim-agent requires --controller".into()))?;
+            let epoch = option_value(args, "--epoch")?
+                .ok_or_else(|| (2, "claim-agent requires --epoch".into()))?
+                .parse::<u64>()
+                .map_err(|_| (2, "claim-agent epoch must be an integer".into()))?;
+            let controller = macluster_protocol::types::ControllerEpoch {
+                controller_uuid: macluster_protocol::identifiers::ControllerUuid(
+                    Id128::parse(&uuid).map_err(|error| (2, error.to_string()))?,
+                ),
+                epoch,
+            };
+            let config = load_config(global.config.as_deref()).map_err(config_error)?;
+            let node = config
+                .nodes
+                .get(&node_id)
+                .ok_or_else(|| (2, "claim-agent node is absent from config".into()))?;
+            macluster_agent::validate_node_identity(
+                node,
+                &local_machine_uuid().map_err(|error| (1, error))?,
+                unsafe { libc::geteuid() },
+            )
+            .map_err(|error| (1, error))?;
+            let state = global
+                .state_dir
+                .unwrap_or_else(macluster_agent::default_state_dir);
+            macluster_agent::admin::claim_idle(&state, controller, &config.share_uuid)
+                .map_err(|error| (1, error.to_string()))
+        }
+        Some("archive-agent-state") => {
+            let namespace = option_value(args, "--share-id")?
+                .ok_or_else(|| (2, "archive-agent-state requires --share-id".into()))?;
+            let archive = option_value(args, "--archive")?
+                .ok_or_else(|| (2, "archive-agent-state requires --archive".into()))?;
+            let discard = args.iter().any(|arg| arg == "--discard-terminal-sync");
+            let state = global
+                .state_dir
+                .unwrap_or_else(macluster_agent::default_state_dir);
+            let outcome = macluster_agent::admin::archive_idle_namespace(
+                &state,
+                Path::new(&archive),
+                &namespace,
+                discard,
+            )
+            .map_err(|error| (1, error.to_string()))?;
+            println!(
+                "{}",
+                serde_json::to_string(&outcome).map_err(|error| (1, error.to_string()))?
+            );
+            Ok(())
+        }
+        Some("commit-enrollment-config") => {
+            let destination = option_value(args, "--destination")?
+                .ok_or_else(|| (2, "missing enrollment destination".into()))?;
+            let staged = option_value(args, "--staged")?
+                .ok_or_else(|| (2, "missing staged enrollment config".into()))?;
+            let baseline = option_value(args, "--baseline")?
+                .ok_or_else(|| (2, "missing enrollment config baseline".into()))?;
+            crate::node_admin::commit_enrollment_config(
+                Path::new(&destination),
+                Path::new(&staged),
+                &baseline,
+            )
+        }
+        Some("power-helper") => {
+            if args.get(1).map(String::as_str) != Some("--version") || args.len() != 2 {
+                return Err((2, "internal power-helper only supports --version".into()));
+            }
+            let helper =
+                crate::embedded_power::ExtractedHelper::new().map_err(|error| (1, error))?;
+            let output = process::Command::new(helper.path())
+                .arg("--version")
+                .output()
+                .map_err(|error| (1, format!("cannot inspect embedded power helper: {error}")))?;
+            if !output.status.success() {
+                return Err((
+                    1,
+                    format!(
+                        "embedded power helper failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                ));
+            }
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            Ok(())
+        }
         Some("publish-snapshot") => {
             let state_dir = global
                 .state_dir
@@ -3868,11 +4265,23 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
         Some("metrics") => {
             if args.iter().any(|arg| arg == "--json") {
-                let snapshot = macluster_metrics::sample_local();
-                println!(
-                    "{}",
-                    serde_json::to_string(&snapshot).map_err(|error| (1, error.to_string()))?
-                );
+                if args.iter().any(|arg| arg == "--fast") {
+                    let snapshot = macluster_metrics::sample_local_fast();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "sample_phase": "initial",
+                            "snapshot": snapshot,
+                        }))
+                        .map_err(|error| (1, error.to_string()))?
+                    );
+                } else {
+                    let snapshot = macluster_metrics::sample_local();
+                    println!(
+                        "{}",
+                        serde_json::to_string(&snapshot).map_err(|error| (1, error.to_string()))?
+                    );
+                }
                 Ok(())
             } else {
                 Err((2, "internal metrics only supports --json".into()))
@@ -3892,6 +4301,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         METRICS_FAN_SPEED_FEATURE,
                         INTERACTIVE_PTY_FEATURE,
                         macluster_protocol::types::NAMESPACED_JOBS_FEATURE
+                        , "agent.idle-handoff.v1"
                     ]
                 });
                 println!("{}", serde_json::to_string(&report).unwrap());
@@ -4297,10 +4707,11 @@ mod tests {
 
     use super::{
         ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
-        aggregate_metrics, build_submission, explain_legacy_power_agent, format_job_details,
-        format_jobs_table, format_power, is_macluster_binary_path, maybe_run_agent_update,
-        metric_row, metric_table_header, prepare_task_environment, promote_inline_command,
-        should_block_agent_update_for_pending_node_recovery,
+        aggregate_metrics, build_submission, can_defer_agent_update_for_work,
+        explain_legacy_power_agent, format_job_details, format_jobs_table, format_power,
+        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
+        prepare_task_environment, promote_inline_command,
+        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
         update_requires_restart_retry,
     };
@@ -4311,13 +4722,15 @@ mod tests {
     };
 
     #[test]
-    fn operational_agent_update_preflight_skips_internal_and_help_but_checks_init() {
+    fn operational_agent_update_preflight_keeps_init_recovery_independent() {
         for (command, args) in [
             ("internal", vec!["capabilities".into(), "--json".into()]),
             ("agent", vec!["--stdio".into()]),
             ("top", vec!["--help".into()]),
             ("node", vec!["-h".into()]),
             ("init", vec!["--help".into()]),
+            ("init", vec![]),
+            ("init", vec!["--force".into()]),
         ] {
             assert!(
                 !should_preflight_agent_update(command, &args),
@@ -4332,7 +4745,6 @@ mod tests {
             "top",
             "node",
             "controller",
-            "init",
         ] {
             assert!(
                 should_preflight_agent_update(command, &[]),
@@ -4348,7 +4760,30 @@ mod tests {
             "submit",
             &["python".into(), "-h".into()]
         ));
-        assert!(should_preflight_agent_update("init", &["--force".into()]));
+        assert!(!super::should_refresh_node_addresses("init", &[]));
+    }
+
+    #[test]
+    fn node_removal_can_recover_an_endpoint_before_any_agent_update() {
+        for flag in ["-rm", "--remove"] {
+            assert!(!should_preflight_agent_update(
+                "node",
+                &[flag.into(), "worker".into()]
+            ));
+            assert!(!should_preflight_agent_update(
+                "node",
+                &[
+                    flag.into(),
+                    "worker".into(),
+                    "--connect".into(),
+                    "operator@192.0.2.20".into()
+                ]
+            ));
+        }
+        assert!(should_preflight_agent_update(
+            "node",
+            &["-a".into(), "operator@192.0.2.20".into()]
+        ));
     }
 
     #[test]
@@ -4358,6 +4793,36 @@ mod tests {
         assert!(!should_defer_agent_update_for_node_recovery("submit", true));
         assert!(!should_defer_agent_update_for_node_recovery("node", false));
         assert!(!should_defer_agent_update_for_node_recovery("init", false));
+    }
+
+    #[test]
+    fn only_status_and_cancel_commands_can_defer_an_agent_update_for_active_work() {
+        for command in ["job", "queue", "kill", "top"] {
+            assert!(can_defer_agent_update_for_work(command, &[]), "{command}");
+        }
+        for args in [vec!["-l".into()], vec!["--list".into()]] {
+            assert!(can_defer_agent_update_for_work("node", &args));
+        }
+        for (command, args) in [
+            ("submit", vec![]),
+            ("node", vec!["-a".into(), "user@192.0.2.1".into()]),
+            ("node", vec!["-rm".into(), "worker".into()]),
+            ("init", vec![]),
+            ("controller", vec!["run".into()]),
+        ] {
+            assert!(
+                !can_defer_agent_update_for_work(command, &args),
+                "{command} {args:?} must stay blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn address_migration_is_deferred_for_status_commands_only_while_jobs_are_active() {
+        assert!(should_defer_address_migration(true, true));
+        assert!(!should_defer_address_migration(true, false));
+        assert!(!should_defer_address_migration(false, true));
+        assert!(!should_defer_address_migration(false, false));
     }
 
     #[test]

@@ -65,6 +65,7 @@ pub struct AppState {
     pub refresh_requested: bool,
     pub no_color: bool,
     pub updated_at: Option<Instant>,
+    pub sample_latency: HashMap<String, Duration>,
     pub jobs_updated_at: Option<Instant>,
     pub job_store_error: Option<String>,
     pub status_message: Option<String>,
@@ -85,6 +86,7 @@ impl AppState {
             refresh_requested: false,
             no_color: false,
             updated_at: None,
+            sample_latency: HashMap::new(),
             jobs_updated_at: None,
             job_store_error: None,
             status_message: None,
@@ -896,8 +898,20 @@ fn render_detail(
         .get(&node.identity.id)
         .copied()
         .unwrap_or_default();
+    let request_latency = state.sample_latency.get(&node.identity.id).map_or_else(
+        || "N/A".to_owned(),
+        |latency| format!("{}ms", latency.as_millis()),
+    );
     if state.expanded {
-        render_expanded_detail(frame, area, node, tasks, state.process_sort, state.no_color);
+        render_expanded_detail(
+            frame,
+            area,
+            node,
+            tasks,
+            state.process_sort,
+            state.no_color,
+            &request_latency,
+        );
         return;
     }
     let selected_age = match &node.metrics {
@@ -936,7 +950,7 @@ fn render_detail(
                 },
             ),
             Span::raw(format!(
-                " · {} · sample age {selected_age}",
+                " · {} · sample age {selected_age} · request {request_latency}",
                 node.identity.host
             )),
         ]),
@@ -1027,6 +1041,7 @@ fn render_expanded_detail(
     tasks: TaskCounts,
     process_sort: ProcessSort,
     no_color: bool,
+    request_latency: &str,
 ) {
     let selected_age = match &node.metrics {
         MetricView::Available { age, .. } => format_age(*age),
@@ -1070,7 +1085,7 @@ fn render_expanded_detail(
                 },
             ),
             Span::raw(format!(
-                " · {} · sample age {selected_age} · queues {queues}",
+                " · {} · sample age {selected_age} · request {request_latency} · queues {queues}",
                 node.identity.host
             )),
         ])),

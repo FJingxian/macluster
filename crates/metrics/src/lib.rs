@@ -11,6 +11,12 @@ pub fn sample_local() -> MetricSnapshot {
     macos::sample_local()
 }
 
+/// Collect readings that do not need a counter-delta window. mtop uses this
+/// for its initial paint, then replaces it with a full-rate sample.
+pub fn sample_local_fast() -> MetricSnapshot {
+    macos::sample_local_fast()
+}
+
 pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
     let mut errors = BTreeMap::new();
     errors.insert("sampler".into(), reason.into());
@@ -216,6 +222,48 @@ mod macos {
             disk_write_bytes_per_sec,
             network_rx_bytes_per_sec,
             network_tx_bytes_per_sec,
+            power_watts: power.watts,
+            power_scope: power.scope,
+            cpu_temp_celsius: hardware.cpu_temp_celsius,
+            fan_speed_rpm: hardware.fan_speed_rpm,
+            power_age_ms: power.age_ms,
+            gpu_percent: power.gpu_percent,
+            gpu_source: power.gpu_source,
+            gpu_age_ms: power.gpu_age_ms,
+            gpu_window_ms: power.gpu_window_ms,
+            stale: false,
+            errors,
+        }
+    }
+
+    pub fn sample_local_fast() -> MetricSnapshot {
+        let sampled_unix_ms = now_ms();
+        let mut errors = BTreeMap::new();
+        let cpu_max_percent = match cpu_counters() {
+            Ok(counters) => Some(counters.cpus as f64 * 100.0),
+            Err(error) => {
+                errors.insert("cpu".into(), error);
+                None
+            }
+        };
+        let (memory_total_bytes, memory_used_bytes, swap_used_bytes) = memory_sample(&mut errors);
+        let mut power = power_sample(&mut errors);
+        let hardware = sample_hardware_metrics();
+        if let Some(error) = hardware.cpu_temp_error.as_ref() {
+            errors.insert("cpu_temp".into(), error.clone());
+        }
+        apply_gpu_fallback(&mut power, &hardware, &mut errors);
+        MetricSnapshot {
+            sampled_unix_ms,
+            cpu_percent: None,
+            cpu_max_percent,
+            memory_total_bytes,
+            memory_used_bytes,
+            swap_used_bytes,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
+            network_rx_bytes_per_sec: None,
+            network_tx_bytes_per_sec: None,
             power_watts: power.watts,
             power_scope: power.scope,
             cpu_temp_celsius: hardware.cpu_temp_celsius,
@@ -851,6 +899,10 @@ mod macos {
             now_ms(),
             "macOS metric sampling is not available on this platform",
         )
+    }
+
+    pub fn sample_local_fast() -> MetricSnapshot {
+        sample_local()
     }
 }
 

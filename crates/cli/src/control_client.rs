@@ -59,6 +59,7 @@ impl ControlClient {
                     "status.v1".into(),
                     "jobs.v1".into(),
                     "snapshot.upload.v1".into(),
+                    "agent.compatibility.v1".into(),
                 ],
             },
         )?;

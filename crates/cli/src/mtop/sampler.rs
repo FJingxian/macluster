@@ -19,14 +19,22 @@ const REMOTE_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug)]
 pub enum SampleTarget {
     Local,
-    Node(NodeConfig),
+    Node {
+        node_id: String,
+        namespace: String,
+        node: NodeConfig,
+    },
 }
 
 impl SampleTarget {
-    pub fn for_node(node: &NodeConfig) -> Self {
+    pub fn for_node(node_id: &str, namespace: &str, node: &NodeConfig) -> Self {
         match node.transport {
             Transport::Local => Self::Local,
-            Transport::Ssh => Self::Node(node.clone()),
+            Transport::Ssh => Self::Node {
+                node_id: node_id.to_owned(),
+                namespace: namespace.to_owned(),
+                node: node.clone(),
+            },
         }
     }
 }
@@ -195,7 +203,11 @@ fn sample_initial_target(
     }
     match target {
         SampleTarget::Local => Ok((macluster_metrics::sample_local_fast(), true)),
-        SampleTarget::Node(node) => sample_remote_phase(node, stop, true),
+        SampleTarget::Node {
+            node_id,
+            namespace,
+            node,
+        } => sample_remote_phase(node_id, namespace, node, stop, true),
     }
 }
 
@@ -205,15 +217,26 @@ fn sample_target(target: &SampleTarget, stop: &AtomicBool) -> Result<MetricSnaps
     }
     match target {
         SampleTarget::Local => Ok(macluster_metrics::sample_local()),
-        SampleTarget::Node(node) => sample_remote(node, stop),
+        SampleTarget::Node {
+            node_id,
+            namespace,
+            node,
+        } => sample_remote(node_id, namespace, node, stop),
     }
 }
 
-fn sample_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<MetricSnapshot, String> {
-    sample_remote_phase(node, stop, false).map(|(snapshot, _)| snapshot)
+fn sample_remote(
+    node_id: &str,
+    namespace: &str,
+    node: &NodeConfig,
+    stop: &AtomicBool,
+) -> Result<MetricSnapshot, String> {
+    sample_remote_phase(node_id, namespace, node, stop, false).map(|(snapshot, _)| snapshot)
 }
 
 fn sample_remote_phase(
+    node_id: &str,
+    namespace: &str,
     node: &NodeConfig,
     stop: &AtomicBool,
     initial: bool,
@@ -228,7 +251,7 @@ fn sample_remote_phase(
         "-oConnectionAttempts=1",
     ]);
     node.add_ssh_identity_args(&mut command);
-    super::ssh::add_control_args(node, &mut command);
+    super::ssh::add_control_args(namespace, node_id, node, &mut command);
     command.arg(&node.host).arg(&node.remote_binary);
     node.add_remote_config_args(&mut command);
     command.arg("internal").arg("metrics").arg("--json");
@@ -394,7 +417,7 @@ mod tests {
                 sampler_peak.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(35));
                 sampler_active.fetch_sub(1, Ordering::SeqCst);
-                let SampleTarget::Node(node) = target else {
+                let SampleTarget::Node { node, .. } = target else {
                     unreachable!()
                 };
                 if node.host == "fail" {
@@ -404,8 +427,10 @@ mod tests {
                 }
             }),
         );
-        let node = |host: &str| {
-            SampleTarget::Node(macluster_core::config::NodeConfig {
+        let node = |host: &str| SampleTarget::Node {
+            node_id: host.into(),
+            namespace: "test".into(),
+            node: macluster_core::config::NodeConfig {
                 host: host.into(),
                 transport: macluster_core::config::Transport::Ssh,
                 remote_binary: "macluster".into(),
@@ -415,7 +440,7 @@ mod tests {
                 remote_config: None,
                 machine_uuid: None,
                 execution_uid: None,
-            })
+            },
         };
         let mut results = Vec::new();
         for wave in 0..2 {

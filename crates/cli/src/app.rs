@@ -19,8 +19,9 @@ use macluster_core::{
 };
 use macluster_protocol::{
     control::{
+        AgentCompatibilityRecord, AgentCompatibilityState, AgentCompatibilityUpdate,
         ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
-        MAX_CONTROL_SNAPSHOT_CHUNK_BYTES,
+        MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES,
     },
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
@@ -95,6 +96,12 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let command = command.expect("argv0 alias or parsed subcommand is present");
 
     let (global, args) = take_global_options(args, command == "submit")?;
+    if command == "submit"
+        && parse_submit_args(&args).is_ok_and(|options| options.interactive)
+        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+    {
+        return Err((2, "msub -Is requires terminal stdin and stdout".into()));
+    }
     let mut address_migration_deferred = false;
     if is_macluster_executable() && should_refresh_node_addresses(&command, &args) {
         let config_path = resolved_config_path(global.config.as_deref());
@@ -374,29 +381,52 @@ fn preflight_agent_update_with_compatibility(
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
     }
-    let compatibility = match checked_compatibility {
+    let (compatibility, compatibility_age_ms, publish_compatibility) = match checked_compatibility {
         Some(_) if command == "top" => {
-            crate::node_admin::configured_agent_build_compatibility_cached(
-                &config,
-                &state_dir.join("mtop-cache"),
-            )
-            .map_err(|(code, error)| {
-                (
-                    code,
-                    format!("cannot revalidate configured Agent builds: {error}"),
+            let (compatibility, age_ms) =
+                crate::node_admin::configured_agent_build_compatibility_cached_with_age(
+                    &config,
+                    &state_dir.join("mtop-cache"),
                 )
-            })?
+                .map_err(|(code, error)| {
+                    (
+                        code,
+                        format!("cannot revalidate configured Agent builds: {error}"),
+                    )
+                })?;
+            (compatibility, age_ms, true)
         }
-        Some(compatibility) => compatibility,
-        None => crate::node_admin::configured_agent_build_compatibility(&config).map_err(
-            |(code, error)| {
-                (
-                    code,
-                    format!("cannot check configured Agent builds: {error}"),
-                )
-            },
-        )?,
+        Some(compatibility) => (compatibility, 0, true),
+        None => {
+            if let Some(compatibility) =
+                query_controller_agent_compatibility(&config_path, &state_dir, &config)
+            {
+                (compatibility, 0, false)
+            } else {
+                let (compatibility, age_ms) =
+                    crate::node_admin::configured_agent_build_compatibility_cached_with_age(
+                        &config,
+                        &state_dir.join("mtop-cache"),
+                    )
+                    .map_err(|(code, error)| {
+                        (
+                            code,
+                            format!("cannot check configured Agent builds: {error}"),
+                        )
+                    })?;
+                (compatibility, age_ms, true)
+            }
+        }
     };
+    if publish_compatibility {
+        publish_controller_agent_compatibility(
+            &config_path,
+            &state_dir,
+            &config,
+            &compatibility,
+            compatibility_age_ms,
+        );
+    }
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -432,10 +462,14 @@ fn preflight_agent_update_with_compatibility(
             "Agent update is blocked by an unfinished node administration operation; finish or resolve it with `mnode`, then retry the requested command.".into(),
         ));
     }
-    if maybe_run_agent_update(update_required, || {
+    let update_result = maybe_run_agent_update(update_required, || {
         crate::node_admin::update_all_agents_for_preflight(&config_path, &state_dir)
-    })?
-    .is_some_and(|controller_was_running| {
+    })?;
+    if update_result.is_some() {
+        crate::node_admin::invalidate_agent_validation_cache(&state_dir.join("mtop-cache"));
+        publish_unknown_controller_agent_compatibility(&config_path, &state_dir, &config);
+    }
+    if update_result.is_some_and(|controller_was_running| {
         update_requires_restart_retry(command, args, controller_was_running)
     }) {
         return Err((
@@ -444,6 +478,151 @@ fn preflight_agent_update_with_compatibility(
         ));
     }
     Ok(())
+}
+
+fn query_controller_agent_compatibility(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+) -> Option<crate::node_admin::AgentBuildCompatibility> {
+    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+        return None;
+    }
+    let binding = ServiceBinding::load(config_path, state_dir).ok()?;
+    let mut client =
+        crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200)).ok()?;
+    if !client
+        .hello()
+        .capabilities
+        .iter()
+        .any(|capability| capability == "agent.compatibility.v1")
+    {
+        return None;
+    }
+    let node_ids = config
+        .nodes
+        .keys()
+        .map(|id| id.parse::<NodeId>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let payload = client
+        .request(ControlCommand::QueryAgentCompatibility {
+            node_ids: node_ids.clone(),
+        })
+        .ok()?;
+    let ControlPayload::AgentCompatibility(records) = payload else {
+        return None;
+    };
+    if records.len() != node_ids.len() {
+        return None;
+    }
+    let mut compatibility = crate::node_admin::AgentBuildCompatibility::default();
+    let mut expected = node_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    for AgentCompatibilityRecord {
+        node_id,
+        state,
+        age_ms,
+    } in records
+    {
+        if !expected.remove(&node_id) {
+            return None;
+        }
+        if !matches!(state, AgentCompatibilityState::Stale)
+            && (age_ms.is_none() || age_ms.is_some_and(|age| age >= 60_000))
+        {
+            // An unpopulated service cache is not an observation. Fall back to
+            // the bounded local compatibility check on first use.
+            return None;
+        }
+        match state {
+            AgentCompatibilityState::Current => compatibility.current.push(node_id.to_string()),
+            AgentCompatibilityState::Mismatch => compatibility.stale.push(node_id.to_string()),
+            AgentCompatibilityState::Unknown => compatibility.unknown.push(node_id.to_string()),
+            AgentCompatibilityState::Stale => return None,
+        }
+    }
+    if !expected.is_empty() {
+        return None;
+    }
+    Some(compatibility)
+}
+
+fn publish_controller_agent_compatibility(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+    compatibility: &crate::node_admin::AgentBuildCompatibility,
+    age_ms: u64,
+) {
+    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+        return;
+    }
+    let Some(mut client) = agent_compatibility_control_client(config_path, state_dir) else {
+        return;
+    };
+    let entries = config
+        .nodes
+        .keys()
+        .filter_map(|id| {
+            let node_id = id.parse::<NodeId>().ok()?;
+            let state = if compatibility.current.iter().any(|value| value == id) {
+                AgentCompatibilityState::Current
+            } else if compatibility.stale.iter().any(|value| value == id) {
+                AgentCompatibilityState::Mismatch
+            } else {
+                AgentCompatibilityState::Unknown
+            };
+            Some(AgentCompatibilityUpdate {
+                node_id,
+                state,
+                boot_id: None,
+                age_ms,
+            })
+        })
+        .collect();
+    let _ = client.request(ControlCommand::PublishAgentCompatibility { entries });
+}
+
+fn publish_unknown_controller_agent_compatibility(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+) {
+    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+        return;
+    }
+    let Some(mut client) = agent_compatibility_control_client(config_path, state_dir) else {
+        return;
+    };
+    let entries = config
+        .nodes
+        .keys()
+        .filter_map(|id| {
+            Some(AgentCompatibilityUpdate {
+                node_id: id.parse::<NodeId>().ok()?,
+                state: AgentCompatibilityState::Unknown,
+                boot_id: None,
+                age_ms: 0,
+            })
+        })
+        .collect();
+    let _ = client.request(ControlCommand::PublishAgentCompatibility { entries });
+}
+
+fn agent_compatibility_control_client(
+    config_path: &Path,
+    state_dir: &Path,
+) -> Option<crate::control_client::ControlClient> {
+    let binding = ServiceBinding::load(config_path, state_dir).ok()?;
+    let client =
+        crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200)).ok()?;
+    client
+        .hello()
+        .capabilities
+        .iter()
+        .any(|capability| capability == "agent.compatibility.v1")
+        .then_some(client)
 }
 
 fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
@@ -938,8 +1117,10 @@ fn run_interactive_submission(
                 "\r\nJob {} allocated on {}; attaching.\r\n",
                 job.id, node_id
             ))?;
-            let transport =
-                macluster_controller::transport::ClusterTransport::new(config_path.to_path_buf());
+            let transport = macluster_controller::transport::ClusterTransport::new_with_namespace(
+                config_path.to_path_buf(),
+                config.share_uuid.clone(),
+            );
             let attach_status =
                 match transport.attach_interactive(node_id, node, job.id, *start_token) {
                     Ok(status) => status,
@@ -3746,7 +3927,10 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             let mut service = macluster_controller::ControllerService::new(
                 config.clone(),
                 storage,
-                macluster_controller::transport::ClusterTransport::new(config_file.clone()),
+                macluster_controller::transport::ClusterTransport::new_with_namespace(
+                    config_file.clone(),
+                    config.share_uuid.clone(),
+                ),
             )
             .map_err(|error| (1, error.to_string()))?;
             if let Some((_, login)) = config
@@ -3832,6 +4016,7 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                         "status.v1".into(),
                         "jobs.v1".into(),
                         "snapshot.upload.v1".into(),
+                        "agent.compatibility.v1".into(),
                     ],
                     controller_epoch: service.epoch(),
                     config_generation: 0,
@@ -5278,6 +5463,8 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::{Path, PathBuf},
+        thread,
+        time::{Duration, Instant},
     };
 
     use super::{
@@ -5292,8 +5479,12 @@ mod tests {
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
+        control::{
+            AgentCompatibilityRecord, AgentCompatibilityState, CONTROL_PROTOCOL_VERSION,
+            ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
+        },
         identifiers::{Id128, NodeId, QueueName},
-        types::{JobMode, JobRecord, JobSpec, JobState},
+        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState},
     };
 
     #[test]
@@ -6989,6 +7180,111 @@ mod tests {
             encoded["pool_total"]["errors"],
             serde_json::json!(BTreeMap::<String, String>::new())
         );
+    }
+
+    fn query_agent_cache_from_fake_controller(
+        records: Vec<AgentCompatibilityRecord>,
+    ) -> Option<crate::node_admin::AgentBuildCompatibility> {
+        let root =
+            std::env::temp_dir().join(format!("macluster-preflight-ipc-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(root.join("state")).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            format!(
+                "[cluster]\nname=\"preflight\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                root.display(),
+                unsafe { libc::geteuid() }
+            ),
+        )
+        .unwrap();
+        let config_path = root.join("config.toml");
+        let state_dir = root.join("state");
+        let config = ClusterConfig::parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let binding =
+            macluster_core::service::ServiceBinding::load(&config_path, &state_dir).unwrap();
+        let instance = macluster_controller::InstanceLock::acquire(&state_dir).unwrap();
+        let hello = ControllerHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            binding_digest: binding.binding_digest().into(),
+            namespace: binding.namespace().into(),
+            uid: binding.uid(),
+            build_id: "test-controller".into(),
+            capabilities: vec!["agent.compatibility.v1".into()],
+            controller_epoch: ControllerEpoch {
+                controller_uuid: macluster_protocol::identifiers::ControllerUuid::random(),
+                epoch: 1,
+            },
+            config_generation: 0,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let mut listener =
+            macluster_controller::ControlListener::bind(&binding, &instance, hello).unwrap();
+        let expected_records = records.clone();
+        let query = thread::spawn(move || {
+            super::query_controller_agent_compatibility(&config_path, &state_dir, &config)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            if let Some(request) = listener.poll_request() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for preflight query"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            &request.request().command,
+            ControlCommand::QueryAgentCompatibility { .. }
+        ));
+        request
+            .respond(Ok(ControlPayload::AgentCompatibility(expected_records)))
+            .unwrap();
+        let result = query.join().unwrap();
+        drop(listener);
+        drop(instance);
+        let _ = fs::remove_dir_all(root);
+        result
+    }
+
+    #[test]
+    fn preflight_accepts_fresh_controller_cache_and_keeps_mismatch_visible() {
+        let records = vec![
+            AgentCompatibilityRecord {
+                node_id: "login".parse().unwrap(),
+                state: AgentCompatibilityState::Current,
+                age_ms: Some(30),
+            },
+            AgentCompatibilityRecord {
+                node_id: "worker".parse().unwrap(),
+                state: AgentCompatibilityState::Mismatch,
+                age_ms: Some(50),
+            },
+        ];
+        let compatibility = query_agent_cache_from_fake_controller(records).unwrap();
+        assert_eq!(compatibility.current, ["login"]);
+        assert_eq!(compatibility.stale, ["worker"]);
+        assert!(compatibility.unknown.is_empty());
+        assert!(compatibility.requires_update());
+    }
+
+    #[test]
+    fn preflight_does_not_treat_an_uninitialized_service_cache_as_current() {
+        let records = vec![
+            AgentCompatibilityRecord {
+                node_id: "login".parse().unwrap(),
+                state: AgentCompatibilityState::Unknown,
+                age_ms: None,
+            },
+            AgentCompatibilityRecord {
+                node_id: "worker".parse().unwrap(),
+                state: AgentCompatibilityState::Unknown,
+                age_ms: None,
+            },
+        ];
+        assert!(query_agent_cache_from_fake_controller(records).is_none());
     }
 }
 

@@ -1,9 +1,11 @@
 //! Login-node reconciliation and whole-node FIFO dispatch.
 
+pub mod compatibility;
 mod control;
 pub mod events;
 mod ipc;
 mod runtime;
+pub mod ssh;
 pub mod transport;
 pub mod wake;
 

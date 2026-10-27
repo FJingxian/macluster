@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::identifiers::NodeId;
 use crate::{
     identifiers::{Id128, RequestId},
     types::{ControllerEpoch, JobRecord, JobSpec, JobState, SnapshotRef},
@@ -10,6 +11,7 @@ use crate::{
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_CONTROL_JOB_PAGE: usize = 256;
+pub const MAX_CONTROL_COMPATIBILITY_NODES: usize = 128;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
@@ -73,6 +75,12 @@ pub enum HelloResponse {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlCommand {
     Status,
+    QueryAgentCompatibility {
+        node_ids: Vec<NodeId>,
+    },
+    PublishAgentCompatibility {
+        entries: Vec<AgentCompatibilityUpdate>,
+    },
     BeginSnapshot {
         upload_id: Id128,
         size_bytes: u64,
@@ -116,6 +124,7 @@ pub enum ControlCommand {
 #[serde(tag = "payload", content = "value", rename_all = "snake_case")]
 pub enum ControlPayload {
     Status(ControllerHello),
+    AgentCompatibility(Vec<AgentCompatibilityRecord>),
     SnapshotProgress { offset: u64 },
     SnapshotFinished(SnapshotRef),
     Submission(JobRecord),
@@ -123,6 +132,33 @@ pub enum ControlPayload {
     Job(JobRecord),
     Jobs(JobPage),
     Queues(Vec<QueueSummary>),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCompatibilityState {
+    Current,
+    Mismatch,
+    Unknown,
+    Stale,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentCompatibilityUpdate {
+    pub node_id: NodeId,
+    pub state: AgentCompatibilityState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default)]
+    pub age_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentCompatibilityRecord {
+    pub node_id: NodeId,
+    pub state: AgentCompatibilityState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -23,7 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_controller::transport::{ClusterTransport, NodeTransport, SshTransport};
+use macluster_controller::ssh::ConnectionKey;
+use macluster_controller::transport::{ClusterTransport, NodeTransport};
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
@@ -1129,8 +1130,8 @@ struct AgentValidationCache {
     compatibility: AgentBuildCompatibility,
 }
 
-const AGENT_VALIDATION_CACHE_TTL_MS: u64 = 30_000;
-const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 1;
+const AGENT_VALIDATION_CACHE_TTL_MS: u64 = 60_000;
+const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 2;
 const AGENT_VALIDATION_CACHE_MAX_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn current_agent_sha256() -> AppResult<String> {
@@ -1168,16 +1169,22 @@ pub(crate) fn configured_agent_build_compatibility_cached(
     config: &ClusterConfig,
     cache_root: &Path,
 ) -> AppResult<AgentBuildCompatibility> {
+    configured_agent_build_compatibility_cached_with_age(config, cache_root)
+        .map(|(compatibility, _)| compatibility)
+}
+
+pub(crate) fn configured_agent_build_compatibility_cached_with_age(
+    config: &ClusterConfig,
+    cache_root: &Path,
+) -> AppResult<(AgentBuildCompatibility, u64)> {
     let key = agent_validation_cache_key(config)?;
     let cache_path = cache_root.join("mtop-agent-validation.json");
-    if let Some(cache) = read_agent_validation_cache(&cache_path, &key) {
-        return Ok(cache);
+    if let Some((cache, age_ms)) = read_agent_validation_cache(&cache_path, &key) {
+        return Ok((cache, age_ms));
     }
 
     let compatibility = configured_agent_build_compatibility(config)?;
-    if compatibility.unknown.is_empty()
-        && agent_validation_cache_key(config).is_ok_and(|after| after == key)
-    {
+    if agent_validation_cache_key(config).is_ok_and(|after| after == key) {
         write_agent_validation_cache(
             &cache_path,
             AgentValidationCache {
@@ -1188,7 +1195,7 @@ pub(crate) fn configured_agent_build_compatibility_cached(
             },
         );
     }
-    Ok(compatibility)
+    Ok((compatibility, 0))
 }
 
 fn bounded_legacy_agent_probes(
@@ -1238,6 +1245,13 @@ fn agent_validation_cache_key(config: &ClusterConfig) -> AppResult<String> {
                 ";local={node_id}:{}",
                 file_identity_fingerprint(Path::new(&node.remote_binary))
             ));
+        } else {
+            let connection = ConnectionKey::for_node(&config.share_uuid, node_id, node)
+                .map_err(|error| (1, error.to_string()))?;
+            let digest = connection
+                .cache_fingerprint()
+                .map_err(|error| (1, error.to_string()))?;
+            identity.push_str(&format!(";ssh={node_id}:{digest}"));
         }
     }
     sha256_hex(identity.as_bytes()).map_err(|error| (1, error.to_string()))
@@ -1265,7 +1279,7 @@ fn file_identity_fingerprint(path: &Path) -> String {
     )
 }
 
-fn read_agent_validation_cache(path: &Path, key: &str) -> Option<AgentBuildCompatibility> {
+fn read_agent_validation_cache(path: &Path, key: &str) -> Option<(AgentBuildCompatibility, u64)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -1290,9 +1304,12 @@ fn read_agent_validation_cache(path: &Path, key: &str) -> Option<AgentBuildCompa
     let age = validation_now_ms().checked_sub(cache.checked_unix_ms)?;
     (cache.schema == AGENT_VALIDATION_CACHE_SCHEMA
         && cache.key == key
-        && age <= AGENT_VALIDATION_CACHE_TTL_MS
-        && cache.compatibility.unknown.is_empty())
-    .then_some(cache.compatibility)
+        && age <= AGENT_VALIDATION_CACHE_TTL_MS)
+        .then_some((cache.compatibility, age))
+}
+
+pub(crate) fn invalidate_agent_validation_cache(cache_root: &Path) {
+    let _ = fs::remove_file(cache_root.join("mtop-agent-validation.json"));
 }
 
 fn write_agent_validation_cache(path: &Path, cache: AgentValidationCache) {
@@ -6506,7 +6523,10 @@ pub(crate) fn remote_execution_status(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/dev/null")),
     };
-    let mut transport = ClusterTransport::new(config_path);
+    let namespace = read_config(local_config_path)
+        .map(|config| config.share_uuid)
+        .unwrap_or_else(|_| format!("config-path:{}", local_config_path.display()));
+    let mut transport = ClusterTransport::new_with_namespace(config_path, namespace);
     transport.timeout = Duration::from_secs(12);
     let response = match transport.call(&id, node, Operation::Status) {
         Err(macluster_controller::transport::TransportError::Remote(ProtocolError::NotFound)) => {
@@ -6745,7 +6765,10 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
             .join(",");
         let check = remote_node_check(node, id).ok();
         let health = NodeId::new(id.clone()).ok().and_then(|node_id| {
-            let mut transport = ClusterTransport::new(config_path.to_path_buf());
+            let mut transport = ClusterTransport::new_with_namespace(
+                config_path.to_path_buf(),
+                config.share_uuid.clone(),
+            );
             transport.timeout = Duration::from_secs(8);
             match transport.call(&node_id, node, Operation::Health) {
                 Ok(ResponseBody::Health(health)) => Some(health),
@@ -6753,7 +6776,10 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
             }
         });
         let bridge_online = NodeId::new(id.clone()).ok().is_some_and(|node_id| {
-            let mut transport = ClusterTransport::new(config_path.to_path_buf());
+            let mut transport = ClusterTransport::new_with_namespace(
+                config_path.to_path_buf(),
+                config.share_uuid.clone(),
+            );
             transport.timeout = Duration::from_secs(8);
             transport
                 .call(&node_id, node, Operation::Ping)
@@ -9853,11 +9879,12 @@ fn add_ssh_node(
     let candidate_config =
         ClusterConfig::parse(&candidate_source).map_err(|error| (2, error.to_string()))?;
     let candidate_node_id = NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
-    let bridge = SshTransport {
-        timeout: Duration::from_secs(12),
-    }
-    .call(&candidate_node_id, &node_config, Operation::Ping)
-    .map_err(|error| (1, format!("candidate agent bridge check failed: {error}")))?;
+    let mut candidate_transport =
+        ClusterTransport::new_with_namespace(PathBuf::from("/dev/null"), config.share_uuid.clone());
+    candidate_transport.timeout = Duration::from_secs(12);
+    let bridge = candidate_transport
+        .call(&candidate_node_id, &node_config, Operation::Ping)
+        .map_err(|error| (1, format!("candidate agent bridge check failed: {error}")))?;
     if bridge != ResponseBody::Pong {
         return Err((
             1,
@@ -10167,16 +10194,16 @@ fn add_existing_ssh_node_to_queue(
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AdminState, AgentBuildState, AgentStagePurpose, AppResult, ClientMountRequest,
-        ClientUnmountRequest, ClusterConfig, NFS_DAEMON_PATH, NamedShareMountStatus, NodeEndpoint,
-        NodeListRow, NodeNfsMapping, NodeOperation, ShareConfig, UpdateRecovery,
-        abort_duplicate_pristine_adds, acquire_node_maintenance, acquire_node_maintenance_with,
-        acquire_node_maintenance_with_confirmation_using, admin_shell_command,
-        agent_update_recovery_pending, append_client_mount_marker_check, candidate_admin_script,
-        classify_configured_agents, cleanup_node_from_endpoint, client_mount_batch_script,
-        client_mount_status_awk_script, client_nfs_cleanup_batch_script, client_nfs_cleanup_plan,
-        client_share_alias_script, config_path_candidate, controller_command_matches,
-        dispatch_sync_pending, ensure_controller_recovery_clean,
+        Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
+        ClientMountRequest, ClientUnmountRequest, ClusterConfig, NFS_DAEMON_PATH,
+        NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
+        ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds, acquire_node_maintenance,
+        acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
+        admin_shell_command, agent_update_recovery_pending, append_client_mount_marker_check,
+        candidate_admin_script, classify_configured_agents, cleanup_node_from_endpoint,
+        client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
+        client_nfs_cleanup_plan, client_share_alias_script, config_path_candidate,
+        controller_command_matches, dispatch_sync_pending, ensure_controller_recovery_clean,
         ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
         inspect_configured_agent_build, list_nodes, local_config_candidate, managed_binary_digest,
         migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
@@ -11162,6 +11189,61 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let unknown = classify_configured_agents(&config, |_, _| AgentBuildState::Unknown);
         assert_eq!(unknown.unknown, ["arm-a", "arm-b", "login"]);
         assert!(!unknown.requires_update());
+    }
+
+    #[test]
+    fn agent_validation_cache_key_changes_when_ssh_identity_changes() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let identity = root.join("id_ed25519");
+        fs::write(&identity, b"first-key-material").unwrap();
+        let mut config = parse_build_test_config();
+        config.nodes.get_mut("arm-a").unwrap().ssh_identity_file =
+            Some(identity.display().to_string());
+        let first = super::agent_validation_cache_key(&config).unwrap();
+        fs::write(&identity, b"rotated-key-material-with-new-size").unwrap();
+        let second = super::agent_validation_cache_key(&config).unwrap();
+        assert_ne!(first, second);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_validation_cache_keeps_unknown_for_at_most_sixty_seconds() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let config = parse_build_test_config();
+        let key = super::agent_validation_cache_key(&config).unwrap();
+        let path = root.join("cache.json");
+        let now = super::validation_now_ms();
+        let unknown = AgentBuildCompatibility {
+            current: vec!["login".into()],
+            stale: Vec::new(),
+            unknown: vec!["arm-a".into()],
+        };
+        super::write_agent_validation_cache(
+            &path,
+            super::AgentValidationCache {
+                schema: super::AGENT_VALIDATION_CACHE_SCHEMA,
+                key: key.clone(),
+                checked_unix_ms: now.saturating_sub(45_000),
+                compatibility: unknown.clone(),
+            },
+        );
+        let (cached, age_ms) = super::read_agent_validation_cache(&path, &key).unwrap();
+        assert_eq!(cached, unknown);
+        assert!((45_000..=46_000).contains(&age_ms));
+
+        super::write_agent_validation_cache(
+            &path,
+            super::AgentValidationCache {
+                schema: super::AGENT_VALIDATION_CACHE_SCHEMA,
+                key: key.clone(),
+                checked_unix_ms: now.saturating_sub(60_001),
+                compatibility: unknown,
+            },
+        );
+        assert!(super::read_agent_validation_cache(&path, &key).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn parse_build_test_config() -> ClusterConfig {

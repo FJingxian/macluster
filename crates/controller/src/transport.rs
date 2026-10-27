@@ -20,6 +20,8 @@ use macluster_protocol::{
 };
 use thiserror::Error;
 
+use crate::ssh::{ConnectionKey, SshPool};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
@@ -54,18 +56,35 @@ pub trait NodeTransport: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ClusterTransport {
     config_path: PathBuf,
+    ssh_pool: SshPool,
     pub timeout: Duration,
 }
 
 impl ClusterTransport {
     pub fn new(config_path: PathBuf) -> Self {
+        let namespace = format!("config-path:{}", config_path.display());
+        Self::new_with_namespace(config_path, namespace)
+    }
+
+    pub fn new_with_namespace(config_path: PathBuf, namespace: impl Into<String>) -> Self {
         Self {
             config_path,
+            ssh_pool: SshPool::new(namespace),
             timeout: DEFAULT_TIMEOUT,
         }
     }
 
     fn command_for(node_id: &NodeId, node: &NodeConfig, config_path: &Path) -> Command {
+        Self::command_for_with_pool(node_id, node, config_path, None)
+            .expect("unpooled SSH command construction cannot fail")
+    }
+
+    fn command_for_with_pool(
+        node_id: &NodeId,
+        node: &NodeConfig,
+        config_path: &Path,
+        pool: Option<&SshPool>,
+    ) -> Result<Command, TransportError> {
         match node.transport {
             Transport::Local => {
                 let mut command = Command::new(&node.remote_binary);
@@ -75,7 +94,7 @@ impl ClusterTransport {
                     "--node",
                     node_id.as_str(),
                 ]);
-                command
+                Ok(command)
             }
             Transport::Ssh => {
                 let mut command = Command::new("/usr/bin/ssh");
@@ -89,14 +108,25 @@ impl ClusterTransport {
                     "-oServerAliveCountMax=1",
                 ]);
                 node.add_ssh_identity_args(&mut command);
+                if let Some(pool) = pool {
+                    if let Ok(key) =
+                        ConnectionKey::for_node(pool.namespace(), node_id.as_str(), node)
+                    {
+                        // Connection pooling is an optimization. If the private
+                        // socket directory is unavailable, keep ordinary SSH
+                        // transport available rather than blocking scheduling.
+                        let _ = pool.append_args(&key, &mut command);
+                    }
+                }
                 command.arg(&node.host).arg(&node.remote_binary);
                 node.add_remote_config_args(&mut command);
                 command.args(["internal", "agent-stdio", "--node", node_id.as_str()]);
-                command
+                Ok(command)
             }
         }
     }
 
+    #[cfg(test)]
     fn interactive_attach_command_for(
         node_id: &NodeId,
         node: &NodeConfig,
@@ -104,6 +134,25 @@ impl ClusterTransport {
         job_id: u64,
         start_token: StartToken,
     ) -> Command {
+        Self::interactive_attach_command_with_pool(
+            node_id,
+            node,
+            config_path,
+            job_id,
+            start_token,
+            None,
+        )
+        .expect("unpooled SSH command construction cannot fail")
+    }
+
+    fn interactive_attach_command_with_pool(
+        node_id: &NodeId,
+        node: &NodeConfig,
+        config_path: &Path,
+        job_id: u64,
+        start_token: StartToken,
+        pool: Option<&SshPool>,
+    ) -> Result<Command, TransportError> {
         match node.transport {
             Transport::Local => {
                 let mut command = Command::new(&node.remote_binary);
@@ -120,7 +169,7 @@ impl ClusterTransport {
                     .arg(job_id.to_string())
                     .arg("--start-token")
                     .arg(start_token.to_string());
-                command
+                Ok(command)
             }
             Transport::Ssh => {
                 let mut command = Command::new("/usr/bin/ssh");
@@ -134,6 +183,13 @@ impl ClusterTransport {
                     INTERACTIVE_SSH_ALIVE_COUNT,
                 ]);
                 node.add_ssh_identity_args(&mut command);
+                if let Some(pool) = pool {
+                    if let Ok(key) =
+                        ConnectionKey::for_node(pool.namespace(), node_id.as_str(), node)
+                    {
+                        let _ = pool.append_args(&key, &mut command);
+                    }
+                }
                 command.arg(&node.host).arg(&node.remote_binary);
                 node.add_remote_config_args(&mut command);
                 command
@@ -147,7 +203,7 @@ impl ClusterTransport {
                     .arg(job_id.to_string())
                     .arg("--start-token")
                     .arg(start_token.to_string());
-                command
+                Ok(command)
             }
         }
     }
@@ -162,13 +218,14 @@ impl ClusterTransport {
         job_id: u64,
         start_token: StartToken,
     ) -> Result<i32, TransportError> {
-        let mut command = Self::interactive_attach_command_for(
+        let mut command = Self::interactive_attach_command_with_pool(
             node_id,
             node,
             &self.config_path,
             job_id,
             start_token,
-        );
+            Some(&self.ssh_pool),
+        )?;
         command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -209,7 +266,8 @@ impl NodeTransport for ClusterTransport {
         let mut request_bytes = Vec::new();
         write_frame(&mut request_bytes, &request)
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
-        let command = Self::command_for(node_id, node, &self.config_path);
+        let command =
+            Self::command_for_with_pool(node_id, node, &self.config_path, Some(&self.ssh_pool))?;
         let timeout = if self.timeout.is_zero() {
             DEFAULT_TIMEOUT
         } else {
@@ -622,6 +680,38 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-oStrictHostKeyChecking=yes"));
         assert!(args.iter().any(|arg| arg == "-l"));
         assert!(args.iter().any(|arg| arg == "2222"));
+    }
+
+    #[test]
+    fn controller_ssh_transport_uses_the_shared_pool_without_weakening_host_checks() {
+        let node_id = "mini01-a".parse().unwrap();
+        let node = node(Transport::Ssh, "/usr/local/bin/macluster");
+        let pool = SshPool::new("transport-pool-test");
+        let command = ClusterTransport::command_for_with_pool(
+            &node_id,
+            &node,
+            Path::new("/tmp/cluster.toml"),
+            Some(&pool),
+        )
+        .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg == "-oControlMaster=auto"));
+        assert!(args.iter().any(|arg| arg == "-oControlPersist=10"));
+        assert!(args.iter().any(|arg| arg == "-oStrictHostKeyChecking=yes"));
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("-oControlPath=/tmp/"))
+        );
+        let control_path = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("-oControlPath="))
+            .unwrap();
+        if let Some(root) = Path::new(control_path).parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]

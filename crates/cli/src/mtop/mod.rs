@@ -113,7 +113,12 @@ pub(crate) fn sample_one_shot(
         nodes
             .iter()
             .filter(|(_, node)| node.transport == Transport::Ssh)
-            .map(|(id, node)| (id.clone(), SampleTarget::for_node(node))),
+            .map(|(id, node)| {
+                (
+                    id.clone(),
+                    SampleTarget::for_node(id, &config.share_uuid, node),
+                )
+            }),
     );
     let target_lookup: HashMap<_, _> = targets.iter().cloned().collect();
     let mut round: VecDeque<_> = targets.iter().map(|(id, _)| id.clone()).collect();
@@ -197,13 +202,17 @@ pub fn run_interactive(
                 {
                     SampleTarget::Local
                 } else {
-                    SampleTarget::for_node(node)
+                    SampleTarget::for_node(&identity.id, &config.share_uuid, node)
                 }
             }
         };
         let process_target = match &target {
             SampleTarget::Local => ProcessTarget::Local,
-            SampleTarget::Node(node) => ProcessTarget::for_node(node),
+            SampleTarget::Node {
+                node_id,
+                namespace,
+                node,
+            } => ProcessTarget::for_node(node_id, namespace, node),
         };
         process_targets_by_id.insert(identity.id.clone(), process_target);
         targets.push((identity.id.clone(), target));
@@ -496,10 +505,18 @@ pub fn run_interactive(
                             });
                             if let Some(node) = node {
                                 identity.host = node.host.clone();
-                                targets_by_id
-                                    .insert(identity.id.clone(), SampleTarget::for_node(node));
-                                process_targets_by_id
-                                    .insert(identity.id.clone(), ProcessTarget::for_node(node));
+                                targets_by_id.insert(
+                                    identity.id.clone(),
+                                    SampleTarget::for_node(&identity.id, &current.share_uuid, node),
+                                );
+                                process_targets_by_id.insert(
+                                    identity.id.clone(),
+                                    ProcessTarget::for_node(
+                                        &identity.id,
+                                        &current.share_uuid,
+                                        node,
+                                    ),
+                                );
                             }
                         }
                     }

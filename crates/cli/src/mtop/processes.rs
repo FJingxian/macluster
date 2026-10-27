@@ -146,14 +146,22 @@ impl ProcessCache {
 #[derive(Clone, Debug)]
 pub(super) enum ProcessTarget {
     Local,
-    Ssh(NodeConfig),
+    Ssh {
+        node_id: String,
+        namespace: String,
+        node: NodeConfig,
+    },
 }
 
 impl ProcessTarget {
-    pub fn for_node(node: &NodeConfig) -> Self {
+    pub fn for_node(node_id: &str, namespace: &str, node: &NodeConfig) -> Self {
         match node.transport {
             Transport::Local => Self::Local,
-            Transport::Ssh => Self::Ssh(node.clone()),
+            Transport::Ssh => Self::Ssh {
+                node_id: node_id.to_owned(),
+                namespace: namespace.to_owned(),
+                node: node.clone(),
+            },
         }
     }
 }
@@ -235,7 +243,11 @@ fn sample_target(target: &ProcessTarget, stop: &AtomicBool) -> Result<Vec<Proces
     }
     let output = match target {
         ProcessTarget::Local => run_local(stop)?,
-        ProcessTarget::Ssh(node) => run_remote(node, stop)?,
+        ProcessTarget::Ssh {
+            node_id,
+            namespace,
+            node,
+        } => run_remote(node_id, namespace, node, stop)?,
     };
     parse_top_processes(&output)
 }
@@ -251,7 +263,12 @@ fn run_local(stop: &AtomicBool) -> Result<String, String> {
     collect_child(&mut child, PROCESS_TIMEOUT, stop, "local process sample")
 }
 
-fn run_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<String, String> {
+fn run_remote(
+    node_id: &str,
+    namespace: &str,
+    node: &NodeConfig,
+    stop: &AtomicBool,
+) -> Result<String, String> {
     let mut command = process::Command::new("/usr/bin/ssh");
     command.args([
         "-T",
@@ -262,7 +279,7 @@ fn run_remote(node: &NodeConfig, stop: &AtomicBool) -> Result<String, String> {
         "-oConnectionAttempts=1",
     ]);
     node.add_ssh_identity_args(&mut command);
-    super::ssh::add_control_args(node, &mut command);
+    super::ssh::add_control_args(namespace, node_id, node, &mut command);
     let mut child = command
         .arg(&node.host)
         .arg(PROCESS_COMMAND)

@@ -1,3 +1,6 @@
+mod common;
+
+use common::macluster_command;
 use std::{
     fs,
     io::{Read, Write},
@@ -56,7 +59,7 @@ fn regression_stderr_filter_ignores_stream_markers_in_stdout_body() {
     )
     .unwrap();
     fs::write(dir.join("summary.json"), "{\"annotation_failed\":null}").unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let result = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -83,7 +86,7 @@ fn regression_stderr_filter_ignores_stream_markers_in_stdout_body() {
 
 #[test]
 fn capabilities_report_primary_storage_source_support() {
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args(["internal", "capabilities", "--json"])
         .output()
         .unwrap();
@@ -133,7 +136,7 @@ fn enrollment_config_commit_honors_controller_lock_and_original_digest() {
     let staged = root.join("staged-config.toml");
     fs::write(&staged, &candidate).unwrap();
     let commit = |baseline: &str| {
-        Command::new(env!("CARGO_BIN_EXE_macluster"))
+        macluster_command()
             .args(["internal", "commit-enrollment-config", "--destination"])
             .arg(&config)
             .arg("--staged")
@@ -165,7 +168,7 @@ fn enrollment_config_commit_honors_controller_lock_and_original_digest() {
     assert_eq!(fs::read(&config).unwrap(), candidate);
     assert!(!staged.exists());
     // A malformed internal request must never delete the active config.
-    let same = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let same = macluster_command()
         .args(["internal", "commit-enrollment-config", "--destination"])
         .arg(&config)
         .arg("--staged")
@@ -244,7 +247,7 @@ fn init_refuses_to_overwrite_an_existing_config_without_reset() {
 
 #[test]
 fn init_help_is_available_without_a_cluster_config() {
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args(["init", "--help"])
         .output()
         .unwrap();
@@ -274,7 +277,7 @@ fn init_in_pty_with_args(
     input: &[u8],
 ) -> (std::process::ExitStatus, String) {
     let (mut master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let mut child = macluster_command()
         .arg("--config")
         .arg(config)
         .arg("--state-dir")
@@ -481,7 +484,7 @@ fn broken_address_migration_keeps_status_and_pending_cancellation_available() {
         vec!["mtop", "--json"],
         vec!["mkill", "1"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        let output = macluster_command()
             .arg("--config")
             .arg(&config)
             .arg("--state-dir")
@@ -517,7 +520,7 @@ fn broken_address_migration_does_not_block_init_confirmation_or_allow_submission
     assert!(output.contains("Reset existing cluster"), "{output}");
     assert!(output.contains("cluster reset cancelled"), "{output}");
     assert_eq!(fs::read(&config).unwrap(), before);
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -578,7 +581,7 @@ fn stale_address_migration_keeps_queries_and_init_available() {
         format!("{source}\n# changed after migration planning\n"),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -594,7 +597,7 @@ fn stale_address_migration_keeps_queries_and_init_available() {
     let (status, output) = init_in_pty(&config, &state, b"n\n");
     assert!(!status.success());
     assert!(output.contains("Reset existing cluster"), "{output}");
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -730,7 +733,7 @@ fn init_resumes_cleanup_and_creates_the_new_cluster_in_the_same_invocation() {
 #[test]
 fn job_queue_and_kill_help_are_available_without_cluster_state() {
     for command in ["mjob", "mqueue", "mkill"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        let output = macluster_command()
             .args([command, "--help"])
             .output()
             .unwrap();
@@ -762,7 +765,7 @@ fn noninteractive_init_requires_explicit_terminal_confirmation() {
         .filter_map(|value| value.parse::<std::net::Ipv4Addr>().ok())
         .find(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
         .expect("init needs a local cluster interface");
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -806,7 +809,7 @@ fn init_force_requires_an_existing_cluster_or_recovery_record() {
     fs::create_dir_all(&root).unwrap();
     let config = root.join("config.toml");
     let state = root.join("state");
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -873,7 +876,7 @@ fn msub_is_blocked_while_node_maintenance_is_draining() {
         0
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -1056,7 +1059,7 @@ fn msub_preserves_named_share_cwd_and_translates_server_alias() {
     // never change the test harness's process-wide working directory.
     for explicit in [false, true] {
         let state = root.join("controller");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_macluster"));
+        let mut command = macluster_command();
         command
             .arg("--config")
             .arg(&config)
@@ -1091,7 +1094,7 @@ fn msub_preserves_named_share_cwd_and_translates_server_alias() {
 
     // Inline commands from outside all registered shares default to primary root.
     let fallback_state = root.join("controller");
-    let fallback = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let fallback = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")
@@ -1139,7 +1142,7 @@ fn msub_remaps_submitter_environment_into_compute_share_paths() {
     )
     .unwrap();
     let submit_path = format!("{}/bin:/usr/bin:/bin", source.display());
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args(["--config", config.to_str().unwrap()])
         .args(["--state-dir", state.to_str().unwrap()])
         .args(["msub", "--wrap", "true"])
@@ -1281,7 +1284,7 @@ fn cached_interactive_shell_submission_replays_without_snapshot() {
     .unwrap();
 
     let (mut master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let mut child = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1339,7 +1342,7 @@ fn cached_interactive_shell_submission_replays_without_snapshot() {
 fn interactive_submission_without_tty_does_not_create_job() {
     let (root, _shared, config) = fixture();
     let state = root.join("controller");
-    let result = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let result = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1369,7 +1372,7 @@ fn interrupt_while_pending_cancels_job() {
     let state = root.join("controller");
     let (mut master, slave) = open_pty();
     let original = terminal_attributes(slave.as_raw_fd());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let mut child = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1489,7 +1492,7 @@ fn mjob_details_display_controller_waiting_reason() {
         .unwrap();
     drop(storage);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1543,7 +1546,7 @@ fn concurrent_cli_submissions_initialize_controller_storage_once() {
             let config = config.clone();
             let state = state.clone();
             std::thread::spawn(move || {
-                Command::new(env!("CARGO_BIN_EXE_macluster"))
+                macluster_command()
                     .arg("--config")
                     .arg(config)
                     .arg("--state-dir")
@@ -1646,7 +1649,7 @@ fn mjob_mqueue_and_mkill_read_and_mutate_the_persistent_queue() {
 #[test]
 fn standalone_mupdate_and_update_commands_are_removed() {
     for command in ["mupdate", "update"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        let output = macluster_command()
             .args([command, "--help"])
             .output()
             .expect("check removed update command");
@@ -1657,10 +1660,7 @@ fn standalone_mupdate_and_update_commands_are_removed() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let help = Command::new(env!("CARGO_BIN_EXE_macluster"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let help = macluster_command().arg("--help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(!help.contains("mupdate"));
     assert!(!help.contains("<submit|job|queue|kill|top|node|update"));
@@ -1676,7 +1676,7 @@ fn standalone_mupdate_and_update_commands_are_removed() {
 
 #[test]
 fn agent_capabilities_advertise_runtime_features() {
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args(["internal", "capabilities", "--json"])
         .output()
         .expect("query Agent capabilities");
@@ -1712,7 +1712,7 @@ fn operational_command_does_not_skip_preflight_for_an_invalid_existing_config() 
     fs::write(&config, "[cluster]\nname = \"broken\"\n").unwrap();
     let state = root.join("controller");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1808,7 +1808,7 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
     );
     assert!(!stderr.contains("Stop it for Agent update"), "{stderr}");
 
-    let inspection = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let inspection = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1893,7 +1893,7 @@ execution_uid = {}
     .unwrap();
     let state = root.join("controller");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .args([
             "--config",
             config.to_str().unwrap(),
@@ -1971,7 +1971,7 @@ fn operational_command_attempts_orphaned_agent_update_recovery() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let output = macluster_command()
         .arg("--config")
         .arg(&config)
         .arg("--state-dir")

@@ -1,11 +1,13 @@
 //! Login-node reconciliation and whole-node FIFO dispatch.
 
+mod control;
 mod ipc;
 mod runtime;
 pub mod transport;
 pub mod wake;
 
-pub use ipc::{ControlListener, IpcError, PendingControlRequest};
+pub use control::ControlApi;
+pub use ipc::{ControlListener, IpcError, PendingControlEvent, PendingControlRequest};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -516,6 +518,26 @@ impl<T: NodeTransport> ControllerService<T> {
         runtime::run_forever_with_shutdown(
             self,
             Duration::from_secs(interval_secs.max(1)),
+            shutdown_requested,
+            requested,
+            apply,
+        )
+    }
+
+    pub fn run_forever_with_control(
+        &mut self,
+        interval_secs: u64,
+        listener: &mut ControlListener<'_>,
+        hello: macluster_protocol::control::ControllerHello,
+        shutdown_requested: impl FnMut() -> bool,
+        requested: impl FnMut() -> bool,
+        apply: impl FnMut(&mut Self) -> Result<bool, ControllerError>,
+    ) -> Result<(), ControllerError> {
+        runtime::run_forever_with_control(
+            self,
+            Duration::from_secs(interval_secs.max(1)),
+            listener,
+            hello,
             shutdown_requested,
             requested,
             apply,

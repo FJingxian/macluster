@@ -55,7 +55,11 @@ impl ControlClient {
                 namespace: binding.namespace().to_owned(),
                 uid: binding.uid(),
                 build_id: concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")).into(),
-                capabilities: vec!["status.v1".into()],
+                capabilities: vec![
+                    "status.v1".into(),
+                    "jobs.v1".into(),
+                    "snapshot.upload.v1".into(),
+                ],
             },
         )?;
         let response: HelloResponse = read_frame(&mut stream)?.ok_or_else(|| {
@@ -102,20 +106,19 @@ impl ControlClient {
         Ok(response)
     }
 
-    pub fn status(&mut self) -> Result<ControllerHello, ControlClientError> {
+    pub fn request(
+        &mut self,
+        command: macluster_protocol::control::ControlCommand,
+    ) -> Result<ControlPayload, ControlClientError> {
         let response = self.call(ControlRequest {
             request_id: RequestId(Id128::random()),
             expected_generation: Some(self.hello.config_generation),
-            command: macluster_protocol::control::ControlCommand::Status,
+            command,
         })?;
-        match response
-            .result
-            .map_err(|error| ControlClientError::Remote {
-                code: error.code,
-                message: error.message,
-            })? {
-            ControlPayload::Status(status) => Ok(status),
-        }
+        response.result.map_err(|error| ControlClientError::Remote {
+            code: error.code,
+            message: error.message,
+        })
     }
 }
 
@@ -218,7 +221,13 @@ mod tests {
             let mut client =
                 ControlClient::connect(&client_binding, Duration::from_secs(2)).unwrap();
             assert_eq!(client.hello(), &client_expected);
-            client.status().unwrap()
+            match client
+                .request(macluster_protocol::control::ControlCommand::Status)
+                .unwrap()
+            {
+                ControlPayload::Status(status) => status,
+                _ => panic!("controller returned an unexpected status payload"),
+            }
         });
 
         let request = wait_request(&mut listener);

@@ -1,3 +1,6 @@
+mod common;
+
+use common::macluster_command;
 use macluster_controller::transport::run_child_bounded;
 use macluster_core::storage::Storage;
 use macluster_protocol::{
@@ -13,13 +16,12 @@ use std::{
     io::Cursor,
     os::unix::fs::PermissionsExt,
     path::Path,
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 fn agent(config: &Path, state: &Path, operation: Operation) -> ResponseBody {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_macluster"));
+    let mut command = macluster_command();
     command
         .arg("--config")
         .arg(config)
@@ -151,7 +153,7 @@ fn fresh_controller_can_reuse_shared_storage_without_colliding_with_old_job_one(
         config_text.push_str(&format!("\n[shares.janusx]\nserver=\"worker\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"{project_uuid}\"\n", project.display(), project.display()));
         config_text.push_str(&format!("\n[shares.analysis]\nserver=\"worker\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"{mamba_uuid}\"\n", mamba_env.display(), mamba_env.display()));
         fs::write(&config, config_text).unwrap();
-        let mut submit_command = Command::new(env!("CARGO_BIN_EXE_macluster"));
+        let mut submit_command = macluster_command();
         submit_command
             .arg("--config")
             .arg(&config)
@@ -173,7 +175,7 @@ fn fresh_controller_can_reuse_shared_storage_without_colliding_with_old_job_one(
             "{}",
             String::from_utf8_lossy(&submit.stderr)
         );
-        let publish = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        let publish = macluster_command()
             .arg("--state-dir")
             .arg(&state)
             .args([

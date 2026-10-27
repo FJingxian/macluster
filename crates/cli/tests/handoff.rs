@@ -1,5 +1,9 @@
 #![cfg(target_os = "macos")]
 
+mod common;
+
+use common::macluster_command;
+
 use macluster_controller::transport::run_child_bounded;
 use macluster_protocol::{
     framing::{read_frame, sha256_hex, write_frame},
@@ -59,7 +63,7 @@ impl Fixture {
         path
     }
     fn rpc(&self, config: &Path, operation: Operation) -> Result<ResponseBody, ProtocolError> {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_macluster"));
+        let mut cmd = macluster_command();
         cmd.arg("--config")
             .arg(config)
             .arg("--state-dir")
@@ -87,7 +91,7 @@ impl Fixture {
             .result
     }
     fn claim(&self, config: &Path, controller: ControllerEpoch) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_macluster"))
+        macluster_command()
             .arg("--config")
             .arg(config)
             .arg("--state-dir")
@@ -106,7 +110,7 @@ impl Fixture {
             .unwrap()
     }
     fn archive(&self, namespace: Id128) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_macluster"))
+        macluster_command()
             .arg("--state-dir")
             .arg(&self.state)
             .args([

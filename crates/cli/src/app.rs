@@ -18,13 +18,16 @@ use macluster_core::{
     storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
 use macluster_protocol::{
-    control::{ControllerHello, ControllerLifecycle},
+    control::{
+        ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
+        MAX_CONTROL_SNAPSHOT_CHUNK_BYTES,
+    },
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
         ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord,
         JobSpec, JobState, METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION,
-        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
+        SnapshotRef, VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -612,14 +615,11 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         return Err((2, "script exceeds the 8 MiB limit".into()));
     }
     if let Some(expected) = spec.snapshot.as_ref() {
-        if loaded_from_cache {
-            let staged = storage.stage_snapshot(&script).map_err(operation_error)?;
-            if &staged != expected {
-                return Err((
-                    1,
-                    "cached script does not match the cached submission".into(),
-                ));
-            }
+        if loaded_from_cache && snapshot_reference(&script)? != *expected {
+            return Err((
+                1,
+                "cached script does not match the cached submission".into(),
+            ));
         }
     } else if loaded_from_cache && !script.is_empty() {
         return Err((
@@ -627,7 +627,7 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             "cached interactive shell unexpectedly contains a script".into(),
         ));
     } else if !script.is_empty() {
-        spec.snapshot = Some(storage.stage_snapshot(&script).map_err(operation_error)?);
+        spec.snapshot = Some(snapshot_reference(&script)?);
     }
     if !loaded_from_cache {
         save_submission_cache(&state_root, request_id, &spec, &script)?;
@@ -659,9 +659,20 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     crate::init::reset::ensure_no_reset_in_progress(&config_file, &state_root)?;
     crate::node_admin::ensure_no_node_maintenance_in_progress(&config_file, &state_root)
         .map_err(|error| (1, error))?;
-    let record = storage
-        .submit_once(request_id, spec)
-        .map_err(operation_error)?;
+    let mut online = online_controller(&config_file, &state_root, spec.mode == JobMode::Batch)?;
+    let record = if let Some(controller) = &mut online {
+        submit_online(controller, request_id, spec, &script)?
+    } else {
+        if let Some(expected) = spec.snapshot.as_ref() {
+            let staged = storage.stage_snapshot(&script).map_err(operation_error)?;
+            if &staged != expected {
+                return Err((1, "script snapshot changed before local admission".into()));
+            }
+        }
+        storage
+            .submit_once(request_id, spec)
+            .map_err(operation_error)?
+    };
     wake_controller_best_effort(&state_root);
     if !record.snapshot_sync_pending {
         if record.spec.mode == JobMode::Interactive {
@@ -701,6 +712,136 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         );
     }
     Ok(())
+}
+
+fn snapshot_reference(script: &[u8]) -> AppResult<SnapshotRef> {
+    Ok(SnapshotRef {
+        sha256: sha256_hex(script).map_err(|error| (1, error.to_string()))?,
+        size_bytes: script.len() as u64,
+    })
+}
+
+fn submit_online(
+    controller: &mut OnlineController,
+    request_id: RequestId,
+    spec: JobSpec,
+    script: &[u8],
+) -> AppResult<JobRecord> {
+    if let Some(expected) = spec.snapshot.as_ref() {
+        if snapshot_reference(script)? != *expected {
+            return Err((
+                1,
+                "script snapshot digest does not match the submission".into(),
+            ));
+        }
+        let upload_id = Id128::random();
+        let begin = controller
+            .client
+            .request(ControlCommand::BeginSnapshot {
+                upload_id,
+                size_bytes: expected.size_bytes,
+                sha256: expected.sha256.clone(),
+            })
+            .map_err(|error| (1, error.to_string()))?;
+        if !matches!(begin, ControlPayload::SnapshotProgress { offset: 0 }) {
+            return Err((
+                1,
+                "controller returned an invalid script upload response".into(),
+            ));
+        }
+        let mut offset = 0_u64;
+        for bytes in script.chunks(MAX_CONTROL_SNAPSHOT_CHUNK_BYTES) {
+            let payload = controller
+                .client
+                .request(ControlCommand::PutSnapshotChunk {
+                    upload_id,
+                    offset,
+                    bytes: bytes.to_vec(),
+                })
+                .map_err(|error| (1, error.to_string()))?;
+            offset = offset.saturating_add(bytes.len() as u64);
+            if payload != (ControlPayload::SnapshotProgress { offset }) {
+                return Err((
+                    1,
+                    "controller returned an invalid script chunk offset".into(),
+                ));
+            }
+        }
+        match controller
+            .client
+            .request(ControlCommand::FinishSnapshot { upload_id })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::SnapshotFinished(staged) if staged == *expected => {}
+            ControlPayload::SnapshotFinished(_) => {
+                return Err((1, "controller staged a different script snapshot".into()));
+            }
+            _ => return Err((1, "controller returned an invalid script completion".into())),
+        }
+    }
+
+    match controller.client.request(ControlCommand::Submit {
+        request_id,
+        spec: spec.clone(),
+    }) {
+        Ok(ControlPayload::Submission(record)) => Ok(record),
+        Ok(_) => Err((
+            1,
+            "controller returned an invalid submission response".into(),
+        )),
+        Err(crate::control_client::ControlClientError::Remote { code, message }) => Err((
+            1,
+            format!("controller rejected submission ({code:?}): {message}"),
+        )),
+        Err(first_error) => {
+            // The controller may have committed the request before the reply was lost.
+            // Resolve the durable request ID before considering any retry or fallback.
+            let mut retry_client = crate::control_client::ControlClient::connect(
+                &controller.binding,
+                Duration::from_secs(5),
+            )
+            .map_err(|_error| {
+                (
+                    1,
+                    format!(
+                        "submission result is unknown after {first_error}; query `mjob --request-id {request_id}` after the controller reconnects"
+                    ),
+                )
+            })?;
+            match retry_client
+                .request(ControlCommand::LookupRequest { request_id })
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "submission result is unknown after {first_error}; request lookup failed: {error}; retry with `msub --request-id {request_id}`"
+                        ),
+                    )
+                })? {
+                ControlPayload::Lookup(Some(record)) => {
+                    controller.client = retry_client;
+                    Ok(record)
+                }
+                ControlPayload::Lookup(None) => match retry_client.request(ControlCommand::Submit {
+                    request_id,
+                    spec,
+                }) {
+                    Ok(ControlPayload::Submission(record)) => {
+                        controller.client = retry_client;
+                        Ok(record)
+                    }
+                    Ok(_) => Err((1, "controller returned an invalid retry response".into())),
+                    Err(error) => Err((
+                        1,
+                        format!(
+                            "submission result is still unknown after retry: {error}; query `mjob --request-id {request_id}` before submitting again"
+                        ),
+                    )),
+                },
+                _ => Err((1, "controller returned an invalid request lookup".into())),
+            }
+        }
+    }
 }
 
 fn submit_help_requested(args: &[String]) -> bool {
@@ -2711,35 +2852,73 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     if request_id.is_some() && positional.is_some() {
         return Err((2, "use either job ID or --request-id".into()));
     }
-    let storage =
-        Storage::open(state_root(global.state_dir.as_deref())?).map_err(operation_error)?;
+    let state_dir = state_root(global.state_dir.as_deref())?;
+    let mut online = online_controller(
+        &resolved_config_path(global.config.as_deref()),
+        &state_dir,
+        true,
+    )?;
+    let storage = Storage::open(&state_dir).map_err(operation_error)?;
     if let Some(id) = log_id {
         if positional.is_some() {
             return Err((2, "use either --log JOBID or a positional job ID".into()));
         }
-        let record = storage
-            .get_job(id)
-            .map_err(operation_error)?
-            .ok_or_else(|| (1, format!("job {id} not found")))?;
+        let record = if let Some(controller) = &mut online {
+            query_job(
+                &mut controller.client,
+                ControlCommand::LookupJob { job_id: id },
+            )?
+        } else {
+            storage
+                .get_job(id)
+                .map_err(operation_error)?
+                .ok_or_else(|| (1, format!("job {id} not found")))?
+        };
         return stream_job_log(&storage, &record, stderr, follow, raw);
     }
     if let Some(request_id) = request_id {
-        let record = storage
-            .get_job_by_request_id(request_id)
-            .map_err(operation_error)?
-            .ok_or_else(|| (1, format!("no job exists for request ID {request_id}")))?;
+        let record = if let Some(controller) = &mut online {
+            match query_control(
+                &mut controller.client,
+                ControlCommand::LookupRequest { request_id },
+            )? {
+                ControlPayload::Lookup(Some(job)) => job,
+                ControlPayload::Lookup(None) => {
+                    return Err((1, format!("no job exists for request ID {request_id}")));
+                }
+                _ => return Err((1, "controller returned an invalid job lookup".into())),
+            }
+        } else {
+            storage
+                .get_job_by_request_id(request_id)
+                .map_err(operation_error)?
+                .ok_or_else(|| (1, format!("no job exists for request ID {request_id}")))?
+        };
         print_job(&record, json)?;
         return Ok(());
     }
     if let Some(id) = positional {
-        let record = storage
-            .get_job(id)
-            .map_err(operation_error)?
-            .ok_or_else(|| (1, format!("job {id} not found")))?;
+        let record = if let Some(controller) = &mut online {
+            query_job(
+                &mut controller.client,
+                ControlCommand::LookupJob { job_id: id },
+            )?
+        } else {
+            storage
+                .get_job(id)
+                .map_err(operation_error)?
+                .ok_or_else(|| (1, format!("job {id} not found")))?
+        };
         print_job(&record, json)?;
         return Ok(());
     }
-    let jobs = if !all && state_filter.is_none() {
+    let jobs = if let Some(controller) = &mut online {
+        query_all_jobs(
+            &mut controller.client,
+            state_filter,
+            !all && state_filter.is_none(),
+        )?
+    } else if !all && state_filter.is_none() {
         storage.list_active_jobs().map_err(operation_error)?
     } else {
         storage.list_jobs(state_filter).map_err(operation_error)?
@@ -3073,37 +3252,73 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
         index += 1;
     }
-    let storage =
-        Storage::open(state_root(global.state_dir.as_deref())?).map_err(operation_error)?;
+    let state_dir = state_root(global.state_dir.as_deref())?;
+    let mut online = online_controller(
+        &resolved_config_path(global.config.as_deref()),
+        &state_dir,
+        true,
+    )?;
+    let storage = Storage::open(&state_dir).map_err(operation_error)?;
     loop {
-        let counts_by_queue: BTreeMap<_, _> = storage
-            .queue_job_counts()
-            .map_err(operation_error)?
-            .into_iter()
-            .map(|counts| (counts.queue.clone(), counts))
-            .collect();
-        let jobs = show_jobs
-            .then(|| storage.list_jobs(None))
-            .transpose()
-            .map_err(operation_error)?;
-        let mut rows = Vec::new();
-        for name in config.queues.keys() {
-            if selected
-                .as_ref()
-                .is_some_and(|selected| selected.as_str() != name)
-            {
-                continue;
+        let rows: Vec<QueueRow> = if let Some(controller) = &mut online {
+            let ControlPayload::Queues(queues) =
+                query_control(&mut controller.client, ControlCommand::QueryQueues)?
+            else {
+                return Err((1, "controller returned an invalid queue list".into()));
+            };
+            queues
+                .into_iter()
+                .filter(|queue| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.as_str() == queue.name)
+                })
+                .map(|queue| QueueRow {
+                    name: queue.name,
+                    nodes: queue.nodes,
+                    pending: queue.pending as usize,
+                    running: queue.running as usize,
+                    completed: queue.completed as usize,
+                    failed: queue.failed as usize,
+                })
+                .collect()
+        } else {
+            let counts_by_queue: BTreeMap<_, _> = storage
+                .queue_job_counts()
+                .map_err(operation_error)?
+                .into_iter()
+                .map(|counts| (counts.queue.clone(), counts))
+                .collect();
+            config
+                .queues
+                .keys()
+                .filter(|name| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.as_str() == name.as_str())
+                })
+                .map(|name| {
+                    let counts = counts_by_queue.get(name);
+                    QueueRow {
+                        name: name.clone(),
+                        nodes: config.queue_compute_nodes(name),
+                        pending: counts.map_or(0, |counts| counts.pending as usize),
+                        running: counts.map_or(0, |counts| counts.running as usize),
+                        completed: counts.map_or(0, |counts| counts.completed as usize),
+                        failed: counts.map_or(0, |counts| counts.failed as usize),
+                    }
+                })
+                .collect()
+        };
+        let jobs = if show_jobs {
+            if let Some(controller) = &mut online {
+                Some(query_all_jobs(&mut controller.client, None, false)?)
+            } else {
+                Some(storage.list_jobs(None).map_err(operation_error)?)
             }
-            let counts = counts_by_queue.get(name);
-            rows.push(QueueRow {
-                name: name.clone(),
-                nodes: config.queue_compute_nodes(name),
-                pending: counts.map_or(0, |counts| counts.pending as usize),
-                running: counts.map_or(0, |counts| counts.running as usize),
-                completed: counts.map_or(0, |counts| counts.completed as usize),
-                failed: counts.map_or(0, |counts| counts.failed as usize),
-            });
-        }
+        } else {
+            None
+        };
         if selected
             .as_ref()
             .is_some_and(|selected| !config.queues.contains_key(selected.as_str()))
@@ -3226,17 +3441,37 @@ fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     if ids.is_empty() {
         return Err((2, "mkill requires one or more job IDs".into()));
     }
-    let storage =
-        Storage::open(state_root(global.state_dir.as_deref())?).map_err(operation_error)?;
+    let state_dir = state_root(global.state_dir.as_deref())?;
+    let mut online = online_controller(
+        &resolved_config_path(global.config.as_deref()),
+        &state_dir,
+        true,
+    )?;
+    let storage = Storage::open(&state_dir).map_err(operation_error)?;
     let mut failures = Vec::new();
     let mut changed = false;
     for id in ids {
-        match storage.request_cancel(id, force) {
+        let result = if let Some(controller) = &mut online {
+            match query_control(
+                &mut controller.client,
+                ControlCommand::CancelJob { job_id: id, force },
+            ) {
+                Ok(ControlPayload::Job(record)) => Ok(record),
+                Ok(_) => Err((
+                    1,
+                    "controller returned an invalid cancellation response".into(),
+                )),
+                Err(error) => Err(error),
+            }
+        } else {
+            storage.request_cancel(id, force).map_err(operation_error)
+        };
+        match result {
             Ok(record) => {
                 changed = true;
                 println!("Job {}: {:?}", id, record.state);
             }
-            Err(error) => {
+            Err((_, error)) => {
                 eprintln!("Job {id}: {error}");
                 failures.push(id);
             }
@@ -3580,7 +3815,8 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             } else {
                 ControllerLifecycle::Ready
             };
-            let _control_listener = if once {
+            let mut control_listener = None;
+            let control_hello = if once {
                 None
             } else {
                 let binding = ServiceBinding::load(&config_file, &state_dir)
@@ -3592,17 +3828,22 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                     uid: binding.uid(),
                     build_id: crate::service::current_executable_build_id()
                         .map_err(service_error)?,
-                    capabilities: vec!["status.v1".into()],
+                    capabilities: vec![
+                        "status.v1".into(),
+                        "jobs.v1".into(),
+                        "snapshot.upload.v1".into(),
+                    ],
                     controller_epoch: service.epoch(),
                     config_generation: 0,
                     lifecycle,
                 };
-                Some(
-                    macluster_controller::ControlListener::bind(&binding, &instance, hello)
+                let listener =
+                    macluster_controller::ControlListener::bind(&binding, &instance, hello.clone())
                         .map_err(|error| {
                             (1, format!("cannot start local controller IPC: {error}"))
-                        })?,
-                )
+                        })?;
+                control_listener = Some(listener);
+                Some(hello)
             };
             if once {
                 service
@@ -3622,8 +3863,11 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                 let requested = std::sync::Arc::clone(&pending);
                 let mut maintenance_lock = Some(maintenance_lock);
                 let _signal_guard = ControllerSignalGuard::install()?;
+                let listener = control_listener
+                    .as_mut()
+                    .expect("long-running controller always has a control listener");
                 service
-                    .run_forever_with_shutdown(interval,
+                    .run_forever_with_control(interval, listener, control_hello.expect("control hello exists"),
                         || CONTROLLER_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst),
                         || requested.load(std::sync::atomic::Ordering::SeqCst),
                         |service| {
@@ -3663,6 +3907,110 @@ fn controller_service_manager(
 
 fn service_error(error: crate::service::ServiceLifecycleError) -> (i32, String) {
     (1, error.to_string())
+}
+
+struct OnlineController {
+    binding: ServiceBinding,
+    client: crate::control_client::ControlClient,
+}
+
+/// Start the per-user controller on demand. Offline mode is used only when the
+/// user explicitly stopped the service or no GUI LaunchAgent session exists.
+fn online_controller(
+    config_path: &Path,
+    state_dir: &Path,
+    allow_offline: bool,
+) -> AppResult<Option<OnlineController>> {
+    if !is_macluster_executable() {
+        return Ok(None);
+    }
+    if env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some() {
+        return Ok(None);
+    }
+    let binding = ServiceBinding::load(config_path, state_dir)
+        .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
+    let manager =
+        crate::service::ServiceManager::current(binding.clone()).map_err(service_error)?;
+    match manager.intent().map_err(service_error)? {
+        ServiceIntent::Stopped if allow_offline => return Ok(None),
+        ServiceIntent::Stopped => {
+            return Err((
+                1,
+                "controller service is stopped; run `macluster controller start` before this operation".into(),
+            ));
+        }
+        ServiceIntent::Resetting => {
+            return Err((
+                1,
+                "cluster reset is in progress; finish `macluster init` before this operation"
+                    .into(),
+            ));
+        }
+        ServiceIntent::Auto => {}
+    }
+    match manager.ensure_running(Duration::from_secs(5)) {
+        Ok(_) => {}
+        Err(crate::service::ServiceLifecycleError::NoGuiSession(_)) if allow_offline => {
+            return Ok(None);
+        }
+        Err(error) => return Err(service_error(error)),
+    }
+    let client = crate::control_client::ControlClient::connect(&binding, Duration::from_secs(5))
+        .map_err(|error| (1, error.to_string()))?;
+    Ok(Some(OnlineController { binding, client }))
+}
+
+fn query_control(
+    client: &mut crate::control_client::ControlClient,
+    command: ControlCommand,
+) -> AppResult<ControlPayload> {
+    client
+        .request(command)
+        .map_err(|error| (1, error.to_string()))
+}
+
+fn query_all_jobs(
+    client: &mut crate::control_client::ControlClient,
+    state: Option<JobState>,
+    active_only: bool,
+) -> AppResult<Vec<JobRecord>> {
+    let mut jobs = Vec::new();
+    let mut offset = 0_usize;
+    loop {
+        let payload = query_control(
+            client,
+            ControlCommand::QueryJobs {
+                offset,
+                limit: 256,
+                state,
+                active_only,
+            },
+        )?;
+        let ControlPayload::Jobs(page) = payload else {
+            return Err((1, "controller returned an invalid job page".into()));
+        };
+        jobs.extend(page.jobs);
+        let Some(next) = page.next_offset else {
+            break;
+        };
+        if next <= offset {
+            return Err((1, "controller returned an invalid job page offset".into()));
+        }
+        offset = next;
+    }
+    Ok(jobs)
+}
+
+fn query_job(
+    client: &mut crate::control_client::ControlClient,
+    command: ControlCommand,
+) -> AppResult<JobRecord> {
+    match query_control(client, command)? {
+        ControlPayload::Job(job) => Ok(job),
+        ControlPayload::Lookup(Some(job)) => Ok(job),
+        ControlPayload::Lookup(None) => Err((1, "job was not found".into())),
+        _ => Err((1, "controller returned an invalid job record".into())),
+    }
 }
 
 static CONTROLLER_SHUTDOWN: std::sync::atomic::AtomicBool =
@@ -5254,6 +5602,206 @@ mod tests {
             "{error:?}"
         );
         drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn online_submission_preserves_the_login_environment_through_controller_ipc() {
+        use std::{
+            fs, thread,
+            time::{Duration, Instant},
+        };
+
+        use macluster_controller::{ControlApi, ControlListener, InstanceLock};
+        use macluster_core::{service::ServiceBinding, storage::Storage};
+        use macluster_protocol::{
+            control::{
+                CONTROL_PROTOCOL_VERSION, ControlCommand, ControlPayload, ControllerHello,
+                ControllerLifecycle,
+            },
+            identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
+            types::{ControllerEpoch, JobMode},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-online-env-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let shared_root = root.join("shared");
+        let software_root = root.join("mamba");
+        let environment_root = software_root.join("envs/analysis");
+        let toolchain_root = software_root.join("toolchain");
+        let state_dir = root.join("state");
+        fs::create_dir_all(shared_root.join("jobs")).unwrap();
+        fs::create_dir_all(environment_root.join("bin")).unwrap();
+        fs::create_dir_all(toolchain_root.join("bin")).unwrap();
+        fs::create_dir_all(toolchain_root.join("lib")).unwrap();
+        for binary in ["python", "clang", "clang++", "rustc"] {
+            fs::write(toolchain_root.join("bin").join(binary), "test tool").unwrap();
+        }
+        fs::write(environment_root.join("bin/python"), "test python").unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[cluster]\nname=\"online-env\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n[shares.mamba]\nserver=\"login\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"340edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\n",
+                shared_root.display(),
+                unsafe { libc::geteuid() },
+                software_root.display(),
+                software_root.display(),
+            ),
+        )
+        .unwrap();
+        let config = ClusterConfig::parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let environment = BTreeMap::from([
+            (
+                "PATH".into(),
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    environment_root.join("bin").display(),
+                    toolchain_root.join("bin").display()
+                ),
+            ),
+            (
+                "VIRTUAL_ENV".into(),
+                environment_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "CC".into(),
+                toolchain_root
+                    .join("bin/clang")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "CXX".into(),
+                toolchain_root
+                    .join("bin/clang++")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RUSTC".into(),
+                toolchain_root
+                    .join("bin/rustc")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RUSTFLAGS".into(),
+                format!("-L native={}", toolchain_root.join("lib").display()),
+            ),
+        ]);
+        let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
+        let spec = JobSpec {
+            storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+            queue: QueueName::new("compute").unwrap(),
+            node: Some(NodeId::new("worker").unwrap()),
+            name: "login-environment".into(),
+            cwd: shared_root.display().to_string(),
+            stdout_path: shared_root.join("jobs/out.log").display().to_string(),
+            stderr_path: shared_root.join("jobs/err.log").display().to_string(),
+            walltime_secs: None,
+            env: task_env.clone(),
+            mode: JobMode::Batch,
+            snapshot: Some(super::snapshot_reference(b"#!/bin/sh\ntrue\n").unwrap()),
+        };
+        let script = b"#!/bin/sh\ntrue\n".to_vec();
+
+        let binding = ServiceBinding::load(&config_path, &state_dir).unwrap();
+        let hello = ControllerHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            binding_digest: binding.binding_digest().into(),
+            namespace: binding.namespace().into(),
+            uid: binding.uid(),
+            build_id: "environment-test-controller".into(),
+            capabilities: vec!["jobs.v1".into()],
+            controller_epoch: ControllerEpoch {
+                controller_uuid: ControllerUuid::random(),
+                epoch: 1,
+            },
+            config_generation: 0,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let instance = Box::leak(Box::new(InstanceLock::acquire(&state_dir).unwrap()));
+        let mut listener = ControlListener::bind(&binding, instance, hello.clone()).unwrap();
+        let storage = Storage::open(&state_dir).unwrap();
+        let mut api = ControlApi::new(config, storage, hello);
+        let client =
+            crate::control_client::ControlClient::connect(&binding, Duration::from_secs(2))
+                .unwrap();
+        let mut online = super::OnlineController { binding, client };
+        let request_id = RequestId::random();
+        let submitter = thread::spawn(move || {
+            super::submit_online(&mut online, request_id, spec, &script).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.poll_event() {
+                Some(macluster_controller::PendingControlEvent::Request(request)) => {
+                    let command = request.request().command.clone();
+                    let response = api.handle(request.client_session(), request.request().clone());
+                    if matches!(command, ControlCommand::Submit { .. }) {
+                        // Simulate a controller process/connection failure after the durable
+                        // commit but before the submit acknowledgement reaches the client.
+                        drop(request);
+                        continue;
+                    }
+                    let resolved = matches!(
+                        (&command, &response),
+                        (
+                            ControlCommand::LookupRequest { .. },
+                            Ok(ControlPayload::Lookup(Some(_)))
+                        )
+                    );
+                    request.respond(response).unwrap();
+                    if resolved {
+                        break;
+                    }
+                }
+                Some(macluster_controller::PendingControlEvent::Disconnected(session)) => {
+                    api.disconnect(session);
+                }
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "submission IPC request timed out"
+                    );
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        let record = submitter.join().unwrap();
+        assert_eq!(record.spec.env, task_env);
+        assert_eq!(
+            record.spec.env["VIRTUAL_ENV"],
+            environment_root.to_string_lossy()
+        );
+        assert_eq!(
+            record.spec.env["CC"],
+            toolchain_root
+                .join("bin/clang")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(
+            record.spec.env["CXX"],
+            toolchain_root
+                .join("bin/clang++")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert!(
+            record.spec.env["RUSTFLAGS"]
+                .contains(&toolchain_root.join("lib").display().to_string())
+        );
+
+        drop(listener);
         fs::remove_dir_all(root).unwrap();
     }
 

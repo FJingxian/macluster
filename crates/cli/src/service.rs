@@ -237,7 +237,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         let launch_state = self
             .launcher
             .inspect(&self.label())
-            .map_err(ServiceLifecycleError::Launchd)?;
+            .map_err(map_launchd_error)?;
         let loaded = launch_state != LaunchState::NotLoaded;
         if !loaded && self.probe_once(Duration::from_millis(100))?.is_some() {
             return Err(ServiceLifecycleError::ForegroundController);
@@ -246,7 +246,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         if loaded {
             self.launcher
                 .bootout(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
         }
         Ok(())
     }
@@ -257,8 +257,10 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             ServiceStartLock::acquire(&self.service_dir(), self.binding.uid(), deadline)?;
         let launch_state = match self.launcher.inspect(&self.label()) {
             Ok(state) => state,
-            Err(error) if error.contains("no active GUI session") => LaunchState::NotLoaded,
-            Err(error) => return Err(ServiceLifecycleError::Launchd(error)),
+            Err(error) => match map_launchd_error(error) {
+                ServiceLifecycleError::NoGuiSession(_) => LaunchState::NotLoaded,
+                error => return Err(error),
+            },
         };
         let loaded = launch_state != LaunchState::NotLoaded;
         if !loaded && self.probe_once(Duration::from_millis(100))?.is_some() {
@@ -306,7 +308,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         if loaded {
             self.launcher
                 .bootout(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
         }
         if plist_exists {
             fs::remove_file(&plist).map_err(|source| ServiceLifecycleError::Io {
@@ -333,7 +335,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         let launch_state = self
             .launcher
             .inspect(&self.label())
-            .map_err(ServiceLifecycleError::Launchd)?;
+            .map_err(map_launchd_error)?;
         let loaded = launch_state != LaunchState::NotLoaded;
         if !loaded && self.probe_once(Duration::from_millis(100))?.is_some() {
             return Err(ServiceLifecycleError::ForegroundController);
@@ -351,11 +353,11 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         if loaded {
             self.launcher
                 .bootout(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
         }
         self.launcher
             .bootstrap(&self.label(), &plist)
-            .map_err(ServiceLifecycleError::Launchd)?;
+            .map_err(map_launchd_error)?;
         self.wait_for_hello(deadline, timeout, &expected_build)
     }
 
@@ -364,7 +366,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         let launch_state = self
             .launcher
             .inspect(&self.label())
-            .map_err(ServiceLifecycleError::Launchd)?;
+            .map_err(map_launchd_error)?;
         let loaded = launch_state != LaunchState::NotLoaded;
         let hello = if loaded {
             match self
@@ -403,7 +405,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             let launch_state = self
                 .launcher
                 .inspect(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
             let loaded = launch_state != LaunchState::NotLoaded;
             if !loaded {
                 return Err(ServiceLifecycleError::ForegroundController);
@@ -420,16 +422,16 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             let plist = self.install_plist()?;
             self.launcher
                 .bootout(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
             self.launcher
                 .bootstrap(&self.label(), &plist)
-                .map_err(ServiceLifecycleError::Launchd)?;
+                .map_err(map_launchd_error)?;
             return self.wait_for_hello(deadline, timeout, &expected_build);
         }
         let launch_state = self
             .launcher
             .inspect(&self.label())
-            .map_err(ServiceLifecycleError::Launchd)?;
+            .map_err(map_launchd_error)?;
         let loaded = launch_state != LaunchState::NotLoaded;
         if loaded {
             let active_jobs = self.active_job_count()?;
@@ -440,7 +442,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
                 if self.plist_targets_build(&expected_build)? {
                     self.launcher
                         .kickstart(&self.label())
-                        .map_err(ServiceLifecycleError::Launchd)?;
+                        .map_err(map_launchd_error)?;
                     return self.wait_for_hello(deadline, timeout, &expected_build);
                 }
                 return self.wait_for_existing_hello(deadline, &expected_build, active_jobs);
@@ -452,11 +454,11 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             LaunchState::Running | LaunchState::Loaded => self
                 .launcher
                 .kickstart(&self.label())
-                .map_err(ServiceLifecycleError::Launchd)?,
+                .map_err(map_launchd_error)?,
             LaunchState::NotLoaded => self
                 .launcher
                 .bootstrap(&self.label(), &plist)
-                .map_err(ServiceLifecycleError::Launchd)?,
+                .map_err(map_launchd_error)?,
         }
         self.wait_for_hello(deadline, timeout, &expected_build)
     }
@@ -794,6 +796,14 @@ fn ensure_auto(intent: ServiceIntent) -> Result<(), ServiceLifecycleError> {
         ServiceIntent::Auto => Ok(()),
         ServiceIntent::Stopped => Err(ServiceLifecycleError::ManuallyStopped),
         ServiceIntent::Resetting => Err(ServiceLifecycleError::Resetting),
+    }
+}
+
+fn map_launchd_error(message: String) -> ServiceLifecycleError {
+    if message.contains("no active GUI session") {
+        ServiceLifecycleError::NoGuiSession(message)
+    } else {
+        ServiceLifecycleError::Launchd(message)
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_controller::{ControlListener, InstanceLock};
+use macluster_controller::{ControlListener, InstanceLock, PendingControlEvent};
 use macluster_core::service::ServiceBinding;
 use macluster_protocol::{
     control::{
@@ -160,6 +160,45 @@ fn authenticated_client_receives_status_and_correlated_response() {
         .respond(Ok(ControlPayload::Status(response_hello)))
         .unwrap();
     client.join().unwrap();
+}
+
+#[test]
+fn stale_generation_is_rejected_before_the_request_reaches_the_controller() {
+    let fixture = Fixture::new();
+    let binding = fixture.binding();
+    let hello = controller_hello(&binding);
+    let instance = InstanceLock::acquire(&fixture.root().join("state")).unwrap();
+    let mut listener = ControlListener::bind(&binding, &instance, hello.clone()).unwrap();
+    let path = listener.path().to_path_buf();
+    let client_identity = client_hello(&binding);
+    let stale_generation = hello.config_generation + 1;
+
+    let client = thread::spawn(move || {
+        let (mut stream, greeting) = connect_and_handshake(&path, &client_identity);
+        assert!(matches!(greeting, HelloResponse::Accepted(_)));
+        let request_id = RequestId(Id128::random());
+        write_frame(
+            &mut stream,
+            &ControlRequest {
+                request_id,
+                expected_generation: Some(stale_generation),
+                command: ControlCommand::Status,
+            },
+        )
+        .unwrap();
+        let response: ControlResponse = read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(response.request_id, request_id);
+        response.result.unwrap_err().code
+    });
+
+    assert_eq!(client.join().unwrap(), ControlErrorCode::StaleGeneration);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if let Some(PendingControlEvent::Request(_)) = listener.poll_event() {
+            panic!("stale-generation request must not reach controller admission");
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]

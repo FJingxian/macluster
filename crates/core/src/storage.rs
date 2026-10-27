@@ -102,6 +102,8 @@ pub enum SubmitError {
     NodeBusy(String),
     #[error("job {0} cannot transition from {1} to {2}")]
     InvalidTransition(u64, String, String),
+    #[error("job page size must be between 1 and 256")]
+    InvalidPageSize,
     #[error("invalid stored job record: {0}")]
     Serialization(String),
 }
@@ -155,6 +157,31 @@ impl ReadOnlyJobStore {
         };
         self.connection
             .query_texts(sql, state.map(job_state_name))?
+            .into_iter()
+            .map(|payload| decode_job(&payload))
+            .collect()
+    }
+
+    /// Read one bounded page without materializing the full job history.
+    pub fn list_jobs_page(
+        &self,
+        state: Option<JobState>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, SubmitError> {
+        if limit == 0 || limit > 256 {
+            return Err(SubmitError::InvalidPageSize);
+        }
+        let sql = match state {
+            Some(_) => format!(
+                "SELECT payload_json FROM jobs WHERE state=?1 ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
+            ),
+            None => format!(
+                "SELECT payload_json FROM jobs ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
+            ),
+        };
+        self.connection
+            .query_texts(&sql, state.map(job_state_name))?
             .into_iter()
             .map(|payload| decode_job(&payload))
             .collect()
@@ -600,6 +627,50 @@ impl Storage {
         };
         self.connection
             .query_texts(sql, state.map(job_state_name))?
+            .into_iter()
+            .map(|payload| decode_job(&payload))
+            .collect()
+    }
+
+    /// Read a bounded page without loading all persisted job history.
+    pub fn list_jobs_page(
+        &self,
+        state: Option<JobState>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, SubmitError> {
+        if limit == 0 || limit > 256 {
+            return Err(SubmitError::InvalidPageSize);
+        }
+        let sql = match state {
+            Some(_) => format!(
+                "SELECT payload_json FROM jobs WHERE state=?1 ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
+            ),
+            None => format!(
+                "SELECT payload_json FROM jobs ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
+            ),
+        };
+        self.connection
+            .query_texts(&sql, state.map(job_state_name))?
+            .into_iter()
+            .map(|payload| decode_job(&payload))
+            .collect()
+    }
+
+    /// Read a bounded page of nonterminal jobs and jobs with pending sync work.
+    pub fn list_active_jobs_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, SubmitError> {
+        if limit == 0 || limit > 256 {
+            return Err(SubmitError::InvalidPageSize);
+        }
+        let sql = format!(
+            "SELECT payload_json FROM jobs WHERE state IN ('PENDING','STARTING','RUNNING','CANCELLING') OR snapshot_sync_pending=1 OR log_sync_pending=1 ORDER BY id DESC LIMIT {limit} OFFSET {offset}"
+        );
+        self.connection
+            .query_texts(&sql, None)?
             .into_iter()
             .map(|payload| decode_job(&payload))
             .collect()

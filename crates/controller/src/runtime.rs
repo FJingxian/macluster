@@ -15,8 +15,9 @@ use macluster_core::{
     config::Transport,
     maintenance::ResetBarrierPolicy,
     scheduler::{NodeEligibility, next_dispatch},
-    storage::SubmitError,
+    storage::{Storage, SubmitError},
 };
+use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
     identifiers::NodeId,
     types::{
@@ -1228,6 +1229,45 @@ pub(crate) fn run_forever_with_idle_maintenance<T: NodeTransport + 'static>(
 pub(crate) fn run_forever_with_shutdown<T: NodeTransport + 'static>(
     service: &mut ControllerService<T>,
     interval: Duration,
+    shutdown_requested: impl FnMut() -> bool,
+    requested: impl FnMut() -> bool,
+    apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
+) -> Result<(), ControllerError> {
+    run_forever_with_control_inner(
+        service,
+        interval,
+        None,
+        shutdown_requested,
+        requested,
+        apply,
+    )
+}
+
+pub(crate) fn run_forever_with_control<T: NodeTransport + 'static>(
+    service: &mut ControllerService<T>,
+    interval: Duration,
+    listener: &mut crate::ControlListener<'_>,
+    hello: ControllerHello,
+    shutdown_requested: impl FnMut() -> bool,
+    requested: impl FnMut() -> bool,
+    apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
+) -> Result<(), ControllerError> {
+    let storage = Storage::open(service.storage.root())?;
+    let api = crate::ControlApi::new(service.config.clone(), storage, hello);
+    run_forever_with_control_inner(
+        service,
+        interval,
+        Some((listener, api)),
+        shutdown_requested,
+        requested,
+        apply,
+    )
+}
+
+fn run_forever_with_control_inner<T: NodeTransport + 'static>(
+    service: &mut ControllerService<T>,
+    interval: Duration,
+    mut control: Option<(&mut crate::ControlListener<'_>, crate::ControlApi)>,
     mut shutdown_requested: impl FnMut() -> bool,
     mut requested: impl FnMut() -> bool,
     mut apply: impl FnMut(&mut ControllerService<T>) -> Result<bool, ControllerError>,
@@ -1264,6 +1304,35 @@ pub(crate) fn run_forever_with_shutdown<T: NodeTransport + 'static>(
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
         runtime.poll_workers(service)?;
+        if let Some((listener, api)) = control.as_mut() {
+            let lifecycle = if reset_policy.is_some() || maintenance_active {
+                ControllerLifecycle::Paused
+            } else if !service.dispatch_enabled {
+                ControllerLifecycle::RecoveryPending
+            } else {
+                ControllerLifecycle::Ready
+            };
+            api.set_lifecycle(lifecycle);
+            for _ in 0..16 {
+                let Some(event) = listener.poll_event() else {
+                    break;
+                };
+                match event {
+                    crate::PendingControlEvent::Request(request) => {
+                        let result =
+                            api.handle(request.client_session(), request.request().clone());
+                        if let Err(error) = request.respond(result)
+                            && !matches!(error, crate::IpcError::ClientDisconnected)
+                        {
+                            eprintln!(
+                                "macluster: could not respond to local controller request: {error}"
+                            );
+                        }
+                    }
+                    crate::PendingControlEvent::Disconnected(session) => api.disconnect(session),
+                }
+            }
+        }
         let address_maintenance = reset_policy.is_none() && !maintenance_active && requested();
         if address_maintenance {
             let all_jobs = service.storage.list_jobs(None)?;

@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use macluster_cli::service::{HelloProbeError, LaunchState, ServiceLauncher, ServiceManager};
+use macluster_cli::service::{
+    HelloProbeError, LaunchState, ServiceLauncher, ServiceLifecycleError, ServiceManager,
+};
 use macluster_core::service::{ServiceBinding, ServiceIntent};
 use macluster_protocol::{
     control::{CONTROL_PROTOCOL_VERSION, ControllerHello, ControllerLifecycle},
@@ -63,6 +65,7 @@ struct FakeLauncher {
     wrong_hello: AtomicBool,
     stale_build: AtomicBool,
     lifecycle: Mutex<ControllerLifecycle>,
+    inspect_error: Mutex<Option<String>>,
 }
 
 impl Default for FakeLauncher {
@@ -76,6 +79,7 @@ impl Default for FakeLauncher {
             wrong_hello: AtomicBool::new(false),
             stale_build: AtomicBool::new(false),
             lifecycle: Mutex::new(ControllerLifecycle::Ready),
+            inspect_error: Mutex::new(None),
         }
     }
 }
@@ -118,6 +122,9 @@ impl FakeLauncher {
 
 impl ServiceLauncher for FakeLauncher {
     fn inspect(&self, _label: &str) -> Result<LaunchState, String> {
+        if let Some(error) = self.inspect_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         Ok(if !self.loaded.load(Ordering::SeqCst) {
             LaunchState::NotLoaded
         } else if self.ready.load(Ordering::SeqCst) {
@@ -159,6 +166,24 @@ impl ServiceLauncher for FakeLauncher {
             .load(Ordering::SeqCst)
             .then(|| self.hello_for(binding)))
     }
+}
+
+#[test]
+fn missing_gui_session_is_reported_as_an_offline_service_condition() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("macluster-source");
+    fs::write(&source, b"fake executable").unwrap();
+    let launcher = Arc::new(FakeLauncher::default());
+    *launcher.inspect_error.lock().unwrap() =
+        Some("launchctl: no active GUI session for uid 501".into());
+    let service = manager(&fixture, Arc::clone(&launcher), source);
+
+    let error = service
+        .ensure_running(Duration::from_millis(100))
+        .unwrap_err();
+
+    assert!(matches!(error, ServiceLifecycleError::NoGuiSession(_)));
+    assert_eq!(launcher.bootstraps.load(Ordering::SeqCst), 0);
 }
 
 fn manager(

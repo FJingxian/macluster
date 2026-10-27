@@ -17,10 +17,11 @@ use std::{
 use macluster_core::service::{ServiceBinding, ServiceError, peer_uid};
 use macluster_protocol::{
     control::{
-        CONTROL_PROTOCOL_VERSION, ClientHello, ControlCommand, ControlError, ControlErrorCode,
-        ControlPayload, ControlRequest, ControlResponse, ControllerHello, HelloResponse,
+        CONTROL_PROTOCOL_VERSION, ClientHello, ControlError, ControlErrorCode, ControlPayload,
+        ControlRequest, ControlResponse, ControllerHello, HelloResponse,
     },
     framing::{FrameError, read_frame, write_frame},
+    identifiers::Id128,
 };
 use thiserror::Error;
 
@@ -58,18 +59,28 @@ pub struct ControlListener<'lock> {
     inode: u64,
     stopping: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
-    request_receiver: Receiver<PendingControlRequest>,
+    request_receiver: Receiver<PendingControlEvent>,
     _instance: &'lock InstanceLock,
 }
 
 pub struct PendingControlRequest {
     request: ControlRequest,
     response_sender: SyncSender<Result<ControlPayload, ControlError>>,
+    client_session: Id128,
+}
+
+pub enum PendingControlEvent {
+    Request(PendingControlRequest),
+    Disconnected(Id128),
 }
 
 impl PendingControlRequest {
     pub fn request(&self) -> &ControlRequest {
         &self.request
+    }
+
+    pub fn client_session(&self) -> Id128 {
+        self.client_session
     }
 
     pub fn respond(self, result: Result<ControlPayload, ControlError>) -> Result<(), IpcError> {
@@ -178,10 +189,17 @@ impl<'lock> ControlListener<'lock> {
     }
 
     pub fn poll_request(&mut self) -> Option<PendingControlRequest> {
-        match self.request_receiver.try_recv() {
-            Ok(request) => Some(request),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        loop {
+            match self.request_receiver.try_recv() {
+                Ok(PendingControlEvent::Request(request)) => return Some(request),
+                Ok(PendingControlEvent::Disconnected(_)) => continue,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+            }
         }
+    }
+
+    pub fn poll_event(&mut self) -> Option<PendingControlEvent> {
+        self.request_receiver.try_recv().ok()
     }
 }
 
@@ -228,7 +246,7 @@ fn accept_loop(
     listener: UnixListener,
     binding: ServiceBinding,
     hello: ControllerHello,
-    request_sender: SyncSender<PendingControlRequest>,
+    request_sender: SyncSender<PendingControlEvent>,
     stopping: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
 ) {
@@ -303,7 +321,7 @@ fn serve_connection(
     mut stream: UnixStream,
     binding: &ServiceBinding,
     controller_hello: &ControllerHello,
-    request_sender: &SyncSender<PendingControlRequest>,
+    request_sender: &SyncSender<PendingControlEvent>,
 ) {
     if stream.set_read_timeout(Some(HELLO_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(HELLO_TIMEOUT)).is_err()
@@ -326,6 +344,11 @@ fn serve_connection(
     {
         return;
     }
+    let client_session = Id128::random();
+    let _disconnect_notice = DisconnectNotice {
+        session: client_session,
+        sender: request_sender.clone(),
+    };
     if stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(REQUEST_TIMEOUT)).is_err()
     {
@@ -354,24 +377,12 @@ fn serve_connection(
             }
             continue;
         }
-        if request.command != ControlCommand::Status {
-            let response = ControlResponse {
-                request_id,
-                result: Err(ControlError {
-                    code: ControlErrorCode::InvalidRequest,
-                    message: "control command is not available in this protocol phase".into(),
-                }),
-            };
-            if write_frame(&mut stream, &response).is_err() {
-                return;
-            }
-            continue;
-        }
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
-        match request_sender.try_send(PendingControlRequest {
+        match request_sender.try_send(PendingControlEvent::Request(PendingControlRequest {
             request,
             response_sender,
-        }) {
+            client_session,
+        })) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => {
                 let response = ControlResponse {
@@ -399,6 +410,19 @@ fn serve_connection(
         if write_frame(&mut stream, &ControlResponse { request_id, result }).is_err() {
             return;
         }
+    }
+}
+
+struct DisconnectNotice {
+    session: Id128,
+    sender: SyncSender<PendingControlEvent>,
+}
+
+impl Drop for DisconnectNotice {
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .try_send(PendingControlEvent::Disconnected(self.session));
     }
 }
 

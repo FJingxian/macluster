@@ -1,5 +1,8 @@
 //! Real agent subprocesses with a deliberately blocked log source. No live NFS
 //! exports, running cluster state, or administrator permissions are needed.
+mod common;
+
+use common::macluster_command;
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -9,7 +12,7 @@ use std::{
         process::{CommandExt, ExitStatusExt},
     },
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -89,7 +92,7 @@ impl Fixture {
     }
 
     fn status(&self) -> Result<Response, String> {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_macluster"));
+        let mut command = macluster_command();
         command
             .arg("--config")
             .arg(&self.config)
@@ -117,7 +120,7 @@ impl Fixture {
     }
 
     fn worker(&self, idle_timeout_ms: u64) -> Child {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_macluster"));
+        let mut command = macluster_command();
         command
             .arg("--state-dir")
             .arg(&self.state)
@@ -328,7 +331,7 @@ fn reset_stops_blocked_publishers_and_prevents_delayed_workers_after_archive() {
         .fifo_writer()
         .expect("worker did not enter publication");
     let reset_id = Id128::random().to_string();
-    let stopped = Command::new(env!("CARGO_BIN_EXE_macluster"))
+    let stopped = macluster_command()
         .arg("--state-dir")
         .arg(&fixture.state)
         .args([

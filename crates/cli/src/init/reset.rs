@@ -183,9 +183,13 @@ pub(crate) fn run(
     // A scoped node operation no longer holds the controller's shared config
     // lock. Serialize reset against that durable maintenance ticket before
     // writing the reset barrier or stopping the controller.
-    let _maintenance_client_lock = if config_path.exists() {
+    let _maintenance_client_lock = if config_path.exists() && state_dir.is_dir() {
         Some(node_admin::acquire_maintenance_client_lock(&state_dir)?)
     } else {
+        // A first-run or partially cleaned cluster has no live maintenance
+        // ticket state to serialize. Keep the reset prompt side-effect free;
+        // once the state directory exists, the shared client lock fences any
+        // live node operation for the full reset transaction.
         None
     };
     let path = journal_path(&config_path);

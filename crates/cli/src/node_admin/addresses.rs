@@ -13,7 +13,12 @@ const INVENTORY_FILE: &str = "node-addresses.json";
 const MIGRATION_FILE: &str = "node-address-migration.json";
 const PROPOSAL_FILE: &str = "node-address-proposal.json";
 const CHECK_INTERVAL_MS: u64 = 30_000;
+const SUBNET_SCAN_INTERVAL_MS: u64 = 5 * 60_000;
 pub(super) const MAINTENANCE_OPERATION: &str = "node address and NFS migration";
+
+fn full_subnet_scan_due(last_scan_ms: u64, now_ms: u64, force: bool) -> bool {
+    force || last_scan_ms == 0 || now_ms.saturating_sub(last_scan_ms) >= SUBNET_SCAN_INTERVAL_MS
+}
 
 #[derive(Clone, Debug)]
 struct InterfaceAddress {
@@ -42,6 +47,8 @@ struct Inventory {
     #[serde(default)]
     config_digest: String,
     checked_ms: u64,
+    #[serde(default)]
+    last_subnet_scan_ms: u64,
     nodes: BTreeMap<String, AddressRecord>,
 }
 
@@ -543,12 +550,13 @@ fn discover_remote(
     record: Option<&AddressRecord>,
     interfaces: &[InterfaceAddress],
     force: bool,
-) -> AppResult<Option<(NodeConfig, AddressRecord)>> {
+    allow_full_subnet_scan: bool,
+) -> AppResult<(Option<(NodeConfig, AddressRecord)>, bool)> {
     let Ok(old_address) = node.host.parse::<Ipv4Addr>() else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let Some(interface) = matching_interface(old_address, interfaces, None) else {
-        return Ok(None);
+        return Ok((None, false));
     };
     let pinned = ensure_host_key_pin(node)?;
     let local = interfaces.iter().any(|entry| entry.address == old_address);
@@ -565,16 +573,16 @@ fn discover_remote(
             && mac_matches
             && let Some(record) = record
         {
-            return Ok(Some((node.clone(), record.clone())));
+            return Ok((Some((node.clone(), record.clone())), false));
         }
         if let Ok(record) = verified_record(node, old_address) {
-            return Ok(Some((node.clone(), record)));
+            return Ok((Some((node.clone(), record)), false));
         }
     }
     // A MAC address narrows the search. Only a trusted host key and matching
     // machine UUID authorize a replacement address; never trust ssh-keyscan.
     if !pinned {
-        return Ok(None);
+        return Ok((None, false));
     }
     eprintln!(
         "Searching {} for the registered node formerly at {} (MAC + trusted SSH key + machine UUID)",
@@ -587,9 +595,12 @@ fn discover_remote(
         record.and_then(|entry| entry.mac.as_deref()),
     );
     if let Some(found) = scan_candidates(node, &preferred)? {
-        return Ok(Some(found));
+        return Ok((Some(found), false));
     }
-    scan_candidates(node, &rest)
+    if !allow_full_subnet_scan {
+        return Ok((None, false));
+    }
+    Ok((scan_candidates(node, &rest)?, true))
 }
 
 fn address_candidate(
@@ -1181,6 +1192,8 @@ fn check_addresses(
     let mut inventory = read_private_json::<Inventory>(&inventory_path)?
         .filter(|record| record.share_uuid == config.share_uuid)
         .unwrap_or_default();
+    let allow_full_subnet_scan =
+        full_subnet_scan_due(inventory.last_subnet_scan_ms, now_ms(), force);
     let interfaces = local_interfaces()?;
     let local_current = interfaces
         .iter()
@@ -1233,6 +1246,7 @@ fn check_addresses(
         return Err((1, "login address changed but no unambiguous interface remains in the registered subnet; select the intended cluster interface explicitly".into()));
     }
     let mut unreachable = Vec::new();
+    let mut scanned_full_subnet = false;
     for (node_id, node) in &config.nodes {
         if node.transport != Transport::Ssh {
             continue;
@@ -1242,7 +1256,10 @@ fn check_addresses(
                 .as_deref()
                 .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&record.machine_uuid))
         });
-        match discover_remote(node, known, &interfaces, force)? {
+        let (discovered, scanned) =
+            discover_remote(node, known, &interfaces, force, allow_full_subnet_scan)?;
+        scanned_full_subnet |= scanned;
+        match discovered {
             Some((connection, record)) => {
                 if let Some((pin, _)) = node.ssh_host_key_pin()
                     && pin.is_file()
@@ -1267,11 +1284,15 @@ fn check_addresses(
     inventory.config_digest =
         sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
     inventory.checked_ms = now_ms();
+    if scanned_full_subnet {
+        inventory.last_subnet_scan_ms = inventory.checked_ms;
+    }
     if replacements.is_empty() {
         write_json(&inventory_path, &inventory)?;
         return Ok(false);
     }
     if !unreachable.is_empty() {
+        write_json(&inventory_path, &inventory)?;
         return Err((
             1,
             format!(
@@ -1573,5 +1594,23 @@ mod tests {
         assert!(!rest.contains(&interface.address));
         assert!(!rest.contains(&"192.168.2.255".parse().unwrap()));
         assert!(rest.iter().all(|address| interface.contains(*address)));
+    }
+
+    #[test]
+    fn full_subnet_scan_is_rate_limited_but_can_be_forced() {
+        let last_scan_ms = 1_000;
+        assert!(!full_subnet_scan_due(
+            last_scan_ms,
+            last_scan_ms + SUBNET_SCAN_INTERVAL_MS - 1,
+            false
+        ));
+        assert!(full_subnet_scan_due(
+            last_scan_ms,
+            last_scan_ms + SUBNET_SCAN_INTERVAL_MS,
+            false
+        ));
+        assert!(full_subnet_scan_due(last_scan_ms, last_scan_ms + 1, true));
+        assert!(full_subnet_scan_due(0, 1, false));
+        assert!(!full_subnet_scan_due(last_scan_ms, last_scan_ms - 1, false));
     }
 }

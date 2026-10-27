@@ -28,6 +28,7 @@ use crate::control_client::{ControlClient, ControlClientError};
 
 const MAX_READY_WAIT: Duration = Duration::from_secs(5);
 const START_LOCK_POLL: Duration = Duration::from_millis(10);
+const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchState {
@@ -79,6 +80,8 @@ pub enum ServiceLifecycleError {
     StartupLockTimeout,
     #[error("controller did not become ready within {0:?}")]
     ReadyTimeout(Duration),
+    #[error("controller LaunchAgent did not unload within {0:?}")]
+    UnloadTimeout(Duration),
     #[error("controller hello belongs to a different service binding: {0}")]
     WrongHello(String),
     #[error(
@@ -244,9 +247,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         }
         self.set_intent(ServiceIntent::Stopped)?;
         if loaded {
-            self.launcher
-                .bootout(&self.label())
-                .map_err(map_launchd_error)?;
+            self.bootout_and_wait(Instant::now() + MAX_READY_WAIT, MAX_READY_WAIT)?;
         }
         Ok(())
     }
@@ -306,9 +307,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         };
         self.set_intent(ServiceIntent::Resetting)?;
         if loaded {
-            self.launcher
-                .bootout(&self.label())
-                .map_err(map_launchd_error)?;
+            self.bootout_and_wait(Instant::now() + MAX_READY_WAIT, MAX_READY_WAIT)?;
         }
         if plist_exists {
             fs::remove_file(&plist).map_err(|source| ServiceLifecycleError::Io {
@@ -351,9 +350,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         self.install_stable_binary()?;
         let plist = self.install_plist()?;
         if loaded {
-            self.launcher
-                .bootout(&self.label())
-                .map_err(map_launchd_error)?;
+            self.bootout_and_wait(deadline, timeout)?;
         }
         self.launcher
             .bootstrap(&self.label(), &plist)
@@ -420,9 +417,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             }
             self.install_stable_binary()?;
             let plist = self.install_plist()?;
-            self.launcher
-                .bootout(&self.label())
-                .map_err(map_launchd_error)?;
+            self.bootout_and_wait(deadline, timeout)?;
             self.launcher
                 .bootstrap(&self.label(), &plist)
                 .map_err(map_launchd_error)?;
@@ -461,6 +456,31 @@ impl<L: ServiceLauncher> ServiceManager<L> {
                 .map_err(map_launchd_error)?,
         }
         self.wait_for_hello(deadline, timeout, &expected_build)
+    }
+
+    fn bootout_and_wait(
+        &self,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<(), ServiceLifecycleError> {
+        self.launcher
+            .bootout(&self.label())
+            .map_err(map_launchd_error)?;
+        loop {
+            if self
+                .launcher
+                .inspect(&self.label())
+                .map_err(map_launchd_error)?
+                == LaunchState::NotLoaded
+            {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ServiceLifecycleError::UnloadTimeout(timeout));
+            }
+            thread::sleep(remaining.min(UNLOAD_POLL_INTERVAL));
+        }
     }
 
     fn wait_for_hello(

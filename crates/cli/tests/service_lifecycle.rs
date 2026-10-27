@@ -62,6 +62,8 @@ struct FakeLauncher {
     bootstraps: AtomicUsize,
     kickstarts: AtomicUsize,
     bootouts: AtomicUsize,
+    unload_delay_inspections: AtomicUsize,
+    unload_pending: AtomicBool,
     wrong_hello: AtomicBool,
     stale_build: AtomicBool,
     lifecycle: Mutex<ControllerLifecycle>,
@@ -76,6 +78,8 @@ impl Default for FakeLauncher {
             bootstraps: AtomicUsize::new(0),
             kickstarts: AtomicUsize::new(0),
             bootouts: AtomicUsize::new(0),
+            unload_delay_inspections: AtomicUsize::new(0),
+            unload_pending: AtomicBool::new(false),
             wrong_hello: AtomicBool::new(false),
             stale_build: AtomicBool::new(false),
             lifecycle: Mutex::new(ControllerLifecycle::Ready),
@@ -125,6 +129,14 @@ impl ServiceLauncher for FakeLauncher {
         if let Some(error) = self.inspect_error.lock().unwrap().clone() {
             return Err(error);
         }
+        if self.unload_pending.load(Ordering::SeqCst) {
+            let remaining = self.unload_delay_inspections.fetch_sub(1, Ordering::SeqCst);
+            if remaining <= 1 {
+                self.unload_pending.store(false, Ordering::SeqCst);
+                self.loaded.store(false, Ordering::SeqCst);
+                self.ready.store(false, Ordering::SeqCst);
+            }
+        }
         Ok(if !self.loaded.load(Ordering::SeqCst) {
             LaunchState::NotLoaded
         } else if self.ready.load(Ordering::SeqCst) {
@@ -135,6 +147,9 @@ impl ServiceLauncher for FakeLauncher {
     }
 
     fn bootstrap(&self, _label: &str, _plist: &Path) -> Result<(), String> {
+        if self.loaded.load(Ordering::SeqCst) {
+            return Err("LaunchAgent is still loaded after bootout".into());
+        }
         self.bootstraps.fetch_add(1, Ordering::SeqCst);
         self.loaded.store(true, Ordering::SeqCst);
         self.ready.store(true, Ordering::SeqCst);
@@ -151,8 +166,12 @@ impl ServiceLauncher for FakeLauncher {
 
     fn bootout(&self, _label: &str) -> Result<(), String> {
         self.bootouts.fetch_add(1, Ordering::SeqCst);
-        self.loaded.store(false, Ordering::SeqCst);
-        self.ready.store(false, Ordering::SeqCst);
+        if self.unload_delay_inspections.load(Ordering::SeqCst) == 0 {
+            self.loaded.store(false, Ordering::SeqCst);
+            self.ready.store(false, Ordering::SeqCst);
+        } else {
+            self.unload_pending.store(true, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -248,6 +267,22 @@ fn installed_version_survives_moving_the_source_binary() {
         fixture.binding().namespace()
     );
     assert!(installed.is_file());
+}
+
+#[test]
+fn restart_waits_for_launchd_to_finish_bootout_before_bootstrap() {
+    let fixture = Fixture::new();
+    let source = fixture.root().join("macluster-source");
+    fs::write(&source, b"fake executable").unwrap();
+    let launcher = Arc::new(FakeLauncher::active());
+    launcher.unload_delay_inspections.store(2, Ordering::SeqCst);
+    let service = manager(&fixture, Arc::clone(&launcher), source);
+
+    let hello = service.restart(Duration::from_secs(2)).unwrap();
+
+    assert_eq!(hello.lifecycle, ControllerLifecycle::Ready);
+    assert_eq!(launcher.bootouts.load(Ordering::SeqCst), 1);
+    assert_eq!(launcher.bootstraps.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -430,6 +465,7 @@ fn an_idle_controller_with_an_old_binary_is_replaced_by_the_current_build() {
     fs::write(&source, b"fake executable").unwrap();
     let launcher = Arc::new(FakeLauncher::active());
     launcher.stale_build.store(true, Ordering::SeqCst);
+    launcher.unload_delay_inspections.store(2, Ordering::SeqCst);
     let service = manager(&fixture, Arc::clone(&launcher), source);
 
     let hello = service.ensure_running(Duration::from_secs(2)).unwrap();

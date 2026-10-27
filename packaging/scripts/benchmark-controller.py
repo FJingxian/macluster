@@ -11,14 +11,19 @@ import platform
 import re
 import shutil
 import sqlite3
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[2] / "target" / "controller-bench"
 COMMAND_TIMEOUT_SECONDS = 45
+CONTROL_PROTOCOL_VERSION = 1
+CONTROL_FRAME_LIMIT = 8 * 1024 * 1024
 
 
 def build_probe_commands(binary, config, state_dir):
@@ -156,6 +161,138 @@ def run_probe_set(commands, cold_count, warm_count, warmup_count):
     return results, failed
 
 
+def _read_exact(stream, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = stream.recv(size - len(data))
+        if not chunk:
+            raise OSError("controller closed an incomplete IPC frame")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _read_frame(stream):
+    length = struct.unpack(">I", _read_exact(stream, 4))[0]
+    if length == 0 or length > CONTROL_FRAME_LIMIT:
+        raise ValueError("controller IPC frame has an invalid size")
+    return json.loads(_read_exact(stream, length))
+
+
+def _write_frame(stream, value):
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    if not payload or len(payload) > CONTROL_FRAME_LIMIT:
+        raise ValueError("benchmark IPC request exceeds the frame limit")
+    stream.sendall(struct.pack(">I", len(payload)) + payload)
+
+
+def service_binding(config, state_dir):
+    """Derive the local socket path without changing controller state."""
+    content = config.read_text(encoding="utf-8")
+    match = re.search(r'^\s*share_uuid\s*=\s*"([^"]+)"\s*$', content, re.MULTILINE)
+    if match is None:
+        raise ValueError("cluster config has no share_uuid")
+    namespace = str(uuid.UUID(match.group(1)))
+    config_path = str(config.resolve()).encode(sys.getfilesystemencoding())
+    state_path = str(state_dir.resolve()).encode(sys.getfilesystemencoding())
+    uid = os.getuid()
+    parts = [config_path, state_path, namespace.encode("ascii"), uid.to_bytes(4, "big")]
+    binding_material = b"".join(struct.pack(">Q", len(part)) + part for part in parts)
+    digest = hashlib.sha256(binding_material).hexdigest()
+    endpoint = Path("/private/tmp") / f"macluster-{uid}" / f"{digest}.sock"
+    return {"endpoint": endpoint, "binding_digest": digest, "namespace": namespace, "uid": uid}
+
+
+def service_rpc(binding, command):
+    """Issue one read-only request over the controller's authenticated local IPC."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(5)
+        stream.connect(str(binding["endpoint"]))
+        _write_frame(
+            stream,
+            {
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "binding_digest": binding["binding_digest"],
+                "namespace": binding["namespace"],
+                "uid": binding["uid"],
+                "build_id": "macluster-benchmark/1",
+                "capabilities": ["status.v1", "jobs.v1", "monitor.v1"],
+            },
+        )
+        greeting = _read_frame(stream)
+        if greeting.get("status") != "accepted":
+            raise RuntimeError("controller rejected the benchmark IPC client")
+        hello = greeting.get("value", {})
+        if (
+            hello.get("protocol_version") != CONTROL_PROTOCOL_VERSION
+            or hello.get("binding_digest") != binding["binding_digest"]
+            or hello.get("namespace") != binding["namespace"]
+            or hello.get("uid") != binding["uid"]
+        ):
+            raise RuntimeError("controller hello does not match the selected cluster")
+        request_id = str(uuid.uuid4())
+        _write_frame(
+            stream,
+            {
+                "request_id": request_id,
+                "expected_generation": hello.get("config_generation"),
+                "command": command,
+            },
+        )
+        response = _read_frame(stream)
+        if response.get("request_id") != request_id:
+            raise RuntimeError("controller response ID does not match the request")
+        result = response.get("result", {})
+        if "Err" in result:
+            raise RuntimeError("controller rejected the read-only benchmark request")
+        if "Ok" not in result:
+            raise RuntimeError("controller returned an invalid IPC response")
+        return result["Ok"], hello
+
+
+def run_service_sample(binding, command):
+    started = time.perf_counter_ns()
+    try:
+        service_rpc(binding, command)
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+        status = "command_error"
+    else:
+        status = "ok"
+    return {"duration_ms": (time.perf_counter_ns() - started) / 1_000_000, "status": status}
+
+
+def run_service_probe_set(binding, cold_count, warm_count, warmup_count):
+    commands = {
+        "jobs": {"command": "query_jobs", "offset": 0, "limit": 256, "state": None, "active_only": False},
+        "queues": {"command": "query_queues"},
+        "controller_status": {"command": "status"},
+        "monitor_snapshot": {"command": "monitor_snapshot", "page": 0},
+    }
+    results = {}
+    failed = False
+    for name, command in commands.items():
+        cold = [run_service_sample(binding, command) for _ in range(cold_count)]
+        for _ in range(warmup_count):
+            run_service_sample(binding, command)
+        warm = [run_service_sample(binding, command) for _ in range(warm_count)]
+        results[name] = {"cold_connection": summarize(cold), "warm_connection": summarize(warm)}
+        failed = failed or any(sample["status"] != "ok" for sample in cold + warm)
+    return results, failed
+
+
+def validate_service_ready(binding):
+    payload, hello = service_rpc(binding, {"command": "status"})
+    status = payload.get("value", {})
+    if payload.get("payload") != "status" or status.get("lifecycle") != "ready":
+        raise RuntimeError("controller must already be Ready; service mode never starts or updates it")
+    if "monitor.v1" not in hello.get("capabilities", []):
+        raise RuntimeError("controller does not provide the monitor.v1 IPC capability")
+    return {
+        "build_id": hello.get("build_id"),
+        "config_generation": hello.get("config_generation"),
+        "controller_epoch": hello.get("controller_epoch"),
+    }
+
+
 def atomic_write_json(output_dir, document):
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -172,7 +309,7 @@ def atomic_write_json(output_dir, document):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("baseline",), required=True)
+    parser.add_argument("--mode", choices=("baseline", "service"), required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -200,29 +337,56 @@ def main(argv=None):
     if not config.is_file():
         print("benchmark config must be an existing file", file=sys.stderr)
         return 2
-    if not state_dir.is_dir() or not (state_dir / "controller.sqlite3").is_file():
-        print("benchmark state directory must contain an existing controller.sqlite3", file=sys.stderr)
+    if not state_dir.is_dir():
+        print("benchmark state directory must be an existing directory", file=sys.stderr)
+        return 2
+    if args.mode == "baseline" and not (state_dir / "controller.sqlite3").is_file():
+        print("baseline state directory must contain an existing controller.sqlite3", file=sys.stderr)
         return 2
     if args.samples < 1 or args.cold_samples < 1 or args.warmups < 0:
         print("sample counts must be positive; warmups may be zero", file=sys.stderr)
         return 2
 
     try:
-        with tempfile.TemporaryDirectory(prefix="macluster-controller-bench-") as scratch:
-            scratch_dir = Path(scratch)
-            scratch_state_dir = Path(scratch) / "state"
-            scratch_state_dir.mkdir(mode=0o700)
-            snapshot_state_database(state_dir, scratch_state_dir)
-            benchmark_binary = prepare_benchmark_binary(binary, scratch_dir)
-            commands = build_probe_commands(benchmark_binary, config, scratch_state_dir)
-            probes, failed = run_probe_set(
-                commands, args.cold_samples, args.samples, args.warmups
+        service_metadata = None
+        if args.mode == "baseline":
+            with tempfile.TemporaryDirectory(prefix="macluster-controller-bench-") as scratch:
+                scratch_dir = Path(scratch)
+                scratch_state_dir = Path(scratch) / "state"
+                scratch_state_dir.mkdir(mode=0o700)
+                snapshot_state_database(state_dir, scratch_state_dir)
+                benchmark_binary = prepare_benchmark_binary(binary, scratch_dir)
+                commands = build_probe_commands(benchmark_binary, config, scratch_state_dir)
+                probes, failed = run_probe_set(
+                    commands, args.cold_samples, args.samples, args.warmups
+                )
+                if args.submit_smoke:
+                    print("Submitting one `true` smoke job; it will be kept in the cluster job history.")
+                    sys.stdout.flush()
+                    submit_argv = [
+                        str(benchmark_binary),
+                        "--config",
+                        str(config),
+                        "--state-dir",
+                        str(state_dir),
+                        "msub",
+                        "--wrap",
+                        "true",
+                    ]
+                    submit_result = run_sample(submit_argv, timeout=300)
+                    probes["submit_smoke"] = {"sample": submit_result}
+                    failed = failed or submit_result["status"] != "ok"
+        else:
+            binding = service_binding(config, state_dir)
+            service_metadata = validate_service_ready(binding)
+            probes, failed = run_service_probe_set(
+                binding, args.cold_samples, args.samples, args.warmups
             )
             if args.submit_smoke:
                 print("Submitting one `true` smoke job; it will be kept in the cluster job history.")
                 sys.stdout.flush()
                 submit_argv = [
-                    str(benchmark_binary),
+                    str(binary),
                     "--config",
                     str(config),
                     "--state-dir",
@@ -234,20 +398,31 @@ def main(argv=None):
                 submit_result = run_sample(submit_argv, timeout=300)
                 probes["submit_smoke"] = {"sample": submit_result}
                 failed = failed or submit_result["status"] != "ok"
-    except (OSError, sqlite3.Error) as error:
-        print(f"could not create an isolated benchmark state snapshot: {error}", file=sys.stderr)
+    except (OSError, sqlite3.Error, ValueError, RuntimeError) as error:
+        print(f"benchmark setup failed: {error}", file=sys.stderr)
         return 2
     document = {
         "schema_version": 1,
         "mode": args.mode,
         "measurement": {
-            "cold_definition": "fresh CLI process; the OS file cache is not flushed",
+            "cold_definition": (
+                "fresh CLI process; the OS file cache is not flushed"
+                if args.mode == "baseline"
+                else "fresh local IPC connection to an already-running controller"
+            ),
+            "warm_definition": (
+                "fresh CLI process after warmups"
+                if args.mode == "baseline"
+                else "fresh local IPC connection after warmups; controller remains running"
+            ),
             "outputs_recorded": False,
             "configured_samples": {"cold_process": args.cold_samples, "warm_process": args.samples},
         },
         "metadata": collect_metadata(binary, config),
         "probes": probes,
     }
+    if service_metadata is not None:
+        document["metadata"]["controller"] = service_metadata
     try:
         destination = atomic_write_json(output_dir, document)
     except OSError as error:

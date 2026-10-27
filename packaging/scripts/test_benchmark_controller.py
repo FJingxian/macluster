@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 
@@ -15,6 +17,65 @@ SCRIPT = Path(__file__).with_name("benchmark-controller.py")
 
 
 class BenchmarkControllerTests(unittest.TestCase):
+    def test_service_rpc_uses_bound_local_ipc_without_recording_response_data(self):
+        spec = importlib.util.spec_from_file_location("benchmark_controller_service", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory(prefix="macluster-bench-ipc-") as temp:
+            endpoint = Path(temp) / "controller.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(endpoint))
+            listener.listen(1)
+            binding = {
+                "endpoint": endpoint,
+                "binding_digest": "a" * 64,
+                "namespace": "240edfcc-0fe5-4fa8-a83a-29c6ede02b42",
+                "uid": os.getuid(),
+            }
+            hello = {
+                "protocol_version": 1,
+                "binding_digest": binding["binding_digest"],
+                "namespace": binding["namespace"],
+                "uid": binding["uid"],
+                "config_generation": 7,
+                "lifecycle": "ready",
+            }
+            observed = {}
+
+            def serve_once():
+                with listener:
+                    stream, _ = listener.accept()
+                    with stream:
+                        client_hello = module._read_frame(stream)
+                        observed["hello"] = client_hello
+                        module._write_frame(stream, {"status": "accepted", "value": hello})
+                        request = module._read_frame(stream)
+                        observed["request"] = request
+                        module._write_frame(
+                            stream,
+                            {
+                                "request_id": request["request_id"],
+                                "result": {
+                                    "Ok": {
+                                        "payload": "status",
+                                        "value": {"lifecycle": "ready", "private": "discarded"},
+                                    }
+                                },
+                            },
+                        )
+
+            server = threading.Thread(target=serve_once)
+            server.start()
+            payload, returned_hello = module.service_rpc(binding, {"command": "status"})
+            server.join(timeout=2)
+            self.assertFalse(server.is_alive())
+            self.assertEqual(payload["payload"], "status")
+            self.assertEqual(returned_hello["config_generation"], 7)
+            self.assertEqual(observed["hello"]["binding_digest"], binding["binding_digest"])
+            self.assertEqual(observed["request"]["expected_generation"], 7)
+            self.assertEqual(observed["request"]["command"], {"command": "status"})
+
     def test_default_run_only_executes_local_read_only_commands(self):
         self.assertTrue(SCRIPT.is_file(), "read-only controller benchmark script is missing")
         spec = importlib.util.spec_from_file_location("benchmark_controller", SCRIPT)

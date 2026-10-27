@@ -26,6 +26,7 @@ use macluster_protocol::{
 use crate::{AgentError, AgentRecord};
 
 const ATTACH_MAGIC: &[u8; 5] = b"MPTY2";
+const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 const EVENT_INPUT: u8 = 1;
@@ -589,7 +590,10 @@ fn wait_for_attachment(
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+                // On macOS, an accepted socket can inherit the listener's
+                // nonblocking mode. Normalize it before the timed handshake.
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(ATTACH_HANDSHAKE_TIMEOUT))?;
                 let mut handshake = [0_u8; 53];
                 let accepted = stream.read_exact(&mut handshake).is_ok()
                     && &handshake[..5] == ATTACH_MAGIC
@@ -1241,6 +1245,7 @@ mod tests {
             active: Some(record),
             tombstones: Vec::new(),
             log_sync_shutdown: None,
+            ..Default::default()
         };
         crate::write_store(&state_dir, &store).unwrap();
         (root, state_dir, token)
@@ -1746,6 +1751,59 @@ mod tests {
             String::from_utf8_lossy(&output)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attach_accepts_handshake_split_by_a_brief_scheduler_delay() {
+        let (root, state_dir, token) =
+            ready_interactive_state(Some("read -r value\necho VALUE:$value\nexit 0\n"), None);
+        let runner = run_in_thread(state_dir.clone(), token);
+        let socket = state_dir.join("jobs/1/pty.sock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut slow = loop {
+            match UnixStream::connect(&socket) {
+                Ok(stream) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    assert!(Instant::now() < deadline, "PTY socket was not created");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("could not connect to PTY socket: {error}"),
+            }
+        };
+        let mut handshake = Vec::with_capacity(53);
+        handshake.extend_from_slice(ATTACH_MAGIC);
+        handshake.extend_from_slice(&1_u64.to_be_bytes());
+        handshake.extend_from_slice(&24_u16.to_be_bytes());
+        handshake.extend_from_slice(&80_u16.to_be_bytes());
+        handshake.extend_from_slice(token.to_string().as_bytes());
+        slow.write_all(&handshake[..17]).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let sent_remaining = slow.write_all(&handshake[17..]).is_ok();
+        let mut response = [1_u8; 1];
+        let read_response = slow.read_exact(&mut response).is_ok();
+        let accepted = sent_remaining && read_response && response == [0];
+
+        let mut output = Vec::new();
+        if accepted {
+            send_input(&mut slow, b"go\n");
+            slow.read_to_end(&mut output).unwrap();
+        } else {
+            drop(slow);
+            let mut attachment = attach_socket(&state_dir, 1, token);
+            send_input(&mut attachment, b"go\n");
+            attachment.read_to_end(&mut output).unwrap();
+        }
+        runner.join().unwrap();
+        let output = String::from_utf8_lossy(&output);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            accepted,
+            "attach rejected a valid delayed handshake (sent={sent_remaining}, read={read_response}, response={response:?})"
+        );
+        assert!(output.contains("VALUE:go"), "{output}");
     }
 
     #[test]

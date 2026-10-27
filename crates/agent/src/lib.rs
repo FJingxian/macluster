@@ -1,5 +1,6 @@
 //! SSH stdio agent and detached per-job runner.
 
+pub mod admin;
 pub mod log_sync;
 pub mod runner;
 
@@ -47,6 +48,16 @@ pub enum AgentError {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct AgentStore {
+    #[serde(default)]
+    owner_namespace: Option<String>,
+    #[serde(default)]
+    reset_fence: bool,
+    #[serde(default)]
+    pending_archive: Option<admin::PendingArchive>,
+    #[serde(default)]
+    pending_handoff: Option<admin::PendingHandoff>,
+    #[serde(default)]
+    retired_controllers: Vec<ControllerEpoch>,
     #[serde(default)]
     controller: Option<ControllerEpoch>,
     #[serde(default)]
@@ -871,6 +882,22 @@ fn hydrate_record_storage_identity(record: &mut AgentRecord, config: &ClusterCon
         && record.storage_host.is_some()
         && record.storage_source_root.is_some()
     {
+        // A completed task retains its output locally while NFS endpoints move.
+        // Only rebind the host when the storage namespace and paths are unchanged.
+        if record.terminal()
+            && record.log_sync_pending
+            && record
+                .share_uuid
+                .as_deref()
+                .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&config.share_uuid))
+            && record.storage_node_id.as_deref() == Some(config.storage_server.as_str())
+            && Path::new(&record.shared_root) == config.shared_root
+            && record.storage_source_root.as_deref().map(Path::new)
+                == Some(config.primary_source_root())
+            && let Some(storage) = config.nodes.get(config.storage_server.as_str())
+        {
+            record.storage_host = Some(storage.host.clone());
+        }
         return;
     }
     if Path::new(&record.shared_root) != config.shared_root {
@@ -1061,6 +1088,14 @@ pub(crate) fn local_script_path(state_dir: &Path, job_id: u64) -> PathBuf {
 }
 
 fn admit_epoch(store: &mut AgentStore, request: ControllerEpoch) -> Result<(), String> {
+    if store.reset_fence || store.pending_archive.is_some() || store.pending_handoff.is_some() {
+        return Err(
+            "agent administrative transition must be resumed before controller requests".into(),
+        );
+    }
+    if store.controller.is_none() && !store.retired_controllers.is_empty() {
+        return Err("retired agent requires an explicit idle claim".into());
+    }
     if let Some(current) = store.controller {
         if current.controller_uuid != request.controller_uuid {
             return Err(
@@ -1613,6 +1648,7 @@ mod tests {
                 active: Some(record),
                 tombstones: Vec::new(),
                 log_sync_shutdown: None,
+                ..AgentStore::default()
             },
         )
         .unwrap();
@@ -1646,6 +1682,34 @@ mod tests {
             commit_log_sync_result(state_dir, snapshot, result)?;
         }
         status(state_dir)
+    }
+
+    #[test]
+    fn terminal_log_identity_follows_storage_address_only_with_the_same_namespace() {
+        let (root, state_dir, _, shared) = status_fixture(
+            "readdress-storage",
+            &boot_id(),
+            Some(JobState::Completed),
+            true,
+        );
+        let original = read_store(&state_dir).unwrap().active.unwrap();
+        let mut config = status_config(&shared);
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.20".into();
+        let mut migrated = original.clone();
+        hydrate_record_storage_identity(&mut migrated, &config);
+        assert_eq!(migrated.storage_host.as_deref(), Some("192.0.2.20"));
+        assert!(migrated.log_sync_pending);
+        assert_eq!(migrated.start_token, original.start_token);
+        let mut running = original.clone();
+        running.terminal_state = None;
+        running.phase = RuntimePhase::Running;
+        hydrate_record_storage_identity(&mut running, &config);
+        assert_eq!(running.storage_host.as_deref(), Some("127.0.0.1"));
+        config.share_uuid = "00000000-0000-4000-8000-000000000099".into();
+        let mut wrong_cluster = original;
+        hydrate_record_storage_identity(&mut wrong_cluster, &config);
+        assert_eq!(wrong_cluster.storage_host.as_deref(), Some("127.0.0.1"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

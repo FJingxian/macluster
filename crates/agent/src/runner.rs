@@ -1812,6 +1812,7 @@ mod tests {
             active: Some(record),
             tombstones: Vec::new(),
             log_sync_shutdown: None,
+            ..Default::default()
         };
         crate::write_store(&state_dir, &store).unwrap();
         (root, state_dir, token)

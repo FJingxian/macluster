@@ -204,19 +204,19 @@ pub fn quiesce(
     {
         let _lock = StateLock::acquire_existing(state)?;
         let mut store = read_store(state)?;
-        if let Some(active) = store.active.as_ref() {
-            if !active.terminal() {
-                return Err(AgentError::Busy);
-            }
-            if active
-                .share_uuid
-                .as_deref()
-                .is_some_and(|uuid| Id128::parse(uuid).ok() != Some(expected_share))
-            {
-                return Err(AgentError::State(
-                    "agent state belongs to another share".into(),
-                ));
-            }
+        if store.pending_handoff.is_some() {
+            return Err(AgentError::Busy);
+        }
+        if !crate::admin::namespace_owned(state, &store, &expected_share.to_string())? {
+            // Foreign and unknown account state belongs to another reset. Do
+            // not set its shutdown barrier or signal its publication workers.
+            return Ok(());
+        }
+        if crate::admin::records(state, &store)?
+            .iter()
+            .any(|record| !record.terminal())
+        {
+            return Err(AgentError::Busy);
         }
         if store
             .log_sync_shutdown

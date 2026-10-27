@@ -4,6 +4,7 @@ pub mod compatibility;
 mod control;
 pub mod events;
 mod ipc;
+pub mod monitor;
 mod runtime;
 pub mod ssh;
 pub mod transport;

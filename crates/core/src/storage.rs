@@ -687,6 +687,19 @@ impl Storage {
             .collect()
     }
 
+    /// Return pending and active tasks for live monitor displays without
+    /// loading terminal job history or unrelated output synchronization rows.
+    pub fn list_monitor_jobs(&self) -> Result<Vec<JobRecord>, SubmitError> {
+        self.connection
+            .query_texts(
+                "SELECT payload_json FROM jobs WHERE state IN ('PENDING','STARTING','RUNNING','CANCELLING') ORDER BY id DESC",
+                None,
+            )?
+            .into_iter()
+            .map(|payload| decode_job(&payload))
+            .collect()
+    }
+
     pub fn list_reconcile_jobs(&self) -> Result<Vec<JobRecord>, SubmitError> {
         self.connection
             .query_texts(

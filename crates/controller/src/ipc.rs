@@ -17,8 +17,8 @@ use std::{
 use macluster_core::service::{ServiceBinding, ServiceError, peer_uid};
 use macluster_protocol::{
     control::{
-        CONTROL_PROTOCOL_VERSION, ClientHello, ControlError, ControlErrorCode, ControlPayload,
-        ControlRequest, ControlResponse, ControllerHello, HelloResponse,
+        CONTROL_PROTOCOL_VERSION, ClientHello, ControlCommand, ControlError, ControlErrorCode,
+        ControlPayload, ControlRequest, ControlResponse, ControllerHello, HelloResponse,
     },
     framing::{FrameError, read_frame, write_frame},
     identifiers::Id128,
@@ -31,6 +31,7 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MONITOR_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const BUSY_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
@@ -376,6 +377,12 @@ fn serve_connection(
             Ok(Some(request)) => request,
             Ok(None) | Err(_) => return,
         };
+        let monitor_session = matches!(
+            &request.command,
+            ControlCommand::SubscribeMonitor { .. }
+                | ControlCommand::WatchProcesses { .. }
+                | ControlCommand::MonitorSnapshot { .. }
+        );
         let request_id = request.request_id;
         if request
             .expected_generation
@@ -424,6 +431,13 @@ fn serve_connection(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         if write_frame(&mut stream, &ControlResponse { request_id, result }).is_err() {
+            return;
+        }
+        if monitor_session
+            && stream
+                .set_read_timeout(Some(MONITOR_SESSION_TIMEOUT))
+                .is_err()
+        {
             return;
         }
     }

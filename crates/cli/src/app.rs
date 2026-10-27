@@ -3747,7 +3747,12 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
             _ => Ok(()),
         };
     }
-    let view = sample_cluster(&config, selected_queue.as_ref(), &state_dir);
+    let view = sample_cluster(
+        &config,
+        selected_queue.as_ref(),
+        &state_dir,
+        &resolved_config_path(global.config.as_deref()),
+    );
     if json {
         println!(
             "{}",
@@ -4017,6 +4022,7 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                         "jobs.v1".into(),
                         "snapshot.upload.v1".into(),
                         "agent.compatibility.v1".into(),
+                        "monitor.v1".into(),
                     ],
                     controller_epoch: service.epoch(),
                     config_generation: 0,
@@ -4277,6 +4283,7 @@ fn sample_cluster(
     config: &ClusterConfig,
     selected_queue: Option<&QueueName>,
     state_dir: &Path,
+    config_path: &Path,
 ) -> ClusterMetricView {
     let local_uuid = local_machine_uuid().ok();
     let login_compute_node_id = config
@@ -4297,8 +4304,10 @@ fn sample_cluster(
             is_local && selected && !config.is_login_node(id)
         })
         .map(|(id, _)| id.clone());
-    let (login, samples) =
-        crate::mtop::sample_one_shot(config, selected_queue.map(QueueName::as_str));
+    let (login, samples) = cached_monitor_samples(config, config_path, state_dir, selected_queue)
+        .unwrap_or_else(|| {
+            crate::mtop::sample_one_shot(config, selected_queue.map(QueueName::as_str))
+        });
     let mut rows: Vec<NodeMetricRow> = samples
         .into_iter()
         .map(|(id, node, result)| match result {
@@ -4333,6 +4342,79 @@ fn sample_cluster(
         login_compute_node_id,
         task_counts_by_node: one_shot_task_counts(config, state_dir),
     }
+}
+
+fn cached_monitor_samples(
+    config: &ClusterConfig,
+    config_path: &Path,
+    state_dir: &Path,
+    selected_queue: Option<&QueueName>,
+) -> Option<(
+    MetricSnapshot,
+    Vec<(
+        String,
+        macluster_core::config::NodeConfig,
+        Result<MetricSnapshot, String>,
+    )>,
+)> {
+    let snapshot = crate::mtop::read_cached_monitor_snapshot(config_path, state_dir)?;
+    let rows = snapshot
+        .nodes
+        .into_iter()
+        .map(|row| (row.node_id.to_string(), row))
+        .collect::<HashMap<_, _>>();
+    let fresh = |row: &macluster_protocol::control::NodeMonitorRow| {
+        !row.stale && row.age_ms.is_some_and(|age| age < 6_000)
+    };
+    let current_metrics = |row: &macluster_protocol::control::NodeMonitorRow| {
+        let mut metrics = row.metrics.clone();
+        if let Some(age_ms) = row.age_ms {
+            metrics.power_age_ms = metrics.power_age_ms.map(|age| age.saturating_add(age_ms));
+            metrics.gpu_age_ms = metrics.gpu_age_ms.map(|age| age.saturating_add(age_ms));
+        }
+        metrics
+    };
+    let login_row = rows.get(config.login_node.as_ref()?.as_str())?;
+    if !fresh(login_row) {
+        return None;
+    }
+    let login = current_metrics(login_row);
+    let allowed = selected_queue.map(|queue| config.queue_compute_nodes(queue.as_str()));
+    let mut nodes = config
+        .nodes
+        .iter()
+        .filter(|(id, _)| {
+            !config.is_login_node(id)
+                && allowed
+                    .as_ref()
+                    .is_none_or(|members| members.iter().any(|member| member == *id))
+        })
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let samples = nodes
+        .into_iter()
+        .map(|(id, node)| {
+            let result = if node.transport == Transport::Local {
+                Ok(login.clone())
+            } else {
+                rows.get(&id)
+                    .filter(|row| fresh(row))
+                    .map(|row| Ok(current_metrics(row)))
+                    .unwrap_or_else(
+                        || Err("controller monitor cache is stale or incomplete".into()),
+                    )
+            };
+            (id, node, result)
+        })
+        .collect::<Vec<_>>();
+    if samples
+        .iter()
+        .any(|(_, node, result)| node.transport == Transport::Ssh && result.is_err())
+    {
+        return None;
+    }
+    Some((login, samples))
 }
 
 fn one_shot_task_counts(
@@ -5469,10 +5551,10 @@ mod tests {
 
     use super::{
         ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
-        aggregate_metrics, build_submission, can_defer_agent_update_for_work,
-        explain_legacy_power_agent, format_job_details, format_jobs_table, format_power,
-        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
-        prepare_task_environment, promote_inline_command,
+        aggregate_metrics, build_submission, cached_monitor_samples,
+        can_defer_agent_update_for_work, explain_legacy_power_agent, format_job_details,
+        format_jobs_table, format_power, is_macluster_binary_path, maybe_run_agent_update,
+        metric_row, metric_table_header, prepare_task_environment, promote_inline_command,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
         update_requires_restart_retry,
@@ -5481,10 +5563,11 @@ mod tests {
     use macluster_protocol::{
         control::{
             AgentCompatibilityRecord, AgentCompatibilityState, CONTROL_PROTOCOL_VERSION,
-            ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
+            ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle, MonitorSnapshot,
+            NodeMonitorRow,
         },
         identifiers::{Id128, NodeId, QueueName},
-        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState},
+        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, MetricSnapshot},
     };
 
     #[test]
@@ -7180,6 +7263,138 @@ mod tests {
             encoded["pool_total"]["errors"],
             serde_json::json!(BTreeMap::<String, String>::new())
         );
+    }
+
+    fn query_cached_monitor_for_test(
+        age_ms: u64,
+        stale: bool,
+    ) -> Option<(
+        MetricSnapshot,
+        Vec<(
+            String,
+            macluster_core::config::NodeConfig,
+            Result<MetricSnapshot, String>,
+        )>,
+    )> {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-monitor-cache-test-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        fs::create_dir_all(root.join("state")).unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[cluster]\nname=\"monitor-cache\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                root.join("shared").display(),
+                unsafe { libc::geteuid() }
+            ),
+        )
+        .unwrap();
+        let state_dir = root.join("state");
+        let config = ClusterConfig::parse(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let queue = QueueName::new("q").unwrap();
+        let binding =
+            macluster_core::service::ServiceBinding::load(&config_path, &state_dir).unwrap();
+        let instance = macluster_controller::InstanceLock::acquire(&state_dir).unwrap();
+        let hello = ControllerHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            binding_digest: binding.binding_digest().into(),
+            namespace: binding.namespace().into(),
+            uid: binding.uid(),
+            build_id: "monitor-cache-test".into(),
+            capabilities: vec!["monitor.v1".into()],
+            controller_epoch: ControllerEpoch {
+                controller_uuid: macluster_protocol::identifiers::ControllerUuid::random(),
+                epoch: 1,
+            },
+            config_generation: 9,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let mut listener =
+            macluster_controller::ControlListener::bind(&binding, &instance, hello).unwrap();
+        let request = thread::spawn(move || {
+            cached_monitor_samples(&config, &config_path, &state_dir, Some(&queue))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let control_request = loop {
+            if let Some(request) = listener.poll_request() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "monitor cache query did not arrive"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            &control_request.request().command,
+            ControlCommand::MonitorSnapshot { page: 0 }
+        ));
+        let mut login = macluster_metrics::unavailable(10, "fixture");
+        login.cpu_percent = Some(10.0);
+        login.power_age_ms = Some(20);
+        let mut worker = macluster_metrics::unavailable(10, "fixture");
+        worker.cpu_percent = Some(50.0);
+        worker.power_age_ms = Some(30);
+        control_request
+            .respond(Ok(ControlPayload::MonitorSnapshot(MonitorSnapshot {
+                sequence: 4,
+                sampled_unix_ms: 10,
+                generation: 9,
+                page: 0,
+                total_pages: 1,
+                nodes: vec![
+                    NodeMonitorRow {
+                        node_id: "login".parse().unwrap(),
+                        metrics: login,
+                        age_ms: Some(age_ms),
+                        stale,
+                        sample_error: None,
+                        running_tasks: 0,
+                        waiting_tasks: 0,
+                        processes: None,
+                        process_age_ms: None,
+                        process_stale: false,
+                        process_error: None,
+                    },
+                    NodeMonitorRow {
+                        node_id: "worker".parse().unwrap(),
+                        metrics: worker,
+                        age_ms: Some(age_ms),
+                        stale,
+                        sample_error: None,
+                        running_tasks: 0,
+                        waiting_tasks: 0,
+                        processes: None,
+                        process_age_ms: None,
+                        process_stale: false,
+                        process_error: None,
+                    },
+                ],
+            })))
+            .unwrap();
+        let result = request.join().unwrap();
+        drop(listener);
+        drop(instance);
+        let _ = fs::remove_dir_all(root);
+        result
+    }
+
+    #[test]
+    fn one_shot_uses_only_fresh_controller_monitor_cache_and_preserves_source_age() {
+        let (login, nodes) = query_cached_monitor_for_test(500, false).unwrap();
+        assert_eq!(login.cpu_percent, Some(10.0));
+        assert_eq!(nodes.len(), 1);
+        let worker = nodes[0].2.as_ref().unwrap();
+        assert_eq!(worker.cpu_percent, Some(50.0));
+        assert_eq!(worker.power_age_ms, Some(530));
+    }
+
+    #[test]
+    fn one_shot_rejects_stale_controller_monitor_cache() {
+        assert!(query_cached_monitor_for_test(6_000, true).is_none());
     }
 
     fn query_agent_cache_from_fake_controller(

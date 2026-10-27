@@ -2,16 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identifiers::NodeId;
 use crate::{
-    identifiers::{Id128, RequestId},
-    types::{ControllerEpoch, JobRecord, JobSpec, JobState, SnapshotRef},
+    identifiers::{Id128, NodeId, RequestId},
+    types::{ControllerEpoch, JobRecord, JobSpec, JobState, MetricSnapshot, SnapshotRef},
 };
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_CONTROL_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_CONTROL_JOB_PAGE: usize = 256;
 pub const MAX_CONTROL_COMPATIBILITY_NODES: usize = 128;
+pub const MAX_CONTROL_MONITOR_NODES: usize = 128;
+pub const MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES: usize = 4096;
+pub const MAX_MONITOR_PROCESS_ROWS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
@@ -81,6 +83,15 @@ pub enum ControlCommand {
     PublishAgentCompatibility {
         entries: Vec<AgentCompatibilityUpdate>,
     },
+    MonitorSnapshot {
+        page: usize,
+    },
+    SubscribeMonitor {
+        node_ids: Vec<NodeId>,
+    },
+    WatchProcesses {
+        node_id: Option<NodeId>,
+    },
     BeginSnapshot {
         upload_id: Id128,
         size_bytes: u64,
@@ -125,6 +136,9 @@ pub enum ControlCommand {
 pub enum ControlPayload {
     Status(ControllerHello),
     AgentCompatibility(Vec<AgentCompatibilityRecord>),
+    MonitorSnapshot(MonitorSnapshot),
+    MonitorSubscribed,
+    MonitorAcknowledged,
     SnapshotProgress { offset: u64 },
     SnapshotFinished(SnapshotRef),
     Submission(JobRecord),
@@ -159,6 +173,46 @@ pub struct AgentCompatibilityRecord {
     pub state: AgentCompatibilityState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct MonitorSnapshot {
+    pub sequence: u64,
+    pub sampled_unix_ms: u64,
+    pub generation: u64,
+    pub page: usize,
+    pub total_pages: usize,
+    pub nodes: Vec<NodeMonitorRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NodeMonitorRow {
+    pub node_id: NodeId,
+    pub metrics: MetricSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_error: Option<String>,
+    pub running_tasks: u32,
+    pub waiting_tasks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Vec<ProcessRow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_age_ms: Option<u64>,
+    #[serde(default)]
+    pub process_stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProcessRow {
+    pub pid: u32,
+    pub cpu_percent: f64,
+    pub memory: String,
+    pub cpu_time: String,
+    pub command: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -60,6 +60,7 @@ impl ControlClient {
                     "jobs.v1".into(),
                     "snapshot.upload.v1".into(),
                     "agent.compatibility.v1".into(),
+                    "monitor.v1".into(),
                 ],
             },
         )?;
@@ -90,6 +91,16 @@ impl ControlClient {
 
     pub fn hello(&self) -> &ControllerHello {
         &self.hello
+    }
+
+    pub fn set_timeouts(&self, timeout: Duration) -> Result<(), ControlClientError> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    pub fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.stream.try_clone()
     }
 
     pub fn call(&mut self, request: ControlRequest) -> Result<ControlResponse, ControlClientError> {

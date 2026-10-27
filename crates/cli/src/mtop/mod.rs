@@ -1,3 +1,4 @@
+mod controller_monitor;
 mod jobs;
 mod model;
 mod processes;
@@ -22,15 +23,20 @@ use std::{
 
 use crossterm::event::{self, Event, KeyEventKind};
 use macluster_core::config::{ClusterConfig, Transport};
-use macluster_protocol::types::{JobRecord, JobState, MetricSnapshot};
+use macluster_protocol::{
+    control::{NodeMonitorRow, ProcessRow},
+    identifiers::NodeId,
+    types::{JobRecord, JobState, MetricSnapshot},
+};
 
 use self::{
+    controller_monitor::MonitorFeed,
     jobs::JobPoller,
     model::{
         ConfiguredNode, CpuHistory, DisplayNodeIdentity, LoginIdentity, MetricView,
         NodeMetricCache, NodeRole, display_node_identities,
     },
-    processes::{ProcessCache, ProcessSampler, ProcessTarget, ProcessView},
+    processes::{ProcessCache, ProcessInfo, ProcessSampler, ProcessTarget, ProcessView},
     sampler::{MetricSampler, SampleTarget},
     terminal::{TerminalGuard, install_panic_restore_hook},
     ui::{AppState, InputAction, UiNode, handle_key, render},
@@ -157,6 +163,13 @@ pub(crate) fn sample_one_shot(
     (login_snapshot, node_results)
 }
 
+pub(crate) fn read_cached_monitor_snapshot(
+    config_path: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Option<macluster_protocol::control::MonitorSnapshot> {
+    controller_monitor::read_cached_snapshot(config_path, state_dir)
+}
+
 pub fn run_interactive(
     config: ClusterConfig,
     state_dir: PathBuf,
@@ -240,10 +253,21 @@ pub fn run_interactive(
         .collect();
     state.selected_id = state.nodes.first().map(|node| node.identity.id.clone());
 
-    let mut sampler = MetricSampler::new(4.min(targets.len().max(1)));
-    let mut process_sampler = ProcessSampler::new();
+    let monitor_nodes = identities
+        .iter()
+        .filter_map(|identity| monitor_node_id(&config, &identity.id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let monitor_feed = MonitorFeed::connect(&config_path, &state_dir, monitor_nodes);
+    let controller_monitor_active = monitor_feed.is_some();
+    let mut sampler =
+        (!controller_monitor_active).then(|| MetricSampler::new(4.min(targets.len().max(1))));
+    let mut process_sampler = (!controller_monitor_active).then(ProcessSampler::new);
     let mut process_caches: BTreeMap<String, ProcessCache> = BTreeMap::new();
     let mut process_selection: Option<String> = None;
+    let mut monitor_selection: Option<NodeId> = None;
+    let mut last_monitor_sequence = None;
     let mut next_process_sample = Instant::now();
     let jobs = JobPoller::spawn(state_dir.clone());
     let mut caches: BTreeMap<String, NodeMetricCache> = BTreeMap::new();
@@ -363,22 +387,37 @@ pub fn run_interactive(
             }
 
             if let Some(round) = &mut manual_round {
-                schedule_round(round, &targets_by_id, &mut sampler, false);
+                if let Some(sampler) = sampler.as_mut() {
+                    schedule_round(round, &targets_by_id, sampler, false);
+                } else {
+                    round.clear();
+                }
                 if round.is_empty() {
                     manual_round = None;
                     status_message = Some("refresh scheduled".into());
                     dirty = true;
                 }
             } else {
-                if now >= next_sample && auto_round.is_none() && sampler.in_flight_count() == 0 {
+                let sampler_idle = sampler
+                    .as_ref()
+                    .is_none_or(|sampler| sampler.in_flight_count() == 0);
+                if !controller_monitor_active
+                    && now >= next_sample
+                    && auto_round.is_none()
+                    && sampler_idle
+                {
                     auto_round = Some(target_ids.iter().cloned().collect());
                     next_sample = now + SAMPLE_INTERVAL;
-                } else if now >= next_sample && sampler.in_flight_count() > 0 {
+                } else if !controller_monitor_active && now >= next_sample && !sampler_idle {
                     // Skip this interval instead of queuing catch-up work.
                     next_sample = now + SAMPLE_INTERVAL;
                 }
                 if let Some(round) = &mut auto_round {
-                    schedule_round(round, &targets_by_id, &mut sampler, initial_auto_round);
+                    if let Some(sampler) = sampler.as_mut() {
+                        schedule_round(round, &targets_by_id, sampler, initial_auto_round);
+                    } else {
+                        round.clear();
+                    }
                     if round.is_empty() {
                         auto_round = None;
                         initial_auto_round = false;
@@ -386,7 +425,11 @@ pub fn run_interactive(
                 }
             }
 
-            for completed in sampler.poll() {
+            for completed in sampler
+                .as_mut()
+                .map(MetricSampler::poll)
+                .unwrap_or_default()
+            {
                 let request_latency = completed
                     .received_at
                     .saturating_duration_since(completed.started_at);
@@ -426,7 +469,11 @@ pub fn run_interactive(
                 dirty = true;
             }
 
-            for completed in process_sampler.poll() {
+            for completed in process_sampler
+                .as_mut()
+                .map(ProcessSampler::poll)
+                .unwrap_or_default()
+            {
                 let cache = process_caches.entry(completed.id).or_default();
                 match completed.result {
                     Ok(rows) => cache.apply_success(rows, completed.received_at),
@@ -435,15 +482,64 @@ pub fn run_interactive(
                 dirty = true;
             }
 
-            if state.expanded {
+            if controller_monitor_active {
+                let desired_watch = if state.expanded {
+                    state
+                        .selected_id
+                        .as_deref()
+                        .and_then(|id| monitor_node_id(&config, id))
+                } else {
+                    None
+                };
+                if monitor_selection != desired_watch {
+                    if let Some(feed) = &monitor_feed {
+                        feed.watch(desired_watch.clone());
+                    }
+                    monitor_selection = desired_watch;
+                }
+                if let Some(update) = monitor_feed.as_ref().and_then(MonitorFeed::poll) {
+                    if monitor_feed
+                        .as_ref()
+                        .is_some_and(|feed| feed.generation() == update.generation)
+                    {
+                        let record_history = last_monitor_sequence != Some(update.sequence);
+                        for identity in &identities {
+                            let Some(node_id) = monitor_node_id(&config, &identity.id) else {
+                                continue;
+                            };
+                            if let Some(row) = update.rows.iter().find(|row| row.node_id == node_id)
+                            {
+                                apply_monitor_row(
+                                    &mut caches,
+                                    &mut process_caches,
+                                    &mut histories,
+                                    &identity.id,
+                                    row,
+                                    update.received_at,
+                                    record_history,
+                                );
+                            }
+                        }
+                        state.updated_at = Some(update.received_at);
+                        last_monitor_sequence = Some(update.sequence);
+                        dirty = true;
+                    }
+                }
+            } else if state.expanded {
                 if let Some(selected_id) = state.selected_id.as_deref() {
                     if process_selection.as_deref() != Some(selected_id) {
                         process_selection = Some(selected_id.to_owned());
                         next_process_sample = now;
                     }
-                    if now >= next_process_sample && !process_sampler.is_in_flight() {
+                    if now >= next_process_sample
+                        && process_sampler
+                            .as_ref()
+                            .is_some_and(|sampler| !sampler.is_in_flight())
+                    {
                         if let Some(target) = process_targets_by_id.get(selected_id) {
-                            if process_sampler.request(selected_id.to_owned(), target.clone()) {
+                            if process_sampler.as_mut().is_some_and(|sampler| {
+                                sampler.request(selected_id.to_owned(), target.clone())
+                            }) {
                                 next_process_sample = now + PROCESS_SAMPLE_INTERVAL;
                             }
                         }
@@ -590,6 +686,70 @@ fn configured_node_identities(config: &ClusterConfig) -> Vec<ConfiguredNode> {
             local_transport: node.transport == Transport::Local,
         })
         .collect()
+}
+
+fn monitor_node_id(config: &ClusterConfig, display_id: &str) -> Option<NodeId> {
+    let id = if display_id == "@login" {
+        config.login_node.as_ref()?.as_str()
+    } else {
+        display_id
+    };
+    NodeId::new(id.to_owned()).ok()
+}
+
+fn apply_monitor_row(
+    metrics: &mut BTreeMap<String, NodeMetricCache>,
+    processes: &mut BTreeMap<String, ProcessCache>,
+    histories: &mut BTreeMap<String, CpuHistory>,
+    display_id: &str,
+    row: &NodeMonitorRow,
+    received_at: Instant,
+    record_history: bool,
+) {
+    let metric_cache = metrics.entry(display_id.to_owned()).or_default();
+    if let Some(age_ms) = row.age_ms {
+        let sampled_at = received_at
+            .checked_sub(Duration::from_millis(age_ms))
+            .unwrap_or(received_at);
+        metric_cache.apply_success(row.metrics.clone(), sampled_at);
+        if let Some(error) = &row.sample_error {
+            metric_cache.apply_error(error.clone());
+        }
+        if record_history {
+            histories.entry(display_id.to_owned()).or_default().record(
+                sampled_at,
+                row.metrics.cpu_percent,
+                row.metrics.cpu_max_percent,
+            );
+        }
+    } else if let Some(error) = &row.sample_error {
+        metric_cache.apply_error(error.clone());
+    } else {
+        metric_cache.apply_error("waiting for first monitor sample".into());
+    }
+
+    let process_cache = processes.entry(display_id.to_owned()).or_default();
+    if let Some(rows) = &row.processes {
+        let sampled_at = received_at
+            .checked_sub(Duration::from_millis(row.process_age_ms.unwrap_or(0)))
+            .unwrap_or(received_at);
+        process_cache.apply_success(rows.iter().map(process_info_from_row).collect(), sampled_at);
+        if let Some(error) = &row.process_error {
+            process_cache.apply_error(error.clone());
+        }
+    } else if let Some(error) = &row.process_error {
+        process_cache.apply_error(error.clone());
+    }
+}
+
+fn process_info_from_row(row: &ProcessRow) -> ProcessInfo {
+    ProcessInfo {
+        pid: row.pid,
+        cpu_percent: row.cpu_percent,
+        memory: row.memory.clone(),
+        cpu_time: row.cpu_time.clone(),
+        command: row.command.clone(),
+    }
 }
 
 fn update_visible_nodes(

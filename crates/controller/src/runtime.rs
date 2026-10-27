@@ -1385,6 +1385,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                 ControllerLifecycle::Ready
             };
             api.set_lifecycle(lifecycle);
+            api.expire_monitor_subscriptions(Instant::now());
             for _ in 0..16 {
                 let Some(event) = listener.poll_event() else {
                     break;

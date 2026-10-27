@@ -15,16 +15,18 @@ use macluster_protocol::{
     control::{
         AgentCompatibilityRecord, AgentCompatibilityState, ControlCommand, ControlError,
         ControlErrorCode, ControlPayload, ControlRequest, ControllerHello, ControllerLifecycle,
-        JobPage, MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_JOB_PAGE,
-        MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, QueueSummary,
+        JobPage, MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_JOB_PAGE, MAX_CONTROL_MONITOR_NODES,
+        MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, QueueSummary,
     },
     framing::{ChunkAssembler, MAX_SNAPSHOT_BYTES},
-    identifiers::Id128,
+    identifiers::{Id128, NodeId},
+    types::JobState,
 };
 
 use crate::compatibility::{
     CompatibilityCache, CompatibilityRefresher, CompatibilityState, CompatibilityView,
 };
+use crate::monitor::MonitorHub;
 
 const MAX_ACTIVE_UPLOADS: usize = 4;
 const SNAPSHOT_UPLOAD_TTL: Duration = Duration::from_secs(10 * 60);
@@ -42,6 +44,8 @@ pub struct ControlApi {
     hello: ControllerHello,
     compatibility: Arc<CompatibilityCache>,
     compatibility_refresher: CompatibilityRefresher,
+    monitor: MonitorHub,
+    last_monitor_job_counts_at: Option<Instant>,
     uploads: HashMap<(Id128, Id128), SnapshotUpload>,
 }
 
@@ -53,12 +57,15 @@ impl ControlApi {
             config.clone(),
             hello.namespace.clone(),
         );
+        let monitor = MonitorHub::new(config.clone(), hello.namespace.clone());
         Self {
             config,
             storage,
             hello,
             compatibility,
             compatibility_refresher,
+            monitor,
+            last_monitor_job_counts_at: None,
             uploads: HashMap::new(),
         }
     }
@@ -73,6 +80,7 @@ impl ControlApi {
         request: ControlRequest,
     ) -> Result<ControlPayload, ControlError> {
         self.expire_uploads();
+        self.monitor.expire(Instant::now());
         match request.command {
             ControlCommand::Status => Ok(ControlPayload::Status(self.hello.clone())),
             ControlCommand::QueryAgentCompatibility { node_ids } => {
@@ -182,6 +190,65 @@ impl ControlApi {
                     });
                 }
                 Ok(ControlPayload::AgentCompatibility(records))
+            }
+            ControlCommand::MonitorSnapshot { page } => {
+                let total_pages = self
+                    .config
+                    .nodes
+                    .len()
+                    .div_ceil(MAX_CONTROL_MONITOR_NODES)
+                    .max(1);
+                if page >= total_pages {
+                    return Err(invalid_request("monitor snapshot page is out of range"));
+                }
+                let now = Instant::now();
+                if self.last_monitor_job_counts_at.is_none_or(|sampled_at| {
+                    now.saturating_duration_since(sampled_at) >= Duration::from_secs(1)
+                }) {
+                    self.refresh_monitor_job_counts()?;
+                    self.last_monitor_job_counts_at = Some(now);
+                }
+                let snapshot = self
+                    .monitor
+                    .snapshot(self.hello.config_generation, page, now);
+                Ok(ControlPayload::MonitorSnapshot(snapshot))
+            }
+            ControlCommand::SubscribeMonitor { node_ids } => {
+                if node_ids.len() > MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES {
+                    return Err(invalid_request("too many monitor subscription nodes"));
+                }
+                let mut seen = HashSet::with_capacity(node_ids.len());
+                for node_id in &node_ids {
+                    if !seen.insert(node_id.clone()) {
+                        return Err(invalid_request("duplicate monitor subscription node"));
+                    }
+                    if !self.config.nodes.contains_key(node_id.as_str()) {
+                        return Err(invalid_request(format!(
+                            "node '{}' is not in the active cluster config",
+                            node_id
+                        )));
+                    }
+                }
+                self.monitor
+                    .subscribe(client_session, node_ids, Instant::now());
+                Ok(ControlPayload::MonitorSubscribed)
+            }
+            ControlCommand::WatchProcesses { node_id } => {
+                if node_id
+                    .as_ref()
+                    .is_some_and(|node_id| !self.config.nodes.contains_key(node_id.as_str()))
+                {
+                    return Err(invalid_request("process watch node is not configured"));
+                }
+                if !self
+                    .monitor
+                    .watch_processes(client_session, node_id, Instant::now())
+                {
+                    return Err(invalid_request(
+                        "process watch requires an active monitor subscription for that node",
+                    ));
+                }
+                Ok(ControlPayload::MonitorAcknowledged)
             }
             ControlCommand::BeginSnapshot {
                 upload_id,
@@ -336,6 +403,11 @@ impl ControlApi {
     pub fn disconnect(&mut self, client_session: Id128) {
         self.uploads
             .retain(|(session, _), _| *session != client_session);
+        self.monitor.disconnect(client_session);
+    }
+
+    pub fn expire_monitor_subscriptions(&mut self, now: Instant) {
+        self.monitor.expire(now);
     }
 
     fn require_ready(&self) -> Result<(), ControlError> {
@@ -355,6 +427,45 @@ impl ControlApi {
     fn expire_uploads(&mut self) {
         let now = Instant::now();
         self.uploads.retain(|_, upload| upload.expires_at > now);
+    }
+
+    fn refresh_monitor_job_counts(&mut self) -> Result<(), ControlError> {
+        let jobs = self.storage.list_monitor_jobs().map_err(storage_error)?;
+        let mut counts = self
+            .config
+            .nodes
+            .keys()
+            .filter_map(|id| NodeId::new(id.clone()).ok())
+            .map(|node_id| (node_id, (0_u32, 0_u32)))
+            .collect::<std::collections::HashMap<_, _>>();
+        for job in jobs {
+            match job.state {
+                JobState::Starting | JobState::Running | JobState::Cancelling => {
+                    if let Some(target) = job.node.as_ref()
+                        && let Ok(node_id) = NodeId::new(target.to_string())
+                        && let Some((running, _)) = counts.get_mut(&node_id)
+                    {
+                        *running = running.saturating_add(1);
+                    }
+                }
+                JobState::Pending => {
+                    let targets = job.spec.node.as_ref().map_or_else(
+                        || self.config.queue_compute_nodes(job.spec.queue.as_str()),
+                        |node| vec![node.to_string()],
+                    );
+                    for target in targets {
+                        if let Ok(node_id) = NodeId::new(target)
+                            && let Some((_, waiting)) = counts.get_mut(&node_id)
+                        {
+                            *waiting = waiting.saturating_add(1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.monitor.update_job_counts(counts);
+        Ok(())
     }
 }
 
@@ -447,7 +558,7 @@ mod tests {
                 namespace: config.share_uuid.clone(),
                 uid: unsafe { libc::geteuid() },
                 build_id: "test".into(),
-                capabilities: vec!["agent.compatibility.v1".into()],
+                capabilities: vec!["agent.compatibility.v1".into(), "monitor.v1".into()],
                 controller_epoch: ControllerEpoch {
                     controller_uuid: ControllerUuid::random(),
                     epoch: 1,
@@ -580,5 +691,125 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ControlErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn monitor_subscription_and_details_are_bound_to_ipc_session() {
+        let fixture = Fixture::new();
+        let mut api = fixture.api();
+        let session = Id128::random();
+        let login: NodeId = "login".parse().unwrap();
+
+        assert!(matches!(
+            api.handle(
+                session,
+                request(ControlCommand::SubscribeMonitor {
+                    node_ids: vec![login.clone()],
+                }),
+            )
+            .unwrap(),
+            ControlPayload::MonitorSubscribed
+        ));
+        assert!(matches!(
+            api.handle(
+                session,
+                request(ControlCommand::WatchProcesses {
+                    node_id: Some(login.clone()),
+                }),
+            )
+            .unwrap(),
+            ControlPayload::MonitorAcknowledged
+        ));
+        let snapshot = api
+            .handle(
+                session,
+                request(ControlCommand::MonitorSnapshot { page: 0 }),
+            )
+            .unwrap();
+        let ControlPayload::MonitorSnapshot(snapshot) = snapshot else {
+            panic!("unexpected control response")
+        };
+        assert_eq!(snapshot.total_pages, 1);
+        assert!(snapshot.nodes.iter().all(|row| row.node_id == login));
+
+        api.disconnect(session);
+        let error = api
+            .handle(
+                session,
+                request(ControlCommand::WatchProcesses {
+                    node_id: Some(login),
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn monitor_counts_unpinned_pending_tasks_on_every_node_in_their_queue() {
+        use std::collections::BTreeMap;
+
+        use macluster_protocol::{
+            identifiers::QueueName,
+            types::{JobMode, JobSpec},
+        };
+
+        let fixture = Fixture::new();
+        let config = ClusterConfig::parse(&format!(
+            "[cluster]\nname=\"monitor-counts\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
+            fixture.0.display(),
+            unsafe { libc::geteuid() }
+        ))
+        .unwrap();
+        let storage = Storage::open(fixture.0.join("state")).unwrap();
+        storage
+            .submit_once(
+                RequestId(Id128::random()),
+                JobSpec {
+                    storage_namespace: Some(Id128::parse(&config.share_uuid).unwrap()),
+                    queue: QueueName::new("q").unwrap(),
+                    node: None,
+                    name: "pending".into(),
+                    cwd: fixture.0.display().to_string(),
+                    stdout_path: fixture.0.join("out.log").display().to_string(),
+                    stderr_path: fixture.0.join("err.log").display().to_string(),
+                    walltime_secs: None,
+                    env: BTreeMap::new(),
+                    mode: JobMode::Interactive,
+                    snapshot: None,
+                },
+            )
+            .unwrap();
+        let hello = macluster_protocol::control::ControllerHello {
+            protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+            binding_digest: "b".repeat(64),
+            namespace: config.share_uuid.clone(),
+            uid: unsafe { libc::geteuid() },
+            build_id: "test".into(),
+            capabilities: vec!["monitor.v1".into()],
+            controller_epoch: ControllerEpoch {
+                controller_uuid: ControllerUuid::random(),
+                epoch: 1,
+            },
+            config_generation: 12,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let mut api = ControlApi::new(config, storage, hello);
+        let response = api
+            .handle(
+                Id128::random(),
+                request(ControlCommand::MonitorSnapshot { page: 0 }),
+            )
+            .unwrap();
+        let ControlPayload::MonitorSnapshot(snapshot) = response else {
+            panic!("unexpected control response")
+        };
+        let counts = snapshot
+            .nodes
+            .into_iter()
+            .map(|row| (row.node_id.to_string(), row.waiting_tasks))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(counts["worker-a"], 1);
+        assert_eq!(counts["worker-b"], 1);
+        assert_eq!(counts["login"], 0);
     }
 }

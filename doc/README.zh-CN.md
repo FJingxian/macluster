@@ -30,17 +30,19 @@
 在登录 Mac 上，进入本仓库后执行：
 
 ~~~sh
-cargo build --release --locked --workspace
+cargo build --release --locked -p macluster-cli
 packaging/scripts/install-user.sh
 ~~~
 
-程序、功耗采集工具和命令别名会安装到 `~/.local/bin`。将它加入 `PATH`：
+程序 `macluster` 和命令别名会安装到 `~/.local/bin`。将它加入 `PATH`：
 
 ~~~sh
 export PATH="$HOME/.local/bin:$PATH"
 ~~~
 
 把这一行加入 shell 配置文件，重新打开终端后也能使用。安装后的程序运行时不需要 Rust 或 Python。
+
+分发时只需复制 `target/release/macluster`。匹配版本的功耗采集工具已经内嵌，无需单独下载 `macluster-power`。配置时会按需安装到系统受保护的位置，可能需要管理员授权。
 
 ## 创建集群
 
@@ -144,13 +146,20 @@ CPU 利用率可以超过 100%，例如有 8 个逻辑 CPU 的 Mac 最高为 800
 | --- | --- |
 | `mnode -l` | 查看节点和 NFS 共享路径。 |
 | `mnode -rm NODE_ID` | 移除空闲且没有托管共享目录的节点。 |
+| `mnode -rm NODE_ID --connect USER@IP[:PORT]` | 使用当前 SSH 地址移除地址已变化的节点，清理前核对登记的机器身份。 |
 | `mnode -rm share:SHARE_ID` | 取消尚未完成的共享目录配置。 |
 | `macluster init` | 确认重置当前集群，然后重新配置。 |
 | `macluster init --force` | 重置时允许放弃已结束任务的待同步输出；活动任务仍需先结束。 |
 
+移除节点会直接验证机器 UUID、任务状态和待同步输出，无需先更新即将移除的 Agent。新连接地址会保存在移除记录中，便于中断后重试；NFS 授权仍按原登记地址清理。SSH 主机密钥校验保持启用，遇到密钥变化需先核实目标机器。
+
 重置会保留共享目录里的数据文件，并归档旧配置和任务状态。
 
-修改节点或共享目录时，程序可能询问是否关闭控制器。操作完成后按提示重新启动。检测到已知 Agent 版本或 hash 不一致时，会在执行操作前自动更新。
+节点在同网段内更换 IP 后可以继续使用原节点 ID。macluster 会用登记的 MAC 地址和邻居表查找候选，再核对已信任的 SSH 主机密钥与机器 UUID；不会仅凭 MAC 地址接受陌生机器。
+
+controller 每 30 秒后台检查地址。核实变化后，先暂停派发新任务，等活动任务结束，再更新托管的 NFS 授权、挂载和各节点配置，保留原队列及任务历史。已结束任务的待同步输出会保留，迁移后继续同步。涉及管理员权限时会提示对应机器；后台 controller 无法取得授权时，可在前台运行 macluster 命令继续。迁移记录支持中断后重试。完整网段扫描最多覆盖 1,024 个地址，更大网段使用邻居表。
+
+修改节点或共享目录时，程序可能询问是否关闭控制器。操作完成后按提示重新启动。常规操作检测到已知 Agent 版本或 hash 不一致时，会先自动更新；移除节点直接执行上述安全检查。
 
 如果要用另一台 Mac 存储文件，在初始化时指定 `--primary-nfs`：
 

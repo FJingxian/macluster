@@ -30,17 +30,19 @@ For protected folders or external volumes, the storage Mac may also require **Sy
 Run on the login Mac, from this repository:
 
 ~~~sh
-cargo build --release --locked --workspace
+cargo build --release --locked -p macluster-cli
 packaging/scripts/install-user.sh
 ~~~
 
-The installer places the application, power helper, and command aliases in `~/.local/bin`. Add it to your shell's `PATH`:
+The installer places `macluster` and its command aliases in `~/.local/bin`. Add it to your shell's `PATH`:
 
 ~~~sh
 export PATH="$HOME/.local/bin:$PATH"
 ~~~
 
 Add that line to your shell configuration to keep it after reopening Terminal. Rust and Python are not needed to run the installed application.
+
+To distribute the application, copy only `target/release/macluster`. The matching power helper is embedded; a separate `macluster-power` download is not needed. Setup installs the helper into its protected system location when required and may ask for administrator authorization.
 
 ## Create a cluster
 
@@ -144,13 +146,18 @@ CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable 
 | --- | --- |
 | `mnode -l` | Show nodes and their NFS paths. |
 | `mnode -rm NODE_ID` | Remove an idle node that does not host a share. |
+| `mnode -rm NODE_ID --connect USER@IP[:PORT]` | Remove a moved node using its current SSH address and verify its registered machine identity. |
 | `mnode -rm share:SHARE_ID` | Cancel an incomplete named-share setup. |
 | `macluster init` | Ask to reset the current cluster, then configure a new one. |
 | `macluster init --force` | Allow reset to abandon unsynchronized output from finished jobs. Active jobs still block reset. |
 
 Reset preserves shared data files and archives old configuration and job state.
 
-Node or share changes may ask to stop the controller. Follow the command's restart instructions afterward. Known Agent version/hash differences trigger an automatic update before an operation.
+Nodes can keep their IDs when their IP changes within the same subnet. macluster uses the recorded MAC address and nearby hosts to find candidates, then verifies a trusted SSH host key and the registered machine UUID. It never accepts a changed key based on a MAC address alone.
+
+The controller checks addresses in the background every 30 seconds. When a change is verified, it pauses new dispatches, waits for active tasks to finish, updates managed NFS exports/mounts and peer configs, then resumes with the same queues and job history. Finished tasks keep their pending output and resume synchronization after migration. Administrator authorization may be needed on the affected Macs; a controller without a terminal reports how to finish authorization in a foreground command. Migration progress is saved for retries. Full subnet scans are capped at 1,024 addresses; larger subnets use the neighbor cache.
+
+Node or share changes may ask to stop the controller. Follow the command's restart instructions afterward. Normal cluster operations check Agent versions/hashes and trigger updates when needed. Node removal uses identity and idle checks directly, so a stale address or outdated Agent does not first require a cluster update. A moved-node removal saves its verified connection for retries and cleans exports using the original registered client address. Keep SSH host-key verification enabled; verify a changed fingerprint before replacing any trusted key.
 
 For a separate storage Mac, initialize with `--primary-nfs`:
 

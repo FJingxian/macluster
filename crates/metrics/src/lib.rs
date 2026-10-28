@@ -76,6 +76,7 @@ mod macos {
     };
 
     const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
+    const POWER_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(25);
 
     #[derive(Clone, serde::Deserialize)]
     struct PowerSample {
@@ -95,6 +96,40 @@ mod macos {
         gpu_window_ms: Option<u32>,
         #[serde(default)]
         gpu_reason: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct PowerRequestError {
+        message: String,
+        retryable: bool,
+    }
+
+    impl PowerRequestError {
+        fn from_io(stage: &str, error: std::io::Error) -> Self {
+            let retryable = matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+            let message = match (stage, error.kind()) {
+                ("connect", std::io::ErrorKind::NotFound) => {
+                    "power helper socket is missing; rerun mnode to install the power sampler"
+                        .to_owned()
+                }
+                ("connect", std::io::ErrorKind::ConnectionRefused) => {
+                    "power helper is not running; rerun mnode to restart the power sampler"
+                        .to_owned()
+                }
+                _ => format!("power helper {stage} failed: {error}"),
+            };
+            Self { message, retryable }
+        }
     }
 
     #[derive(Default)]
@@ -389,33 +424,7 @@ mod macos {
 
     fn power_sample(errors: &mut BTreeMap<String, String>) -> PowerMetrics {
         let request_started = Instant::now();
-        let result = (|| -> Result<PowerSample, String> {
-            let mut stream =
-                UnixStream::connect(POWER_SOCKET).map_err(|error| match error.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        "power helper socket is missing; rerun mnode to install the power sampler"
-                            .to_owned()
-                    }
-                    std::io::ErrorKind::ConnectionRefused => {
-                        "power helper is not running; rerun mnode to restart the power sampler"
-                            .to_owned()
-                    }
-                    _ => format!("power helper unavailable: {error}"),
-                })?;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .map_err(|error| error.to_string())?;
-            stream
-                .write_all(b"sample\n")
-                .map_err(|error| format!("power helper request failed: {error}"))?;
-            let mut response = Vec::new();
-            stream
-                .take(16 * 1024)
-                .read_to_end(&mut response)
-                .map_err(|error| format!("power helper response failed: {error}"))?;
-            serde_json::from_slice(&response)
-                .map_err(|error| format!("power helper returned invalid JSON: {error}"))
-        })();
+        let result = retry_transient_power_request(request_power_sample);
         match result {
             Ok(sample) => {
                 let request_age = request_started.elapsed();
@@ -432,10 +441,45 @@ mod macos {
                 }
             }
             Err(error) => {
-                errors.insert("power".into(), error.clone());
-                errors.insert("gpu".into(), format!("GPU helper unavailable: {error}"));
+                errors.insert("power".into(), error.message.clone());
+                errors.insert(
+                    "gpu".into(),
+                    format!("GPU helper unavailable: {}", error.message),
+                );
                 PowerMetrics::default()
             }
+        }
+    }
+
+    fn request_power_sample() -> Result<PowerSample, PowerRequestError> {
+        let mut stream = UnixStream::connect(POWER_SOCKET)
+            .map_err(|error| PowerRequestError::from_io("connect", error))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|error| PowerRequestError::from_io("read timeout setup", error))?;
+        stream
+            .write_all(b"sample\n")
+            .map_err(|error| PowerRequestError::from_io("request", error))?;
+        let mut response = Vec::new();
+        stream
+            .take(16 * 1024)
+            .read_to_end(&mut response)
+            .map_err(|error| PowerRequestError::from_io("response", error))?;
+        serde_json::from_slice(&response).map_err(|error| PowerRequestError {
+            message: format!("power helper returned invalid JSON: {error}"),
+            retryable: false,
+        })
+    }
+
+    fn retry_transient_power_request<T>(
+        mut request: impl FnMut() -> Result<T, PowerRequestError>,
+    ) -> Result<T, PowerRequestError> {
+        match request() {
+            Err(error) if error.retryable => {
+                thread::sleep(POWER_REQUEST_RETRY_DELAY);
+                request()
+            }
+            result => result,
         }
     }
 
@@ -513,10 +557,42 @@ mod macos {
     #[cfg(test)]
     mod power_tests {
         use super::{
-            HardwareMetrics, PowerMetrics, PowerSample, apply_gpu_fallback, gpu_response,
-            power_response, validated_gpu_percent,
+            HardwareMetrics, PowerMetrics, PowerRequestError, PowerSample, apply_gpu_fallback,
+            gpu_response, power_response, retry_transient_power_request, validated_gpu_percent,
         };
         use std::{collections::BTreeMap, time::Duration};
+
+        #[test]
+        fn power_helper_retries_one_transient_invalid_argument_error() {
+            let mut attempts = 0;
+            let sample = PowerSample {
+                watts: Some(12.0),
+                scope: Some("System".into()),
+                available: true,
+                reason: None,
+                age_ms: Some(100),
+                gpu_percent: None,
+                gpu_source: None,
+                gpu_age_ms: None,
+                gpu_window_ms: None,
+                gpu_reason: None,
+            };
+
+            let result = retry_transient_power_request(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(PowerRequestError {
+                        message: "Invalid argument (os error 22)".into(),
+                        retryable: true,
+                    })
+                } else {
+                    Ok(sample.clone())
+                }
+            });
+
+            assert_eq!(attempts, 2);
+            assert_eq!(result.unwrap().watts, Some(12.0));
+        }
 
         #[test]
         fn cached_power_is_kept_while_helper_refresh_warning_is_exposed() {

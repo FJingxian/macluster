@@ -61,6 +61,8 @@ mnode -l
 
 Enrollment installs the Agent, writes its configuration, and sets up shared storage. If needed, it helps you verify the SSH host key and install an SSH key. The SSH login password and each Mac's administrator password are separate.
 
+Enrollment also installs a system LaunchDaemon on each NFS client to restore approved mounts after boot. Failed attempts retry after 15, 30, then 60 seconds. Existing mounts are checked by source and share ID; occupied paths are preserved. For a node enrolled by an older version, rerun `mnode -a user@address` once to repair its mounts and install recovery. Node removal and `init` stop recovery before cleaning up mounts. Administrator approval is required when installing or changing this service.
+
 After initialization, macluster installs and starts a per-user LaunchAgent in the current GUI login session. It keeps scheduling after you close Terminal. The controller runs only while that user session is active; logging out stops it.
 
 Manage the service with:

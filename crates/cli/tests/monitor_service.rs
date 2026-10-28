@@ -72,6 +72,13 @@ fn two_monitor_subscribers_share_one_metric_sample_without_real_ssh() {
         page.nodes.iter().filter(|row| row.node_id == node).count(),
         1
     );
+    let worker = page.nodes.iter().find(|row| row.node_id == node).unwrap();
+    assert!(
+        worker
+            .request_latency_ms
+            .is_some_and(|latency| latency >= 20),
+        "controller monitor row should include the measured node request latency: {worker:?}"
+    );
 }
 
 #[test]

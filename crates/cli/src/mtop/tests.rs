@@ -1,13 +1,15 @@
 use std::time::{Duration, Instant};
 
-use super::job_targets_node;
 use super::model::{
     ConfiguredNode, CpuHistory, LoginIdentity, MetricView, NodeMetricCache, NodeRole,
     ResourceValues, SortDirection, SortKey, SortRow, aggregate_cpu, aggregate_disk,
     aggregate_memory, aggregate_network, aggregate_power, display_node_identities, sort_rows,
 };
+use super::{apply_monitor_row, job_targets_node};
 use macluster_metrics::unavailable;
 use macluster_protocol::types::{JobRecord, MetricSnapshot};
+use macluster_protocol::{control::NodeMonitorRow, identifiers::NodeId};
+use std::collections::{BTreeMap, HashMap};
 
 fn metric(cpu: Option<f64>, max: Option<f64>, power: Option<(f64, &str)>) -> MetricSnapshot {
     let mut value = unavailable(1, "fixture");
@@ -58,6 +60,45 @@ fn node_task_counts_include_active_and_node_pinned_pending_jobs() {
     assert!(job_targets_node(&pinned_pending, "mini01-a"));
     assert!(!job_targets_node(&pinned_pending, "mini01-b"));
     assert!(!job_targets_node(&unpinned_pending, "mini01-a"));
+}
+
+#[test]
+fn controller_monitor_request_latency_reaches_node_details() {
+    let received_at = Instant::now();
+    let row = NodeMonitorRow {
+        node_id: NodeId::new("worker-a").unwrap(),
+        metrics: metric(Some(50.0), Some(800.0), None),
+        age_ms: Some(0),
+        request_latency_ms: Some(87),
+        stale: false,
+        sample_error: None,
+        running_tasks: 0,
+        waiting_tasks: 0,
+        processes: None,
+        process_age_ms: None,
+        process_stale: false,
+        process_error: None,
+    };
+    let mut metrics = BTreeMap::new();
+    let mut processes = BTreeMap::new();
+    let mut histories = BTreeMap::new();
+    let mut sample_latency = HashMap::new();
+
+    apply_monitor_row(
+        &mut metrics,
+        &mut processes,
+        &mut histories,
+        &mut sample_latency,
+        "worker-a",
+        &row,
+        received_at,
+        true,
+    );
+
+    assert_eq!(
+        sample_latency.get("worker-a"),
+        Some(&Duration::from_millis(87))
+    );
 }
 
 #[test]

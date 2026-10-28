@@ -240,6 +240,8 @@ pub struct NodeMonitorRow {
     pub stale: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_latency_ms: Option<u64>,
     pub running_tasks: u32,
     pub waiting_tasks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,4 +291,41 @@ pub struct ControlRequest {
 pub struct ControlResponse {
     pub request_id: RequestId,
     pub result: Result<ControlPayload, ControlError>,
+}
+
+#[cfg(test)]
+mod monitor_row_tests {
+    use super::NodeMonitorRow;
+
+    #[test]
+    fn monitor_rows_from_older_controllers_keep_unknown_request_latency() {
+        let row: NodeMonitorRow = serde_json::from_value(serde_json::json!({
+            "node_id": "worker-a",
+            "metrics": {
+                "sampled_unix_ms": 1,
+                "cpu_percent": null,
+                "cpu_max_percent": null,
+                "memory_total_bytes": null,
+                "memory_used_bytes": null,
+                "swap_used_bytes": null,
+                "disk_read_bytes_per_sec": null,
+                "disk_write_bytes_per_sec": null,
+                "network_rx_bytes_per_sec": null,
+                "network_tx_bytes_per_sec": null,
+                "power_watts": null,
+                "power_scope": null,
+                "cpu_temp_celsius": null,
+                "fan_speed_rpm": null,
+                "stale": false,
+                "errors": {}
+            },
+            "age_ms": 0,
+            "stale": false,
+            "running_tasks": 0,
+            "waiting_tasks": 0
+        }))
+        .expect("older monitor row should remain readable");
+
+        assert_eq!(row.request_latency_ms, None);
+    }
 }

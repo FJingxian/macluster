@@ -29,6 +29,7 @@ pub(super) struct MetricResult {
     pub(super) node_id: NodeId,
     pub(super) result: Result<MetricSnapshot, String>,
     pub(super) completed_at: std::time::Instant,
+    pub(super) request_latency_ms: u64,
 }
 
 pub(super) struct MetricSampler {
@@ -55,12 +56,17 @@ impl MetricSampler {
                             Err(_) => return,
                         };
                         let Ok(task) = task else { return };
+                        let started_at = std::time::Instant::now();
                         let result = sample(&task.node_id, &task.node);
+                        let completed_at = std::time::Instant::now();
                         if results
                             .send(MetricResult {
                                 node_id: task.node_id,
                                 result,
-                                completed_at: std::time::Instant::now(),
+                                completed_at,
+                                request_latency_ms: duration_ms(
+                                    completed_at.saturating_duration_since(started_at),
+                                ),
                             })
                             .is_err()
                         {
@@ -106,6 +112,10 @@ impl MetricSampler {
         }
         completed
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 pub(super) fn sample_node(

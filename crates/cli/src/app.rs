@@ -427,6 +427,21 @@ fn preflight_agent_update_with_compatibility(
             compatibility_age_ms,
         );
     }
+    // The controller's build cache cannot see a stale/partial executable at a
+    // managed path whose directory hash is current. Reuse the short-lived
+    // local validation cache to also verify runtime capabilities before a job
+    // can be admitted to a queue that no worker can service.
+    let (local_validation, _) =
+        crate::node_admin::configured_agent_build_compatibility_cached_with_age(
+            &config,
+            &state_dir.join("mtop-cache"),
+        )
+        .map_err(|(code, error)| {
+            (
+                code,
+                format!("cannot validate configured Agent capabilities: {error}"),
+            )
+        })?;
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -436,7 +451,26 @@ fn preflight_agent_update_with_compatibility(
                 )
             },
         )?;
-    let update_required = recovery_pending || compatibility.requires_update();
+    let helper_refresh_pending =
+        crate::node_admin::agent_helper_refresh_pending(&state_dir).map_err(|error| (1, error))?;
+    let agent_mismatch = compatibility.requires_update() || local_validation.requires_update();
+    if helper_refresh_pending
+        && !agent_mismatch
+        && !recovery_pending
+        && unsafe { libc::isatty(0) } != 1
+    {
+        eprintln!(
+            "A privileged helper refresh is pending; run a macluster command from Terminal to authorize it."
+        );
+        return Ok(());
+    }
+    let update_required = recovery_pending || agent_mismatch || helper_refresh_pending;
+    if !local_validation.missing_required_features.is_empty() {
+        eprintln!(
+            "Agent capability mismatch detected on {}; updating the cluster before `{command}`.",
+            local_validation.missing_required_features.join(", ")
+        );
+    }
     if update_required
         && can_defer_agent_update_for_work(command, args)
         && crate::node_admin::agent_update_blocked_by_work(&state_dir).map_err(|error| {
@@ -470,12 +504,19 @@ fn preflight_agent_update_with_compatibility(
         publish_unknown_controller_agent_compatibility(&config_path, &state_dir, &config);
     }
     if update_result.is_some_and(|controller_was_running| {
-        update_requires_restart_retry(command, args, controller_was_running)
+        controller_should_resume_after_agent_update(command, args, controller_was_running)
     }) {
-        return Err((
-            1,
-            "Agent update completed and stopped the controller. Run `macluster controller run`, then retry the requested command.".into(),
-        ));
+        controller_service_manager(global, &state_dir)?
+            .ensure_running(Duration::from_secs(5))
+            .map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "Agent update completed, but the controller could not be restarted automatically: {error}. Run `macluster controller start`, then retry the requested command."
+                    ),
+                )
+            })?;
+        eprintln!("Controller restarted after Agent update.");
     }
     Ok(())
 }
@@ -1077,7 +1118,7 @@ fn maybe_run_agent_update(
     update().map(Some)
 }
 
-fn update_requires_restart_retry(
+fn controller_should_resume_after_agent_update(
     command: &str,
     args: &[String],
     controller_was_running: bool,
@@ -4212,10 +4253,10 @@ fn online_controller(
     match manager.intent().map_err(service_error)? {
         ServiceIntent::Stopped if allow_offline => return Ok(None),
         ServiceIntent::Stopped => {
-            return Err((
-                1,
-                "controller service is stopped; run `macluster controller start` before this operation".into(),
-            ));
+            eprintln!("Controller is stopped; starting it for the interactive submission.");
+            manager
+                .start(Duration::from_secs(5))
+                .map_err(service_error)?;
         }
         ServiceIntent::Resetting => {
             return Err((
@@ -4224,14 +4265,13 @@ fn online_controller(
                     .into(),
             ));
         }
-        ServiceIntent::Auto => {}
-    }
-    match manager.ensure_running(Duration::from_secs(5)) {
-        Ok(_) => {}
-        Err(crate::service::ServiceLifecycleError::NoGuiSession(_)) if allow_offline => {
-            return Ok(None);
-        }
-        Err(error) => return Err(service_error(error)),
+        ServiceIntent::Auto => match manager.ensure_running(Duration::from_secs(5)) {
+            Ok(_) => {}
+            Err(crate::service::ServiceLifecycleError::NoGuiSession(_)) if allow_offline => {
+                return Ok(None);
+            }
+            Err(error) => return Err(service_error(error)),
+        },
     }
     let client = crate::control_client::ControlClient::connect(&binding, Duration::from_secs(5))
         .map_err(|error| (1, error.to_string()))?;
@@ -4985,6 +5025,7 @@ fn now_unix_ms() -> u64 {
 
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
+        Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -5639,12 +5680,12 @@ mod tests {
     use super::{
         ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
         aggregate_metrics, build_submission, cached_monitor_samples,
-        can_defer_agent_update_for_work, explain_legacy_power_agent, format_job_details,
-        format_jobs_table, format_power, is_macluster_binary_path, maybe_run_agent_update,
-        metric_row, metric_table_header, prepare_task_environment, promote_inline_command,
+        can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
+        explain_legacy_power_agent, format_job_details, format_jobs_table, format_power,
+        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
+        prepare_task_environment, promote_inline_command,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        update_requires_restart_retry,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -5860,14 +5901,27 @@ mod tests {
     }
 
     #[test]
-    fn update_that_stops_controller_requires_restart_and_retry_except_controller_run() {
-        assert!(update_requires_restart_retry("submit", &[], true));
-        assert!(!update_requires_restart_retry(
+    fn agent_update_resumes_controller_before_continuing_requested_command() {
+        assert!(controller_should_resume_after_agent_update(
+            "submit",
+            &[],
+            true
+        ));
+        assert!(controller_should_resume_after_agent_update(
+            "job",
+            &[],
+            true
+        ));
+        assert!(!controller_should_resume_after_agent_update(
             "controller",
             &["run".into()],
             true
         ));
-        assert!(!update_requires_restart_retry("submit", &[], false));
+        assert!(!controller_should_resume_after_agent_update(
+            "submit",
+            &[],
+            false
+        ));
     }
 
     fn sample_job(
@@ -7476,6 +7530,7 @@ mod tests {
                         age_ms: Some(age_ms),
                         stale,
                         sample_error: None,
+                        request_latency_ms: None,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,
@@ -7489,6 +7544,7 @@ mod tests {
                         age_ms: Some(age_ms),
                         stale,
                         sample_error: None,
+                        request_latency_ms: None,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,

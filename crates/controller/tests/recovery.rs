@@ -200,7 +200,14 @@ fn namespaced_submission_stays_pending_with_an_update_hint_on_legacy_agents() {
             .waiting_reason
             .as_deref()
             .unwrap()
-            .contains("resubmit with msub")
+            .contains("this job remains queued")
+    );
+    assert!(
+        !pending
+            .waiting_reason
+            .as_deref()
+            .unwrap()
+            .contains("cancel and resubmit")
     );
     assert_eq!(transport.starts(), 0);
     transport

@@ -21,6 +21,10 @@ use super::model::{
 };
 use super::processes::{ProcessInfo, ProcessSort, ProcessView, sort_processes};
 
+const POWER_STALE_AFTER: Duration = Duration::from_secs(15);
+const POWER_CACHE_TTL: Duration =
+    Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
     TooSmall,
@@ -230,8 +234,8 @@ pub(super) fn resources(view: &MetricView) -> ResourceValues {
         .power_age_ms
         .map(Duration::from_millis)
         .map(|source_age| source_age.saturating_add(*age));
-    let power_fresh = snapshot.power_watts.is_some()
-        && power_age.is_some_and(|age| age < Duration::from_secs(15));
+    let power_fresh =
+        snapshot.power_watts.is_some() && power_age.is_some_and(|age| age <= POWER_CACHE_TTL);
     let gpu_age = snapshot
         .gpu_age_ms
         .map(Duration::from_millis)
@@ -1221,7 +1225,7 @@ fn power_cell(view: &MetricView) -> String {
         format!(" {scope}")
     };
     let age = match age {
-        Some(age) if age < Duration::from_secs(15) => "",
+        Some(age) if age < POWER_STALE_AFTER => "",
         Some(_) => "*",
         None => "?",
     };
@@ -1230,7 +1234,7 @@ fn power_cell(view: &MetricView) -> String {
 
 pub(super) fn power_text(view: &MetricView) -> String {
     match power_reading(view) {
-        Some((watts, scope, Some(age))) if age < Duration::from_secs(15) => {
+        Some((watts, scope, Some(age))) if age < POWER_STALE_AFTER => {
             format!("{watts:.1} W {scope} · age {}s", age.as_secs())
         }
         Some((watts, scope, Some(age))) => {
@@ -1252,6 +1256,9 @@ fn power_reading(view: &MetricView) -> Option<(f64, &str, Option<Duration>)> {
         .power_age_ms
         .map(Duration::from_millis)
         .map(|source_age| source_age.saturating_add(*age));
+    if age.is_some_and(|age| age > POWER_CACHE_TTL) {
+        return None;
+    }
     Some((watts, scope, age))
 }
 

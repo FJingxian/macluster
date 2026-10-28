@@ -294,9 +294,7 @@ fn an_authenticated_hello_with_wrong_binding_is_never_ready() {
     launcher.wrong_hello.store(true, Ordering::SeqCst);
     let service = manager(&fixture, Arc::clone(&launcher), source);
 
-    let error = service
-        .ensure_running(Duration::from_millis(100))
-        .unwrap_err();
+    let error = service.ensure_running(Duration::from_secs(2)).unwrap_err();
     assert!(error.to_string().contains("binding"));
 }
 

@@ -701,6 +701,7 @@ fn enable_force_reset(journal: &mut ResetJournal) {
 
 #[derive(Clone)]
 struct MountSpec {
+    share_uuid: String,
     node_id: String,
     node: NodeConfig,
     server_host: String,
@@ -1258,6 +1259,7 @@ impl ResetPlan {
                 continue;
             }
             self.mounts.push(MountSpec {
+                share_uuid: share_uuid.to_owned(),
                 node_id: node_id.clone(),
                 node: node.clone(),
                 server_host: server.host.clone(),
@@ -1292,6 +1294,7 @@ impl ResetPlan {
             .get(config.storage_server.as_str())
             .expect("validated storage server");
         self.mounts.push(MountSpec {
+            share_uuid: config.share_uuid.clone(),
             node_id: node_id.to_owned(),
             node: node.clone(),
             server_host: primary.host.clone(),
@@ -1306,6 +1309,7 @@ impl ResetPlan {
                 .expect("validated share server");
             if node_id != share.server.as_str() {
                 self.mounts.push(MountSpec {
+                    share_uuid: share.share_uuid.clone(),
                     node_id: node_id.to_owned(),
                     node: node.clone(),
                     server_host: server.host.clone(),
@@ -2010,6 +2014,15 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
         let mut privileged_script = String::from("set -e\n");
         let mut has_privileged_changes = false;
         let mut admin_actions = Vec::new();
+        // Disable recovery even when a share is already unmounted, before any cleanup.
+        for mount in &batch.mounts {
+            privileged_script.push_str(&crate::nfs_recovery::cleanup_script(
+                &format!("{}:{}", mount.server_host, mount.source_root.display()),
+                &mount.mount_root,
+                &mount.share_uuid,
+            ));
+            has_privileged_changes = true;
+        }
         if !batch.mounts.is_empty() {
             let output = node_admin::ssh_output(node, "/sbin/mount", None)?;
             if !output.status.success() {
@@ -4356,6 +4369,7 @@ mod tests {
             known_uuids: BTreeMap::new(),
             mounts: vec![
                 MountSpec {
+                    share_uuid: "00000000-0000-4000-8000-000000000001".into(),
                     node_id: "mini01-a".into(),
                     node: node.clone(),
                     server_host: "192.0.2.10".into(),
@@ -4364,6 +4378,7 @@ mod tests {
                     label: "primary".into(),
                 },
                 MountSpec {
+                    share_uuid: "00000000-0000-4000-8000-000000000001".into(),
                     node_id: "mini01-c".into(),
                     node: second_node,
                     server_host: "192.0.2.10".into(),

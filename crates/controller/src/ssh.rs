@@ -13,6 +13,13 @@ use thiserror::Error;
 
 const SOCKET_PATH_LIMIT: usize = 100;
 const CONTROL_PERSIST: &str = "10";
+const CONTROL_PATH_TOKEN_LEN: usize = "%C".len();
+const OPENSSH_CONTROL_HASH_LEN: usize = 40;
+const OPENSSH_CONTROL_SUFFIX_LEN: usize = 17;
+const SOCKET_PATH_NUL_LEN: usize = 1;
+const CONTROL_PATH_EXPANSION_LEN: usize = OPENSSH_CONTROL_HASH_LEN - CONTROL_PATH_TOKEN_LEN
+    + OPENSSH_CONTROL_SUFFIX_LEN
+    + SOCKET_PATH_NUL_LEN;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionKey {
@@ -101,7 +108,7 @@ impl SshPool {
         }
         let namespace_hash = digest_fields([self.namespace.as_str()])?;
         let root = PathBuf::from(format!(
-            "/tmp/macluster-ssh-{}-{}",
+            "/tmp/mc-{}-{}",
             unsafe { libc::geteuid() },
             &namespace_hash[..8]
         ));
@@ -109,9 +116,16 @@ impl SshPool {
 
         let connection_hash = key.cache_fingerprint()?;
         let control_path = root.join(format!("{}-%C", &connection_hash[..16]));
-        // OpenSSH expands %C to a 40-byte digest. Keep a margin below the
-        // macOS sockaddr_un path limit, including the trailing NUL.
-        if control_path.as_os_str().as_encoded_bytes().len() + 40 >= SOCKET_PATH_LIMIT {
+        // OpenSSH expands %C to a 40-byte digest and may append a dot plus a
+        // 16-byte suffix to the listener path on macOS. Include the NUL byte
+        // and keep the resolved path below sockaddr_un's limit.
+        if control_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .len()
+            .saturating_add(CONTROL_PATH_EXPANSION_LEN)
+            >= SOCKET_PATH_LIMIT
+        {
             return Err(SshPoolError::SocketPathTooLong);
         }
         command
@@ -299,9 +313,9 @@ mod tests {
     #[test]
     fn identical_node_identity_reuses_control_socket() {
         let node = node();
-        let pool = SshPool::new("cluster-a");
-        let first = ConnectionKey::for_node("cluster-a", "worker-a", &node).unwrap();
-        let second = ConnectionKey::for_node("cluster-a", "worker-a", &node).unwrap();
+        let pool = SshPool::new("reuse-test");
+        let first = ConnectionKey::for_node("reuse-test", "worker-a", &node).unwrap();
+        let second = ConnectionKey::for_node("reuse-test", "worker-a", &node).unwrap();
 
         let first_path = control_path(&pool, &first);
         let second_path = control_path(&pool, &second);
@@ -359,6 +373,11 @@ mod tests {
         let pool = SshPool::new("cluster-with-long-name");
         let path = control_path(&pool, &key);
         assert!(path.len() < 100, "ControlPath too long: {path}");
+        let resolved_path_len = path.len() - "%C".len() + 40 + 17 + 1;
+        assert!(
+            resolved_path_len < 100,
+            "expanded ControlPath too long for macOS: {path}"
+        );
         assert!(path.starts_with("/tmp/"));
         assert!(path.contains("%C"));
         assert!(path.ends_with("-%C"));

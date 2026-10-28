@@ -56,6 +56,12 @@ impl MonitorFeed {
         }
         let binding = ServiceBinding::load(config_path, state_dir).ok()?;
         let client = ControlClient::connect(&binding, CONNECT_TIMEOUT).ok()?;
+        // An older resident controller may omit telemetry added by this CLI.
+        // Use direct sampling until the controller is upgraded when idle.
+        let expected_build = crate::service::current_executable_build_id().ok()?;
+        if !monitor_build_matches(client.hello(), &expected_build) {
+            return None;
+        }
         if !client
             .hello()
             .capabilities
@@ -116,6 +122,13 @@ impl MonitorFeed {
             *selection = Some(node_id);
         }
     }
+}
+
+fn monitor_build_matches(
+    hello: &macluster_protocol::control::ControllerHello,
+    expected_build: &str,
+) -> bool {
+    hello.build_id == expected_build
 }
 
 impl Drop for MonitorFeed {
@@ -467,7 +480,7 @@ mod tests {
             binding_digest: binding.binding_digest().to_owned(),
             namespace: binding.namespace().to_owned(),
             uid: binding.uid(),
-            build_id: "monitor-test-controller".into(),
+            build_id: crate::service::current_executable_build_id().unwrap(),
             capabilities: vec!["monitor.v1".into()],
             controller_epoch: ControllerEpoch {
                 controller_uuid: ControllerUuid::random(),
@@ -489,6 +502,16 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("monitor feed did not produce generation {generation}");
+    }
+
+    #[test]
+    fn monitor_rejects_a_stale_controller_build() {
+        let fixture = Fixture::new();
+        let binding = ServiceBinding::load(&fixture.config_path(), &fixture.state_dir()).unwrap();
+        let mut server = hello(&binding, 1);
+        assert!(super::monitor_build_matches(&server, &server.build_id));
+        server.build_id = "older-controller".into();
+        assert!(!super::monitor_build_matches(&server, "current-cli"));
     }
 
     #[test]

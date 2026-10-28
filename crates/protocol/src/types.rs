@@ -249,6 +249,9 @@ pub struct QueueRecord {
     pub scheduler: SchedulerKind,
 }
 
+/// Maximum age accepted for a cached power sample exposed by the power helper.
+pub const POWER_SAMPLE_CACHE_TTL_MS: u64 = 60_000;
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MetricSnapshot {
     pub sampled_unix_ms: u64,

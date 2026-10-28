@@ -3,7 +3,7 @@ use macluster_protocol::types::JobRecord;
 use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color};
 
 use super::{
-    model::{DisplayNodeIdentity, MetricView, NodeRole, SortKey},
+    model::{DisplayNodeIdentity, MetricView, NodeRole, SortKey, aggregate_power},
     processes::{ProcessInfo, ProcessView},
     ui::{
         AppState, InputAction, LayoutMode, handle_key, job_label, layout_mode, power_text, render,
@@ -862,6 +862,32 @@ fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
     };
     assert_eq!(power_text(&unknown_age), "11.2 W SoC · age ?");
     assert!(!resources(&unknown_age).power_fresh);
+}
+
+#[test]
+fn cached_power_remains_in_pool_totals_until_the_helper_cache_expires() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.power_watts = Some(11.2);
+    snapshot.power_scope = Some("System".into());
+    snapshot.power_age_ms = Some(30_000);
+    let cached = MetricView::Available {
+        snapshot: snapshot.clone(),
+        age: std::time::Duration::from_secs(1),
+        stale: false,
+    };
+
+    assert_eq!(power_text(&cached), "11.2 W System · STALE 31s");
+    let totals = aggregate_power(&[resources(&cached)]);
+    assert_eq!(totals["System"].watts, 11.2);
+
+    snapshot.power_age_ms = Some(60_001);
+    let expired = MetricView::Available {
+        snapshot,
+        age: std::time::Duration::ZERO,
+        stale: false,
+    };
+    assert!(aggregate_power(&[resources(&expired)]).is_empty());
+    assert_eq!(power_text(&expired), "N/A");
 }
 
 #[test]

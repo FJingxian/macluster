@@ -12,10 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS;
 use serde::{Deserialize, Serialize};
 
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
-const POWER_CACHE_TTL: Duration = Duration::from_secs(60);
+const POWER_CACHE_TTL: Duration = Duration::from_millis(POWER_SAMPLE_CACHE_TTL_MS);
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
 const GPU_CACHE_TTL: Duration = Duration::from_secs(8);
 const GPU_SAMPLE_WINDOW_MS: u32 = 100;

@@ -44,6 +44,7 @@ struct Subscription {
 struct MetricCache {
     snapshot: Option<MetricSnapshot>,
     sampled_at: Option<Instant>,
+    request_latency_ms: Option<u64>,
     error: Option<String>,
     next_sample_at: Option<Instant>,
 }
@@ -280,6 +281,7 @@ impl MonitorHub {
             age_ms: age,
             stale,
             sample_error,
+            request_latency_ms: metrics.and_then(|cache| cache.request_latency_ms),
             running_tasks,
             waiting_tasks,
             processes: process_rows,
@@ -292,6 +294,7 @@ impl MonitorHub {
     fn poll_and_schedule(&mut self, now: Instant) {
         for result in self.metric_sampler.poll() {
             if let Some(cache) = self.metric_cache.get_mut(&result.node_id) {
+                cache.request_latency_ms = Some(result.request_latency_ms);
                 match result.result {
                     Ok(snapshot) => {
                         cache.snapshot = Some(bound_metric_snapshot(snapshot));

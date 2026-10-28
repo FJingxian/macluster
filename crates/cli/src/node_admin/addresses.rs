@@ -776,6 +776,13 @@ fn address_unmount_script(
     let awk = shell_quote(client_mount_status_awk_script());
     let mut script = String::from("set -eu\n");
     for request in requests {
+        script.push_str(&crate::nfs_recovery::cleanup_script(
+            &request.source,
+            &request.mount_root,
+            &request.share_uuid,
+        ));
+    }
+    for request in requests {
         script.push_str("mounts=$(/sbin/mount)\n");
         append_client_mount_status(&mut script, &awk, request);
         script.push_str("case \"$mount_status\" in expected|none) ;; *) echo 'managed mount source changed before address migration' >&2; exit 1 ;; esac\n");

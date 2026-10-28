@@ -6,6 +6,7 @@ mod control_client;
 mod embedded_power;
 mod init;
 mod mtop;
+mod nfs_recovery;
 mod node_admin;
 pub mod service;
 mod ssh_bootstrap;

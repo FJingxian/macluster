@@ -675,7 +675,7 @@ fn namespace_waiting_reason(
     (job.spec.storage_namespace.is_some() && !nodes.iter().any(|node| {
         node.online && node.namespaced_jobs && queue.nodes.iter().any(|id| id == node.id.as_str())
             && job.spec.node.as_ref().is_none_or(|pinned| pinned == &node.id)
-    })).then(|| "waiting for an online node with namespaced job storage support; cancel and resubmit with msub to trigger an Agent update if needed".into())
+    })).then(|| "waiting for an online node that advertises namespaced job storage support; this job remains queued while nodes reconnect or are updated".into())
 }
 
 pub fn verify_shared_storage(config: &ClusterConfig) -> bool {

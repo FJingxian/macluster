@@ -513,6 +513,7 @@ pub fn run_interactive(
                                     &mut caches,
                                     &mut process_caches,
                                     &mut histories,
+                                    &mut state.sample_latency,
                                     &identity.id,
                                     row,
                                     update.received_at,
@@ -701,11 +702,20 @@ fn apply_monitor_row(
     metrics: &mut BTreeMap<String, NodeMetricCache>,
     processes: &mut BTreeMap<String, ProcessCache>,
     histories: &mut BTreeMap<String, CpuHistory>,
+    sample_latency: &mut HashMap<String, Duration>,
     display_id: &str,
     row: &NodeMonitorRow,
     received_at: Instant,
     record_history: bool,
 ) {
+    match row.request_latency_ms {
+        Some(latency_ms) => {
+            sample_latency.insert(display_id.to_owned(), Duration::from_millis(latency_ms));
+        }
+        None => {
+            sample_latency.remove(display_id);
+        }
+    }
     let metric_cache = metrics.entry(display_id.to_owned()).or_default();
     if let Some(age_ms) = row.age_ms {
         let sampled_at = received_at

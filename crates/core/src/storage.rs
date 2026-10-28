@@ -2,6 +2,7 @@
 //! process operations; callers perform those operations only after a commit.
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString, c_char, c_int, c_void},
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -26,6 +27,7 @@ const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
 const SQLITE_OPEN_READWRITE: c_int = 0x0000_0002;
 const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
+const SNAPSHOT_RETAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 #[repr(C)]
 struct sqlite3 {
@@ -115,6 +117,14 @@ pub struct QueueJobCounts {
     pub running: u64,
     pub completed: u64,
     pub failed: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JobStorageLimitReport {
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub pruned_job_ids: Vec<u64>,
+    pub over_limit_bytes: u64,
 }
 
 /// A bounded, read-only view of persisted job records for monitor clients.
@@ -391,6 +401,7 @@ impl Storage {
         let target = self.root.join("snapshots").join(format!("{digest}.sh"));
         if target.exists() {
             self.verify_snapshot_file(&target, &digest, bytes.len() as u64)?;
+            File::open(&target)?.set_modified(SystemTime::now())?;
             return Ok(SnapshotRef {
                 sha256: digest,
                 size_bytes: bytes.len() as u64,
@@ -422,6 +433,7 @@ impl Storage {
             }
             Err(error) => return Err(error.into()),
         }
+        File::open(&target)?.set_modified(SystemTime::now())?;
         Ok(SnapshotRef {
             sha256: digest,
             size_bytes: bytes.len() as u64,
@@ -713,6 +725,191 @@ impl Storage {
 
     pub fn queue_job_counts(&self) -> Result<Vec<QueueJobCounts>, SubmitError> {
         self.connection.query_queue_job_counts()
+    }
+
+    /// Keep the cluster-managed job log tree and its controller records below
+    /// a byte limit. Only terminal jobs whose output synchronization finished
+    /// are eligible for removal; user result files outside each managed job
+    /// directory are never touched.
+    pub fn enforce_job_storage_limit(
+        &self,
+        shared_root: &Path,
+        namespace: Id128,
+        limit_bytes: u64,
+    ) -> Result<JobStorageLimitReport, SubmitError> {
+        let shared_root = shared_root.canonicalize()?;
+        let jobs = self.list_jobs(None)?;
+        let mut report = JobStorageLimitReport::default();
+        let mut bytes = self.job_storage_bytes(&shared_root, namespace, &jobs)?;
+        report.bytes_before = bytes;
+        if bytes <= limit_bytes {
+            report.bytes_after = bytes;
+            return Ok(report);
+        }
+
+        let mut snapshot_references = HashMap::<String, usize>::new();
+        for job in &jobs {
+            if let Some(snapshot) = &job.spec.snapshot {
+                *snapshot_references
+                    .entry(snapshot.sha256.clone())
+                    .or_default() += 1;
+            }
+        }
+        let mut removed_snapshot_bytes = self.prune_unreferenced_snapshots(&snapshot_references)?;
+        bytes = bytes.saturating_sub(removed_snapshot_bytes);
+
+        let mut candidates = jobs
+            .into_iter()
+            .filter(|job| {
+                (job.spec.storage_namespace.is_none()
+                    || job.spec.storage_namespace == Some(namespace))
+                    && job.state.is_terminal()
+                    && !job.snapshot_sync_pending
+                    && !job.log_sync_pending
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|job| (job.created_unix_ms, job.id));
+
+        for job in candidates {
+            if bytes <= limit_bytes {
+                break;
+            }
+            let job_dir = job.spec.shared_job_dir(&shared_root, job.id);
+            let job_bytes = safe_tree_size(&shared_root, &job_dir)?;
+            safe_remove_tree(&shared_root, &job_dir)?;
+
+            // Keep the historical row if another actor changed its status or
+            // synchronization flags while this maintenance pass was running.
+            let Some(removed) = self.delete_prunable_job(job.id)? else {
+                continue;
+            };
+            bytes = bytes.saturating_sub(job_bytes);
+            if let Some(snapshot) = removed.spec.snapshot.as_ref() {
+                let references = snapshot_references
+                    .entry(snapshot.sha256.clone())
+                    .or_default();
+                *references = references.saturating_sub(1);
+            }
+            report.pruned_job_ids.push(job.id);
+        }
+        let second_snapshot_sweep = self.prune_unreferenced_snapshots(&snapshot_references)?;
+        removed_snapshot_bytes = removed_snapshot_bytes.saturating_add(second_snapshot_sweep);
+
+        let compacted_size =
+            self.job_storage_bytes(&shared_root, namespace, &self.list_jobs(None)?)?;
+        if (!report.pruned_job_ids.is_empty() || removed_snapshot_bytes > 0)
+            && compacted_size > limit_bytes
+        {
+            // DELETE reuses SQLite pages but does not release them to APFS.
+            // Measure the database file itself after pruning, then compact
+            // only when the managed storage is still over budget.
+            self.connection
+                .exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        }
+        bytes = self.job_storage_bytes(&shared_root, namespace, &self.list_jobs(None)?)?;
+        report.bytes_after = bytes;
+        report.over_limit_bytes = bytes.saturating_sub(limit_bytes);
+        Ok(report)
+    }
+
+    fn job_storage_bytes(
+        &self,
+        shared_root: &Path,
+        namespace: Id128,
+        jobs: &[JobRecord],
+    ) -> Result<u64, SubmitError> {
+        let state_root = self.root.canonicalize()?;
+        let managed_root = shared_root.join("jobs").join(namespace.to_string());
+        let mut bytes = safe_tree_size(shared_root, &managed_root)?;
+        for job in jobs {
+            if job
+                .spec
+                .storage_namespace
+                .is_some_and(|value| value != namespace)
+            {
+                continue;
+            }
+            if job.spec.storage_namespace.is_none() {
+                let legacy = shared_root.join("jobs").join(job.id.to_string());
+                bytes = bytes.saturating_add(safe_tree_size(shared_root, &legacy)?);
+            }
+        }
+        bytes = bytes.saturating_add(safe_tree_size(&state_root, &state_root.join("snapshots"))?);
+        for suffix in ["", "-wal", "-shm"] {
+            let path = state_root.join(format!("controller.sqlite3{suffix}"));
+            bytes = bytes.saturating_add(file_size_if_present(&path)?);
+        }
+        Ok(bytes)
+    }
+
+    fn prune_unreferenced_snapshots(
+        &self,
+        references: &HashMap<String, usize>,
+    ) -> Result<u64, SubmitError> {
+        let state_root = self.root.canonicalize()?;
+        let snapshot_root = state_root.join("snapshots");
+        let entries = match fs::read_dir(&snapshot_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let now = SystemTime::now();
+        let mut freed = 0_u64;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("sh") {
+                continue;
+            }
+            let Some(digest) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || references.get(digest).copied().unwrap_or(0) > 0
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let recent = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < SNAPSHOT_RETAIN_GRACE);
+            if recent {
+                continue;
+            }
+            let size = safe_file_size(&snapshot_root, &path)?;
+            safe_remove_file(&snapshot_root, &path)?;
+            freed = freed.saturating_add(size);
+        }
+        Ok(freed)
+    }
+
+    fn delete_prunable_job(&self, job_id: u64) -> Result<Option<JobRecord>, SubmitError> {
+        self.transaction(|| {
+            let Some(record) = self.get_job(job_id)? else {
+                return Ok(None);
+            };
+            if !record.state.is_terminal()
+                || record.snapshot_sync_pending
+                || record.log_sync_pending
+            {
+                return Ok(None);
+            }
+            self.connection.execute_integer(
+                "DELETE FROM state_events WHERE job_id=?1",
+                job_id as i64,
+            )?;
+            self.connection.execute_integer(
+                "DELETE FROM jobs WHERE id=?1 AND state IN ('COMPLETED','FAILED','CANCELLED','TIMEOUT','NODE_LOST') AND snapshot_sync_pending=0 AND log_sync_pending=0",
+                job_id as i64,
+            )?;
+            Ok(Some(record))
+        })
     }
 
     fn has_active_node_job(
@@ -1393,6 +1590,18 @@ impl Connection {
         }
     }
 
+    fn execute_integer(&self, sql: &str, value: i64) -> Result<(), SubmitError> {
+        let statement = self.prepare(sql)?;
+        check_sqlite(self.raw, unsafe { sqlite3_bind_int64(statement, 1, value) })?;
+        let code = unsafe { sqlite3_step(statement) };
+        unsafe { sqlite3_finalize(statement) };
+        if code == SQLITE_DONE {
+            Ok(())
+        } else {
+            Err(SubmitError::Database(self.error_message()))
+        }
+    }
+
     fn error_message(&self) -> String {
         unsafe { CStr::from_ptr(sqlite3_errmsg(self.raw)) }
             .to_string_lossy()
@@ -1445,6 +1654,128 @@ fn check_sqlite(database: *mut sqlite3, code: c_int) -> Result<(), SubmitError> 
                 .into_owned(),
         ))
     }
+}
+
+fn file_size_if_present(path: &Path) -> Result<u64, SubmitError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+            Ok(metadata.len())
+        }
+        Ok(_) => Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn safe_tree_size(root: &Path, path: &Path) -> Result<u64, SubmitError> {
+    let root = root.canonicalize()?;
+    let Some(metadata) = checked_managed_path(&root, path)? else {
+        return Ok(0);
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    tree_size_no_follow(path).map_err(SubmitError::Io)
+}
+
+fn safe_file_size(root: &Path, path: &Path) -> Result<u64, SubmitError> {
+    let root = root.canonicalize()?;
+    let Some(metadata) = checked_managed_path(&root, path)? else {
+        return Ok(0);
+    };
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        Ok(metadata.len())
+    } else {
+        Ok(0)
+    }
+}
+
+fn safe_remove_tree(root: &Path, path: &Path) -> Result<(), SubmitError> {
+    let root = root.canonicalize()?;
+    let Some(metadata) = checked_managed_path(&root, path)? else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn safe_remove_file(root: &Path, path: &Path) -> Result<(), SubmitError> {
+    let root = root.canonicalize()?;
+    let Some(metadata) = checked_managed_path(&root, path)? else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(SubmitError::Database(format!(
+            "refusing to remove non-file snapshot path {}",
+            path.display()
+        )));
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Confirm every ancestor below a managed root is a real directory. This
+/// prevents cleanup from following a user-created symlink outside the store.
+fn checked_managed_path(root: &Path, path: &Path) -> Result<Option<fs::Metadata>, SubmitError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        SubmitError::Database(format!(
+            "managed cleanup path {} escaped {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(SubmitError::Database(
+            "refusing to operate on a managed storage root".into(),
+        ));
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(SubmitError::Database(
+                "managed cleanup path contains an unsafe component".into(),
+            ));
+        };
+        current.push(name);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let last = index + 1 == components.len();
+        if !last && (metadata.file_type().is_symlink() || !metadata.is_dir()) {
+            return Err(SubmitError::Database(format!(
+                "managed path ancestor {} is not a real directory",
+                current.display()
+            )));
+        }
+        if last {
+            return Ok(Some(metadata));
+        }
+    }
+    Ok(None)
+}
+
+fn tree_size_no_follow(path: &Path) -> io::Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            total = total.saturating_add(tree_size_no_follow(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

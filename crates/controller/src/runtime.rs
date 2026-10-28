@@ -20,7 +20,7 @@ use macluster_core::{
 use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
     control::MaintenanceScope,
-    identifiers::NodeId,
+    identifiers::{Id128, NodeId},
     types::{
         ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, Operation,
         ProtocolError, ResponseBody,
@@ -46,6 +46,8 @@ const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
 const MAX_IDLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const JOB_STORAGE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const JOB_STORAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 type WorkerTask<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 
@@ -1486,6 +1488,8 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
     )?;
     let mut queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
     let mut next_maintenance_attempt = Instant::now();
+    let mut next_job_storage_sweep = Instant::now();
+    let mut web_service: Option<crate::web::WebService> = None;
     if let Some((_, api)) = control.as_mut() {
         service.set_maintenance_scope(api.maintenance_scope());
     }
@@ -1539,6 +1543,27 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                             api.validate_generation(control_request.expected_generation)
                         {
                             Err(error)
+                        } else if let macluster_protocol::control::ControlCommand::StartWeb {
+                            port,
+                        } = control_request.command.clone()
+                        {
+                            if let Some(web_service) = web_service.as_mut() {
+                                web_service
+                                    .start_or_reuse(port)
+                                    .map_err(web_start_control_error)
+                            } else {
+                                match crate::web::WebService::bind_and_start(
+                                    listener.binding().clone(),
+                                    service.config.clone(),
+                                    port,
+                                ) {
+                                    Ok((started, payload)) => {
+                                        web_service = Some(started);
+                                        Ok(payload)
+                                    }
+                                    Err(error) => Err(web_start_control_error(error)),
+                                }
+                            }
                         } else if let macluster_protocol::control::ControlCommand::CompleteMaintenance {
                             ticket,
                             candidate_config_digest,
@@ -1581,6 +1606,9 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                                 ) {
                                                     Ok(()) => {
                                                         service.set_maintenance_recovery_blocked(false);
+                                                        if let Some(web_service) = web_service.as_ref() {
+                                                            web_service.update_config(service.config.clone());
+                                                        }
                                                         queue_names = service
                                                             .config
                                                             .queues
@@ -1624,6 +1652,39 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                     }
                     crate::PendingControlEvent::Disconnected(session) => api.disconnect(session),
                 }
+            }
+        }
+        let now = Instant::now();
+        if reset_policy.is_none() && !maintenance_active && now >= next_job_storage_sweep {
+            next_job_storage_sweep = now + JOB_STORAGE_SWEEP_INTERVAL;
+            match Id128::parse(&service.config.share_uuid) {
+                Ok(namespace) => match service.storage.enforce_job_storage_limit(
+                    &service.config.shared_root,
+                    namespace,
+                    JOB_STORAGE_LIMIT_BYTES,
+                ) {
+                    Ok(report) => {
+                        if !report.pruned_job_ids.is_empty() {
+                            eprintln!(
+                                "macluster: removed {} oldest terminal job log record(s); managed job storage is now {:.2} GiB",
+                                report.pruned_job_ids.len(),
+                                report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
+                            );
+                        }
+                        if report.over_limit_bytes > 0 {
+                            eprintln!(
+                                "macluster: managed job storage remains {:.2} GiB, above the 1 GiB limit; active, unsynchronized, or otherwise non-prunable data is retained",
+                                report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("macluster: could not enforce the 1 GiB job log limit: {error}")
+                    }
+                },
+                Err(error) => eprintln!(
+                    "macluster: could not enforce the 1 GiB job log limit because the storage namespace is invalid: {error}"
+                ),
             }
         }
         let address_maintenance = reset_policy.is_none() && !maintenance_active && requested();
@@ -1726,6 +1787,23 @@ impl Drop for WakeForwarder {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn web_start_control_error(
+    error: crate::web::WebError,
+) -> macluster_protocol::control::ControlError {
+    let code = if matches!(
+        &error,
+        crate::web::WebError::PortConflict(_) | crate::web::WebError::RunningPortConflict { .. }
+    ) {
+        macluster_protocol::control::ControlErrorCode::Conflict
+    } else {
+        macluster_protocol::control::ControlErrorCode::Unavailable
+    };
+    macluster_protocol::control::ControlError {
+        code,
+        message: format!("cannot start local web monitor: {error}"),
     }
 }
 

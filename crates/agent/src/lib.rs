@@ -860,10 +860,12 @@ fn commit_log_sync_result(
     record.storage_node_id = snapshot.storage_node_id;
     record.storage_host = snapshot.storage_host;
     record.storage_source_root = snapshot.storage_source_root;
+    let mut cleanup_record = None;
     match sync {
         Ok(()) => {
             record.log_sync_pending = false;
             record.log_sync_retry_after_unix_ms = None;
+            cleanup_record = Some(record.clone());
         }
         Err(_) => {
             // Another publisher may have succeeded after this attempt took
@@ -873,7 +875,14 @@ fn commit_log_sync_result(
                 .then(|| now_ms().saturating_add(LOG_SYNC_RETRY_DELAY_MS));
         }
     }
-    write_store(state_dir, &store).map_err(protocol_failed)
+    write_store(state_dir, &store).map_err(protocol_failed)?;
+    drop(_lock);
+    if let Some(record) = cleanup_record {
+        // Shared logs are durable now. Preserve execution receipts, but bound
+        // the duplicate local log spool on this Agent.
+        let _ = runner::prune_synced_log_payloads(state_dir, &record);
+    }
+    Ok(())
 }
 
 fn hydrate_record_storage_identity(record: &mut AgentRecord, config: &ClusterConfig) {

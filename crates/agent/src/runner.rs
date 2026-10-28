@@ -44,8 +44,149 @@ use macluster_protocol::{
 use crate::{AgentError, AgentRecord, active_record, local_script_path, write_active};
 
 const BASE_TASK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+const LOCAL_JOB_LOG_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const LOCAL_JOB_LOG_PAYLOADS: &[&str] = &[
+    "script.sh",
+    "stdout.log",
+    "stderr.log",
+    "monitor.log",
+    "resources.jsonl",
+    "summary.json",
+    "stdout.segments",
+    "stderr.segments",
+    "monitor.segments",
+    "resources.segments",
+];
 const RESERVED_VERBOSE_OUTPUT_ERROR: &str = "task output path is reserved for verbose task logs; choose a different stdout/stderr destination";
 const TASK_GATE_SCRIPT: &str = "gate=$1; shift; tries=0; while [ ! -e \"$gate\" ]; do tries=$((tries + 1)); [ \"$tries\" -lt 1000 ] || exit 125; /bin/sleep 0.01; done; /bin/rm -f \"$gate\"; exec \"$@\"";
+
+/// Bound synchronized per-task log spools on this node while preserving the
+/// small execution receipts that the controller may still need for recovery.
+pub(crate) fn prune_synced_log_payloads(
+    state_dir: &Path,
+    current: &AgentRecord,
+) -> io::Result<usize> {
+    let jobs_root = state_dir.join("jobs");
+    let entries = match fs::read_dir(&jobs_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut eligible = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(job_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let mut terminal_at = None;
+        for receipt in fs::read_dir(entry.path())? {
+            let receipt = receipt?;
+            let name = receipt.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("execution-") || !name.ends_with(".json") {
+                continue;
+            }
+            let receipt_meta = fs::symlink_metadata(receipt.path())?;
+            if !receipt_meta.is_file() || receipt_meta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<AgentRecord>(&fs::read(receipt.path())?)
+            else {
+                continue;
+            };
+            if record.job_id == job_id
+                && record.controller.controller_uuid == current.controller.controller_uuid
+                && record.share_uuid == current.share_uuid
+                && record.terminal_state.is_some()
+                && !record.log_sync_pending
+            {
+                terminal_at = Some(terminal_at.map_or(record.started_unix_ms, |time: u64| {
+                    time.min(record.started_unix_ms)
+                }));
+            }
+        }
+        if let Some(terminal_at) = terminal_at {
+            let directory = entry.path();
+            let bytes = local_log_payload_size(&directory)?;
+            if bytes > 0 {
+                eligible.push((terminal_at, job_id, directory, bytes));
+            }
+        }
+    }
+    let mut total = eligible
+        .iter()
+        .fold(0_u64, |sum, (_, _, _, bytes)| sum.saturating_add(*bytes));
+    if total <= LOCAL_JOB_LOG_LIMIT_BYTES {
+        return Ok(0);
+    }
+    eligible.sort_by_key(|(started, job_id, _, _)| (*started, *job_id));
+    let mut pruned = 0;
+    for (_, _, directory, _bytes) in eligible {
+        if total <= LOCAL_JOB_LOG_LIMIT_BYTES {
+            break;
+        }
+        let _lock = match LogSyncLock::acquire(&directory.join(".log-sync.lock")) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        };
+        let bytes = local_log_payload_size(&directory)?;
+        remove_local_log_payloads(&directory)?;
+        total = total.saturating_sub(bytes);
+        pruned += 1;
+    }
+    Ok(pruned)
+}
+
+fn local_log_payload_size(directory: &Path) -> io::Result<u64> {
+    let mut total = 0_u64;
+    for name in LOCAL_JOB_LOG_PAYLOADS {
+        total = total.saturating_add(local_tree_size(&directory.join(name))?);
+    }
+    Ok(total)
+}
+
+fn local_tree_size(path: &Path) -> io::Result<u64> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let mut total = 0_u64;
+        for entry in fs::read_dir(path)? {
+            total = total.saturating_add(local_tree_size(&entry?.path())?);
+        }
+        Ok(total)
+    } else {
+        Ok(metadata.len())
+    }
+}
+
+fn remove_local_log_payloads(directory: &Path) -> io::Result<()> {
+    for name in LOCAL_JOB_LOG_PAYLOADS {
+        let path = directory.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
 
 pub fn run(state_dir: &Path, job_id: u64, token: StartToken) -> Result<(), AgentError> {
     let record = wait_for_authorization(state_dir, job_id, token)?;

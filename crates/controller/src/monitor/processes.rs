@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     process::Command,
     sync::{
         Arc, Mutex,
@@ -22,6 +22,7 @@ use crate::{
 
 const PROCESS_COMMAND: &str = "/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu && printf '\\n__MACLUSTER_PS_NAMES__\\n' && /bin/ps -axo pid=,ucomm=";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_WORKERS: usize = 2;
 const PROCESS_MARKER: &str = "__MACLUSTER_PS_NAMES__";
 
 struct ProcessTask {
@@ -38,57 +39,66 @@ pub(super) struct ProcessResult {
 pub(super) struct ProcessSampler {
     sender: SyncSender<ProcessTask>,
     receiver: Receiver<ProcessResult>,
-    in_flight: bool,
+    in_flight: HashSet<NodeId>,
 }
 
 impl ProcessSampler {
     pub fn new(sample: Arc<super::ProcessSampleFn>) -> Self {
-        let (sender, tasks) = mpsc::sync_channel::<ProcessTask>(1);
+        let (sender, tasks) = mpsc::sync_channel::<ProcessTask>(PROCESS_WORKERS);
         let tasks = Arc::new(Mutex::new(tasks));
         let (results, receiver) = mpsc::channel();
-        let _ = thread::Builder::new()
-            .name("monitor-processes".into())
-            .spawn(move || {
-                loop {
-                    let task = match tasks.lock() {
-                        Ok(receiver) => receiver.recv(),
-                        Err(_) => return,
-                    };
-                    let Ok(task) = task else { return };
-                    if results
-                        .send(ProcessResult {
-                            node_id: task.node_id.clone(),
-                            result: sample(&task.node_id, &task.node),
-                            completed_at: std::time::Instant::now(),
-                        })
-                        .is_err()
-                    {
-                        return;
+        for index in 0..PROCESS_WORKERS {
+            let tasks = Arc::clone(&tasks);
+            let results = results.clone();
+            let sample = Arc::clone(&sample);
+            let _ = thread::Builder::new()
+                .name(format!("monitor-processes-{index}"))
+                .spawn(move || {
+                    loop {
+                        let task = match tasks.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(task) = task else { return };
+                        if results
+                            .send(ProcessResult {
+                                node_id: task.node_id.clone(),
+                                result: sample(&task.node_id, &task.node),
+                                completed_at: std::time::Instant::now(),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
-                }
-            });
+                });
+        }
+        drop(results);
         Self {
             sender,
             receiver,
-            in_flight: false,
+            in_flight: HashSet::new(),
         }
     }
 
     pub fn request(&mut self, node_id: NodeId, node: NodeConfig) -> bool {
-        if self.in_flight {
+        if self.in_flight.len() >= PROCESS_WORKERS || self.in_flight.contains(&node_id) {
             return false;
         }
-        match self.sender.try_send(ProcessTask { node_id, node }) {
+        match self.sender.try_send(ProcessTask {
+            node_id: node_id.clone(),
+            node,
+        }) {
             Ok(()) => {
-                self.in_flight = true;
+                self.in_flight.insert(node_id);
                 true
             }
             Err(mpsc::TrySendError::Full(_) | mpsc::TrySendError::Disconnected(_)) => false,
         }
     }
 
-    pub fn is_in_flight(&self) -> bool {
-        self.in_flight
+    pub fn has_capacity(&self) -> bool {
+        self.in_flight.len() < PROCESS_WORKERS
     }
 
     pub fn poll(&mut self) -> Vec<ProcessResult> {
@@ -96,7 +106,7 @@ impl ProcessSampler {
         loop {
             match self.receiver.try_recv() {
                 Ok(result) => {
-                    self.in_flight = false;
+                    self.in_flight.remove(&result.node_id);
                     completed.push(result);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -178,6 +188,7 @@ fn parse_processes(input: &str) -> Result<Vec<ProcessRow>, String> {
         rows.push(ProcessRow {
             pid,
             cpu_percent,
+            memory_bytes: parse_memory_bytes(fields[2]),
             memory: fields[2].to_owned(),
             cpu_time: fields[3].to_owned(),
             command,
@@ -191,6 +202,20 @@ fn parse_processes(input: &str) -> Result<Vec<ProcessRow>, String> {
     });
     rows.truncate(MAX_MONITOR_PROCESS_ROWS);
     Ok(rows)
+}
+
+fn parse_memory_bytes(memory: &str) -> Option<u64> {
+    let value = memory.trim_end_matches('+');
+    let (number, multiplier) = match value.chars().last()? {
+        'B' | 'b' => (&value[..value.len() - 1], 1_f64),
+        'K' | 'k' => (&value[..value.len() - 1], 1024_f64),
+        'M' | 'm' => (&value[..value.len() - 1], 1024_f64.powi(2)),
+        'G' | 'g' => (&value[..value.len() - 1], 1024_f64.powi(3)),
+        'T' | 't' => (&value[..value.len() - 1], 1024_f64.powi(4)),
+        _ => return value.parse::<u64>().ok(),
+    };
+    let bytes = number.parse::<f64>().ok()? * multiplier;
+    (bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64).then_some(bytes.round() as u64)
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {

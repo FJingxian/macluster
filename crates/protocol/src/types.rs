@@ -252,6 +252,16 @@ pub struct QueueRecord {
 /// Maximum age accepted for a cached power sample exposed by the power helper.
 pub const POWER_SAMPLE_CACHE_TTL_MS: u64 = 60_000;
 
+/// Read-only per-fan values copied from the platform sensor sampler. This is
+/// telemetry only; it does not imply that the fan can be safely controlled.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FanReading {
+    pub name: String,
+    pub rpm: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MetricSnapshot {
     pub sampled_unix_ms: u64,
@@ -272,6 +282,8 @@ pub struct MetricSnapshot {
     // mtop uses that distinction to explain that an Agent update is needed.
     #[serde(default)]
     pub fan_speed_rpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_readings: Option<Vec<FanReading>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

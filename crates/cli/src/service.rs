@@ -445,16 +445,14 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         }
         self.install_stable_binary()?;
         let plist = self.install_plist()?;
-        match launch_state {
-            LaunchState::Running | LaunchState::Loaded => self
-                .launcher
-                .kickstart(&self.label())
-                .map_err(map_launchd_error)?,
-            LaunchState::NotLoaded => self
-                .launcher
-                .bootstrap(&self.label(), &plist)
-                .map_err(map_launchd_error)?,
+        // launchd retains ProgramArguments from bootstrap. Rewriting the plist
+        // followed by kickstart would restart the previously loaded executable.
+        if loaded {
+            self.bootout_and_wait(deadline, timeout)?;
         }
+        self.launcher
+            .bootstrap(&self.label(), &plist)
+            .map_err(map_launchd_error)?;
         self.wait_for_hello(deadline, timeout, &expected_build)
     }
 

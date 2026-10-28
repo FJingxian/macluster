@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use macluster_protocol::types::MetricSnapshot;
+use macluster_protocol::types::{FanReading, MetricSnapshot};
 
 pub fn sample_local() -> MetricSnapshot {
     macos::sample_local()
@@ -35,6 +35,7 @@ pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
         power_scope: None,
         cpu_temp_celsius: None,
         fan_speed_rpm: None,
+        fan_readings: None,
         power_age_ms: None,
         gpu_percent: None,
         gpu_source: None,
@@ -65,7 +66,7 @@ fn now_ms() -> u64 {
 
 #[cfg(target_vendor = "apple")]
 mod macos {
-    use super::{MetricSnapshot, average_fan_speed_rpm, now_ms};
+    use super::{FanReading, MetricSnapshot, average_fan_speed_rpm, now_ms};
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
@@ -147,6 +148,7 @@ mod macos {
     struct HardwareMetrics {
         cpu_temp_celsius: Option<f64>,
         fan_speed_rpm: Option<f64>,
+        fan_readings: Option<Vec<FanReading>>,
         cpu_temp_error: Option<String>,
         gpu_percent: Option<f64>,
         gpu_window_ms: Option<u32>,
@@ -261,6 +263,7 @@ mod macos {
             power_scope: power.scope,
             cpu_temp_celsius: hardware.cpu_temp_celsius,
             fan_speed_rpm: hardware.fan_speed_rpm,
+            fan_readings: hardware.fan_readings,
             power_age_ms: power.age_ms,
             gpu_percent: power.gpu_percent,
             gpu_source: power.gpu_source,
@@ -303,6 +306,7 @@ mod macos {
             power_scope: power.scope,
             cpu_temp_celsius: hardware.cpu_temp_celsius,
             fan_speed_rpm: hardware.fan_speed_rpm,
+            fan_readings: hardware.fan_readings,
             power_age_ms: power.age_ms,
             gpu_percent: power.gpu_percent,
             gpu_source: power.gpu_source,
@@ -361,6 +365,18 @@ mod macos {
             fan_speed_rpm: average_fan_speed_rpm(
                 &sample.fans.iter().map(|fan| fan.rpm).collect::<Vec<_>>(),
             ),
+            fan_readings: (!sample.fans.is_empty()).then(|| {
+                sample
+                    .fans
+                    .iter()
+                    .take(16)
+                    .map(|fan| FanReading {
+                        name: fan.name.clone(),
+                        rpm: fan.rpm,
+                        max_rpm: fan.max_rpm,
+                    })
+                    .collect()
+            }),
             cpu_temp_error,
             gpu_percent,
             gpu_window_ms: gpu_percent.map(|_| 100),
@@ -669,6 +685,7 @@ mod macos {
                 cpu_temp_celsius: Some(48.0),
                 cpu_temp_error: None,
                 fan_speed_rpm: None,
+                fan_readings: None,
                 gpu_percent: Some(0.0),
                 gpu_window_ms: Some(100),
                 gpu_error: None,

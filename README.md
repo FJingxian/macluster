@@ -129,7 +129,7 @@ msub -Is python --version
 msub -Is pip install . --break-system-packages
 ~~~
 
-`msub` forwards exported environment variables, including the active Python environment. The software files must also be shared, and active environments must resolve at the same absolute path on every node. An unshared environment is rejected.
+`msub` forwards exported environment variables, including the active Python environment. The software files must also be shared, and active environments must resolve at the same absolute path on every node. A task that uses an unshared active environment is rejected rather than falling back to compute-local software. Simple commands resolved outside that environment, such as `ls`, do not need its Python interpreter to be shared.
 
 Shell aliases and functions are not forwarded. Environment variables are saved with the job, so avoid exporting secrets to tasks.
 
@@ -142,9 +142,19 @@ mtop --once
 
 `mtop` shows jobs, CPU, memory, disk I/O, network, and available GPU, temperature, fan, and power readings.
 
+Start the read-only browser dashboard through the controller:
+
+~~~sh
+macluster controller run --web
+~~~
+
+It shows live node details, recent CPU and memory history, jobs, queues, and shared task logs. It listens on `127.0.0.1` and runs while the controller is active. If the controller is already running, this command starts the dashboard there and returns. Use `--no-open` to print a one-time browser link, or `--web-port PORT` to select a port.
+
 Use arrows or `j`/`k` to select a node, Enter for its processes, and `q` to quit. In process details, `c` sorts by CPU and `m` by memory.
 
 CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable hardware readings show `N/A`.
+
+An optional menu bar app adds a native resource window and bounded job log viewer. Build instructions are in [macos/README.md](macos/README.md). Fan readings are shown when available; fan control stays read-only until hardware recovery is verified.
 
 ## Maintain the cluster
 

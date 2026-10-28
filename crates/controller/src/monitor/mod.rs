@@ -23,7 +23,7 @@ use self::{processes::ProcessSampler, sampler::MetricSampler};
 
 const MONITOR_LEASE: Duration = Duration::from_secs(30);
 const METRIC_INTERVAL: Duration = Duration::from_secs(2);
-const PROCESS_INTERVAL: Duration = Duration::from_secs(3);
+const PROCESS_INTERVAL: Duration = Duration::from_secs(2);
 const METRIC_STALE_AFTER: Duration = Duration::from_secs(6);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
 const MAX_MONITOR_ERROR_BYTES: usize = 1_024;
@@ -68,6 +68,8 @@ pub struct MonitorHub {
     process_sampler: ProcessSampler,
     job_counts: HashMap<NodeId, (u32, u32)>,
     sequence: u64,
+    metric_cursor: usize,
+    process_cursor: usize,
 }
 
 impl MonitorHub {
@@ -109,6 +111,8 @@ impl MonitorHub {
             process_sampler: ProcessSampler::new(process_sample),
             job_counts: HashMap::new(),
             sequence: 1,
+            metric_cursor: 0,
+            process_cursor: 0,
         }
     }
 
@@ -312,6 +316,12 @@ impl MonitorHub {
             .values()
             .flat_map(|subscription| subscription.nodes.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let mut active_nodes = active_nodes.into_iter().collect::<Vec<_>>();
+        if !active_nodes.is_empty() {
+            let offset = self.metric_cursor % active_nodes.len();
+            active_nodes.rotate_left(offset);
+            self.metric_cursor = (offset + 1) % active_nodes.len();
+        }
         for node_id in active_nodes {
             let due = self
                 .metric_cache
@@ -355,29 +365,39 @@ impl MonitorHub {
             }
         }
 
-        if self.subscriptions.is_empty() || self.process_sampler.is_in_flight() {
+        if self.subscriptions.is_empty() || !self.process_sampler.has_capacity() {
             return;
         }
-        let mut watched = self
+        let watched = self
             .subscriptions
             .values()
             .filter_map(|subscription| subscription.processes.clone())
             .collect::<BTreeSet<_>>();
-        watched.retain(|node_id| {
-            self.process_cache
-                .get(node_id)
-                .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next))
-        });
-        let Some(node_id) = watched.into_iter().next() else {
-            return;
-        };
-        let Some(node) = self.config.nodes.get(node_id.as_str()) else {
-            return;
-        };
-        if self.process_sampler.request(node_id.clone(), node.clone())
-            && let Some(cache) = self.process_cache.get_mut(&node_id)
-        {
-            cache.next_sample_at = Some(now + PROCESS_INTERVAL);
+        let mut watched = watched.iter().cloned().collect::<Vec<_>>();
+        if !watched.is_empty() {
+            let offset = self.process_cursor % watched.len();
+            watched.rotate_left(offset);
+            self.process_cursor = (offset + 1) % watched.len();
+        }
+        for node_id in watched {
+            let due = self
+                .process_cache
+                .get(&node_id)
+                .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next));
+            if !due {
+                continue;
+            }
+            let Some(node) = self.config.nodes.get(node_id.as_str()) else {
+                continue;
+            };
+            if self.process_sampler.request(node_id.clone(), node.clone())
+                && let Some(cache) = self.process_cache.get_mut(&node_id)
+            {
+                cache.next_sample_at = Some(now + PROCESS_INTERVAL);
+            }
+            if !self.process_sampler.has_capacity() {
+                break;
+            }
         }
     }
 }
@@ -398,6 +418,16 @@ fn bound_metric_snapshot(mut snapshot: MetricSnapshot) -> MetricSnapshot {
             )
         })
         .collect();
+    if let Some(fans) = snapshot.fan_readings.as_mut() {
+        fans.retain(|fan| fan.rpm <= 100_000);
+        fans.truncate(16);
+        for fan in fans {
+            fan.name = bound_text(std::mem::take(&mut fan.name), 64);
+            if fan.max_rpm.is_some_and(|rpm| rpm > 100_000) {
+                fan.max_rpm = None;
+            }
+        }
+    }
     snapshot
 }
 

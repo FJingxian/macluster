@@ -56,6 +56,7 @@ pub enum IpcError {
 
 pub struct ControlListener<'lock> {
     path: PathBuf,
+    binding: ServiceBinding,
     device: u64,
     inode: u64,
     stopping: Arc<AtomicBool>,
@@ -183,6 +184,7 @@ impl<'lock> ControlListener<'lock> {
 
         Ok(Self {
             path,
+            binding: binding.clone(),
             device,
             inode,
             stopping,
@@ -231,6 +233,10 @@ impl<'lock> ControlListener<'lock> {
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
             }
         }
+    }
+
+    pub fn binding(&self) -> &ServiceBinding {
+        &self.binding
     }
 
     pub fn poll_event(&mut self) -> Option<PendingControlEvent> {

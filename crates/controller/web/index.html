@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>macluster · Monitor</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#overview" aria-label="macluster overview">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span>macluster</span>
+      </a>
+      <div class="cluster-heading">
+        <span class="eyebrow">CLUSTER</span>
+        <strong id="cluster-name">Connecting…</strong>
+      </div>
+      <div class="topbar-status">
+        <span id="controller-status" class="status-pill pending"><span class="status-dot"></span>Connecting</span>
+        <span class="updated-label">Updated <time id="last-updated">—</time></span>
+      </div>
+    </header>
+
+    <nav class="main-nav" aria-label="Main navigation">
+      <button class="nav-item active" data-page="overview">Overview <span id="nav-node-count" class="nav-count">—</span></button>
+      <button class="nav-item" data-page="jobs">Jobs</button>
+      <button class="nav-item" data-page="queues">Queues</button>
+      <span class="nav-spacer"></span>
+      <span id="connection-state" class="connection-state">Starting local monitor</span>
+    </nav>
+
+    <main>
+      <div id="banner" class="banner hidden" role="status"></div>
+      <section id="page-overview" class="page active" aria-labelledby="overview-title">
+        <div class="page-heading">
+          <div><p class="eyebrow">LIVE CLUSTER</p><h1 id="overview-title">Overview</h1></div>
+          <div class="heading-actions"><button id="refresh-button" class="button button-secondary">Refresh</button><span id="sample-age" class="muted small">Waiting for first sample</span></div>
+        </div>
+        <div class="summary-grid">
+          <article class="summary-card"><span class="summary-label">NODES ONLINE</span><strong id="kpi-nodes" class="summary-value">—</strong><span id="kpi-nodes-note" class="summary-note">of — configured</span></article>
+          <article class="summary-card"><span class="summary-label">RUNNING</span><strong id="kpi-running" class="summary-value">—</strong><span class="summary-note">jobs currently executing</span></article>
+          <article class="summary-card"><span class="summary-label">WAITING</span><strong id="kpi-waiting" class="summary-value">—</strong><span class="summary-note">unique queued jobs</span></article>
+          <article class="summary-card"><span class="summary-label">CPU CAPACITY</span><div id="cluster-cpu-ring" class="resource-ring cpu"><strong id="kpi-cpu">—</strong></div><span id="kpi-cpu-note" class="summary-note">across available nodes</span></article>
+          <article class="summary-card"><span class="summary-label">MEMORY</span><div id="cluster-memory-ring" class="resource-ring memory"><strong id="kpi-memory">—</strong></div><span class="summary-note">of shared cluster memory</span></article>
+        </div>
+
+        <section class="panel node-panel" aria-label="Cluster nodes">
+          <div class="panel-heading">
+            <div><h2>Nodes</h2><p id="node-table-note" class="muted">A live picture of every Mac · select a card to explore</p></div>
+            <div class="table-tools"><label class="search-box"><span aria-hidden="true">⌕</span><input id="node-search" type="search" placeholder="Find a node" aria-label="Find a node"></label><select id="queue-filter" aria-label="Filter by queue"><option value="">All queues</option></select></div>
+          </div>
+          <div id="node-rows" class="node-grid"></div>
+          <div id="node-empty" class="empty-state hidden"><div class="empty-symbol">⌁</div><strong>No nodes match this view</strong><span>Change the search or queue filter.</span></div>
+          <footer class="panel-footer"><span id="node-count-label">0 nodes</span><span>Click a node for metrics and sampled processes</span></footer>
+        </section>
+      </section>
+
+      <section id="page-jobs" class="page" aria-labelledby="jobs-title">
+        <div class="page-heading"><div><p class="eyebrow">SCHEDULER</p><h1 id="jobs-title">Jobs</h1></div><div class="heading-actions"><select id="job-state-filter" aria-label="Filter jobs by state"><option value="">All states</option><option>PENDING</option><option>STARTING</option><option>RUNNING</option><option>COMPLETED</option><option>FAILED</option><option>CANCELLED</option><option>TIMEOUT</option><option>NODE_LOST</option></select><button id="jobs-refresh" class="button button-secondary">Refresh</button></div></div>
+        <div class="panel table-panel"><div class="table-scroll"><div id="job-rows" class="job-card-grid"></div><div id="jobs-empty" class="empty-state hidden"><div class="empty-symbol">◷</div><strong>No jobs found</strong><span>Jobs will appear here as the controller records them.</span></div></div><footer class="panel-footer"><button id="jobs-prev" class="text-button" disabled>← Newer</button><span id="jobs-page-label">Showing recent jobs</span><button id="jobs-next" class="text-button" disabled>Older →</button></footer></div>
+        <section id="job-detail" class="panel job-detail hidden"><div class="panel-heading"><div><p class="eyebrow">JOB DETAILS</p><h2 id="job-detail-title">Job</h2></div><button id="job-detail-close" class="icon-button" aria-label="Close job details">×</button></div><div id="job-detail-content" class="job-meta"></div><div class="log-grid"><section class="log-panel"><div class="log-heading"><h3>stdout</h3><span id="stdout-status" class="muted small">Tail</span></div><pre id="stdout-log" class="log-output">Select a job to load output.</pre></section><section class="log-panel"><div class="log-heading"><h3>stderr</h3><span id="stderr-status" class="muted small">Tail</span></div><pre id="stderr-log" class="log-output">Select a job to load output.</pre></section></div></section>
+      </section>
+
+      <section id="page-queues" class="page" aria-labelledby="queues-title">
+        <div class="page-heading"><div><p class="eyebrow">SCHEDULER</p><h1 id="queues-title">Queues</h1></div><span id="queue-updated" class="muted small">Controller queue summary</span></div>
+        <div class="queue-grid" id="queue-cards"></div>
+        <div id="queues-empty" class="empty-state panel hidden"><div class="empty-symbol">▤</div><strong>No queues configured</strong><span>Configure a queue in the cluster before submitting work.</span></div>
+      </section>
+    </main>
+    <footer class="app-footer"><span>macluster · read-only monitor</span><span>Task submission and node administration remain in Terminal.</span></footer>
+  </div>
+
+  <dialog id="node-dialog" class="node-dialog">
+    <div class="dialog-shell">
+      <div class="dialog-heading"><div><p class="eyebrow">NODE DETAILS</p><h2 id="detail-title">Node</h2><span id="detail-subtitle" class="muted small"></span></div><button id="detail-close" class="icon-button" aria-label="Close node details">×</button></div>
+      <div id="detail-status" class="detail-status"></div>
+      <div id="detail-metrics" class="detail-metrics"></div>
+      <section class="panel chart-panel"><div class="panel-heading"><div><h3>Recent activity</h3><p class="muted">5 minute history · missing samples are left blank</p></div><div class="chart-legend"><span><i class="legend-cpu"></i>CPU</span><span><i class="legend-memory"></i>Memory</span></div></div><canvas id="history-chart" height="180" aria-label="CPU and memory usage history"></canvas></section>
+      <section class="panel process-panel"><div class="panel-heading"><div><h3>Top processes</h3><p id="process-note" class="muted">Sampled process list · CPU descending</p></div><div class="sort-toggle"><button class="active" data-process-sort="cpu">CPU</button><button data-process-sort="memory">Memory</button></div></div><div class="table-scroll"><table class="data-table process-table"><thead><tr><th>PID</th><th>CPU%</th><th>MEMORY</th><th>CPU TIME</th><th>COMMAND</th></tr></thead><tbody id="process-rows"></tbody></table><div id="process-empty" class="empty-state hidden"><strong>No process sample yet</strong><span>Samples are requested about every 2 seconds.</span></div></div></section>
+      <div class="dialog-hint">Press <kbd>c</kbd> or <kbd>m</kbd> to sort processes by CPU or memory.</div>
+    </div>
+  </dialog>
+</body>
+</html>

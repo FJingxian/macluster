@@ -350,7 +350,7 @@ fn a_foreground_controller_is_reused_without_launchctl_start() {
 }
 
 #[test]
-fn a_loaded_but_crashed_service_is_kickstarted_for_recovery() {
+fn a_loaded_but_crashed_service_reloads_its_launch_definition() {
     let fixture = Fixture::new();
     let source = fixture.root().join("macluster-source");
     fs::write(&source, b"fake executable").unwrap();
@@ -359,8 +359,9 @@ fn a_loaded_but_crashed_service_is_kickstarted_for_recovery() {
     let service = manager(&fixture, Arc::clone(&launcher), source);
 
     service.ensure_running(Duration::from_secs(1)).unwrap();
-    assert_eq!(launcher.kickstarts.load(Ordering::SeqCst), 1);
-    assert_eq!(launcher.bootstraps.load(Ordering::SeqCst), 0);
+    assert_eq!(launcher.kickstarts.load(Ordering::SeqCst), 0);
+    assert_eq!(launcher.bootouts.load(Ordering::SeqCst), 1);
+    assert_eq!(launcher.bootstraps.load(Ordering::SeqCst), 1);
 }
 
 #[test]

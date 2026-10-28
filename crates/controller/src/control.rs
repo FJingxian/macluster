@@ -425,6 +425,9 @@ impl ControlApi {
                 }
                 Ok(ControlPayload::MonitorAcknowledged)
             }
+            ControlCommand::StartWeb { .. } => Err(invalid_request(
+                "web startup requests must be handled by the controller runtime",
+            )),
             ControlCommand::BeginSnapshot {
                 upload_id,
                 size_bytes,

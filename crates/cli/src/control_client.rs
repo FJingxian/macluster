@@ -62,6 +62,7 @@ impl ControlClient {
                     "agent.compatibility.v1".into(),
                     "monitor.v1".into(),
                     "maintenance.v1".into(),
+                    "web.v1".into(),
                 ],
             },
         )?;

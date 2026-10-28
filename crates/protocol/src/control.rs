@@ -137,6 +137,9 @@ pub enum ControlCommand {
     WatchProcesses {
         node_id: Option<NodeId>,
     },
+    StartWeb {
+        port: Option<u16>,
+    },
     BeginSnapshot {
         upload_id: Id128,
         size_bytes: u64,
@@ -185,7 +188,14 @@ pub enum ControlPayload {
     MonitorSnapshot(MonitorSnapshot),
     MonitorSubscribed,
     MonitorAcknowledged,
-    SnapshotProgress { offset: u64 },
+    WebStarted {
+        port: u16,
+        token: String,
+        reused: bool,
+    },
+    SnapshotProgress {
+        offset: u64,
+    },
     SnapshotFinished(SnapshotRef),
     Submission(JobRecord),
     Lookup(Option<JobRecord>),
@@ -259,6 +269,8 @@ pub struct ProcessRow {
     pub pid: u32,
     pub cpu_percent: f64,
     pub memory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
     pub cpu_time: String,
     pub command: String,
 }

@@ -305,6 +305,27 @@ fn should_block_agent_update_for_pending_node_recovery(
         && !should_defer_agent_update_for_node_recovery(command, recovery_pending)
 }
 
+// Read-only inspection and cancellation must remain usable from scripts even
+// when a new build needs privileged installation. Submissions still fail closed.
+fn defer_update_without_terminal(
+    command: &str,
+    args: &[String],
+    interactive: bool,
+) -> AppResult<bool> {
+    if interactive {
+        return Ok(false);
+    }
+    if can_defer_agent_update_for_work(command, args) {
+        return Ok(true);
+    }
+    Err((
+        1,
+        format!(
+            "Agent update is required before `{command}`, but administrator authorization needs an interactive Terminal. Rerun the same command from Terminal to resume; any interrupted maintenance is preserved."
+        ),
+    ))
+}
+
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "kill" | "top")
         || command == "node"
@@ -483,6 +504,12 @@ fn preflight_agent_update_with_compatibility(
         eprintln!(
             "Agent update is deferred while active tasks or output synchronization remain; continuing with `{}`. Retry after the work drains to resume the automatic update.",
             command
+        );
+        return Ok(());
+    }
+    if update_required && defer_update_without_terminal(command, args, io::stdin().is_terminal())? {
+        eprintln!(
+            "Agent update needs an interactive Terminal; continuing with `{command}` without updating."
         );
         return Ok(());
     }
@@ -1471,6 +1498,9 @@ fn build_submission(
         return Err((2, "stdout and stderr paths must be different".into()));
     }
 
+    let inherited_env = inherited_task_environment();
+    let validate_active_environment =
+        should_validate_active_environment_for_command(&merged, &inherited_env, &submitter_cwd);
     let name = merged
         .name
         .or_else(|| {
@@ -1488,7 +1518,12 @@ fn build_submission(
                 "wrap".into()
             }
         });
-    let mut task_env = prepare_task_environment(config, inherited_task_environment(), merged.env)?;
+    let mut task_env = prepare_task_environment_with_policy(
+        config,
+        inherited_env,
+        merged.env,
+        validate_active_environment,
+    )?;
     if merged.verbose {
         task_env.insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
         task_env.insert(
@@ -1633,10 +1668,20 @@ fn inherited_task_environment() -> BTreeMap<String, String> {
         .collect()
 }
 
+#[cfg(test)]
 fn prepare_task_environment(
+    config: &ClusterConfig,
+    task_env: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+) -> AppResult<BTreeMap<String, String>> {
+    prepare_task_environment_with_policy(config, task_env, overrides, true)
+}
+
+fn prepare_task_environment_with_policy(
     config: &ClusterConfig,
     mut task_env: BTreeMap<String, String>,
     overrides: BTreeMap<String, String>,
+    should_validate_active_environment: bool,
 ) -> AppResult<BTreeMap<String, String>> {
     let explicit_path = overrides.contains_key("PATH");
     let explicit_env_keys = overrides.keys().cloned().collect::<Vec<_>>();
@@ -1659,7 +1704,11 @@ fn prepare_task_environment(
     if explicit_path {
         task_env.insert(EXPLICIT_TASK_PATH_ENV.into(), "1".into());
     }
-    let selected_prefix = select_active_environment(&task_env)?;
+    let selected_prefix = if should_validate_active_environment && !explicit_path {
+        select_active_environment(&task_env)?
+    } else {
+        None
+    };
     let selected_prefix = selected_prefix
         .as_deref()
         .map(|prefix| validate_active_environment(config, prefix))
@@ -1725,6 +1774,90 @@ fn prepare_task_environment(
         };
     }
     Ok(task_env)
+}
+
+fn should_validate_active_environment_for_command(
+    options: &SubmitOptions,
+    inherited_environment: &BTreeMap<String, String>,
+    working_directory: &Path,
+) -> bool {
+    if options.env.contains_key("PATH") {
+        return false;
+    }
+    let Some(command) = options.wrap.as_deref() else {
+        return true;
+    };
+    if command.chars().any(|character| {
+        matches!(
+            character,
+            ';' | '|' | '&' | '>' | '<' | '\n' | '\r' | '$' | '`'
+        )
+    }) {
+        return true;
+    }
+    let mut environment = inherited_environment.clone();
+    environment.extend(options.env.clone());
+    let Ok(Some(prefix)) = select_active_environment(&environment) else {
+        return false;
+    };
+    let prefix = prefix.canonicalize().unwrap_or(prefix);
+    let Ok(words) = tokenize_shell_words(command) else {
+        return true;
+    };
+    let Some(executable) = words.first() else {
+        return true;
+    };
+    let basename = Path::new(executable)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or(executable);
+    if matches!(basename, "sh" | "bash" | "zsh" | "env" | "command" | "exec") {
+        return true;
+    }
+    let candidate = if Path::new(executable).is_absolute() {
+        Some(PathBuf::from(executable))
+    } else if executable.contains('/') {
+        Some(working_directory.join(executable))
+    } else {
+        environment
+            .get("PATH")
+            .into_iter()
+            .flat_map(|path| path.split(':'))
+            .filter(|path| !path.is_empty())
+            .map(|path| Path::new(path).join(executable))
+            .find(|path| path.is_file())
+            .or_else(|| {
+                prefix
+                    .join("bin")
+                    .join(executable)
+                    .is_file()
+                    .then(|| prefix.join("bin").join(executable))
+            })
+    };
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let candidate_is_in_prefix = candidate.starts_with(&prefix)
+        || candidate
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(&prefix));
+    if !candidate_is_in_prefix {
+        return false;
+    }
+    let python_named =
+        basename.starts_with("python") || basename.starts_with("pip") || basename == "ipython";
+    python_named || executable_has_python_shebang(&candidate)
+}
+
+fn executable_has_python_shebang(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = io::BufReader::new(file);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .is_ok_and(|_| line.starts_with("#!") && line.to_ascii_lowercase().contains("python"))
 }
 
 fn is_optional_software_metadata_variable(key: &str) -> bool {
@@ -3863,12 +3996,13 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
 fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: macluster controller start|stop|restart|status\n       macluster controller run [--once] [--interval SECONDS]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use."
+            "Usage: macluster controller start|stop|restart|status|app-link\n       macluster controller run [--once] [--interval SECONDS] [--web [--web-port PORT] [--no-open]]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use. Add `--web` to start the read-only browser monitor; if a controller is already running, it starts the monitor there and asks before updating an older controller. `app-link` starts or reuses that monitor and prints a one-use local session URL for the native app."
         );
         return Ok(());
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
     match args[0].as_str() {
+        "app-link" => controller_app_link(&global, &state_dir),
         "status" => {
             if resolved_config_path(global.config.as_deref()).is_file() {
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
@@ -3955,10 +4089,27 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
         "run" => {
             let mut once = false;
             let mut interval = 2_u64;
+            let mut web = false;
+            let mut web_port = None;
+            let mut no_open = false;
             let mut index = 1;
             while index < args.len() {
                 match args[index].as_str() {
                     "--once" => once = true,
+                    "--web" => web = true,
+                    "--no-open" => no_open = true,
+                    "--web-port" => {
+                        index += 1;
+                        let value = args
+                            .get(index)
+                            .ok_or_else(|| (2, "missing --web-port value".into()))?;
+                        web_port = Some(value.parse::<u16>().map_err(|_| {
+                            (
+                                2,
+                                format!("invalid web port '{value}'; expected 0 to 65535"),
+                            )
+                        })?);
+                    }
                     "--interval" => {
                         index += 1;
                         interval = args
@@ -3974,7 +4125,43 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                 }
                 index += 1;
             }
+            if no_open && !web {
+                return Err((2, "--no-open requires --web".into()));
+            }
+            if web_port.is_some() && !web {
+                return Err((2, "--web-port requires --web".into()));
+            }
+            if once && web {
+                return Err((2, "--web requires a long-running controller".into()));
+            }
             let config_file = resolved_config_path(global.config.as_deref());
+            if web
+                && let Ok(binding) = ServiceBinding::load(&config_file, &state_dir)
+                && let Ok(mut client) = crate::control_client::ControlClient::connect(
+                    &binding,
+                    Duration::from_millis(300),
+                )
+            {
+                let current_build =
+                    crate::service::current_executable_build_id().map_err(service_error)?;
+                if !controller_supports_web(&client) || client.hello().build_id != current_build {
+                    confirm_controller_web_update()?;
+                    eprintln!("Updating and restarting the controller for the browser monitor…");
+                    crate::service::ServiceManager::current(binding.clone())
+                        .map_err(service_error)?
+                        .ensure_running(Duration::from_secs(10))
+                        .map_err(service_error)?;
+                    client = crate::control_client::ControlClient::connect(
+                        &binding,
+                        Duration::from_secs(5),
+                    )
+                    .map_err(|error| (1, error.to_string()))?;
+                }
+                client
+                    .set_timeouts(Duration::from_secs(10))
+                    .map_err(|error| (1, error.to_string()))?;
+                return start_web_monitor(&mut client, web_port, no_open);
+            }
             if service_child {
                 let binding = ServiceBinding::load(&config_file, &state_dir)
                     .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
@@ -4148,6 +4335,7 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                         "agent.compatibility.v1".into(),
                         "monitor.v1".into(),
                         "maintenance.v1".into(),
+                        "web.v1".into(),
                     ],
                     controller_epoch: service.epoch(),
                     config_generation: maintenance.generation(),
@@ -4183,6 +4371,21 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                 let listener = control_listener
                     .as_mut()
                     .expect("long-running controller always has a control listener");
+                let _web_startup = if web {
+                    let binding = listener.binding().clone();
+                    Some(
+                        schedule_web_monitor_startup(binding, web_port, no_open).map_err(
+                            |error| {
+                                (
+                                    1,
+                                    format!("cannot schedule browser monitor startup: {error}"),
+                                )
+                            },
+                        )?,
+                    )
+                } else {
+                    None
+                };
                 service
                     .run_forever_with_control(interval, listener, control_hello.expect("control hello exists"),
                         config_file.clone(),
@@ -4285,6 +4488,133 @@ fn query_control(
     client
         .request(command)
         .map_err(|error| (1, error.to_string()))
+}
+
+fn controller_app_link(global: &GlobalOptions, state_dir: &Path) -> AppResult<()> {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let Some(mut online) = online_controller(&config_path, state_dir, true)? else {
+        return Err((
+            1,
+            "controller is manually stopped or its per-user service is unavailable; run `macluster controller start` first".into(),
+        ));
+    };
+    if !controller_supports_web(&online.client) {
+        return Err((
+            1,
+            "the running controller does not support the local monitor API; update it from Terminal with `macluster controller run --web`".into(),
+        ));
+    }
+    online
+        .client
+        .set_timeouts(Duration::from_secs(10))
+        .map_err(|error| (1, error.to_string()))?;
+    let payload = query_control(&mut online.client, ControlCommand::StartWeb { port: None })?;
+    let ControlPayload::WebStarted { port, token, .. } = payload else {
+        return Err((
+            1,
+            "controller returned an invalid native monitor session response".into(),
+        ));
+    };
+    println!("Web monitor URL: http://127.0.0.1:{port}/#{token}");
+    Ok(())
+}
+
+fn start_web_monitor(
+    client: &mut crate::control_client::ControlClient,
+    port: Option<u16>,
+    no_open: bool,
+) -> AppResult<()> {
+    if !controller_supports_web(client) {
+        return Err((
+            1,
+            "the running controller still does not support the browser monitor after its update; rebuild or install a macluster binary with browser monitor support".into(),
+        ));
+    }
+    let payload = query_control(client, ControlCommand::StartWeb { port })?;
+    let ControlPayload::WebStarted { port, token, .. } = payload else {
+        return Err((
+            1,
+            "controller returned an invalid browser monitor response".into(),
+        ));
+    };
+    let url = format!("http://127.0.0.1:{port}/#{token}");
+    if no_open {
+        println!("Web monitor URL: {url}");
+    } else if process::Command::new("open").arg(&url).spawn().is_ok() {
+        println!("Opened the local web monitor at http://127.0.0.1:{port}/");
+    } else {
+        println!("Could not launch a browser. Open this one-time URL manually:\n{url}");
+    }
+    println!("The read-only monitor runs while the controller is active.");
+    Ok(())
+}
+
+fn controller_supports_web(client: &crate::control_client::ControlClient) -> bool {
+    client
+        .hello()
+        .capabilities
+        .iter()
+        .any(|capability| capability == "web.v1")
+}
+
+fn confirm_controller_web_update() -> AppResult<()> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err((
+            2,
+            "the running controller needs an update and restart to start the browser monitor; rerun `macluster controller run --web` in Terminal to confirm".into(),
+        ));
+    }
+    eprint!(
+        "The running controller needs an update and restart to start the browser monitor. Continue? Active jobs will not be killed; they block the update. [y/N] "
+    );
+    io::stderr()
+        .flush()
+        .map_err(|error| (1, error.to_string()))?;
+    let mut response = String::new();
+    io::stdin()
+        .read_line(&mut response)
+        .map_err(|error| (1, error.to_string()))?;
+    if matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        Err((
+            1,
+            "browser monitor startup cancelled; the controller was left unchanged".into(),
+        ))
+    }
+}
+
+fn schedule_web_monitor_startup(
+    binding: ServiceBinding,
+    port: Option<u16>,
+    no_open: bool,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("macluster-web-startup".into())
+        .spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut last_error = "controller IPC did not become ready".to_owned();
+            while Instant::now() < deadline {
+                match crate::control_client::ControlClient::connect(
+                    &binding,
+                    Duration::from_secs(2),
+                ) {
+                    Ok(mut client) => {
+                        if let Err(error) = client.set_timeouts(Duration::from_secs(10)) {
+                            eprintln!("macluster: browser monitor startup failed: {error}");
+                            return;
+                        }
+                        if let Err((_, error)) = start_web_monitor(&mut client, port, no_open) {
+                            eprintln!("macluster: browser monitor startup failed: {error}");
+                        }
+                        return;
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            eprintln!("macluster: browser monitor startup failed: {last_error}");
+        })
 }
 
 fn query_all_jobs(
@@ -4644,6 +4974,7 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
             .filter(|value| value.is_finite() && *value > 0.0 && *value < 150.0)
             .reduce(f64::max),
         fan_speed_rpm: None,
+        fan_readings: None,
         power_age_ms: if mixed_power {
             None
         } else {
@@ -7698,6 +8029,26 @@ fn print_help() {
 
 fn print_submit_help() {
     println!(
-        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. A nonempty active VIRTUAL_ENV or CONDA_PREFIX must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Before every operational command and before `init` with an existing valid config, macluster checks all configured Agent version/hash values and automatically updates every node when a known mismatch exists. If that update stops a running controller, restart it and retry the command. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
+        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. When a task uses the active VIRTUAL_ENV or CONDA_PREFIX, that environment must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside that environment do not require its interpreter to be shared. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Before every operational command and before `init` with an existing valid config, macluster checks all configured Agent version/hash values and automatically updates every node when a known mismatch exists. If that update stops a running controller, restart it and retry the command. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
     );
+}
+
+#[cfg(test)]
+mod update_terminal_regressions {
+    use super::*;
+    #[test]
+    fn noninteractive_cancellation_and_inspection_survive_pending_update() {
+        for command in ["kill", "job", "queue", "top"] {
+            assert_eq!(defer_update_without_terminal(command, &[], false), Ok(true));
+        }
+        assert_eq!(
+            defer_update_without_terminal("node", &["-l".into()], false),
+            Ok(true)
+        );
+        assert!(defer_update_without_terminal("submit", &[], false).is_err());
+        assert_eq!(
+            defer_update_without_terminal("submit", &[], true),
+            Ok(false)
+        );
+    }
 }

@@ -26,6 +26,7 @@ use macluster_protocol::{
 use crate::{AgentError, AgentRecord};
 
 const ATTACH_MAGIC: &[u8; 5] = b"MPTY2";
+const ATTACH_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
@@ -228,15 +229,60 @@ fn connect_attach(
             Err(error) => return Err(error.into()),
         }
     };
-    stream.write_all(ATTACH_MAGIC)?;
-    stream.write_all(&job_id.to_be_bytes())?;
-    stream.write_all(&initial_window.0.to_be_bytes())?;
-    stream.write_all(&initial_window.1.to_be_bytes())?;
-    stream.write_all(token.to_string().as_bytes())?;
-    let mut response = [0_u8; 1];
-    stream.read_exact(&mut response)?;
-    match response[0] {
-        0 => Ok(stream),
+    attach_handshake(
+        &mut stream,
+        job_id,
+        token,
+        initial_window,
+        Duration::from_secs(5),
+    )?;
+    Ok(stream)
+}
+
+fn attach_handshake(
+    stream: &mut UnixStream,
+    job_id: u64,
+    token: StartToken,
+    initial_window: (u16, u16),
+    timeout: Duration,
+) -> Result<(), AgentError> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let result = (|| -> io::Result<u8> {
+        stream.write_all(ATTACH_MAGIC)?;
+        stream.write_all(&job_id.to_be_bytes())?;
+        stream.write_all(&initial_window.0.to_be_bytes())?;
+        stream.write_all(&initial_window.1.to_be_bytes())?;
+        stream.write_all(token.to_string().as_bytes())?;
+        let mut response = [0_u8; 1];
+        stream.read_exact(&mut response)?;
+        Ok(response[0])
+    })();
+    // Streaming can remain idle for arbitrarily long commands.
+    // Darwin may reject setsockopt with EINVAL after the peer has closed.
+    // A received acknowledgement is still valid in that case (very short jobs).
+    for reset in [
+        stream.set_read_timeout(None),
+        stream.set_write_timeout(None),
+    ] {
+        if let Err(error) = reset
+            && error.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(error.into());
+        }
+    }
+    let response = result.map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ) {
+            AgentError::State("interactive PTY handshake timed out; runner did not respond".into())
+        } else {
+            error.into()
+        }
+    })?;
+    match response {
+        0 => Ok(()),
         1 => Err(AgentError::State(
             "interactive PTY attachment was rejected".into(),
         )),
@@ -319,7 +365,17 @@ pub(super) fn run_authorized(
     state_dir: &Path,
     job_id: u64,
     token: StartToken,
+    record: AgentRecord,
+) -> Result<(), AgentError> {
+    run_authorized_with_attach_timeout(state_dir, job_id, token, record, ATTACH_WAIT_TIMEOUT)
+}
+
+fn run_authorized_with_attach_timeout(
+    state_dir: &Path,
+    job_id: u64,
+    token: StartToken,
     mut record: AgentRecord,
+    attach_timeout: Duration,
 ) -> Result<(), AgentError> {
     let shared_root = PathBuf::from(&record.shared_root).canonicalize()?;
     if super::verbose_output_conflict(
@@ -388,7 +444,7 @@ pub(super) fn run_authorized(
     // Do not start user code before the authorized terminal has attached. This
     // prevents short commands from exiting before msub receives their output.
     let (mut attachment, initial_window) =
-        match wait_for_attachment(&listener, job_id, token, state_dir)? {
+        match wait_for_attachment(&listener, job_id, token, state_dir, attach_timeout)? {
             Some(attachment) => attachment,
             None => {
                 let _ = fs::remove_file(&socket_path);
@@ -578,7 +634,9 @@ fn wait_for_attachment(
     job_id: u64,
     token: StartToken,
     state_dir: &Path,
+    timeout: Duration,
 ) -> Result<Option<(UnixStream, (u16, u16))>, AgentError> {
+    let deadline = Instant::now() + timeout;
     loop {
         let record = crate::active_record(state_dir, job_id, token)?;
         if record.terminal() {
@@ -586,6 +644,13 @@ fn wait_for_attachment(
         }
         if let Some(cause) = record.termination_cause {
             crate::finalize_active(state_dir, job_id, token, cause, None, record.end_reason)?;
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            crate::finalize_active(
+                state_dir, job_id, token, JobState::Failed, None,
+                Some("interactive terminal did not attach before the allocation timeout; user command was not started".into()),
+            )?;
             return Ok(None);
         }
         match listener.accept() {
@@ -1158,6 +1223,66 @@ mod tests {
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn attach_handshake_times_out_when_runner_does_not_reply() {
+        let (mut client, _stalled_runner) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = attach_handshake(
+            &mut client,
+            1,
+            StartToken(Id128::random()),
+            (24, 80),
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("handshake timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn attach_handshake_clears_timeouts_before_streaming() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let runner = thread::spawn(move || {
+            let mut request = vec![0; ATTACH_MAGIC.len() + 8 + 2 + 2 + 36];
+            server.read_exact(&mut request).unwrap();
+            server.write_all(&[0]).unwrap();
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        attach_handshake(
+            &mut client,
+            1,
+            StartToken(Id128::random()),
+            (24, 80),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert_eq!(client.read_timeout().unwrap(), None);
+        assert_eq!(client.write_timeout().unwrap(), None);
+        done_tx.send(()).unwrap();
+        runner.join().unwrap();
+    }
+
+    #[test]
+    fn attach_handshake_accepts_acknowledgement_from_already_closed_runner() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(&[0]).unwrap();
+        // Keep the request writable, but close the peer before timeout reset.
+        let runner = thread::spawn(move || {
+            let mut request = vec![0; ATTACH_MAGIC.len() + 8 + 2 + 2 + 36];
+            server.read_exact(&mut request).unwrap();
+        });
+        attach_handshake(
+            &mut client,
+            1,
+            StartToken(Id128::random()),
+            (24, 80),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        runner.join().unwrap();
+    }
 
     fn ready_interactive_state(
         script: Option<&str>,
@@ -2120,6 +2245,34 @@ mod tests {
         assert!(!record.log_sync_pending);
         assert!(!state_dir.join("jobs/1/stdout.log").exists());
         assert!(!state_dir.join("jobs/1/stderr.log").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abandoned_interactive_allocation_expires_without_starting_user_code_or_pending_logs() {
+        let (root, state_dir, token) = ready_interactive_state(Some("echo never-started\n"), None);
+        let record = crate::active_record(&state_dir, 1, token).unwrap();
+        run_authorized_with_attach_timeout(
+            &state_dir,
+            1,
+            token,
+            record,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let record = crate::active_record(&state_dir, 1, token).unwrap();
+        assert_eq!(record.terminal_state, Some(JobState::Failed));
+        assert!(
+            record
+                .end_reason
+                .as_deref()
+                .unwrap()
+                .contains("did not attach")
+        );
+        assert!(record.child_pid.is_none());
+        assert!(!record.log_sync_pending);
+        assert!(!state_dir.join("jobs/1/pty.sock").exists());
+        assert!(!state_dir.join("jobs/1/stdout.log").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

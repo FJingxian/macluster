@@ -1147,7 +1147,7 @@ fn run_interactive_submission(
                     format!("interactive attach process exited with status {attach_status}"),
                 ));
             }
-            return wait_for_interactive_completion(storage, job.id);
+            return wait_for_interactive_completion(storage, job.id, config_path);
         }
 
         if let Some(reason) = job.waiting_reason.as_deref()
@@ -1196,16 +1196,68 @@ fn run_interactive_submission(
     }
 }
 
-fn wait_for_interactive_completion(storage: &Storage, job_id: u64) -> AppResult<()> {
+fn wait_for_interactive_completion(
+    storage: &Storage,
+    job_id: u64,
+    config_path: &Path,
+) -> AppResult<()> {
+    wait_for_interactive_completion_with(
+        job_id,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        || {
+            storage
+                .get_job(job_id)
+                .map_err(operation_error)?
+                .ok_or_else(|| (1, format!("job {job_id} disappeared")))
+        },
+        || {
+            // Reuse service lifecycle locking and binding checks; never resubmit
+            // or change the execution identity while recovering reconciliation.
+            let _controller = online_controller(config_path, storage.root(), false)?;
+            macluster_controller::wake::notify_controller(storage.root())
+                .map_err(|error| (1, error.to_string()))
+        },
+    )
+}
+
+fn wait_for_interactive_completion_with(
+    job_id: u64,
+    timeout: Duration,
+    recovery_interval: Duration,
+    mut read_job: impl FnMut() -> AppResult<JobRecord>,
+    mut recover: impl FnMut() -> AppResult<()>,
+) -> AppResult<()> {
+    let deadline = Instant::now() + timeout;
+    let mut next_recovery = Instant::now() + recovery_interval;
+    let mut recovery_error = None;
     loop {
-        let job = storage
-            .get_job(job_id)
-            .map_err(operation_error)?
-            .ok_or_else(|| (1, format!("job {job_id} disappeared")))?;
+        let job = read_job()?;
         if job.state.is_terminal() {
             return interactive_job_result(&job);
         }
-        thread::sleep(Duration::from_millis(100));
+        let now = Instant::now();
+        if now >= deadline {
+            let detail = recovery_error
+                .map(|error: String| format!(" Last recovery error: {error}."))
+                .unwrap_or_default();
+            return Err((
+                1,
+                format!(
+                    "interactive terminal closed, but job {job_id} completion is not yet confirmed.{detail} The job is preserved; inspect `macluster mjob {job_id}` or run `macluster controller run` to reconcile. Do not resubmit until its state is confirmed."
+                ),
+            ));
+        }
+        if now >= next_recovery {
+            recovery_error = recover().err().map(|(_, message)| message);
+            next_recovery = Instant::now() + recovery_interval;
+            continue;
+        }
+        thread::sleep(
+            Duration::from_millis(100)
+                .min(deadline.saturating_duration_since(now))
+                .min(next_recovery.saturating_duration_since(now)),
+        );
     }
 }
 
@@ -5604,6 +5656,43 @@ mod tests {
         identifiers::{Id128, NodeId, QueueName},
         types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, MetricSnapshot},
     };
+
+    #[test]
+    fn interactive_completion_recovers_and_reads_terminal_state() {
+        let job = std::cell::RefCell::new(sample_job(1, JobState::Running, "mini01", None, "wrap"));
+        let attempts = std::cell::Cell::new(0);
+        super::wait_for_interactive_completion_with(
+            1,
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+            || Ok(job.borrow().clone()),
+            || {
+                attempts.set(attempts.get() + 1);
+                job.borrow_mut().state = JobState::Completed;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn interactive_completion_is_bounded_and_preserves_job_on_recovery_failure() {
+        let job = sample_job(7, JobState::Running, "mini01", None, "wrap");
+        let started = Instant::now();
+        let error = super::wait_for_interactive_completion_with(
+            7,
+            Duration::from_millis(30),
+            Duration::from_millis(1),
+            || Ok(job.clone()),
+            || Err((1, "controller unavailable".into())),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.1.contains("mjob 7"));
+        assert!(error.1.contains("controller unavailable"));
+        assert_eq!(job.state, JobState::Running);
+    }
 
     #[test]
     fn operational_agent_update_preflight_keeps_init_recovery_independent() {

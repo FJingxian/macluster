@@ -7642,7 +7642,7 @@ struct NodeListRow {
     mappings: Vec<NodeNfsMapping>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NodeNfsMapping {
     name: String,
     state: &'static str,
@@ -7755,6 +7755,37 @@ fn pending_share_mapping(operation: &NodeOperation) -> Option<NodeNfsMapping> {
     ))
 }
 
+fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
+    let mut indexes: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    let mut mappings: Vec<NodeNfsMapping> = Vec::new();
+    for mapping in rows.iter().flat_map(|row| &row.mappings) {
+        let key = (
+            mapping.name.clone(),
+            mapping.source_node.clone(),
+            mapping.target.clone(),
+        );
+        if let Some(index) = indexes.get(&key).copied() {
+            let current = &mut mappings[index];
+            current.state = if current.state == "PENDING" || mapping.state == "PENDING" {
+                "PENDING"
+            } else if current.state == "UNKNOWN" || mapping.state == "UNKNOWN" {
+                "UNKNOWN"
+            } else {
+                "READY"
+            };
+            current.kind = match (current.kind, mapping.kind) {
+                (_, "MOUNT") | ("MOUNT", _) => "MOUNT",
+                (_, "ALIAS") | ("ALIAS", _) => "ALIAS",
+                _ => "LOCAL",
+            };
+        } else {
+            indexes.insert(key, mappings.len());
+            mappings.push(mapping.clone());
+        }
+    }
+    mappings
+}
+
 fn format_node_list(rows: &[NodeListRow]) -> String {
     let headers = ["ID", "HOST", "SSH USER", "PORT", "QUEUE", "STATE", "PHASE"];
     let widths = std::array::from_fn::<_, 7, _>(|index| {
@@ -7782,18 +7813,15 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
         })));
         output.push('\n');
     }
-    if rows.iter().any(|row| !row.mappings.is_empty()) {
+    let mappings = aggregate_nfs_mappings(rows);
+    if !mappings.is_empty() {
         output.push_str("\nNFS MAPPINGS\n");
-    }
-    for row in rows.iter().filter(|row| !row.mappings.is_empty()) {
-        output.push_str(&format!("  {}\n", row.columns[0]));
-        let name_width = row
-            .mappings
+        let name_width = mappings
             .iter()
             .map(|mapping| mapping.name.chars().count())
             .max()
             .unwrap_or(0);
-        for mapping in &row.mappings {
+        for mapping in mappings {
             output.push_str(&format!(
                 "    {:<name_width$}  {:<7}  {:<7}  {} → {}\n",
                 mapping.name, mapping.state, mapping.kind, mapping.source_node, mapping.target,
@@ -14024,7 +14052,7 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
-    fn node_list_places_nfs_details_after_all_node_rows() {
+    fn node_list_shows_common_nfs_mappings_once_after_all_node_rows() {
         let row = |id: &str, host: &str, state: &'static str, target: &str| -> NodeListRow {
             NodeListRow {
                 columns: [
@@ -14058,7 +14086,15 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(!output.contains("READY\n\narm-a"), "{output}");
         assert!(worker_row < mappings_heading, "{output}");
         assert!(mappings_heading < first_mapping, "{output}");
-        assert!(output.contains("login-01 → /Users/Shared/macluster"));
+        assert_eq!(
+            output
+                .matches("primary  READY    MOUNT    login-01 → /Users/Shared/macluster")
+                .count(),
+            1,
+            "{output}"
+        );
+        assert!(!output.contains("\n  login-01\n"), "{output}");
+        assert!(!output.contains("\n  arm-a\n"), "{output}");
         assert!(!output.contains("SOURCE"));
         assert!(!output.contains("TARGET"));
     }

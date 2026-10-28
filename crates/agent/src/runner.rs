@@ -1,6 +1,7 @@
 //! Detached supervisor for a single whole-node task.
 
 mod interactive;
+mod sdk;
 mod task_logs;
 
 pub fn serve_attach_stdio<R, W>(
@@ -424,8 +425,18 @@ fn configure_task_environment(
     job_id: u64,
     record: &AgentRecord,
 ) -> Result<(), AgentError> {
-    let cargo_target = cargo_target_directory(record)?;
+    // Registry downloads remain reusable across node-local SDK adaptation.
     let cargo_home = cargo_home_directory(record)?;
+    let overrides = sdk::environment_overrides(&record.spec.env).map_err(AgentError::State)?;
+    let adapted_record = if overrides.is_empty() {
+        None
+    } else {
+        let mut adapted = record.clone();
+        adapted.spec.env.extend(overrides);
+        Some(adapted)
+    };
+    let record = adapted_record.as_ref().unwrap_or(record);
+    let cargo_target = cargo_target_directory(record)?;
     let ccache = compiler_cache_directory(record, "CCACHE_DIR", "ccache")?;
     let sccache = compiler_cache_directory(record, "SCCACHE_DIR", "sccache")?;
     if cargo_target_is_managed(record) {

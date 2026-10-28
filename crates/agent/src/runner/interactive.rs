@@ -1798,6 +1798,59 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn task_environment_adapts_sdk_flags_and_reuses_registry_cache() {
+        let (root, state_dir, _) = ready_interactive_state(None, None);
+        let mut store = crate::read_store(&state_dir).unwrap();
+        let record = store.active.as_mut().unwrap();
+        let sdk = root.join("sdk");
+        fs::create_dir_all(&sdk).unwrap();
+        let missing = "/Applications/MaclusterMissingXcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX999.sdk";
+        record
+            .spec
+            .env
+            .insert("SDKROOT".into(), sdk.to_string_lossy().into_owned());
+        record.spec.env.insert(
+            "CMAKE_ARGS".into(),
+            format!("-DCMAKE_OSX_SYSROOT={missing}"),
+        );
+        record
+            .spec
+            .env
+            .insert("HOST_CXXFLAGS".into(), format!("--sysroot={missing}"));
+        record
+            .spec
+            .env
+            .insert("CXX".into(), "/shared/compiler/bin/clang++".into());
+        let original_home = super::super::cargo_home_directory(record).unwrap();
+        let mut command = Command::new("/bin/true");
+        super::super::configure_task_environment(&mut command, 1, record).unwrap();
+        let values: std::collections::BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            values["CMAKE_ARGS"],
+            format!("-DCMAKE_OSX_SYSROOT={}", sdk.display())
+        );
+        assert_eq!(
+            values["HOST_CXXFLAGS"],
+            format!("--sysroot={}", sdk.display())
+        );
+        assert_eq!(values["CXX"], "/shared/compiler/bin/clang++");
+        assert_eq!(values["CARGO_HOME"], original_home.to_string_lossy());
+        assert!(record.spec.env["CMAKE_ARGS"].contains(missing));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cargo_home_uses_a_private_node_cache_when_not_shared() {
         let (root, state_dir, _) = ready_interactive_state(None, None);
         let mut store = crate::read_store(&state_dir).unwrap();

@@ -1,0 +1,4 @@
+interface:
+  display_name: "macluster"
+  short_description: "Submit, monitor, and troubleshoot jobs on Mac clusters"
+  default_prompt: "Use $macluster to inspect my Mac cluster and run the requested job with the correct shared environment."

@@ -110,6 +110,13 @@ pub enum HelloResponse {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum ControlCommand {
+    SubscribeJobResources {
+        job_id: u64,
+    },
+    JobResourceSnapshot {
+        job_id: u64,
+    },
+    UnsubscribeJobResources,
     Status,
     BeginMaintenance {
         operation_id: Id128,
@@ -189,6 +196,8 @@ pub enum ControlCommand {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "payload", content = "value", rename_all = "snake_case")]
 pub enum ControlPayload {
+    JobResourcesSubscribed,
+    JobResourceSnapshot(crate::resources::JobResourceSnapshot),
     Status(ControllerHello),
     Maintenance(Option<MaintenanceStatus>),
     AgentCompatibility(Vec<AgentCompatibilityRecord>),

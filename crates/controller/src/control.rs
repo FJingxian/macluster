@@ -50,6 +50,7 @@ pub struct ControlApi {
     compatibility: Arc<CompatibilityCache>,
     compatibility_refresher: CompatibilityRefresher,
     monitor: MonitorHub,
+    task_resources: crate::task_resources::TaskResourceHub,
     last_monitor_job_counts_at: Option<Instant>,
     uploads: HashMap<(Id128, Id128), SnapshotUpload>,
 }
@@ -83,9 +84,11 @@ impl ControlApi {
             hello.namespace.clone(),
         );
         let monitor = MonitorHub::new(config.clone(), hello.namespace.clone());
+        let task_resources = resource_hub(config_path.clone(), &hello);
         Self {
             config,
             storage,
+            task_resources,
             hello,
             config_path,
             maintenance,
@@ -197,6 +200,7 @@ impl ControlApi {
         );
         self.monitor = MonitorHub::new(self.config.clone(), self.hello.namespace.clone());
         self.last_monitor_job_counts_at = None;
+        self.task_resources = resource_hub(self.config_path.clone(), &self.hello);
         Ok(())
     }
 
@@ -217,6 +221,36 @@ impl ControlApi {
         self.expire_uploads();
         self.monitor.expire(Instant::now());
         match request.command {
+            ControlCommand::SubscribeJobResources { job_id } => {
+                let job = self
+                    .storage
+                    .get_job(job_id)
+                    .map_err(|e| invalid_request(&e.to_string()))?
+                    .ok_or_else(|| invalid_request("job not found"))?;
+                self.task_resources
+                    .subscribe(client_session, &job, std::time::Instant::now())
+                    .map_err(|e| invalid_request(&e))?;
+                self.task_resources
+                    .tick(&self.storage, &self.config, std::time::Instant::now());
+                Ok(ControlPayload::JobResourcesSubscribed)
+            }
+            ControlCommand::JobResourceSnapshot { job_id } => {
+                let job = self
+                    .storage
+                    .get_job(job_id)
+                    .map_err(|e| invalid_request(&e.to_string()))?
+                    .ok_or_else(|| invalid_request("job not found"))?;
+                self.task_resources
+                    .tick(&self.storage, &self.config, std::time::Instant::now());
+                self.task_resources
+                    .snapshot(client_session, &job, std::time::Instant::now())
+                    .map(ControlPayload::JobResourceSnapshot)
+                    .map_err(|e| invalid_request(&e))
+            }
+            ControlCommand::UnsubscribeJobResources => {
+                self.task_resources.disconnect(client_session);
+                Ok(ControlPayload::MonitorAcknowledged)
+            }
             ControlCommand::Status => Ok(ControlPayload::Status(self.hello.clone())),
             ControlCommand::BeginMaintenance {
                 operation_id,
@@ -599,10 +633,12 @@ impl ControlApi {
         self.uploads
             .retain(|(session, _), _| *session != client_session);
         self.monitor.disconnect(client_session);
+        self.task_resources.disconnect(client_session);
     }
 
     pub fn expire_monitor_subscriptions(&mut self, now: Instant) {
         self.monitor.expire(now);
+        self.task_resources.tick(&self.storage, &self.config, now);
     }
 
     fn require_ready(&self) -> Result<(), ControlError> {
@@ -951,6 +987,62 @@ mod tests {
     }
 
     #[test]
+    fn task_resource_queries_require_a_live_subscription_on_the_same_session() {
+        let fixture = Fixture::new();
+        let mut api = fixture.api();
+        let job = api
+            .storage
+            .submit_once(
+                RequestId(Id128::random()),
+                fixture.job_spec(&fixture.config(), None),
+            )
+            .unwrap();
+        let a = Id128::random();
+        let b = Id128::random();
+        assert!(
+            api.handle(
+                a,
+                request(ControlCommand::SubscribeJobResources { job_id: 99999 })
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            api.handle(
+                a,
+                request(ControlCommand::SubscribeJobResources { job_id: job.id })
+            )
+            .unwrap(),
+            ControlPayload::JobResourcesSubscribed
+        ));
+        assert!(
+            api.handle(
+                b,
+                request(ControlCommand::JobResourceSnapshot { job_id: job.id })
+            )
+            .is_err()
+        );
+        let ControlPayload::JobResourceSnapshot(snapshot) = api
+            .handle(
+                a,
+                request(ControlCommand::JobResourceSnapshot { job_id: job.id }),
+            )
+            .unwrap()
+        else {
+            panic!("snapshot required")
+        };
+        assert_eq!(snapshot.state, macluster_protocol::types::JobState::Pending);
+        assert!(snapshot.sample.is_none());
+        api.disconnect(a);
+        assert!(
+            api.handle(
+                a,
+                request(ControlCommand::JobResourceSnapshot { job_id: job.id })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn api_rejects_a_stale_generation_after_request_has_been_queued() {
         let fixture = Fixture::new();
         let mut api = fixture.api();
@@ -1253,4 +1345,36 @@ mod tests {
         assert_eq!(counts["worker-b"], 1);
         assert_eq!(counts["login"], 0);
     }
+}
+
+fn resource_hub(
+    config_path: Option<PathBuf>,
+    hello: &ControllerHello,
+) -> crate::task_resources::TaskResourceHub {
+    let transport = crate::transport::ClusterTransport::new_with_namespace(
+        config_path.unwrap_or_default(),
+        hello.namespace.clone(),
+    );
+    let epoch = hello.controller_epoch;
+    let hub = crate::task_resources::TaskResourceHub::new(Arc::new(move |job, node| {
+        use crate::transport::NodeTransport;
+        let token = job.start_token.ok_or("job has no execution token")?;
+        let id = job.node.as_ref().ok_or("job has no assigned node")?;
+        match transport
+            .call(
+                id,
+                node,
+                macluster_protocol::types::Operation::TaskResources {
+                    controller: epoch,
+                    start_token: token,
+                    job_id: job.id,
+                },
+            )
+            .map_err(|e| e.to_string())?
+        {
+            macluster_protocol::types::ResponseBody::TaskResources(sample) => Ok(sample),
+            _ => Err("Agent does not support task resource sampling".into()),
+        }
+    }));
+    hub
 }

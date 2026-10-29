@@ -977,3 +977,5 @@ mod status_reconciliation_tests {
         let _ = fs::remove_dir_all(root);
     }
 }
+
+mod task_resources;

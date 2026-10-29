@@ -26,6 +26,10 @@ use crate::control_client::ControlClientError;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+// Read controller caches more promptly while the first process sample is
+// arriving. This does not request additional sampling on the node.
+const DETAILS_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(100);
+const DETAILS_WARMUP: Duration = Duration::from_secs(3);
 const RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
@@ -36,6 +40,7 @@ pub struct MonitorFeed {
     shutdown: Arc<Mutex<Option<UnixStream>>>,
     generation: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
+    worker: thread::Thread,
 }
 
 pub struct MonitorUpdate {
@@ -84,7 +89,7 @@ impl MonitorFeed {
         let worker_shutdown = Arc::clone(&shutdown);
         let config_path = config_path.to_path_buf();
         let state_dir = state_dir.to_path_buf();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("mtop-controller-monitor".into())
             .spawn(move || {
                 monitor_loop(
@@ -100,12 +105,14 @@ impl MonitorFeed {
                 )
             })
             .ok()?;
+        let worker = worker.thread().clone();
         Some(Self {
             updates,
             selection,
             shutdown,
             generation,
             running,
+            worker,
         })
     }
 
@@ -121,6 +128,7 @@ impl MonitorFeed {
         if let Ok(mut selection) = self.selection.lock() {
             *selection = Some(node_id);
         }
+        self.worker.unpark();
     }
 }
 
@@ -134,6 +142,7 @@ fn monitor_build_matches(
 impl Drop for MonitorFeed {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        self.worker.unpark();
         if let Ok(mut active) = self.shutdown.lock()
             && let Some(stream) = active.take()
         {
@@ -172,6 +181,7 @@ fn monitor_loop(
     }
     let mut next_snapshot = Instant::now();
     let mut next_renewal = Instant::now() + RENEW_INTERVAL;
+    let mut details_loading_until = None;
 
     while running.load(Ordering::Acquire) {
         let requested_watch = selections
@@ -183,7 +193,12 @@ fn monitor_loop(
         {
             let node_id = requested_watch.filter(|node| nodes.contains(node));
             match watch_processes(&mut client, node_id.clone()) {
-                Ok(()) => last_process_watch = Some(node_id),
+                Ok(()) => {
+                    details_loading_until =
+                        node_id.as_ref().map(|_| Instant::now() + DETAILS_WARMUP);
+                    last_process_watch = Some(node_id);
+                    next_snapshot = Instant::now();
+                }
                 Err(MonitorError::Client) => {
                     let Some((reconnected, refreshed_nodes, restored_watch)) = reconnect_monitor(
                         &config_path,
@@ -233,6 +248,14 @@ fn monitor_loop(
         if now >= next_snapshot {
             match collect_snapshot(&mut client) {
                 Ok(snapshot) => {
+                    if let Some(Some(selected)) = &last_process_watch {
+                        if snapshot.nodes.iter().any(|row| {
+                            &row.node_id == selected
+                                && (row.processes.is_some() || row.process_error.is_some())
+                        }) {
+                            details_loading_until = None;
+                        }
+                    }
                     let update = MonitorUpdate {
                         generation: snapshot.generation,
                         sequence: snapshot.sequence,
@@ -262,12 +285,19 @@ fn monitor_loop(
                 }
                 Err(MonitorError::InvalidResponse) => {}
             }
-            next_snapshot = Instant::now() + SNAPSHOT_INTERVAL;
+            let now = Instant::now();
+            let interval = if details_loading_until.is_some_and(|deadline| now < deadline) {
+                DETAILS_SNAPSHOT_INTERVAL
+            } else {
+                details_loading_until = None;
+                SNAPSHOT_INTERVAL
+            };
+            next_snapshot = now + interval;
         }
         let remaining = next_snapshot
             .min(next_renewal)
             .saturating_duration_since(Instant::now());
-        thread::sleep(remaining);
+        thread::park_timeout(remaining);
     }
 }
 
@@ -541,6 +571,7 @@ mod tests {
         let state_dir = fixture.state_dir();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let (generation_sender, generation_receiver) = mpsc::sync_channel(1);
+        let (watch_sender, watch_receiver) = mpsc::channel();
         let server_stop = Arc::new(AtomicBool::new(false));
         let stop_server = Arc::clone(&server_stop);
         let server = thread::spawn(move || {
@@ -561,6 +592,7 @@ mod tests {
                                 Ok(ControlPayload::MonitorSubscribed)
                             }
                             ControlCommand::WatchProcesses { .. } => {
+                                let _ = watch_sender.send(());
                                 Ok(ControlPayload::MonitorAcknowledged)
                             }
                             ControlCommand::MonitorSnapshot { page } if page == 0 => {
@@ -588,9 +620,21 @@ mod tests {
         });
         ready_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
 
-        let feed = MonitorFeed::connect(&fixture.config_path(), &fixture.state_dir(), Vec::new())
-            .expect("monitor service should be available");
+        let feed = MonitorFeed::connect(
+            &fixture.config_path(),
+            &fixture.state_dir(),
+            vec!["login".parse().unwrap()],
+        )
+        .expect("monitor service should be available");
         wait_for_update(&feed, 1, Duration::from_secs(2));
+        feed.watch(Some("login".parse().unwrap()));
+        watch_receiver
+            .recv_timeout(Duration::from_millis(400))
+            .expect("details selection must wake the sleeping monitor worker");
+        wait_for_update(&feed, 1, Duration::from_millis(400));
+        // No process rows arrive from this fake server: loading should poll
+        // cached snapshots promptly rather than wait another whole second.
+        wait_for_update(&feed, 1, Duration::from_millis(400));
         generation_sender.send(2).unwrap();
 
         let update = wait_for_update(&feed, 2, Duration::from_secs(5));

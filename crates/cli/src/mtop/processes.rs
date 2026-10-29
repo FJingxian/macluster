@@ -14,6 +14,7 @@ use std::{
 use macluster_core::config::{NodeConfig, Transport};
 
 const PROCESS_TABLE_MARKER: &str = "__MACLUSTER_PS_NAMES__";
+const PREVIEW_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm= | /usr/bin/sort -k2,2nr | /usr/bin/head -n 32";
 const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
@@ -112,12 +113,26 @@ pub(super) enum ProcessView {
 pub(super) struct ProcessCache {
     last_success: Option<(Vec<ProcessInfo>, Instant)>,
     last_error: Option<String>,
+    preview: bool,
 }
 
 impl ProcessCache {
+    pub fn needs_preview(&self) -> bool {
+        self.last_success.is_none()
+    }
+
+    pub fn apply_preview(&mut self, rows: Vec<ProcessInfo>, at: Instant) {
+        // A slower SSH preview must never overwrite an interval sample.
+        if self.needs_preview() {
+            self.last_success = Some((rows, at));
+            self.preview = true;
+        }
+    }
+
     pub fn apply_success(&mut self, rows: Vec<ProcessInfo>, at: Instant) {
         self.last_success = Some((rows, at));
         self.last_error = None;
+        self.preview = false;
     }
 
     pub fn apply_error(&mut self, reason: String) {
@@ -131,7 +146,16 @@ impl ProcessCache {
                 rows: rows.clone(),
                 age,
                 stale: age >= PROCESS_STALE_AFTER,
-                warning: self.last_error.clone(),
+                warning: if self.preview {
+                    let mut warning =
+                        "Preview: ps average CPU%, RSS memory; interval sample pending".to_owned();
+                    if let Some(error) = &self.last_error {
+                        warning.push_str(&format!("; {error}"));
+                    }
+                    Some(warning)
+                } else {
+                    self.last_error.clone()
+                },
             };
         }
         match &self.last_error {
@@ -178,6 +202,7 @@ pub(super) struct ProcessSampler {
     result_receiver: Receiver<ProcessResult>,
     in_flight: Option<String>,
     stop: Arc<AtomicBool>,
+    preview_only: bool,
 }
 
 impl ProcessSampler {
@@ -188,7 +213,14 @@ impl ProcessSampler {
             result_receiver,
             in_flight: None,
             stop: Arc::new(AtomicBool::new(false)),
+            preview_only: false,
         }
+    }
+
+    pub fn preview() -> Self {
+        let mut sampler = Self::new();
+        sampler.preview_only = true;
+        sampler
     }
 
     pub fn request(&mut self, id: impl Into<String>, target: ProcessTarget) -> bool {
@@ -198,9 +230,14 @@ impl ProcessSampler {
         let id = id.into();
         let sender = self.result_sender.clone();
         let stop = Arc::clone(&self.stop);
+        let preview = self.preview_only;
         self.in_flight = Some(id.clone());
         thread::spawn(move || {
-            let result = sample_target(&target, &stop);
+            let result = if preview {
+                sample_preview_target(&target, &stop)
+            } else {
+                sample_target(&target, &stop)
+            };
             let _ = sender.send(ProcessResult {
                 id,
                 received_at: Instant::now(),
@@ -238,23 +275,38 @@ impl Drop for ProcessSampler {
 }
 
 fn sample_target(target: &ProcessTarget, stop: &AtomicBool) -> Result<Vec<ProcessInfo>, String> {
+    parse_top_processes(&sample_output(target, stop, PROCESS_COMMAND)?)
+}
+
+fn sample_preview_target(
+    target: &ProcessTarget,
+    stop: &AtomicBool,
+) -> Result<Vec<ProcessInfo>, String> {
+    parse_preview_processes(&sample_output(target, stop, PREVIEW_COMMAND)?)
+}
+
+fn sample_output(
+    target: &ProcessTarget,
+    stop: &AtomicBool,
+    command: &str,
+) -> Result<String, String> {
     if stop.load(Ordering::SeqCst) {
         return Err("process sample cancelled".into());
     }
     let output = match target {
-        ProcessTarget::Local => run_local(stop)?,
+        ProcessTarget::Local => run_local(stop, command)?,
         ProcessTarget::Ssh {
             node_id,
             namespace,
             node,
-        } => run_remote(node_id, namespace, node, stop)?,
+        } => run_remote(node_id, namespace, node, stop, command)?,
     };
-    parse_top_processes(&output)
+    Ok(output)
 }
 
-fn run_local(stop: &AtomicBool) -> Result<String, String> {
+fn run_local(stop: &AtomicBool, command: &str) -> Result<String, String> {
     let mut child = process::Command::new("/bin/sh")
-        .args(["-c", PROCESS_COMMAND])
+        .args(["-c", command])
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
@@ -268,6 +320,7 @@ fn run_remote(
     namespace: &str,
     node: &NodeConfig,
     stop: &AtomicBool,
+    script: &str,
 ) -> Result<String, String> {
     let mut command = process::Command::new("/usr/bin/ssh");
     command.args([
@@ -282,7 +335,7 @@ fn run_remote(
     super::ssh::add_control_args(namespace, node_id, node, &mut command);
     let mut child = command
         .arg(&node.host)
-        .arg(PROCESS_COMMAND)
+        .arg(script)
         .stdin(process::Stdio::null())
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
@@ -402,6 +455,39 @@ fn wait_child(
     }
 }
 
+fn parse_preview_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
+    let mut rows = Vec::new();
+    for line in input.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5 {
+            continue;
+        }
+        let (Ok(pid), Ok(cpu_percent), Ok(rss)) = (
+            fields[0].parse::<u32>(),
+            fields[1].parse::<f64>(),
+            fields[2].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if valid_cpu(cpu_percent).is_none() {
+            continue;
+        }
+        rows.push(ProcessInfo {
+            pid,
+            cpu_percent,
+            memory: format!("{rss}K"),
+            cpu_time: fields[3].into(),
+            command: fields[4..].join(" "),
+        });
+    }
+    if rows.is_empty() {
+        return Err("process preview returned no valid rows".into());
+    }
+    sort_processes(&mut rows, ProcessSort::Cpu);
+    rows.truncate(32);
+    Ok(rows)
+}
+
 fn parse_top_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
     let (top_output, process_output) = input
         .split_once(PROCESS_TABLE_MARKER)
@@ -474,6 +560,61 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "top first sample\nPID    %CPU MEM   TIME     COMMAND\n11 90.0 2M 00:00.01 first_low\n12 2.0 4M 00:00.02 first_busy\nProcesses: 8 total\nPID    %CPU MEM   TIME     COMMAND\n11 1.5 2M 00:00.03 top_low_worker\n12 82.0 4M 00:00.04 top_busy_worker (Renderer)\n13 35.0 1M 00:00.02 top_middle_worker\n__MACLUSTER_PS_NAMES__\n   11 low_worker\n   12 busy_worker\n   13 middle_worker\n";
+
+    #[test]
+    fn preview_parses_rss_units_and_does_not_replace_interval_samples() {
+        let rows = super::parse_preview_processes(
+            "12 83.2 4096 1:23.45 Worker Helper\n13 NaN 4 0:01 invalid\n",
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].memory, "4096K");
+        assert_eq!(rows[0].command, "Worker Helper");
+        let mut cache = ProcessCache::default();
+        let now = Instant::now();
+        cache.apply_preview(rows.clone(), now);
+        assert!(matches!(
+            cache.view_at(now),
+            ProcessView::Available {
+                warning: Some(_),
+                ..
+            }
+        ));
+        cache.apply_error("interval probe failed".into());
+        assert!(
+            matches!(cache.view_at(now), ProcessView::Available {warning: Some(warning), ..} if warning.contains("ps average CPU%") && warning.contains("interval probe failed"))
+        );
+        cache.apply_success(Vec::new(), now);
+        cache.apply_preview(rows, now);
+        assert!(
+            matches!(cache.view_at(now), ProcessView::Available {rows, warning: None, ..} if rows.is_empty())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn local_process_preview_returns_without_top_window() {
+        let started = Instant::now();
+        let rows = super::sample_preview_target(
+            &super::ProcessTarget::Local,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        eprintln!(
+            "local process preview: {:?}, {} rows",
+            started.elapsed(),
+            rows.len()
+        );
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.memory.ends_with('K') && row.cpu_percent.is_finite())
+        );
+        assert!(
+            rows.windows(2)
+                .all(|pair| pair[0].cpu_percent >= pair[1].cpu_percent)
+        );
+    }
 
     #[test]
     fn process_name_lookup_is_limited_to_top_rows() {

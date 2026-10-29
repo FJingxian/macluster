@@ -264,6 +264,8 @@ pub fn run_interactive(
     let mut sampler =
         (!controller_monitor_active).then(|| MetricSampler::new(4.min(targets.len().max(1))));
     let mut process_sampler = (!controller_monitor_active).then(ProcessSampler::new);
+    let mut process_preview = ProcessSampler::preview();
+    let mut preview_attempted = std::collections::BTreeSet::new();
     let mut process_caches: BTreeMap<String, ProcessCache> = BTreeMap::new();
     let mut process_selection: Option<String> = None;
     let mut monitor_selection: Option<NodeId> = None;
@@ -467,6 +469,31 @@ pub fn run_interactive(
                 }
                 state.updated_at = Some(completed.received_at);
                 dirty = true;
+            }
+
+            if state.expanded {
+                if let Some(id) = state.selected_id.as_deref() {
+                    if !preview_attempted.contains(id)
+                        && process_caches
+                            .get(id)
+                            .is_none_or(ProcessCache::needs_preview)
+                    {
+                        if let Some(target) = process_targets_by_id.get(id) {
+                            if process_preview.request(id.to_owned(), target.clone()) {
+                                preview_attempted.insert(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            for completed in process_preview.poll() {
+                if let Ok(rows) = completed.result {
+                    process_caches
+                        .entry(completed.id)
+                        .or_default()
+                        .apply_preview(rows, completed.received_at);
+                    dirty = true;
+                }
             }
 
             for completed in process_sampler

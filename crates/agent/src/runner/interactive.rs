@@ -377,7 +377,25 @@ fn run_authorized_with_attach_timeout(
     mut record: AgentRecord,
     attach_timeout: Duration,
 ) -> Result<(), AgentError> {
-    let shared_root = PathBuf::from(&record.shared_root).canonicalize()?;
+    let verbose_logs = record
+        .spec
+        .env
+        .get(macluster_protocol::types::VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1");
+    // Normal output names are unique to this namespaced job. Defer their NFS
+    // path creation and collision checks until publication after the task;
+    // otherwise several synchronous NFS metadata requests delay every attach.
+    // Custom paths and verbose output retain the full pre-launch validation.
+    let defer_managed_output_paths = !verbose_logs
+        && super::uses_managed_default_outputs(&record, Path::new(&record.shared_root), job_id);
+    // The configured root is already normalized in the cluster config. For
+    // these unique, managed destinations, canonicalizing it here would issue
+    // an unnecessary NFS metadata request before the terminal can attach.
+    let shared_root = if defer_managed_output_paths {
+        PathBuf::from(&record.shared_root)
+    } else {
+        PathBuf::from(&record.shared_root).canonicalize()?
+    };
     if super::verbose_output_conflict(
         &record,
         &shared_root,
@@ -388,34 +406,35 @@ fn run_authorized_with_attach_timeout(
     )? {
         return super::fail_record(state_dir, record, super::RESERVED_VERBOSE_OUTPUT_ERROR);
     }
-    let output_roots = super::permitted_output_roots(&record, &shared_root)?;
+    let output_roots = if defer_managed_output_paths {
+        vec![shared_root.clone()]
+    } else {
+        super::permitted_output_roots(&record, &shared_root)?
+    };
     let local_dir = state_dir.join("jobs").join(job_id.to_string());
     fs::create_dir_all(&local_dir)?;
     fs::set_permissions(&local_dir, fs::Permissions::from_mode(0o700))?;
     let socket_path = local_dir.join("pty.sock");
     let stdout_local = local_dir.join("stdout.log");
     let stderr_local = local_dir.join("stderr.log");
-    let stdout_path = super::resolve_output(&record.spec.stdout_path, job_id, &output_roots)?;
-    let stderr_path = super::resolve_output(&record.spec.stderr_path, job_id, &output_roots)?;
-    if super::verbose_output_conflict(&record, &shared_root, &[&stdout_path, &stderr_path])? {
-        return super::fail_record(state_dir, record, super::RESERVED_VERBOSE_OUTPUT_ERROR);
-    }
-    if stdout_path == stderr_path {
-        return super::fail_record(
-            state_dir,
-            record,
-            "stdout and stderr resolve to the same path",
-        );
-    }
-    if stdout_path.exists() || stderr_path.exists() {
-        return super::fail_record(state_dir, record, "output path already exists");
+    if !defer_managed_output_paths {
+        let stdout_path = super::resolve_output(&record.spec.stdout_path, job_id, &output_roots)?;
+        let stderr_path = super::resolve_output(&record.spec.stderr_path, job_id, &output_roots)?;
+        if super::verbose_output_conflict(&record, &shared_root, &[&stdout_path, &stderr_path])? {
+            return super::fail_record(state_dir, record, super::RESERVED_VERBOSE_OUTPUT_ERROR);
+        }
+        if stdout_path == stderr_path {
+            return super::fail_record(
+                state_dir,
+                record,
+                "stdout and stderr resolve to the same path",
+            );
+        }
+        if stdout_path.exists() || stderr_path.exists() {
+            return super::fail_record(state_dir, record, "output path already exists");
+        }
     }
 
-    let verbose_logs = record
-        .spec
-        .env
-        .get(macluster_protocol::types::VERBOSE_TASK_LOG_ENV)
-        .is_some_and(|value| value == "1");
     let mut stdout_log = if verbose_logs {
         None
     } else {

@@ -1058,6 +1058,20 @@ fn permitted_output_roots(
     Ok(roots)
 }
 
+fn uses_managed_default_outputs(record: &AgentRecord, shared_root: &Path, job_id: u64) -> bool {
+    // Namespace and monotonically allocated job ID make these destinations
+    // unique. The publisher still validates the canonical parent and creates
+    // each file with O_EXCL after execution, so deferring NFS setup cannot
+    // overwrite an existing output or follow a path outside the shared root.
+    if record.spec.storage_namespace.is_none() {
+        return false;
+    }
+    let job_dir = record.spec.shared_job_dir(shared_root, job_id);
+    let expand = |path: &str| PathBuf::from(path.replace("%j", &job_id.to_string()));
+    expand(&record.spec.stdout_path) == job_dir.join("stdout.log")
+        && expand(&record.spec.stderr_path) == job_dir.join("stderr.log")
+}
+
 fn project_output_directory(path: &Path) -> Result<PathBuf, AgentError> {
     let mut ancestor = path;
     let mut suffix = Vec::new();

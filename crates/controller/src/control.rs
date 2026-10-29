@@ -609,6 +609,9 @@ impl ControlApi {
                 .request_cancel(job_id, force)
                 .map(ControlPayload::Job)
                 .map_err(storage_error),
+            ControlCommand::ReconcileNode { .. } => Err(invalid_request(
+                "node reconciliation requests must be handled by the controller runtime",
+            )),
             ControlCommand::FanControl { .. } => Err(invalid_request(
                 "fan control must be coordinated by the controller runtime",
             )),

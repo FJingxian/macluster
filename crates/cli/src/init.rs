@@ -37,6 +37,8 @@ const REMOTE_INIT_JOURNAL_VERSION: u32 = 1;
 pub(crate) struct InitOptions {
     help: bool,
     #[serde(skip)]
+    help_long: bool,
+    #[serde(skip)]
     force: bool,
     name: Option<String>,
     queue: Option<String>,
@@ -103,7 +105,7 @@ struct RemoteInitJournal {
 pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResult<()> {
     let mut options = parse_options(args)?;
     if options.help {
-        print_help();
+        print_help(options.help_long);
         return Ok(());
     }
     let config_path = config_path.canonicalize().unwrap_or(config_path);
@@ -910,7 +912,11 @@ fn parse_options(args: &[String]) -> AppResult<InitOptions> {
                 (key, Some(value))
             });
         match key {
-            "-h" | "--help" => options.help = true,
+            "-h" => options.help = true,
+            "--help" => {
+                options.help = true;
+                options.help_long = true;
+            }
             "--force" if inline.is_none() => options.force = true,
             "--name" | "--queue" | "--shared-root" | "--primary-nfs" | "--host" => {
                 let value = if let Some(value) = inline {
@@ -1815,10 +1821,16 @@ fn prompt_value(label: &str, supplied: Option<&str>, default: &str) -> AppResult
     }
 }
 
-fn print_help() {
-    println!(
-        "Usage: macluster init [--force] [--name NAME] [--queue QUEUE] [--shared-root PATH] [--host IPv4] [--primary-nfs USER@IPv4[:PORT]:SOURCE_PATH]\n\nFirst run creates a cluster with the login Mac as storage and control node; the default compute queue starts empty. Init offers detected Mamba/Conda, virtualenv, and Homebrew roots as named NFS software shares, then lets you add any number of custom software or compiler toolchain roots. Each share is mounted at its original absolute path on every node. Add compute Macs with `mnode -a USER@IPv4[:PORT]`. --primary-nfs selects a remote macOS NFS source; that storage node also stays outside compute queues. With an existing cluster, init asks whether to reset it (Y/N, default N), removes verified managed NFS resources, archives old state, then continues directly to new cluster setup. Shared data files are preserved. --force abandons pending snapshot/log synchronization for terminal jobs during reset; unsynchronized output may be unavailable. Active jobs still block reset. --force requires an existing cluster or an interrupted reset. If cleanup has started, rerun `macluster init` to resume it and continue setup."
-    );
+fn print_help(full: bool) {
+    println!("{}", init_help(full));
+}
+
+fn init_help(full: bool) -> &'static str {
+    if !full {
+        return "Usage: macluster init [--name NAME] [--queue QUEUE] [--shared-root PATH] [--host IPv4] [--primary-nfs USER@IPv4[:PORT]:SOURCE_PATH]\n\nFirst run sets this Mac as login/storage and creates an empty compute queue. Add compute Macs with `mnode -a USER@IPv4[:PORT]`. An existing config starts the reset confirmation flow. Use --help for share setup and reset details.";
+    }
+
+    "Usage: macluster init [--force] [--name NAME] [--queue QUEUE] [--shared-root PATH] [--host IPv4] [--primary-nfs USER@IPv4[:PORT]:SOURCE_PATH]\n\nFirst setup\n  The login Mac is the control and default storage node; the compute queue starts empty. Init offers detected Mamba/Conda, virtualenv, and Homebrew roots as named NFS software shares, then lets you add custom software or compiler toolchain roots. Each share mounts at its original absolute path on every node. Add compute Macs with `mnode -a USER@IPv4[:PORT]`.\n\nStorage\n  --primary-nfs selects a remote macOS NFS source. That storage node stays outside compute queues.\n\nReset\n  With an existing cluster, init asks whether to reset (Y/N, default N), removes verified managed NFS resources, archives old state, then continues with new cluster setup. Shared data files are preserved. --force abandons pending snapshot/log synchronization for terminal jobs, so unsynchronized output may be unavailable. Active jobs still block reset. --force requires an existing cluster or interrupted reset. Rerun `macluster init` to resume cleanup after it has started."
 }
 
 fn validate_name(name: &str) -> AppResult<()> {

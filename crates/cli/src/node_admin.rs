@@ -1855,7 +1855,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         ));
     }
     if args.is_empty() || args.iter().any(|value| value == "-h" || value == "--help") {
-        print_help();
+        print_help(args.iter().any(|value| value == "--help"));
         return Ok(());
     }
     let action = parse_action(args)?;
@@ -2864,7 +2864,7 @@ fn finish_update_sync(
 
 fn parse_action(args: &[String]) -> AppResult<Action> {
     if args.is_empty() || args.iter().any(|value| value == "-h" || value == "--help") {
-        print_help();
+        print_help(args.iter().any(|value| value == "--help"));
         return Err((0, String::new()));
     }
     let (key, inline) = args[0]
@@ -3033,10 +3033,16 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
     }
 }
 
-fn print_help() {
-    println!(
-        "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nSSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues. local adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share. `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources. Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
-    );
+fn print_help(full: bool) {
+    println!("{}", node_help(full));
+}
+
+fn node_help(full: bool) -> &'static str {
+    if !full {
+        return "Usage: mnode -a USER@IPv4[:PORT] [OPTIONS]\n       mnode -a local[:SOURCE_PATH] [OPTIONS]\n       mnode -l | --list\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]]\n       mnode -rm share:SHARE_ID\n\nOptions: --queue QUEUE, --host IPv4, --share-id ID, --mount-root PATH\nSSH nodes join the default compute queue. `local` enrolls this Mac as the login node. Use --help for SSH setup, shares, removal, and controller maintenance.";
+    }
+
+    "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH]\n       mnode -l | --list\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nAdd nodes\n  SSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues.\n\nShares\n  `local` adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share.\n\nRemove nodes and shares\n  `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources.\n\nController maintenance\n  Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
 }
 
 fn read_config(path: &Path) -> AppResult<ClusterConfig> {

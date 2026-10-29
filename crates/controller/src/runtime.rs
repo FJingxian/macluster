@@ -197,6 +197,7 @@ struct NodeRuntime {
     status: Option<NodeStatusCache>,
     health: Option<NodeHealthCache>,
     next_probe_at: Instant,
+    probe_after_inflight_for_job: Option<u64>,
     probe_failures: u8,
     last_probe_error: Option<String>,
     next_control_at: Instant,
@@ -213,6 +214,7 @@ impl NodeRuntime {
             status: None,
             health: None,
             next_probe_at: now,
+            probe_after_inflight_for_job: None,
             probe_failures: 0,
             last_probe_error: None,
             next_control_at: now,
@@ -584,32 +586,35 @@ impl RuntimeState {
                 let Some(node_id) = tag.node_id.as_deref() else {
                     return Ok(());
                 };
-                let Some(runtime) = self.nodes.get_mut(node_id) else {
-                    return Ok(());
+                let probe_after_inflight_for_job = {
+                    let Some(runtime) = self.nodes.get_mut(node_id) else {
+                        return Ok(());
+                    };
+                    if runtime
+                        .in_flight
+                        .is_none_or(|in_flight| in_flight.id != tag.operation_id)
+                    {
+                        return Ok(());
+                    }
+                    runtime.in_flight = None;
+                    if !identity_current {
+                        runtime.status = None;
+                        runtime.next_probe_at = now;
+                        return Ok(());
+                    }
+                    if !node_result_is_current(
+                        &tag,
+                        service.epoch,
+                        &tag.config_digest,
+                        runtime.generation,
+                        now,
+                    ) {
+                        runtime.status = None;
+                        runtime.next_probe_at = now;
+                        return Ok(());
+                    }
+                    runtime.probe_after_inflight_for_job.take()
                 };
-                if runtime
-                    .in_flight
-                    .is_none_or(|in_flight| in_flight.id != tag.operation_id)
-                {
-                    return Ok(());
-                }
-                runtime.in_flight = None;
-                if !identity_current {
-                    runtime.status = None;
-                    runtime.next_probe_at = now;
-                    return Ok(());
-                }
-                if !node_result_is_current(
-                    &tag,
-                    service.epoch,
-                    &tag.config_digest,
-                    runtime.generation,
-                    now,
-                ) {
-                    runtime.status = None;
-                    runtime.next_probe_at = now;
-                    return Ok(());
-                }
                 match tag.kind {
                     WorkKind::Probe | WorkKind::Health => {
                         if let WorkerResult::Probe(probe) = completion.result {
@@ -633,6 +638,9 @@ impl RuntimeState {
                         }
                     }
                     WorkKind::Start | WorkKind::Cancel => {
+                        let Some(runtime) = self.nodes.get_mut(node_id) else {
+                            return Ok(());
+                        };
                         runtime.next_probe_at = now;
                         runtime.status = None;
                         match completion.result {
@@ -663,6 +671,19 @@ impl RuntimeState {
                         runtime.next_control_at = now + retry_delay(runtime.control_failures);
                     }
                     _ => {}
+                }
+                if let Some(job_id) = probe_after_inflight_for_job
+                    && service
+                        .storage
+                        .get_job(job_id)?
+                        .is_some_and(|job| !job.state.is_terminal())
+                {
+                    // A status request already in flight when an interactive
+                    // task exits may have sampled the node before it became
+                    // idle. Preserve the completion request across that probe.
+                    if let Some(runtime) = self.nodes.get_mut(node_id) {
+                        runtime.next_probe_at = Instant::now();
+                    }
                 }
             }
         }
@@ -986,6 +1007,17 @@ impl RuntimeState {
         }
         self.node_cursor = (cursor + 1) % ids.len();
         Ok(())
+    }
+
+    fn request_node_probe(&mut self, node_id: &NodeId, job_id: u64) -> bool {
+        let Some(runtime) = self.nodes.get_mut(node_id.as_str()) else {
+            return false;
+        };
+        if runtime.in_flight.is_some() {
+            runtime.probe_after_inflight_for_job = Some(job_id);
+        }
+        runtime.next_probe_at = Instant::now();
+        true
     }
 
     fn schedule_controls<T: NodeTransport>(
@@ -1340,6 +1372,10 @@ impl RuntimeState {
             }
         }
         self.queue_cursor = (cursor + 1) % queues.len();
+        // A reservation is visible to the submitter immediately. Start the
+        // remote runner in this same reconciliation pass so the next idle
+        // wait cannot defer it to MAX_IDLE_RECONCILE_INTERVAL.
+        self.schedule_controls(service, &jobs)?;
         Ok(())
     }
 
@@ -1551,6 +1587,14 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                             api.validate_generation(control_request.expected_generation)
                         {
                             Err(error)
+                        } else if let macluster_protocol::control::ControlCommand::ReconcileNode {
+                            node_id,
+                            job_id,
+                        } = control_request.command.clone()
+                        {
+                            Ok(macluster_protocol::control::ControlPayload::ReconciliationRequested {
+                                accepted: runtime.request_node_probe(&node_id, job_id),
+                            })
                         } else if let macluster_protocol::control::ControlCommand::StartWeb {
                             port,
                         } = control_request.command.clone()
@@ -1741,13 +1785,13 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         runtime.schedule_share_probe(service);
         let jobs = service.storage.list_reconcile_jobs()?;
         runtime.schedule_controls(service, &jobs)?;
-        runtime.schedule_probes(service)?;
         if !reset_policy.is_some_and(|policy| policy.discard_terminal_sync) {
             runtime.schedule_snapshots(service, &jobs, &queue_names);
         }
         if !address_maintenance {
             runtime.dispatch(service, jobs, &queue_names)?;
         }
+        runtime.schedule_probes(service)?;
         if let Some(policy) = reset_policy {
             let all_jobs = service.storage.list_active_jobs()?;
             if reset_drain_complete(&all_jobs, policy) {
@@ -2313,6 +2357,85 @@ scheduler = "fifo"
             .unwrap();
         storage.publish_snapshot(job.id, shared_root).unwrap();
         job
+    }
+
+    #[test]
+    fn newly_dispatched_job_sends_start_before_due_node_probe() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::{fs, sync::atomic::Ordering};
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-dispatch-start-priority-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut service =
+            ControllerService::new(config, storage, StartCountingTransport(starts.clone()))
+                .unwrap();
+        let job = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let now = Instant::now();
+        runtime.share_ready = Some((true, now));
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.fenced = true;
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: true,
+            interactive_pty: true,
+            namespaced_jobs: true,
+            sampled_at: now,
+            retry_at: now + NODE_HEALTH_TTL,
+        });
+        worker.next_probe_at = now;
+        worker.next_control_at = now;
+
+        let jobs = service.storage.list_reconcile_jobs().unwrap();
+        runtime
+            .dispatch(&mut service, jobs, &["mini01".into()])
+            .unwrap();
+
+        let reserved = service.storage.get_job(job.id).unwrap().unwrap();
+        assert_eq!(reserved.state, JobState::Starting);
+        assert!(runtime.nodes["worker"].pending_start.is_none());
+        assert_eq!(
+            runtime.nodes["worker"]
+                .in_flight
+                .as_ref()
+                .map(|operation| operation.kind),
+            Some(WorkKind::Start),
+            "the controller must send Start in the dispatch pass, before a due probe can occupy the node"
+        );
+
+        runtime.schedule_probes(&service).unwrap();
+        assert_eq!(
+            runtime.nodes["worker"]
+                .in_flight
+                .as_ref()
+                .map(|operation| operation.kind),
+            Some(WorkKind::Start)
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while starts.load(Ordering::SeqCst) == 0 {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(Instant::now() < deadline, "Start RPC was not sent promptly");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

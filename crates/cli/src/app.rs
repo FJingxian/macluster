@@ -41,6 +41,16 @@ use crate::arguments::{
 
 type AppResult<T> = Result<T, (i32, String)>;
 
+const INTERACTIVE_FAST_POLL_WINDOW: Duration = Duration::from_secs(1);
+const INTERACTIVE_FAST_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const INTERACTIVE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HelpMode {
+    Short,
+    Long,
+}
+
 #[derive(Default)]
 struct GlobalOptions {
     config: Option<PathBuf>,
@@ -53,6 +63,7 @@ struct CachedSubmission {
 }
 
 pub fn run(program: &str, input: &[String]) -> AppResult<()> {
+    let command_started_at = Instant::now();
     let invoked_name = Path::new(program)
         .file_name()
         .and_then(OsStr::to_str)
@@ -196,7 +207,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     }
 
     match command.as_str() {
-        "submit" => submit(global, &args),
+        "submit" => submit(global, &args, command_started_at),
         "job" => job(global, &args),
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
@@ -853,9 +864,9 @@ fn is_submit_command_boundary(argument: &str) -> bool {
     argument == "--" || argument == "--wrap" || argument.is_empty() || !argument.starts_with('-')
 }
 
-fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
-    if submit_help_requested(args) {
-        print_submit_help();
+fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -> AppResult<()> {
+    if let Some(mode) = submit_help_mode(args) {
+        print_submit_help(mode);
         return Ok(());
     }
     let config_file = resolved_config_path(global.config.as_deref());
@@ -953,7 +964,10 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     crate::init::reset::ensure_no_reset_in_progress(&config_file, &state_root)?;
     crate::node_admin::ensure_no_node_maintenance_in_progress(&config_file, &state_root)
         .map_err(|error| (1, error))?;
+    let controller_started_at = Instant::now();
     let mut online = online_controller(&config_file, &state_root, spec.mode == JobMode::Batch)?;
+    let controller_ready_at = Instant::now();
+    let submit_started_at = Instant::now();
     let record = if let Some(controller) = &mut online {
         submit_online(controller, request_id, spec, &script)?
     } else {
@@ -967,6 +981,19 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             .submit_once(request_id, spec)
             .map_err(operation_error)?
     };
+    let accepted_at = Instant::now();
+    let interactive_timing = record
+        .spec
+        .env
+        .get(VERBOSE_TASK_LOG_ENV)
+        .is_some_and(|value| value == "1")
+        .then_some(InteractiveSubmitTiming {
+            command_started_at,
+            controller_started_at,
+            controller_ready_at,
+            submit_started_at,
+            accepted_at,
+        });
     wake_controller_best_effort(&state_root);
     if !record.snapshot_sync_pending {
         if record.spec.mode == JobMode::Interactive {
@@ -1003,6 +1030,7 @@ fn submit(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             &config,
             &config_file,
             terminal_guard.expect("interactive mode entered raw terminal mode"),
+            interactive_timing,
         );
     }
     Ok(())
@@ -1139,17 +1167,24 @@ fn submit_online(
 }
 
 fn submit_help_requested(args: &[String]) -> bool {
+    submit_help_mode(args).is_some()
+}
+
+fn submit_help_mode(args: &[String]) -> Option<HelpMode> {
     let mut index = 0;
     while index < args.len() {
         let argument = &args[index];
         if argument == "--" || argument == "--wrap" {
-            return false;
+            return None;
         }
-        if argument == "--help" || argument == "-h" {
-            return true;
+        if argument == "--help" {
+            return Some(HelpMode::Long);
+        }
+        if argument == "-h" {
+            return Some(HelpMode::Short);
         }
         if is_submit_command_boundary(argument) {
-            return false;
+            return None;
         }
         let (key, inline) = argument
             .split_once('=')
@@ -1179,7 +1214,7 @@ fn submit_help_requested(args: &[String]) -> bool {
             index += 1;
         }
     }
-    false
+    None
 }
 
 fn maybe_run_agent_update(
@@ -1201,18 +1236,68 @@ fn controller_should_resume_after_agent_update(
         && !(command == "controller" && args.first().is_some_and(|arg| arg == "run"))
 }
 
+#[derive(Clone, Copy)]
+struct InteractiveSubmitTiming {
+    command_started_at: Instant,
+    controller_started_at: Instant,
+    controller_ready_at: Instant,
+    submit_started_at: Instant,
+    accepted_at: Instant,
+}
+
+impl InteractiveSubmitTiming {
+    fn report(self, allocated_at: Instant, attach_finished_at: Instant, confirmed_at: Instant) {
+        let report = format_interactive_timing(
+            self.controller_started_at
+                .saturating_duration_since(self.command_started_at),
+            self.controller_ready_at
+                .saturating_duration_since(self.controller_started_at),
+            self.accepted_at
+                .saturating_duration_since(self.submit_started_at),
+            allocated_at.saturating_duration_since(self.accepted_at),
+            attach_finished_at.saturating_duration_since(allocated_at),
+            confirmed_at.saturating_duration_since(attach_finished_at),
+            confirmed_at.saturating_duration_since(self.command_started_at),
+        );
+        eprintln!("macluster: {report}");
+    }
+}
+
+fn format_interactive_timing(
+    prepare: Duration,
+    controller: Duration,
+    submit: Duration,
+    dispatch_wait: Duration,
+    attach_and_task: Duration,
+    confirm: Duration,
+    total: Duration,
+) -> String {
+    format!(
+        "msub timing (ms): prepare={} controller={} submit={} dispatch_wait={} attach+task={} confirm={} total={}",
+        prepare.as_millis(),
+        controller.as_millis(),
+        submit.as_millis(),
+        dispatch_wait.as_millis(),
+        attach_and_task.as_millis(),
+        confirm.as_millis(),
+        total.as_millis(),
+    )
+}
+
 fn run_interactive_submission(
     storage: &Storage,
     initial: JobRecord,
     config: &ClusterConfig,
     config_path: &Path,
-    _terminal: crate::terminal::RawModeGuard,
+    terminal: crate::terminal::RawModeGuard,
+    timing: Option<InteractiveSubmitTiming>,
 ) -> AppResult<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
     write_interactive_status("Waiting for an interactive node; press Ctrl-C to cancel.\r\n")?;
     let mut job = initial;
     let mut shown_waiting_reason = None;
+    let waiting_started_at = Instant::now();
 
     loop {
         if job.state.is_terminal() {
@@ -1222,6 +1307,7 @@ fn run_interactive_submission(
             && let (Some(node_id), Some(start_token)) =
                 (job.node.as_ref(), job.start_token.as_ref())
         {
+            let allocated_at = Instant::now();
             let node = config.nodes.get(node_id.as_str()).ok_or_else(|| {
                 (
                     1,
@@ -1246,12 +1332,19 @@ fn run_interactive_submission(
                         return Err((1, format!("interactive attach failed: {error}")));
                     }
                 };
+            let attach_finished_at = Instant::now();
+            // The relay has finished using the terminal. Restore output
+            // processing before printing diagnostics or confirming completion.
+            drop(terminal);
             if attach_status != 0 {
                 let latest = storage
                     .get_job(job.id)
                     .map_err(operation_error)?
                     .ok_or_else(|| (1, format!("job {} disappeared", job.id)))?;
                 if latest.state.is_terminal() {
+                    if let Some(timing) = timing {
+                        timing.report(allocated_at, attach_finished_at, Instant::now());
+                    }
                     return interactive_job_result(&latest);
                 }
                 if storage.request_cancel(job.id, false).is_ok() {
@@ -1262,7 +1355,12 @@ fn run_interactive_submission(
                     format!("interactive attach process exited with status {attach_status}"),
                 ));
             }
-            return wait_for_interactive_completion(storage, job.id, config_path);
+            request_node_reconciliation(config_path, storage.root(), node_id, job.id);
+            let result = wait_for_interactive_completion(storage, job.id, config_path);
+            if let Some(timing) = timing {
+                timing.report(allocated_at, attach_finished_at, Instant::now());
+            }
+            return result;
         }
 
         if let Some(reason) = job.waiting_reason.as_deref()
@@ -1272,12 +1370,14 @@ fn run_interactive_submission(
             shown_waiting_reason = Some(reason.to_owned());
         }
 
-        if event::poll(Duration::from_millis(100)).map_err(|error| {
-            (
-                1,
-                format!("could not read interactive terminal input: {error}"),
-            )
-        })? && let Event::Key(key) = event::read().map_err(|error| {
+        if event::poll(interactive_poll_interval(waiting_started_at.elapsed())).map_err(
+            |error| {
+                (
+                    1,
+                    format!("could not read interactive terminal input: {error}"),
+                )
+            },
+        )? && let Event::Key(key) = event::read().map_err(|error| {
             (
                 1,
                 format!("could not read interactive terminal input: {error}"),
@@ -1309,6 +1409,29 @@ fn run_interactive_submission(
             .map_err(operation_error)?
             .ok_or_else(|| (1, format!("job {} disappeared", job.id)))?;
     }
+}
+
+fn request_node_reconciliation(
+    config_path: &Path,
+    state_dir: &Path,
+    node_id: &NodeId,
+    job_id: u64,
+) {
+    // The Agent closes the PTY stream as soon as the interactive process exits.
+    // Ask the controller to reconcile that node immediately instead of waiting
+    // for the normal background probe interval before msub can return.
+    let Ok(binding) = ServiceBinding::load(config_path, state_dir) else {
+        return;
+    };
+    let Ok(mut client) =
+        crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200))
+    else {
+        return;
+    };
+    let _ = client.request(ControlCommand::ReconcileNode {
+        node_id: node_id.clone(),
+        job_id,
+    });
 }
 
 fn wait_for_interactive_completion(
@@ -1343,8 +1466,9 @@ fn wait_for_interactive_completion_with(
     mut read_job: impl FnMut() -> AppResult<JobRecord>,
     mut recover: impl FnMut() -> AppResult<()>,
 ) -> AppResult<()> {
-    let deadline = Instant::now() + timeout;
-    let mut next_recovery = Instant::now() + recovery_interval;
+    let started_at = Instant::now();
+    let deadline = started_at + timeout;
+    let mut next_recovery = started_at + recovery_interval;
     let mut recovery_error = None;
     loop {
         let job = read_job()?;
@@ -1369,10 +1493,18 @@ fn wait_for_interactive_completion_with(
             continue;
         }
         thread::sleep(
-            Duration::from_millis(100)
+            interactive_poll_interval(started_at.elapsed())
                 .min(deadline.saturating_duration_since(now))
                 .min(next_recovery.saturating_duration_since(now)),
         );
+    }
+}
+
+fn interactive_poll_interval(elapsed: Duration) -> Duration {
+    if elapsed < INTERACTIVE_FAST_POLL_WINDOW {
+        INTERACTIVE_FAST_POLL_INTERVAL
+    } else {
+        INTERACTIVE_IDLE_POLL_INTERVAL
     }
 }
 
@@ -3338,13 +3470,8 @@ fn job_listing_uses_local_store(args: &[String]) -> bool {
 }
 
 fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!(
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\n--metrics subscribes to task process-group CPU/RSS through the running controller. Samples are shared across clients at about five-second intervals. --follow --json emits JSON Lines. First CPU observation is a baseline (null). Historical CPU/memory accounting covers observed intervals, not guaranteed full task lifetime.\n\nTask records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible; reading shared logs still requires access to their storage."
-        );
+    if let Some(mode) = help_mode(args) {
+        println!("{}", job_help(mode));
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--metrics") {
@@ -3943,6 +4070,27 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         println!();
     }
     Ok(())
+}
+
+fn help_mode(args: &[String]) -> Option<HelpMode> {
+    if args.iter().any(|arg| arg == "--help") {
+        Some(HelpMode::Long)
+    } else if args.iter().any(|arg| arg == "-h") {
+        Some(HelpMode::Short)
+    } else {
+        None
+    }
+}
+
+fn job_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\nUse --log to read task output and --metrics to watch CPU/RSS. Use --help for sampling details."
+        }
+        HelpMode::Long => {
+            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\nMetrics\n  --metrics subscribes to task process-group CPU/RSS through the running controller. Samples are shared across clients at about five-second intervals. --follow --json emits JSON Lines. The first CPU observation is a baseline (null). Historical CPU and memory accounting covers observed intervals, not guaranteed full task lifetime.\n\nStorage\n  Task records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible. Reading shared logs still requires access to their storage."
+        }
+    }
 }
 
 fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
@@ -6339,6 +6487,39 @@ mod tests {
     }
 
     #[test]
+    fn interactive_timing_report_names_each_client_side_stage() {
+        let report = super::format_interactive_timing(
+            Duration::from_millis(12),
+            Duration::from_millis(23),
+            Duration::from_millis(34),
+            Duration::from_millis(56),
+            Duration::from_millis(4_000),
+            Duration::from_millis(78),
+            Duration::from_millis(4_203),
+        );
+        assert_eq!(
+            report,
+            "msub timing (ms): prepare=12 controller=23 submit=34 dispatch_wait=56 attach+task=4000 confirm=78 total=4203"
+        );
+    }
+
+    #[test]
+    fn interactive_status_polling_is_fast_at_start_and_backs_off() {
+        assert_eq!(
+            super::interactive_poll_interval(Duration::from_millis(0)),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            super::interactive_poll_interval(Duration::from_millis(999)),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            super::interactive_poll_interval(Duration::from_secs(1)),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
     fn interactive_completion_is_bounded_and_preserves_job_on_recovery_failure() {
         let job = sample_job(7, JobState::Running, "mini01", None, "wrap");
         let started = Instant::now();
@@ -8500,10 +8681,19 @@ fn print_help() {
     );
 }
 
-fn print_submit_help() {
-    println!(
-        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. When a task uses the active VIRTUAL_ENV or CONDA_PREFIX, that environment must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside that environment do not require its interpreter to be shared. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Task submission and cluster changes validate configured Agent builds and capabilities. Read-only commands check locally available build evidence and enter the update workflow for known mismatches; they do not run remote validation or address discovery first. mjob and mqueue read persisted records without starting the controller. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
-    );
+fn print_submit_help(mode: HelpMode) {
+    println!("{}", submit_help(mode));
+}
+
+fn submit_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            "Usage: msub [OPTIONS] SCRIPT|COMMAND [ARGS...]\n       msub -Is [OPTIONS] [COMMAND [ARGS...]]\n       msub --wrap COMMAND\n       msub --request-id UUID\n\nOptions: -q/--queue, --node, -J/--name, -t/--time, --cwd, -o/--output,\n         -e/--error, --env KEY=VALUE, -v/--verbose\n-Is runs an attached PTY task. Omit COMMAND to open a shell. Pass a command as arguments or as one quoted shell command. Use --help for environment, paths, logging, and job behavior."
+        }
+        HelpMode::Long => {
+            "Usage: msub [OPTIONS] SCRIPT|COMMAND [ARGS...]\n       msub -Is [OPTIONS] [COMMAND [ARGS...]]\n       msub --wrap COMMAND\n       msub --request-id UUID\n\nOptions\n  -v, --verbose       Record timestamped output and CPU/memory usage for this task. Off by default. For -Is, print client-side phase timings.\n  -q, --queue QUEUE   Select a queue.\n  --node NODE         Pin the task to one compute node.\n  -J, --name NAME     Set the task name.\n  -t, --time TIME     Set a wall-time limit (HH:MM:SS).\n  --cwd PATH          Set the working directory.\n  -o, --output PATH   Set stdout destination.\n  -e, --error PATH    Set stderr destination.\n  --env KEY=VALUE     Override one task environment variable.\n  -Is                 Run in an attached PTY; with no command, open a shell.\n  --wrap COMMAND      Run one raw shell command.\n  --request-id UUID   Look up or replay a submission request.\n\nCommands and working directory\n  Pass a command as arguments, for example `msub -Is pip install . --break-system-packages`. A single quoted command such as `msub -Is 'pwd; echo done'` keeps shell syntax. Flags after the command belong to the task. Inline commands submitted outside a shared path use the configured shared root; --cwd overrides it.\n\nEnvironment\n  Exported variables from the submitting process are forwarded; --env overrides individual values. An active VIRTUAL_ENV or CONDA_PREFIX must be shared at the same absolute path on every node. Its bin directory takes priority in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside the active environment do not require its interpreter to be shared. An explicit --env PATH=... remains authoritative after filtering. Unshared or relocated active environments fail instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths and standard macOS commands; unshared login-only paths are omitted. Tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs.\n\nExecution and updates\n  Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Avoid concurrent pip installs into the same shared environment. Interactive tasks require terminal stdin and stdout. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs use one whole node; core and memory request flags are unsupported. Submissions and cluster changes validate Agent builds and capabilities. Read-only commands use local build evidence and enter the update workflow for known mismatches without remote validation or address discovery. mjob and mqueue read persisted records without starting the controller."
+        }
+    }
 }
 
 #[cfg(test)]

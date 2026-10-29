@@ -147,6 +147,10 @@ pub enum ControlCommand {
     WatchProcesses {
         node_id: Option<NodeId>,
     },
+    ReconcileNode {
+        node_id: NodeId,
+        job_id: u64,
+    },
     StartWeb {
         port: Option<u16>,
     },
@@ -219,6 +223,9 @@ pub enum ControlPayload {
     Jobs(JobPage),
     Queues(Vec<QueueSummary>),
     FanControl(Vec<NodeFanControlResult>),
+    ReconciliationRequested {
+        accepted: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

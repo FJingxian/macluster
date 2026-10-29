@@ -1778,6 +1778,14 @@ mod tests {
         let changed_toolchain =
             super::super::compiler_cache_directory(record, "CCACHE_DIR", "ccache").unwrap();
         assert_ne!(ccache, changed_toolchain);
+
+        record
+            .spec
+            .env
+            .insert("CPATH".into(), "/shared/include".into());
+        let changed_include_path =
+            super::super::compiler_cache_directory(record, "CCACHE_DIR", "ccache").unwrap();
+        assert_ne!(changed_toolchain, changed_include_path);
         fs::remove_dir_all(root).unwrap();
     }
 

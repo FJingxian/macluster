@@ -631,6 +631,7 @@ fn is_toolchain_cache_variable(key: &str) -> bool {
             | "FCFLAGS"
             | "OBJCFLAGS"
             | "OBJCXXFLAGS"
+            | "CPATH"
     ) || key == ACTIVE_ENV_PREFIX_ENV
         || key.ends_with("_FLAGS")
         || key.ends_with("_PATH")

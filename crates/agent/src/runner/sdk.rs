@@ -240,6 +240,7 @@ mod tests {
                 "CFLAGS".into(),
                 format!("-O2 -isysroot '{OLD}' -I/shared/include"),
             ),
+            ("CPATH".into(), format!("{OLD}/usr/include")),
             (
                 "CXXFLAGS_aarch64_apple_darwin".into(),
                 format!("--sysroot={OLD}"),
@@ -259,6 +260,7 @@ mod tests {
             changes["CFLAGS"],
             format!("-O2 -isysroot '{LOCAL}' -I/shared/include")
         );
+        assert_eq!(changes["CPATH"], format!("{LOCAL}/usr/include"));
         assert_eq!(
             changes["CMAKE_ARGS"],
             format!("-DCMAKE_OSX_SYSROOT='{LOCAL}' -DCMAKE_BUILD_TYPE=Release")

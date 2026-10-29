@@ -1,205 +1,194 @@
 # macluster
 
-Run jobs across a small group of Macs. Written in Rust, with SSH for node access and NFS for shared files.
+Turn your Macs into a personal compute cluster. Submit commands from one Mac, run them on another, and monitor the cluster in your terminal or browser.
 
-English · [简体中文](doc/README.zh-CN.md)
+English · [简体中文](doc/README.zh-CN.md) · [Agent skill](skills/macluster/SKILL.md)
+
+Written in Rust. One binary to distribute. SSH connects nodes; NFS shares projects, software, and results.
 
 ## How it works
 
-- The **login Mac** runs the controller and accepts submissions. It also hosts shared storage by default.
-- **Compute Macs** run the jobs. Each Mac runs one job at a time, with no CPU-core or memory quota.
-- Projects, software environments, and results are shared through NFS.
-- The login Mac stays outside compute queues. You can choose a separate Mac for storage.
+```text
+Login Mac                         Compute Macs
+CLI + background controller  ───►  One job per Mac
+NFS storage by default       ◄──►  Shared projects and tools
+```
 
-This is an early-stage project for home and lab clusters.
+The login Mac stays outside compute queues. Jobs occupy a whole compute node, with no CPU-core or memory quota. You can choose a separate storage Mac during setup.
 
-## Requirements
-
-- macOS 12 or newer.
-- Rust 1.90 or newer to build the application.
-- Remote Login enabled on compute Macs, with SSH access from the login Mac.
-- Accounts and file permissions that allow NFS clients to read and write shared files.
-- Shared directories on volumes that support macOS NFS export, such as APFS. ExFAT volumes cannot be exported.
-
-Setup may ask for administrator authorization on each affected Mac. Use a binary built for that Mac's CPU architecture.
-
-For protected folders or external volumes, the storage Mac may also require **System Settings → Privacy & Security → Full Disk Access** for `/sbin/nfsd`. After granting access, run `sudo /sbin/nfsd restart` on that Mac and retry enrollment.
+This is an early-stage project for personal and lab clusters. It uses macOS accounts and shared storage as its trust boundary.
 
 ## Install
 
-Run on the login Mac, from this repository:
+Requirements: macOS 12+, Remote Login enabled on compute Macs, and SSH access from the login Mac. Building requires Rust 1.90+.
 
-~~~sh
+Build and install on the Mac you want to use as the login node:
+
+```sh
 cargo build --release --locked -p macluster-cli
 packaging/scripts/install-user.sh
-~~~
-
-The installer places `macluster` and its command aliases in `~/.local/bin`. Add it to your shell's `PATH`:
-
-~~~sh
 export PATH="$HOME/.local/bin:$PATH"
-~~~
+```
 
-Add that line to your shell configuration to keep it after reopening Terminal. Rust and Python are not needed to run the installed application.
+Add the PATH line to your shell configuration. To distribute the app, copy only `target/release/macluster`; the power/fan helper is embedded. Rust and Python are not required to run macluster. Use a binary supporting the target Mac's CPU architecture.
 
-To distribute the application, copy only `target/release/macluster`. The matching power helper is embedded; a separate `macluster-power` download is not needed. Setup installs the helper into its protected system location when required and may ask for administrator authorization.
+Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, and `mnode` aliases.
 
-## Create a cluster
+## Start a cluster
 
-Initialize on the login Mac:
+```sh
+# Run on the login Mac. Setup is interactive.
+macluster init --name home --queue default --shared-root /Users/Shared/macluster
 
-~~~sh
-macluster init --name home --queue mini01 --shared-root /Users/Shared/macluster
-~~~
+# Replace the SSH account and address with your compute Mac.
+macluster node -a worker@192.0.2.10
+macluster node -l
+```
 
-Add a compute Mac. Replace the sample SSH user and IP address with your own:
+Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
 
-~~~sh
-mnode -a cluster-user@192.0.2.10
-mnode -l
-~~~
+Initialization installs a per-user background LaunchAgent. Closing Terminal does not stop the controller; logging out of that macOS user session does. Scheduling needs the controller. Job and queue queries can read persisted state while it is stopped.
 
-Enrollment installs the Agent, writes its configuration, and sets up shared storage. If needed, it helps you verify the SSH host key and install an SSH key. The SSH login password and each Mac's administrator password are separate.
-
-Enrollment also installs a system LaunchDaemon on each NFS client to restore approved mounts after boot. Failed attempts retry after 15, 30, then 60 seconds. Existing mounts are checked by source and share ID; occupied paths are preserved. For a node enrolled by an older version, rerun `mnode -a user@address` once to repair its mounts and install recovery. Node removal and `init` stop recovery before cleaning up mounts. Administrator approval is required when installing or changing this service.
-
-After initialization, macluster installs and starts a per-user LaunchAgent in the current GUI login session. It keeps scheduling after you close Terminal. The controller runs only while that user session is active; logging out stops it.
-
-Manage the service with:
-
-~~~sh
+```sh
 macluster controller status
-macluster controller stop
 macluster controller start
-~~~
+macluster controller stop
+```
 
-`macluster controller run` remains available for foreground troubleshooting. A foreground instance can be reused by `controller start`, but stop it with Ctrl-C before asking launchd to stop or restart it.
+`controller run` runs in the foreground for troubleshooting. Do not initialize again just to start the controller: when a configuration exists, `init` offers to reset it.
 
 ## Run jobs
 
-~~~sh
-# Submit a command or a script.
-msub -q mini01 hostname
-msub -q mini01 job.sh
+```sh
+macluster submit hostname                       # Batch command
+macluster submit job.sh                         # Batch script
+macluster submit -q default --node default-001 hostname
+macluster submit -Is python --version           # Attached command; needs a TTY
+macluster submit -Is                            # Interactive shell
 
-# Run an attached command, or open an interactive shell.
-msub -Is python --version
-msub -Is
+macluster job                                  # Active jobs
+macluster job --all                             # Include finished jobs
+macluster job 1                                # Details; replace 1 with your job ID
+macluster job --log 1                          # Captured output
+macluster queue
+macluster kill 1
+```
 
-# Inspect jobs and queues.
-mjob
-mqueue
+Task arguments go after the command. Quote shell operators so they execute on the compute Mac:
 
-# Read output or cancel a job. Replace 1 with the submitted job ID.
-mjob --log 1
-mkill 1
-~~~
+```sh
+macluster submit --wrap 'python analysis.py > analysis.log 2>&1'
+macluster submit -v python analysis.py          # Optional detailed resource log
+```
 
-Quote commands that contain shell operators so the allocated Mac executes them:
+Detailed timestamped CPU/memory logging is **off by default**; enable it with `submit -v`.
 
-~~~sh
-msub --wrap 'python analysis.py > analysis.log 2>&1'
-~~~
+**Where files go:** submitting inside a registered share uses that directory. Inline commands submitted outside all shares use the primary shared root; `--cwd PATH` explicitly selects a shared directory. Relative output files are written there. Default captured logs synchronize to the primary share after completion. Compute nodes cannot read arbitrary unshared files on the login Mac.
 
-Commands submitted from a shared directory run in that directory. From outside all shares, inline commands use the primary shared root. Use `--cwd PATH` to choose a shared working directory.
+## Watch one task's CPU and memory
 
-Relative files written by a task appear in its working directory. Default logs are copied to the primary share after the task exits.
+```sh
+macluster job --metrics 1
+macluster job --metrics 1 --follow --json
+```
 
-## Share projects and tools
+This subscribes to process-group CPU/RSS through the running controller, even if the task was submitted without `-v`. Multiple viewers share one sample about every five seconds. Closing the subscription stops on-demand collection; it does not cancel the job. The first CPU value is null until a second observation is available. `--follow --json` emits JSON Lines and stops at job completion.
 
-Add another shared directory:
+This is live sampled data, not complete lifetime accounting. See [task resource subscriptions](doc/job-resources.md) for the IPC interface, measurement limits, and overhead. `job --log --follow` still waits for completed output publication; it is not a live output stream.
 
-~~~sh
-mnode -a local:~/projects/example --share-id project \
-  --mount-root /Users/Shared/macluster-shares/project
-~~~
+## Share projects and environments
 
-To share a Python environment, Homebrew, or a compiler, register its directory too. `init` offers detected software directories during setup.
+```sh
+# Share a project at the same path on every node.
+macluster node -a "local:$HOME/projects/example" --share-id project \
+  --mount-root "$HOME/projects/example"
 
-For example, share a Mamba installation at its original path:
+# Share the installation containing your software environment.
+macluster node -a "local:$HOME/mamba" --share-id mamba \
+  --mount-root "$HOME/mamba"
+```
 
-~~~sh
-mnode -a "local:$HOME/mamba" --share-id mamba --mount-root "$HOME/mamba"
-~~~
+Activate your environment in the login terminal, enter the shared project, then submit:
 
-Then activate an environment in the login terminal and submit from a shared project directory:
+```sh
+macluster submit -Is python --version
+macluster submit -Is pip install -e .
+```
 
-~~~sh
-msub -Is python --version
-msub -Is pip install . --break-system-packages
-~~~
+`submit` forwards exported environment variables and maps registered shared paths. **The software files must also be shared.** An active environment must resolve at the same absolute path on every node. Unshared toolchains are not replaced silently with compute-local software; standard macOS commands remain available. Shell aliases/functions and node-specific HOME, user, temporary-directory, and SSH-agent values are not forwarded.
 
-`msub` forwards exported environment variables, including the active Python environment. The software files must also be shared, and active environments must resolve at the same absolute path on every node. A task that uses an unshared active environment is rejected rather than falling back to compute-local software. Simple commands resolved outside that environment, such as `ls`, do not need its Python interpreter to be shared.
+Environment variables are stored with jobs: avoid exporting secrets. Avoid concurrent installs into the same shared environment. A software share can hide an existing installation at its mount path; inspect mappings before changing them.
 
-Shell aliases and functions are not forwarded. Environment variables are saved with the job, so avoid exporting secrets to tasks.
+Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected folders and external volumes may require Full Disk Access for `/sbin/nfsd` on the **storage Mac**. After granting it, restart nfsd there and retry enrollment.
 
-## Monitor the cluster
+## Monitor
 
-~~~sh
-mtop
-mtop --once
-~~~
+```sh
+macluster top                                  # Terminal dashboard
+macluster top --once                           # One-shot table
+macluster controller run --web                 # Local browser dashboard
+```
 
-`mtop` shows jobs, CPU, memory, disk I/O, network, and available GPU, temperature, fan, and power readings.
+In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast preview, then replace it with interval samples. The preview labels its average CPU and RSS memory.
 
-Start the read-only browser dashboard through the controller:
+CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, temperature, fan, and power readings depend on hardware/helper support; unavailable readings show `N/A`.
 
-~~~sh
-macluster controller run --web
-~~~
+The browser monitor is read-only and listens on `127.0.0.1`. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart.
 
-It shows live node details, recent CPU and memory history, jobs, queues, and shared task logs. It listens on `127.0.0.1` and runs while the controller is active. If the controller is already running, this command starts the dashboard there and returns. Use `--no-open` to print a one-time browser link, or `--web-port PORT` to select a port.
+## Maintenance
 
-Use arrows or `j`/`k` to select a node, Enter for its processes, and `q` to quit. In process details, `c` sorts by CPU and `m` by memory.
-
-CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable hardware readings show `N/A`.
-
-## Maintain the cluster
-
-| Command | Action |
+| Command | Purpose |
 | --- | --- |
-| `mnode -l` | Show nodes and their NFS paths. |
-| `mnode -rm NODE_ID` | Remove an idle node that does not host a share. |
-| `mnode -rm NODE_ID --connect USER@IP[:PORT]` | Remove a moved node using its current SSH address and verify its registered machine identity. |
-| `mnode -rm share:SHARE_ID` | Cancel an incomplete named-share setup. |
-| `mfans --status [--node ID]` | Show fan policy and helper support on all nodes or one node. |
-| `mfans --reset [--node ID]` | Return fans to macOS system control. |
-| `mfans --auto [--node ID]` | Set the linear 40–80°C fan curve. |
-| `mfans --power [--node ID]` | Set the logarithmic 40–80°C fan curve. |
-| `macluster init` | Ask to reset the current cluster, then configure a new one. |
-| `macluster init --force` | Allow reset to abandon unsynchronized output from finished jobs. Active jobs still block reset. |
-| `macluster controller status` | Show whether the local service is ready without starting it. |
-| `macluster controller start/stop/restart` | Manage the login Mac's background controller. |
+| `macluster node -l` | Nodes and common NFS mappings |
+| `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
+| `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
+| `macluster node -rm share:SHARE_ID` | Cancel incomplete named-share setup |
+| `macluster fans --status [--node ID]` | Fan policy and support |
+| `macluster fans --auto [--node ID]` | Linear 40–80°C temperature curve |
+| `macluster fans --power [--node ID]` | Logarithmic 40–80°C temperature curve |
+| `macluster fans --reset [--node ID]` | Restore macOS fan control |
+| `macluster init` | Confirm reset, archive old state, and configure a new cluster |
+| `macluster init --force` | Allow dropping pending output sync for finished jobs; active jobs still block reset |
 
-The fan curve runs locally in each node's privileged helper. Curves activate at 40°C, reach the node's reported fan maximum at 80°C, use a smoothed CPU temperature average, and restore system control when the reading expires. The control path uses Apple's private AppleSMC interface, so write support depends on the Mac model and firmware; unsupported nodes remain under system control. A helper restart restores system control before accepting a new policy.
+Reset cleans managed NFS mounts/exports and preserves shared data files. Read its confirmation carefully. Fan control uses a private AppleSMC interface and depends on the Mac model; unsupported nodes remain under system control.
 
-Reset preserves shared data files and archives old configuration and job state.
+Agent updates trigger automatically for known build mismatches. Privileged services have independent versions: ordinary Agent updates reuse current services. Initial installation, a service upgrade, or repair can require administrator authorization on each affected Mac. Passwords are not stored.
 
-Nodes can keep their IDs when their IP changes within the same subnet. macluster uses the recorded MAC address and nearby hosts to find candidates, then verifies a trusted SSH host key and the registered machine UUID. It never accepts a changed key based on a MAC address alone.
+For a separate storage Mac:
 
-The controller checks registered addresses and known LAN neighbors in the background every 30 seconds. If a node is unreachable, a full subnet scan is rate-limited to once every five minutes; scans cover at most 1,024 addresses, while larger subnets use the neighbor cache. When an address change is verified, the controller pauses new dispatches, waits for active tasks to finish, updates managed NFS exports/mounts and peer configs, then resumes with the same queues and job history. Finished tasks keep their pending output and resume synchronization after migration. Administrator authorization may be needed on the affected Macs; a controller without a terminal reports how to finish authorization in a foreground command. Migration progress is saved for retries.
-
-The controller stays on the login Mac and handles submissions, scheduling, and shared monitoring. Removing a node drains only that node, so unaffected compute nodes can continue. Enrollment, NFS share changes, and Agent refresh use a cluster-wide drain while configuration is applied. If an older controller cannot perform live maintenance, the command will ask before stopping it and will explain how to restart it. Reset and controller binary updates still use a coordinated stop/restart. Normal cluster operations check Agent versions/hashes and trigger updates when needed. Node removal uses identity and idle checks directly, so a stale address or outdated Agent does not first require a cluster update. A moved-node removal saves its verified connection for retries and cleans exports using the original registered client address. Keep SSH host-key verification enabled; verify a changed fingerprint before replacing any trusted key.
-
-For a separate storage Mac, initialize with `--primary-nfs`:
-
-~~~sh
-macluster init --name home --queue mini01 \
-  --primary-nfs 'storage-user@198.51.100.10:22:/Volumes/Data/macluster' \
+```sh
+macluster init --name home --queue default \
+  --primary-nfs 'storage@198.51.100.10:22:/Volumes/Data/macluster' \
   --shared-root /Users/Shared/macluster
-mnode -a local
-~~~
+```
 
-Replace the example storage account, IP, and directory. The storage Mac also stays outside compute queues.
+The storage Mac stays outside compute queues. Same-subnet IP changes can retain node IDs after SSH trust and machine identity are verified. Migration waits for active work to drain and may require authorization for NFS changes.
 
-## Help
+## Troubleshooting
 
-Run `macluster --help` or `msub --help` for options.
+| Symptom | First check |
+| --- | --- |
+| Job stays pending | `controller status`, `job JOBID`, and `node -l`; the queue needs a ready compute node |
+| Python/compiler missing | Activate the intended environment and share its installation path |
+| Wrong working directory | `node -l` mappings; submit from a share or use `--cwd` |
+| NFS export denied | Filesystem, permissions, and nfsd privacy authorization on the storage Mac |
+| Controller failed to start | `controller status`; logs in `~/Library/Logs/macluster/` |
 
-If a job stays pending, check that the controller is running and its queue has a `READY` compute node. If a tool is missing, check its shared path and the environment in the submitting terminal.
+Use `macluster --help` or `macluster submit --help` for options. Keep SSH host-key checking enabled; verify changed fingerprints before updating trust.
 
-If the service cannot start, `macluster controller status` reports its state and `macluster controller start` retries it. Service logs are in `~/Library/Logs/macluster/`.
+## Agent skill
+
+The bundled [macluster skill](skills/macluster/SKILL.md) helps an agent inspect the cluster, submit jobs, respect environment/path semantics, and diagnose failures.
+
+Install it for Codex from this repository:
+
+```sh
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/macluster "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Example: “Use `$macluster` to submit my analysis from the current shared directory and check the output.”
 
 ## License
 
-[GNU GPL v3 or later](LICENSE) (`GPL-3.0-or-later`). Commercial use is allowed; redistribution must follow the GPL's license and source-code requirements.
+[GNU GPL v3 or later](LICENSE) (`GPL-3.0-or-later`). Commercial use is allowed under the GPL; redistribution must meet its license and source-code requirements.

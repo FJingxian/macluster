@@ -13,6 +13,10 @@ use std::{
 };
 
 const ROOT: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs";
+// Privileged service release version, independent of the Agent build. Bump
+// whenever recovery behavior or its runtime dependencies change (including
+// named_share_mount_status and run_child_bounded). Comments/tests need no bump.
+const SERVICE_VERSION: &str = "nfs-recovery-2";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -35,6 +39,44 @@ fn key(target: &Path) -> String {
 }
 fn directory(target: &Path) -> PathBuf {
     Path::new(ROOT).join(key(target))
+}
+pub(crate) fn version_marker_path(target: &Path) -> PathBuf {
+    directory(target).join("version")
+}
+pub(crate) fn helper_version() -> String {
+    SERVICE_VERSION.to_owned()
+}
+pub(crate) fn installation_probe_script(target: &Path) -> String {
+    installation_check_script(
+        &directory(target),
+        &plist_path(target),
+        &format!("system/{}", label(target)),
+        Path::new("/bin/launchctl"),
+    )
+}
+
+fn installation_check_script(dir: &Path, plist: &Path, service: &str, launchctl: &Path) -> String {
+    let mut checks = Vec::new();
+    for file in [
+        dir.join("macluster"),
+        dir.join("manifest.json"),
+        dir.join("version"),
+        plist.to_owned(),
+    ] {
+        let path = quote(&file.to_string_lossy());
+        checks.push(format!("[ -f {path} ] && [ ! -L {path} ] && [ -s {path} ]"));
+    }
+    checks.push(format!(
+        "[ \"$(/bin/cat {} 2>/dev/null)\" = {} ]",
+        quote(&dir.join("version").to_string_lossy()),
+        quote(SERVICE_VERSION)
+    ));
+    checks.push(format!(
+        "{} print {} >/dev/null 2>&1",
+        quote(&launchctl.to_string_lossy()),
+        quote(service)
+    ));
+    checks.join(" && ")
 }
 fn label(target: &Path) -> String {
     format!("org.macluster.nfs.{}", key(target))
@@ -64,24 +106,33 @@ pub(crate) fn install_script(
 
 pub(crate) fn refresh_script(
     binary: &str,
+    binary_digest: &str,
     source: &str,
     target: &Path,
     uuid: &str,
     execution_uid: Option<u32>,
 ) -> String {
+    let root = quote(ROOT);
     let dir = quote(&directory(target).to_string_lossy());
+    let helper = quote(&directory(target).join("macluster").to_string_lossy());
+    let next = quote(&directory(target).join("macluster.next").to_string_lossy());
     let uid = execution_uid
         .map(|uid| uid.to_string())
         .unwrap_or_else(|| "${SUDO_UID:?missing execution UID}".into());
     format!(
-        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\n/usr/bin/install -o root -g wheel -m 700 {} {dir}/macluster.next\n/bin/mv -f {dir}/macluster.next {dir}/macluster\n{dir}/macluster internal nfs-recovery refresh {} {} {} {uid}\n",
+        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\nif [ ! -f {} ] || [ -L {} ]; then echo 'NFS recovery source binary is not a regular file' >&2; exit 1; fi\nactual=$(/usr/bin/shasum -a 256 {})\n[ \"${{actual%% *}}\" = {} ] || {{ echo 'NFS recovery source checksum mismatch' >&2; exit 1; }}\n[ ! -L {next} ] || {{ echo 'unsafe NFS recovery staging path' >&2; exit 1; }}\n/usr/bin/install -o root -g wheel -m 700 {} {next}\nactual=$(/usr/bin/shasum -a 256 {next})\n[ \"${{actual%% *}}\" = {} ] || {{ /bin/rm -f {next}; echo 'NFS recovery staged checksum mismatch' >&2; exit 1; }}\n/bin/mv -f {next} {helper}\n{helper} internal nfs-recovery refresh {} {} {} {uid}\n",
         quote(binary),
+        quote(binary),
+        quote(binary),
+        quote(binary_digest),
+        quote(binary),
+        quote(binary_digest),
         quote(source),
         quote(&target.to_string_lossy()),
         quote(uuid),
-        root = quote(ROOT),
     )
 }
+
 pub(crate) fn cleanup_script(source: &str, target: &Path, uuid: &str) -> String {
     let helper = quote(&directory(target).join("macluster").to_string_lossy());
     format!(
@@ -268,6 +319,23 @@ fn write_launch_daemon(target: &Path) -> Result<(), String> {
     )?;
     Ok(())
 }
+fn write_version(target: &Path) -> Result<(), String> {
+    let path = version_marker_path(target);
+    let temp = path.with_extension("next");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|error| error.to_string())?;
+    file.write_all(helper_version().as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    fs::rename(temp, path).map_err(|error| error.to_string())
+}
 fn unload(target: &Path) -> Result<(), String> {
     let service = format!("system/{}", label(target));
     match bounded("/bin/launchctl", &["print", &service]) {
@@ -388,7 +456,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 },
             )?;
             write_json(&dir.join("status.json"), &Status::default())?;
-            write_launch_daemon(target)
+            write_launch_daemon(target)?;
+            write_version(target)
         }
         "refresh" => {
             let source = &args[1];
@@ -409,7 +478,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             if !dir.join("status.json").exists() {
                 write_json(&dir.join("status.json"), &Status::default())?;
             }
-            write_launch_daemon(target)
+            write_launch_daemon(target)?;
+            write_version(target)
         }
         "remove" => {
             if manifest_path.exists() {
@@ -428,6 +498,8 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 plist_path(target),
                 manifest_path,
                 dir.join("status.json"),
+                dir.join("version"),
+                dir.join("version.next"),
                 dir.join("macluster"),
             ] {
                 match fs::remove_file(p) {
@@ -491,25 +563,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refresh_can_reinstall_helper_while_nfs_is_unmounted() {
-        let target = Path::new("/Users/Shared/tools");
-        let uuid = "00000000-0000-4000-8000-000000000001";
-        let manifest = refreshed_manifest(None, "192.0.2.1:/tools", target, uuid, 501).unwrap();
-        assert_eq!(manifest.source, "192.0.2.1:/tools");
-        assert_eq!(manifest.target, target);
-        assert_eq!(manifest.uuid, uuid);
-        assert_eq!(manifest.execution_uid, 501);
+    fn current_version_does_not_mask_missing_installation_files_or_service() {
+        let dir = std::env::temp_dir().join(format!("nfs-install-check-{}", Id128::random()));
+        fs::create_dir_all(&dir).unwrap();
+        let plist = dir.join("service.plist");
+        let launchctl = dir.join("launchctl");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let files = [
+            dir.join("macluster"),
+            dir.join("manifest.json"),
+            plist.clone(),
+        ];
+        for file in &files {
+            fs::write(file, "installed").unwrap();
+        }
+        fs::write(dir.join("version"), helper_version()).unwrap();
+        let script = installation_check_script(&dir, &plist, "test.service", &launchctl);
+        let check = || {
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(check());
+        for file in &files {
+            fs::remove_file(file).unwrap();
+            assert!(!check(), "missing {} must require repair", file.display());
+            fs::write(file, "installed").unwrap();
+        }
+        fs::write(&launchctl, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!check(), "an unloaded service must require repair");
+        fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(dir.join("version"), "old-service-version").unwrap();
+        assert!(!check());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
+    #[test]
+    fn helper_version_is_independent_of_agent_build_and_source_text() {
+        let target = Path::new("/Users/Shared/tools");
+        let marker = version_marker_path(target);
+        assert_eq!(marker, directory(target).join("version"));
+        let version = helper_version();
+        assert_eq!(version, SERVICE_VERSION);
+        assert!(version.starts_with("nfs-recovery-"));
+    }
+
+    #[test]
+    fn refresh_script_verifies_staged_binary_before_replacing_root_helper() {
         let script = refresh_script(
             "/Users/worker/.local/bin/macluster",
-            &manifest.source,
-            target,
-            uuid,
+            &"a".repeat(64),
+            "192.0.2.1:/tools",
+            Path::new("/Users/Shared/tools"),
+            "00000000-0000-4000-8000-000000000001",
             Some(501),
         );
+        assert!(script.contains("checksum mismatch"));
         assert!(script.contains("internal nfs-recovery refresh"));
-        assert!(script.contains(uuid));
-        assert!(!script.contains("internal nfs-recovery install"));
+        assert!(script.contains("00000000-0000-4000-8000-000000000001"));
+        assert!(script.contains("macluster.next"));
+        let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
     }
 
     #[test]

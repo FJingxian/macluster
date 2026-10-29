@@ -2641,10 +2641,8 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
         ));
         }
 
-        operation.detail = Some(
-            "refreshing bundled power and persistent NFS recovery helpers on configured nodes"
-                .into(),
-        );
+        operation.detail =
+            Some("checking privileged helper versions and refreshing only changed services".into());
         state
             .operations
             .insert(operation_key.to_owned(), operation.clone());
@@ -4350,20 +4348,82 @@ fn persistent_mount_batch_script(
     (!script.is_empty()).then_some(script)
 }
 
-fn client_nfs_recovery_refresh_script(config: &ClusterConfig, node_id: &str) -> Option<String> {
-    let node = config.nodes.get(node_id)?;
-    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
-    let mut script = String::new();
-    for mount in mounts {
-        script.push_str(&crate::nfs_recovery::refresh_script(
-            &node.remote_binary,
-            &mount.source,
-            &mount.mount_root,
-            &mount.share_uuid,
-            node.execution_uid,
+fn client_nfs_recovery_version_probe_script(mounts: &[ClientUnmountRequest]) -> Option<String> {
+    if mounts.is_empty() {
+        return None;
+    }
+    let mut script = String::from("set -e\n");
+    for (index, mount) in mounts.iter().enumerate() {
+        let check = crate::nfs_recovery::installation_probe_script(&mount.mount_root);
+        script.push_str(&format!(
+            "if ! ( {check} ); then printf '%s\\n' '{index}'; fi\n"
         ));
     }
-    (!script.is_empty()).then_some(script)
+    Some(script)
+}
+
+fn client_nfs_recovery_refresh_script(
+    config: &ClusterConfig,
+    node_id: &str,
+    stale_mounts: &BTreeSet<usize>,
+) -> Result<Option<String>, String> {
+    let Some(node) = config.nodes.get(node_id) else {
+        return Err(format!("unknown node {node_id}"));
+    };
+    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
+    let digest = if node.transport == Transport::Local {
+        local_sha256(Path::new(&node.remote_binary)).map_err(|(_, error)| error)?
+    } else {
+        managed_binary_digest(&node.remote_binary)
+            .ok_or_else(|| format!("Agent path for {node_id} is not managed by digest"))?
+    };
+    let execution_uid = node.execution_uid;
+    let mut script = String::new();
+    for (index, mount) in mounts.iter().enumerate() {
+        if stale_mounts.contains(&index) {
+            script.push_str(&crate::nfs_recovery::refresh_script(
+                &node.remote_binary,
+                &digest,
+                &mount.source,
+                &mount.mount_root,
+                &mount.share_uuid,
+                execution_uid,
+            ));
+        }
+    }
+    Ok((!script.is_empty()).then_some(script))
+}
+
+fn prepare_nfs_recovery_refresh_for_update(
+    config: &ClusterConfig,
+    node_id: &str,
+) -> Result<Option<String>, String> {
+    let Some(node) = config.nodes.get(node_id) else {
+        return Err(format!("unknown node {node_id}"));
+    };
+    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
+    let Some(probe) = client_nfs_recovery_version_probe_script(&mounts) else {
+        return Ok(None);
+    };
+    let output = ssh_output(node, &probe, None).map_err(|(_, error)| error)?;
+    if !output.status.success() {
+        return Err(command_error(
+            "cannot inspect NFS recovery helper versions",
+            &output,
+        ));
+    }
+    let mut stale_mounts = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let index = line
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("invalid NFS recovery version probe response: {line}"))?;
+        if index >= mounts.len() {
+            return Err("NFS recovery version probe returned an invalid mount index".into());
+        }
+        stale_mounts.insert(index);
+    }
+    client_nfs_recovery_refresh_script(config, node_id, &stale_mounts)
 }
 
 fn agent_update_admin_script(
@@ -4405,6 +4465,7 @@ fn refresh_agent_helpers_for_update(config: &ClusterConfig, operation_id: &str) 
         config,
         operation_id,
         prepare_node_power_helper_for_update,
+        prepare_nfs_recovery_refresh_for_update,
     )
 }
 
@@ -4412,11 +4473,13 @@ fn refresh_agent_helpers_for_update_with(
     config: &ClusterConfig,
     operation_id: &str,
     prepare_power: impl FnMut(&NodeConfig, &str) -> Result<Option<PowerHelperSetup>, String>,
+    prepare_nfs: impl FnMut(&ClusterConfig, &str) -> Result<Option<String>, String>,
 ) -> AppResult<bool> {
     refresh_agent_helpers_with_admin(
         config,
         operation_id,
         prepare_power,
+        prepare_nfs,
         run_interactive_admin_with_reason,
     )
 }
@@ -4425,16 +4488,24 @@ fn refresh_agent_helpers_with_admin(
     config: &ClusterConfig,
     operation_id: &str,
     mut prepare_power: impl FnMut(&NodeConfig, &str) -> Result<Option<PowerHelperSetup>, String>,
+    mut prepare_nfs: impl FnMut(&ClusterConfig, &str) -> Result<Option<String>, String>,
     mut execute: impl FnMut(&NodeConfig, &str, &str) -> Result<(), String>,
 ) -> AppResult<bool> {
     let mut deferred = false;
     for (node_id, node) in &config.nodes {
-        let nfs_recovery_script = client_nfs_recovery_refresh_script(config, node_id);
         let power_setup = match prepare_power(node, operation_id) {
             Ok(setup) => setup,
             Err(error) => {
                 deferred = true;
                 eprintln!("Power sampler refresh on {node_id} is pending: {error}");
+                None
+            }
+        };
+        let nfs_recovery_script = match prepare_nfs(config, node_id) {
+            Ok(script) => script,
+            Err(error) => {
+                deferred = true;
+                eprintln!("NFS recovery helper refresh on {node_id} is pending: {error}");
                 None
             }
         };
@@ -4445,12 +4516,10 @@ fn refresh_agent_helpers_with_admin(
         let Some(admin_script) = admin_script else {
             continue;
         };
-        let has_power = power_setup.is_some();
-        let has_nfs_recovery = nfs_recovery_script.is_some();
-        let purpose = match (has_power, has_nfs_recovery) {
-            (true, true) => "refresh the mtop power sampler and persistent NFS recovery service",
+        let purpose = match (power_setup.is_some(), nfs_recovery_script.is_some()) {
+            (true, true) => "refresh the power sampler and NFS recovery service",
             (true, false) => "refresh the mtop power sampler",
-            (false, true) => "refresh persistent NFS recovery services",
+            (false, true) => "refresh the NFS recovery service",
             (false, false) => unreachable!(),
         };
         let result = execute(node, purpose, &admin_script);
@@ -4458,7 +4527,6 @@ fn refresh_agent_helpers_with_admin(
             cleanup_power_helper_stage(node, setup);
         }
         if !io::stdin().is_terminal()
-            && !has_nfs_recovery
             && result
                 .as_ref()
                 .err()
@@ -4466,7 +4534,7 @@ fn refresh_agent_helpers_with_admin(
         {
             deferred = true;
             eprintln!(
-                "Power sampler refresh on {node_id} awaits administrator authorization; rerun from Terminal."
+                "Privileged helper refresh on {node_id} awaits administrator authorization; rerun from Terminal."
             );
             continue;
         }
@@ -11848,23 +11916,22 @@ exec "$@"
     }
 
     #[test]
-    fn nfs_recovery_refresh_reaches_admin_executor_without_terminal() {
+    fn agent_update_skips_root_helpers_when_versions_are_current() {
         let config = parse_build_test_config();
         let mut calls = 0;
         let result = super::refresh_agent_helpers_with_admin(
             &config,
             "test",
             |_, _| Ok(None),
-            |_, purpose, script| {
-                assert!(purpose.contains("NFS"));
-                assert!(script.contains("nfs-recovery"));
+            |_, _| Ok(None),
+            |_, _, _| {
                 calls += 1;
-                Ok(())
+                Err("unexpected administrator operation during Agent update".into())
             },
         )
         .unwrap();
         assert!(!result);
-        assert!(calls > 0);
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -12964,7 +13031,54 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
-    fn agent_update_batches_power_and_nfs_helper_refresh_in_one_admin_script() {
+    fn agent_update_batches_changed_privileged_helpers_in_one_admin_script() {
+        let script = super::agent_update_admin_script(
+            Some("install-power-helper"),
+            Some("refresh-nfs-helper"),
+        )
+        .unwrap();
+        assert_eq!(script, "set -e\ninstall-power-helper\nrefresh-nfs-helper\n");
+        assert_eq!(script.matches("set -e").count(), 1);
+        assert!(super::agent_update_admin_script(None, None).is_none());
+    }
+
+    #[test]
+    fn nfs_helper_probe_checks_version_files_and_service_registration() {
+        let mounts = vec![
+            super::ClientUnmountRequest {
+                source: "192.0.2.1:/shared".into(),
+                mount_root: PathBuf::from("/Users/Shared/macluster"),
+                share_uuid: "00000000-0000-4000-8000-000000000001".into(),
+                label: "primary".into(),
+            },
+            super::ClientUnmountRequest {
+                source: "192.0.2.1:/tools".into(),
+                mount_root: PathBuf::from("/Users/Shared/tools"),
+                share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                label: "tools".into(),
+            },
+        ];
+        let script = super::client_nfs_recovery_version_probe_script(&mounts).unwrap();
+        assert!(script.contains("/bin/cat"));
+        let first_marker = crate::nfs_recovery::version_marker_path(&mounts[0].mount_root);
+        let second_marker = crate::nfs_recovery::version_marker_path(&mounts[1].mount_root);
+        assert!(script.contains(first_marker.to_str().unwrap()));
+        assert!(script.contains(second_marker.to_str().unwrap()));
+        assert_eq!(script.matches("printf '%s\\n'").count(), 2);
+        assert!(!script.contains("internal nfs-recovery refresh"));
+        let syntax = Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[test]
+    fn nfs_update_script_refreshes_only_outdated_mount_helpers() {
         let mut config = parse_build_test_config();
         config.shares.insert(
             "tools".into(),
@@ -12975,16 +13089,19 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
             },
         );
-        let nfs = super::client_nfs_recovery_refresh_script(&config, "arm-a").unwrap();
-        assert_eq!(nfs.matches("internal nfs-recovery refresh").count(), 2);
-        assert!(nfs.contains("/Users/shared/tools"));
-        assert!(!nfs.contains("/sbin/mount_nfs"));
+        let digest = "ab".repeat(32);
+        let node = config.nodes.get_mut("arm-a").unwrap();
+        node.remote_binary = format!("/Users/test/.local/share/macluster/bin/{digest}/macluster");
+        node.execution_uid = Some(501);
 
-        let combined =
-            super::agent_update_admin_script(Some("install-power-helper"), Some(&nfs)).unwrap();
-        assert!(combined.starts_with("set -e\ninstall-power-helper\n"));
-        assert_eq!(combined.matches("set -e").count(), 1);
-        assert!(!combined.contains("sudo"));
+        let script =
+            super::client_nfs_recovery_refresh_script(&config, "arm-a", &BTreeSet::from([1]))
+                .unwrap()
+                .unwrap();
+        assert_eq!(script.matches("internal nfs-recovery refresh").count(), 1);
+        assert!(script.contains("/Users/shared/tools"));
+        assert!(script.contains(&digest));
+        assert!(!script.contains("/tmp/macluster-shared"));
     }
 
     #[test]
@@ -13019,17 +13136,23 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         config.nodes.retain(|id, _| id == "login");
         let root = test_exports_path();
         fs::create_dir_all(&root).unwrap();
-        let deferred =
-            super::refresh_agent_helpers_for_update_with(&config, "retry-test", |_, _| {
-                Err("temporary upload failure".into())
-            })
-            .unwrap();
+        let deferred = super::refresh_agent_helpers_for_update_with(
+            &config,
+            "retry-test",
+            |_, _| Err("temporary upload failure".into()),
+            |_, _| Ok(None),
+        )
+        .unwrap();
         assert!(deferred);
         super::set_agent_helper_refresh_pending(&root, deferred);
         assert!(super::agent_helper_refresh_pending(&root).unwrap());
-        let deferred =
-            super::refresh_agent_helpers_for_update_with(&config, "retry-test", |_, _| Ok(None))
-                .unwrap();
+        let deferred = super::refresh_agent_helpers_for_update_with(
+            &config,
+            "retry-test",
+            |_, _| Ok(None),
+            |_, _| Ok(None),
+        )
+        .unwrap();
         assert!(!deferred);
         super::set_agent_helper_refresh_pending(&root, deferred);
         assert!(!super::agent_helper_refresh_pending(&root).unwrap());

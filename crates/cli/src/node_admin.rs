@@ -75,6 +75,9 @@ const INTERACTIVE_SSH_OPTIONS: &[&str] = &[
     "-oServerAliveInterval=5",
     "-oServerAliveCountMax=1",
 ];
+const ADMIN_COMMAND_LIMIT: Duration = Duration::from_secs(300);
+const ADMIN_TIMEOUT: &str = "administrator command timed out";
+
 const MAINTENANCE_WAIT_LIMIT: Duration = Duration::from_secs(300);
 
 struct NodeMaintenanceGuard {
@@ -310,7 +313,9 @@ fn finish_node_maintenance_with_success_notice<T>(
         }
         Err(error) => {
             let mut error = error;
-            if let Err((_, recovery_error)) = guard.reconcile_after_error() {
+            if !error.1.contains(ADMIN_TIMEOUT)
+                && let Err((_, recovery_error)) = guard.reconcile_after_error()
+            {
                 error.1 = format!(
                     "{}; controller maintenance recovery also failed: {recovery_error}",
                     error.1
@@ -4406,7 +4411,21 @@ fn refresh_agent_helpers_for_update(config: &ClusterConfig, operation_id: &str) 
 fn refresh_agent_helpers_for_update_with(
     config: &ClusterConfig,
     operation_id: &str,
+    prepare_power: impl FnMut(&NodeConfig, &str) -> Result<Option<PowerHelperSetup>, String>,
+) -> AppResult<bool> {
+    refresh_agent_helpers_with_admin(
+        config,
+        operation_id,
+        prepare_power,
+        run_interactive_admin_with_reason,
+    )
+}
+
+fn refresh_agent_helpers_with_admin(
+    config: &ClusterConfig,
+    operation_id: &str,
     mut prepare_power: impl FnMut(&NodeConfig, &str) -> Result<Option<PowerHelperSetup>, String>,
+    mut execute: impl FnMut(&NodeConfig, &str, &str) -> Result<(), String>,
 ) -> AppResult<bool> {
     let mut deferred = false;
     for (node_id, node) in &config.nodes {
@@ -4428,25 +4447,28 @@ fn refresh_agent_helpers_for_update_with(
         };
         let has_power = power_setup.is_some();
         let has_nfs_recovery = nfs_recovery_script.is_some();
-        if has_power && !has_nfs_recovery && unsafe { libc::isatty(0) } != 1 {
-            eprintln!(
-                "Power sampler refresh on {node_id} was skipped because this command has no interactive terminal; run a macluster command from Terminal to authorize the helper update."
-            );
-            if let Some(setup) = &power_setup {
-                cleanup_power_helper_stage(node, setup);
-            }
-            deferred = true;
-            continue;
-        }
         let purpose = match (has_power, has_nfs_recovery) {
             (true, true) => "refresh the mtop power sampler and persistent NFS recovery service",
             (true, false) => "refresh the mtop power sampler",
             (false, true) => "refresh persistent NFS recovery services",
             (false, false) => unreachable!(),
         };
-        let result = run_interactive_admin_with_reason(node, purpose, &admin_script);
+        let result = execute(node, purpose, &admin_script);
         if let Some(setup) = &power_setup {
             cleanup_power_helper_stage(node, setup);
+        }
+        if !io::stdin().is_terminal()
+            && !has_nfs_recovery
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|error| admin_authorization_required(error))
+        {
+            deferred = true;
+            eprintln!(
+                "Power sampler refresh on {node_id} awaits administrator authorization; rerun from Terminal."
+            );
+            continue;
         }
         result.map_err(|error| {
             (
@@ -5289,9 +5311,7 @@ pub(crate) fn run_interactive(node: &NodeConfig, script: &str) -> Result<(), Str
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = command
-        .status()
-        .map_err(|error| format!("could not start interactive admin command: {error}"))?;
+    let status = wait_admin_child(command, ADMIN_COMMAND_LIMIT)?;
     if status.success() {
         Ok(())
     } else {
@@ -5299,6 +5319,98 @@ pub(crate) fn run_interactive(node: &NodeConfig, script: &str) -> Result<(), Str
             "interactive admin command exited with {status}; see terminal output above"
         ))
     }
+}
+
+// Keep the caller's foreground process group so sudo can read the terminal.
+fn wait_admin_child(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not start administrator command: {error}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
+            result => {
+                // SIGTERM lets sudo forward termination to its command before escalation.
+                unsafe {
+                    libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+                }
+                let grace = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < grace {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                let _ = child.kill();
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(match result {
+                    Err(error) => format!("could not observe administrator command: {error}"),
+                    _ => format!(
+                        "{ADMIN_TIMEOUT} after {} seconds; remote changes may be incomplete. Maintenance recovery is preserved; inspect the node and rerun the original command.",
+                        timeout.as_secs()
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn admin_authorization_required(error: &str) -> bool {
+    [
+        "sudo: a password is required",
+        "sudo: a terminal is required",
+        "not allowed to execute",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
+}
+
+fn noninteractive_admin_script(sudo_path: &str, script: &str) -> String {
+    format!(
+        "exec /usr/bin/env LC_ALL=C {} -n /bin/sh -c {}",
+        shell_quote(sudo_path),
+        shell_quote(script)
+    )
+}
+
+fn run_noninteractive_admin(node: &NodeConfig, script: &str) -> Result<(), String> {
+    let script = noninteractive_admin_script("/usr/bin/sudo", script);
+    let mut command = if node.transport == Transport::Local {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        command
+    } else {
+        let mut command = Command::new("/usr/bin/ssh");
+        command.args(SSH_OPTIONS);
+        node.add_ssh_identity_args(&mut command);
+        add_node_admin_ssh_pool_args(node, &mut command);
+        command.arg(&node.host).arg(script);
+        command
+    };
+    command.stdin(Stdio::null());
+    let output = run_child(command, None, ADMIN_COMMAND_LIMIT).map_err(|(_, error)| {
+        if error.to_lowercase().contains("timed out") || error.to_lowercase().contains("timeout") {
+            format!("{ADMIN_TIMEOUT}; inspect the node and rerun the original operation: {error}")
+        } else {
+            error
+        }
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let reason = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "non-interactive administrator command failed ({}): {}; if authorization is required, rerun from Terminal for this node's administrator approval",
+        output.status,
+        reason.trim()
+    ))
 }
 
 fn run_child(command: Command, input: Option<&[u8]>, timeout: Duration) -> AppResult<Output> {
@@ -6120,7 +6232,14 @@ pub(crate) fn nfs_exports_update_commands(
 }
 
 pub(crate) fn run_interactive_admin(node: &NodeConfig, script: &str) -> Result<(), String> {
-    run_interactive(node, &admin_shell_command("/usr/bin/sudo", script))
+    if io::stdin().is_terminal() {
+        run_interactive(
+            node,
+            &format!("exec {}", admin_shell_command("/usr/bin/sudo", script)),
+        )
+    } else {
+        run_noninteractive_admin(node, script)
+    }
 }
 
 fn run_interactive_admin_with_reason(
@@ -11679,6 +11798,73 @@ mod tests {
 
     fn test_exports_path() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-exports-{}.test", Id128::random()))
+    }
+
+    #[test]
+    fn administrator_command_timeout_is_bounded_and_preserves_foreground_group() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec /bin/sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = super::wait_admin_child(command, Duration::from_millis(60)).unwrap_err();
+        assert!(error.contains(super::ADMIN_TIMEOUT), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 17"]);
+        assert_eq!(
+            super::wait_admin_child(command, Duration::from_secs(2))
+                .unwrap()
+                .code(),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn noninteractive_admin_executes_passwordless_command_without_tty() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let sudo = root.join("sudo");
+        fs::write(
+            &sudo,
+            r#"#!/bin/sh
+[ "$1" = -n ] || exit 90
+shift
+exec "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&sudo, fs::Permissions::from_mode(0o700)).unwrap();
+        let script =
+            super::noninteractive_admin_script(sudo.to_str().unwrap(), "printf authorized");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let output = super::run_child(command, None, Duration::from_secs(2)).unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(output.stdout, b"authorized");
+        assert!(super::admin_authorization_required(
+            "sudo: a password is required"
+        ));
+        assert!(!super::admin_authorization_required("nfsd: invalid export"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nfs_recovery_refresh_reaches_admin_executor_without_terminal() {
+        let config = parse_build_test_config();
+        let mut calls = 0;
+        let result = super::refresh_agent_helpers_with_admin(
+            &config,
+            "test",
+            |_, _| Ok(None),
+            |_, purpose, script| {
+                assert!(purpose.contains("NFS"));
+                assert!(script.contains("nfs-recovery"));
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!result);
+        assert!(calls > 0);
     }
 
     #[test]

@@ -351,12 +351,8 @@ fn defer_update_without_terminal(
     if can_defer_agent_update_for_work(command, args) {
         return Ok(true);
     }
-    Err((
-        1,
-        format!(
-            "Agent update is required before `{command}`, but administrator authorization needs an interactive Terminal. Rerun the same command from Terminal to resume; any interrupted maintenance is preserved."
-        ),
-    ))
+    // Mutations may proceed using sudo -n; missing authorization fails without prompting.
+    Ok(false)
 }
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
@@ -4005,6 +4001,7 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             let active = match (status.policy, status.active) {
                 (FanPolicy::System, _) => "DEFAULT",
                 (_, true) => "ACTIVE",
+                (_, false) if status.average_temperature_deci_celsius.is_none() => "WAIT_TEMP",
                 (_, false) => "ARMED",
             };
             let temperature = status
@@ -4014,7 +4011,7 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             let target_rpm = status
                 .target_rpm
                 .map(|value| value.to_string())
-                .unwrap_or_else(|| "N/A".into());
+                .unwrap_or_else(|| if status.active { "N/A" } else { "SYSTEM" }.into());
             println!(
                 "{:<18} {:<8} {:<8} {:<8} {:<10} {}",
                 result.node_id, mode, active, temperature, target_rpm, detail
@@ -8267,7 +8264,10 @@ mod update_terminal_regressions {
             defer_update_without_terminal("node", &["-l".into()], false, true),
             Ok(true)
         );
-        assert!(defer_update_without_terminal("submit", &[], false, true).is_err());
+        assert_eq!(
+            defer_update_without_terminal("submit", &[], false, true),
+            Ok(false)
+        );
         assert_eq!(
             defer_update_without_terminal("submit", &[], true, true),
             Ok(false)

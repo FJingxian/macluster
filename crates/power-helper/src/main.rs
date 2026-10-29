@@ -350,27 +350,44 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
         })
         .map_err(|error| format!("start power sampler: {error}"))?;
 
-    fan::start(peer_uid, Arc::clone(&cache))?;
+    start_optional_fan_service(|| fan::start(peer_uid, Arc::clone(&cache)));
 
     for incoming in listener.incoming() {
         let mut stream = incoming.map_err(|error| format!("accept socket client: {error}"))?;
-        if peer_uid_for(&stream).ok() != Some(peer_uid) {
-            let _ = stream.write_all(b"{\"watts\":null,\"scope\":null,\"available\":false,\"reason\":\"unauthorized local user\"}\n");
-            continue;
-        }
-        let response = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .response(Instant::now());
-        let mut bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
-        if let Err(error) = stream.write_all(&bytes)
-            && !is_disconnected_client_error(&error)
-        {
-            return Err(format!("write sample: {error}"));
-        }
+        serve_power_client(&mut stream, peer_uid, &cache)?;
     }
     Ok(())
+}
+
+fn serve_power_client(
+    stream: &mut UnixStream,
+    peer_uid: libc::uid_t,
+    cache: &Mutex<PowerCache>,
+) -> Result<(), String> {
+    if peer_uid_for(&stream).ok() != Some(peer_uid) {
+        let _ = stream.write_all(b"{\"watts\":null,\"scope\":null,\"available\":false,\"reason\":\"unauthorized local user\"}\n");
+        return Ok(());
+    }
+    let response = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .response(Instant::now());
+    let mut bytes = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if let Err(error) = stream.write_all(&bytes)
+        && !is_disconnected_client_error(&error)
+    {
+        return Err(format!("write sample: {error}"));
+    }
+    Ok(())
+}
+
+fn start_optional_fan_service(start: impl FnOnce() -> Result<(), String>) {
+    if let Err(error) = start() {
+        eprintln!(
+            "macluster-power: fan control unavailable: {error}; power/GPU sampling continues"
+        );
+    }
 }
 
 fn is_disconnected_client_error(error: &io::Error) -> bool {
@@ -539,6 +556,31 @@ mod tests {
         is_disconnected_client_error, macmon_power_reading, parse_powermetrics_power, unavailable,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn fan_start_failure_does_not_prevent_power_socket_response() {
+        use std::{io::Read, os::unix::net::UnixStream, sync::Mutex};
+        let mut cache = PowerCache::default();
+        cache.update(
+            good_sample(),
+            Ok(gpu_reading(true, 0.5).unwrap()),
+            None,
+            Instant::now(),
+        );
+        super::start_optional_fan_service(|| Err("fan socket occupied".into()));
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        super::serve_power_client(&mut server, unsafe { libc::geteuid() }, &Mutex::new(cache))
+            .unwrap();
+        drop(server);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        let response: PowerSample = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.watts, Some(3.5));
+        assert_eq!(response.gpu_percent, Some(50.0));
+    }
 
     fn good_sample() -> PowerSample {
         PowerSample {

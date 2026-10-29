@@ -174,16 +174,24 @@ impl FanEngine {
                 .clone()
                 .unwrap_or_else(|| "system fan restoration is still pending".into()));
         }
+        self.arm_curve(policy);
+        Ok(())
+    }
+
+    fn arm_curve(&mut self, policy: FanPolicy) {
+        if self.policy == policy {
+            return;
+        }
         self.policy = policy;
         self.temperatures.clear();
+        // Keep active hardware ownership/targets while switching curves.
         self.initial_temperature_wait_since = Some(Instant::now());
         self.saw_temperature = false;
-        self.active = false;
-        self.target_rpm = None;
-        self.last_targets.clear();
         self.average_temperature_celsius = None;
-        self.message = Some("curve armed; waiting for the 40°C activation threshold".into());
-        Ok(())
+        self.message = Some(
+            "waiting for a fresh CPU temperature sample; macOS controls fans until activation"
+                .into(),
+        );
     }
 
     fn tick(&mut self, temperature: Option<f32>) {
@@ -219,7 +227,8 @@ impl FanEngine {
         let Some(temperature) =
             temperature.filter(|value| value.is_finite() && (0.0..=130.0).contains(value))
         else {
-            if !self.saw_temperature
+            if !self.active
+                && !self.saw_temperature
                 && self
                     .initial_temperature_wait_since
                     .is_some_and(|started| started.elapsed() < INITIAL_TEMP_GRACE)
@@ -240,6 +249,9 @@ impl FanEngine {
         self.average_temperature_celsius = Some(average);
 
         if average <= FAN_OFF_C {
+            if !self.active {
+                self.message = Some("below 40°C; curve armed, macOS controls fan speed".into());
+            }
             if self.active {
                 if let Some(hardware) = self.hardware.as_mut()
                     && let Err(error) = hardware.restore_system(&self.fans)
@@ -395,10 +407,7 @@ pub fn start(peer_uid: libc::uid_t, power_cache: Arc<Mutex<PowerCache>>) -> Resu
 
     let engine = Arc::new(Mutex::new(FanEngine::new()));
     let listener_engine = Arc::clone(&engine);
-    thread::Builder::new()
-        .name("macluster-fan-control-socket".into())
-        .spawn(move || serve(listener, peer_uid, listener_engine))
-        .map_err(|error| format!("start fan control socket: {error}"))?;
+    let listener_cache = Arc::clone(&power_cache);
 
     thread::Builder::new()
         .name("macluster-fan-policy".into())
@@ -416,10 +425,20 @@ pub fn start(peer_uid: libc::uid_t, power_cache: Arc<Mutex<PowerCache>>) -> Resu
             }
         })
         .map_err(|error| format!("start fan policy loop: {error}"))?;
+    thread::Builder::new()
+        .name("macluster-fan-control-socket".into())
+        .spawn(move || serve(listener, peer_uid, listener_engine, listener_cache))
+        .map_err(|error| format!("start fan control socket: {error}"))?;
+
     Ok(())
 }
 
-fn serve(listener: UnixListener, peer_uid: libc::uid_t, engine: Arc<Mutex<FanEngine>>) {
+fn serve(
+    listener: UnixListener,
+    peer_uid: libc::uid_t,
+    engine: Arc<Mutex<FanEngine>>,
+    power_cache: Arc<Mutex<PowerCache>>,
+) {
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         if peer_uid_for(&stream).ok() != Some(peer_uid) {
@@ -438,12 +457,21 @@ fn serve(listener: UnixListener, peer_uid: libc::uid_t, engine: Arc<Mutex<FanEng
         let Ok(command) = serde_json::from_str::<FanHelperCommand>(&line) else {
             continue;
         };
+        let temperature = power_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .temperature(Instant::now());
         let mut engine = engine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = match command {
             FanHelperCommand::Status => Ok(engine.status()),
-            FanHelperCommand::Set { policy } => engine.set_policy(policy).map(|()| engine.status()),
+            FanHelperCommand::Set { policy } => engine.set_policy(policy).map(|()| {
+                if policy != FanPolicy::System {
+                    engine.tick(temperature);
+                }
+                engine.status()
+            }),
         };
         let (status, error) = match result {
             Ok(status) => (status, None),
@@ -785,3 +813,37 @@ impl Hardware {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const _: [(); 80] = [(); std::mem::size_of::<macmon::sources::KeyData>()];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arming_uses_fresh_cold_temperature_without_hardware_writes() {
+        let mut engine = FanEngine::unsupported("test");
+        engine.supported = true;
+        engine.arm_curve(FanPolicy::Auto);
+        assert!(engine.message.as_deref().unwrap().contains("fresh CPU"));
+        engine.tick(Some(35.0));
+        let status = engine.status();
+        assert_eq!(status.average_temperature_deci_celsius, Some(350));
+        assert!(!status.active);
+        assert!(status.message.unwrap().contains("below 40"));
+    }
+
+    #[test]
+    fn repeated_policy_preserves_samples_and_curve_switch_preserves_manual_ownership() {
+        let mut engine = FanEngine::unsupported("test");
+        engine.arm_curve(FanPolicy::Auto);
+        engine.active = true;
+        engine.target_rpm = Some(2000);
+        engine.last_targets = vec![2000];
+        engine.temperatures.push_back(55.0);
+        engine.arm_curve(FanPolicy::Auto);
+        assert_eq!(engine.temperatures.len(), 1);
+        engine.arm_curve(FanPolicy::Power);
+        assert!(engine.active);
+        assert_eq!(engine.target_rpm, Some(2000));
+        assert_eq!(engine.last_targets, vec![2000]);
+    }
+}

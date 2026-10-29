@@ -14,7 +14,7 @@ use std::{
 use macluster_core::config::{NodeConfig, Transport};
 
 const PROCESS_TABLE_MARKER: &str = "__MACLUSTER_PS_NAMES__";
-const PROCESS_COMMAND: &str = "/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu && printf '\\n__MACLUSTER_PS_NAMES__\\n' && /bin/ps -axo pid=,ucomm=";
+const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
 const MAX_PROCESS_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -468,11 +468,19 @@ fn parse_process_names(input: &str) -> BTreeMap<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessCache, ProcessInfo, ProcessSort, ProcessView, parse_top_processes, sort_processes,
+        PROCESS_COMMAND, ProcessCache, ProcessInfo, ProcessSort, ProcessView, parse_top_processes,
+        sort_processes,
     };
     use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "top first sample\nPID    %CPU MEM   TIME     COMMAND\n11 90.0 2M 00:00.01 first_low\n12 2.0 4M 00:00.02 first_busy\nProcesses: 8 total\nPID    %CPU MEM   TIME     COMMAND\n11 1.5 2M 00:00.03 top_low_worker\n12 82.0 4M 00:00.04 top_busy_worker (Renderer)\n13 35.0 1M 00:00.02 top_middle_worker\n__MACLUSTER_PS_NAMES__\n   11 low_worker\n   12 busy_worker\n   13 middle_worker\n";
+
+    #[test]
+    fn process_name_lookup_is_limited_to_top_rows() {
+        assert!(PROCESS_COMMAND.contains("/bin/ps -p \"$pids\" -o pid=,ucomm="));
+        assert!(!PROCESS_COMMAND.contains("/bin/ps -axo pid=,ucomm="));
+        assert!(PROCESS_COMMAND.contains("{ table=1; count=0; next }"));
+    }
 
     #[test]
     fn parses_the_second_top_sample_joins_names_and_sorts_by_cpu() {

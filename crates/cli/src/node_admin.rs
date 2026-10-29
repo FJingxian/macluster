@@ -692,6 +692,8 @@ fn wait_for_live_maintenance(
 ) -> AppResult<bool> {
     let started = Instant::now();
     let mut last_message = Instant::now();
+    let mut next_epoch_check = Instant::now();
+    let mut epoch_recovered = false;
     loop {
         match client
             .request(ControlCommand::InspectMaintenance)
@@ -700,6 +702,18 @@ fn wait_for_live_maintenance(
             ControlPayload::Maintenance(Some(status))
                 if status.ticket == *ticket && status.scope == *scope =>
             {
+                if matches!(
+                    status.phase,
+                    MaintenancePhase::Ready | MaintenancePhase::Draining
+                ) && !epoch_recovered
+                    && Instant::now() >= next_epoch_check
+                {
+                    next_epoch_check = Instant::now() + Duration::from_secs(5);
+                    if recover_stale_maintenance_controller(client, config_path, journal_path)? {
+                        epoch_recovered = true;
+                        continue;
+                    }
+                }
                 match status.phase {
                     MaintenancePhase::Ready => return Ok(false),
                     MaintenancePhase::RecoveryRequired => {
@@ -764,6 +778,88 @@ fn wait_for_live_maintenance(
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn recover_stale_controller_epoch_with(
+    running: ControllerEpoch,
+    persisted: Option<ControllerEpoch>,
+    has_active_execution: bool,
+    restart: impl FnOnce() -> AppResult<()>,
+) -> AppResult<bool> {
+    let Some(persisted) = persisted else {
+        return Ok(false);
+    };
+    if persisted.controller_uuid != running.controller_uuid {
+        return Err((
+            1,
+            "controller identity changed during maintenance; refusing automatic restart".into(),
+        ));
+    }
+    if persisted.epoch <= running.epoch {
+        return Ok(false);
+    }
+    if has_active_execution {
+        return Err((1, "controller fencing epoch changed while executions are active; automatic restart is blocked to preserve running work".into()));
+    }
+    restart()?;
+    Ok(true)
+}
+
+fn recover_stale_maintenance_controller(
+    client: &mut ControlClient,
+    config_path: &Path,
+    journal_path: &Path,
+) -> AppResult<bool> {
+    let state_dir = journal_path
+        .parent()
+        .ok_or((1, "maintenance state directory is missing".into()))?;
+    if !state_dir.join("controller.sqlite3").is_file() {
+        return Ok(false);
+    }
+    let storage = ReadOnlyJobStore::open(state_dir).map_err(|error| (1, error.to_string()))?;
+    let persisted = storage
+        .current_controller_epoch()
+        .map_err(|error| (1, error.to_string()))?;
+    let running = client.hello().controller_epoch;
+    if persisted.is_none_or(|epoch| epoch == running) {
+        return Ok(false);
+    }
+    let active = storage
+        .list_active_jobs()
+        .map_err(|error| (1, error.to_string()))?
+        .iter()
+        .any(|job| {
+            matches!(
+                job.state,
+                macluster_protocol::types::JobState::Starting
+                    | macluster_protocol::types::JobState::Running
+                    | macluster_protocol::types::JobState::Cancelling
+            )
+        });
+    recover_stale_controller_epoch_with(running, persisted, active, || {
+        eprintln!(
+            "Controller was fenced by an earlier maintenance handoff; restarting the idle controller and resuming maintenance."
+        );
+        let binding =
+            ServiceBinding::load(config_path, state_dir).map_err(|error| (1, error.to_string()))?;
+        crate::service::ServiceManager::current(binding.clone())
+            .map_err(|error| (1, error.to_string()))?
+            .restart(Duration::from_secs(5))
+            .map_err(|error| (1, error.to_string()))?;
+        let next = ControlClient::connect(&binding, Duration::from_secs(5))
+            .map_err(control_client_error)?;
+        if next.hello().controller_epoch.controller_uuid != running.controller_uuid
+            || next.hello().controller_epoch.epoch
+                <= persisted.map_or(running.epoch, |epoch| epoch.epoch)
+        {
+            return Err((
+                1,
+                "controller restart did not establish a newer matching fencing epoch".into(),
+            ));
+        }
+        *client = next;
+        Ok(())
+    })
 }
 
 fn complete_maintenance_ticket(
@@ -7858,9 +7954,9 @@ pub(crate) fn check_remote_idle(
 }
 
 fn enrollment_controller_epoch(state_dir: &Path) -> Result<ControllerEpoch, String> {
-    Storage::open(state_dir)
-        .and_then(|storage| storage.begin_controller_epoch())
-        .map_err(|error| format!("cannot prepare node handoff identity: {error}"))
+    // Enrollment can run under a live maintenance ticket. Advancing the epoch
+    // here fences that still-running controller and prevents its next drain.
+    migration_controller_epoch(state_dir)
 }
 
 fn migration_controller_epoch(state_dir: &Path) -> Result<ControllerEpoch, String> {
@@ -11850,10 +11946,10 @@ mod tests {
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
-    use macluster_core::storage::Storage;
+    use macluster_core::storage::{ReadOnlyJobStore, Storage};
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
-    use macluster_protocol::types::{JobMode, JobSpec, NodeHealth};
+    use macluster_protocol::types::{ControllerEpoch, JobMode, JobSpec, NodeHealth};
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
@@ -12028,8 +12124,62 @@ exec "$@"
         let first = storage.begin_controller_epoch().unwrap();
         assert_eq!(migration_controller_epoch(&state).unwrap(), first);
         assert_eq!(storage.current_controller_epoch().unwrap(), Some(first));
+        assert_eq!(super::enrollment_controller_epoch(&state).unwrap(), first);
+        assert_eq!(storage.current_controller_epoch().unwrap(), Some(first));
         drop(storage);
+        assert_eq!(
+            ReadOnlyJobStore::open(&state)
+                .unwrap()
+                .current_controller_epoch()
+                .unwrap(),
+            Some(first)
+        );
         fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn stale_maintenance_epoch_restarts_only_an_idle_matching_controller() {
+        let running = ControllerEpoch {
+            controller_uuid: macluster_protocol::identifiers::ControllerUuid::random(),
+            epoch: 5,
+        };
+        let newer = ControllerEpoch {
+            epoch: 6,
+            ..running
+        };
+        let mut restarted = false;
+        assert!(
+            super::recover_stale_controller_epoch_with(running, Some(newer), false, || {
+                restarted = true;
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert!(restarted);
+        assert!(
+            super::recover_stale_controller_epoch_with(running, Some(newer), true, || panic!(
+                "must not interrupt active work"
+            ))
+            .is_err()
+        );
+        assert!(
+            !super::recover_stale_controller_epoch_with(running, Some(running), false, || panic!(
+                "current controller needs no restart"
+            ))
+            .unwrap()
+        );
+        assert!(
+            super::recover_stale_controller_epoch_with(
+                running,
+                Some(ControllerEpoch {
+                    controller_uuid: macluster_protocol::identifiers::ControllerUuid::random(),
+                    epoch: 6
+                }),
+                false,
+                || panic!("must not restart a different identity")
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -364,7 +364,6 @@ pub fn run_interactive(
                             post_action = Some(MtopPostAction::CheckBuilds(compatibility));
                             break;
                         }
-                        post_action = Some(MtopPostAction::CheckBuilds(compatibility));
                     }
                     Ok(Err(error)) => {
                         validation_finished = true;

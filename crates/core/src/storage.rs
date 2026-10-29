@@ -227,6 +227,11 @@ impl ReadOnlyJobStore {
             .collect()
     }
 
+    /// Inspect fencing metadata without creating or writing controller state.
+    pub fn current_controller_epoch(&self) -> Result<Option<ControllerEpoch>, SubmitError> {
+        read_controller_epoch(&self.connection)
+    }
+
     pub fn get_job(&self, job_id: u64) -> Result<Option<JobRecord>, SubmitError> {
         self.connection
             .query_text(
@@ -671,29 +676,7 @@ impl Storage {
     /// epoch. Idle maintenance performed by a live controller must keep using
     /// the epoch already held by that controller.
     pub fn current_controller_epoch(&self) -> Result<Option<ControllerEpoch>, SubmitError> {
-        let uuid = self.connection.query_text(
-            "SELECT value FROM schema_meta WHERE key='controller_uuid'",
-            None,
-        )?;
-        let epoch = self.connection.query_text(
-            "SELECT value FROM schema_meta WHERE key='controller_epoch'",
-            None,
-        )?;
-        match (uuid, epoch) {
-            (None, None) => Ok(None),
-            (Some(uuid), Some(epoch)) => Ok(Some(ControllerEpoch {
-                controller_uuid: ControllerUuid(
-                    Id128::parse(&uuid)
-                        .map_err(|error| SubmitError::Database(error.to_string()))?,
-                ),
-                epoch: epoch
-                    .parse::<u64>()
-                    .map_err(|error| SubmitError::Database(error.to_string()))?,
-            })),
-            _ => Err(SubmitError::Database(
-                "controller identity and fencing epoch are inconsistent".into(),
-            )),
-        }
+        read_controller_epoch(&self.connection)
     }
 
     pub fn list_jobs(&self, state: Option<JobState>) -> Result<Vec<JobRecord>, SubmitError> {
@@ -2287,5 +2270,30 @@ mod cancellation_recovery_tests {
         drop(reader);
         drop(storage);
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn read_controller_epoch(connection: &Connection) -> Result<Option<ControllerEpoch>, SubmitError> {
+    let uuid = connection.query_text(
+        "SELECT value FROM schema_meta WHERE key='controller_uuid'",
+        None,
+    )?;
+    let epoch = connection.query_text(
+        "SELECT value FROM schema_meta WHERE key='controller_epoch'",
+        None,
+    )?;
+    match (uuid, epoch) {
+        (None, None) => Ok(None),
+        (Some(uuid), Some(epoch)) => Ok(Some(ControllerEpoch {
+            controller_uuid: ControllerUuid(
+                Id128::parse(&uuid).map_err(|error| SubmitError::Database(error.to_string()))?,
+            ),
+            epoch: epoch
+                .parse::<u64>()
+                .map_err(|error| SubmitError::Database(error.to_string()))?,
+        })),
+        _ => Err(SubmitError::Database(
+            "controller identity and fencing epoch are inconsistent".into(),
+        )),
     }
 }

@@ -198,6 +198,7 @@ struct NodeRuntime {
     health: Option<NodeHealthCache>,
     next_probe_at: Instant,
     probe_failures: u8,
+    last_probe_error: Option<String>,
     next_control_at: Instant,
     control_failures: u8,
     pending_start: Option<JobRecord>,
@@ -213,6 +214,7 @@ impl NodeRuntime {
             health: None,
             next_probe_at: now,
             probe_failures: 0,
+            last_probe_error: None,
             next_control_at: now,
             control_failures: 0,
             pending_start: None,
@@ -416,9 +418,10 @@ impl RuntimeState {
             {
                 blockers.push(format!("node {node_id} still reports an active execution"));
             } else if !node.status_fresh(Instant::now()) {
-                blockers.push(format!(
-                    "node {node_id} execution state is not freshly verified"
-                ));
+                blockers.push(match &node.last_probe_error {
+                    Some(error) => format!("node {node_id} execution verification failed: {error}"),
+                    None => format!("node {node_id} execution state is not freshly verified"),
+                });
             }
             if blockers.len() >= 32 {
                 break;
@@ -678,7 +681,8 @@ impl RuntimeState {
         let Some(runtime) = self.nodes.get_mut(node_id) else {
             return Ok(());
         };
-        if let Some(_error) = probe.fence_error {
+        if let Some(error) = probe.fence_error {
+            runtime.last_probe_error = Some(error.chars().take(256).collect());
             service.fenced_nodes.remove(node_id);
             runtime.fenced = false;
             runtime.status = None;
@@ -700,6 +704,7 @@ impl RuntimeState {
                     sampled_at: tag.started_at,
                 });
                 runtime.probe_failures = 0;
+                runtime.last_probe_error = None;
                 runtime.next_probe_at = received_at + probe_interval;
                 if online && !occupied {
                     service
@@ -717,6 +722,7 @@ impl RuntimeState {
                     sampled_at: tag.started_at,
                 });
                 runtime.probe_failures = 0;
+                runtime.last_probe_error = None;
                 runtime.next_probe_at = received_at + probe_interval;
                 service
                     .idle_since
@@ -732,10 +738,12 @@ impl RuntimeState {
                     sampled_at: tag.started_at,
                 });
                 runtime.probe_failures = 0;
+                runtime.last_probe_error = None;
                 runtime.next_probe_at = received_at + probe_interval;
                 service.idle_since.remove(node_id);
             }
-            Some(Err(ProbeError::Failed(_error))) => {
+            Some(Err(ProbeError::Failed(error))) => {
+                runtime.last_probe_error = Some(error.chars().take(256).collect());
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
                 runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);

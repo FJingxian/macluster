@@ -1548,6 +1548,8 @@ fn build_submission(
     let inherited_env = inherited_task_environment();
     let validate_active_environment =
         should_validate_active_environment_for_command(&merged, &inherited_env, &submitter_cwd);
+    let allow_unused_build_metadata =
+        is_direct_system_utility(&merged, &inherited_env, &submitter_cwd);
     let name = merged
         .name
         .or_else(|| {
@@ -1570,6 +1572,7 @@ fn build_submission(
         inherited_env,
         merged.env,
         validate_active_environment,
+        allow_unused_build_metadata,
     )?;
     if merged.verbose {
         task_env.insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
@@ -1721,7 +1724,7 @@ fn prepare_task_environment(
     task_env: BTreeMap<String, String>,
     overrides: BTreeMap<String, String>,
 ) -> AppResult<BTreeMap<String, String>> {
-    prepare_task_environment_with_policy(config, task_env, overrides, true)
+    prepare_task_environment_with_policy(config, task_env, overrides, true, false)
 }
 
 fn prepare_task_environment_with_policy(
@@ -1729,6 +1732,7 @@ fn prepare_task_environment_with_policy(
     mut task_env: BTreeMap<String, String>,
     overrides: BTreeMap<String, String>,
     should_validate_active_environment: bool,
+    allow_unused_build_metadata: bool,
 ) -> AppResult<BTreeMap<String, String>> {
     let explicit_path = overrides.contains_key("PATH");
     let explicit_env_keys = overrides.keys().cloned().collect::<Vec<_>>();
@@ -1762,6 +1766,7 @@ fn prepare_task_environment_with_policy(
         .transpose()?;
 
     let login_path = task_env.get("PATH").cloned().unwrap_or_default();
+    let mut unused_build_keys = Vec::new();
     for (key, value) in &mut task_env {
         if matches!(
             key.as_str(),
@@ -1782,7 +1787,7 @@ fn prepare_task_environment_with_policy(
         {
             value.clear();
         }
-        *value = remap_task_environment_value(
+        let mapped = remap_task_environment_value(
             config,
             key,
             value,
@@ -1793,7 +1798,24 @@ fn prepare_task_environment_with_policy(
             },
             &login_path,
             cc_shell_escaped_flags,
-        )?;
+        );
+        match mapped {
+            Ok(mapped) => *value = mapped,
+            Err(_)
+                if allow_unused_build_metadata
+                    && !explicit_env_keys.contains(key)
+                    && (is_build_executable_variable(key)
+                        || is_build_flag_variable(key)
+                        || is_build_path_list_variable(key)
+                        || is_build_single_path_variable(key)) =>
+            {
+                unused_build_keys.push(key.clone());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    for key in unused_build_keys {
+        task_env.remove(&key);
     }
     if !explicit_path && let Some(prefix) = selected_prefix.as_ref() {
         task_env.insert(
@@ -1821,6 +1843,66 @@ fn prepare_task_environment_with_policy(
         };
     }
     Ok(task_env)
+}
+
+// Only known system utilities qualify. Scripts, shell expressions, Python,
+// and compilers retain strict toolchain checks, as do explicit --env values.
+fn is_direct_system_utility(
+    options: &SubmitOptions,
+    inherited: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> bool {
+    let Some(command) = options.wrap.as_deref() else {
+        return false;
+    };
+    if command
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '\n' | '\r' | '$' | '`'))
+    {
+        return false;
+    }
+    let Ok(words) = tokenize_shell_words(command) else {
+        return false;
+    };
+    let Some(executable) = words.first() else {
+        return false;
+    };
+    let Some(name) = Path::new(executable).file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if !matches!(
+        name,
+        "ls" | "pwd" | "echo" | "whoami" | "id" | "true" | "false"
+    ) {
+        return false;
+    }
+    let path = Path::new(executable);
+    let resolved = if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else if executable.contains('/') {
+        Some(cwd.join(path))
+    } else {
+        options
+            .env
+            .get("PATH")
+            .or_else(|| inherited.get("PATH"))
+            .into_iter()
+            .flat_map(|p| p.split(':'))
+            .filter(|p| !p.is_empty())
+            .map(|p| Path::new(p).join(executable))
+            .find(|p| p.is_file())
+    };
+    resolved
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|p| {
+            (p.parent() == Some(Path::new("/bin")) || p.parent() == Some(Path::new("/usr/bin")))
+                && p.file_name().and_then(OsStr::to_str).is_some_and(|n| {
+                    matches!(
+                        n,
+                        "ls" | "pwd" | "echo" | "whoami" | "id" | "true" | "false"
+                    )
+                })
+        })
 }
 
 fn should_validate_active_environment_for_command(
@@ -4176,37 +4258,53 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
         io::stdout().is_terminal(),
         term_is_dumb,
     ) {
-        let post_action = crate::mtop::run_interactive(
-            config,
-            state_dir.clone(),
-            resolved_config_path(global.config.as_deref()),
-            selected_queue.map(|queue| queue.to_string()),
-            env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
-            address_migration_deferred,
-        )
-        .map_err(|error| (1, error))?;
-        if address_migration_deferred || crate::node_admin::address_migration_pending(&state_dir) {
-            return Ok(());
-        }
-        return match post_action {
-            Some(crate::mtop::MtopPostAction::CheckBuilds(compatibility))
-                if is_macluster_executable() =>
-            {
-                if compatibility.requires_update() {
+        return run_tui_with_updates(
+            || {
+                // Updates may replace Agent paths and synchronized config.
+                // Rebuild the entire view from the committed configuration.
+                let current = load_config(global.config.as_deref()).map_err(config_error)?;
+                if let Some(queue) = &selected_queue {
+                    if !current.queues.contains_key(queue.as_str()) {
+                        return Err((2, format!("queue '{queue}' is not configured")));
+                    }
+                }
+                let action = crate::mtop::run_interactive(
+                    current,
+                    state_dir.clone(),
+                    resolved_config_path(global.config.as_deref()),
+                    selected_queue.as_ref().map(ToString::to_string),
+                    env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+                    address_migration_deferred,
+                )
+                .map_err(|error| (1, error))?;
+                if address_migration_deferred
+                    || crate::node_admin::address_migration_pending(&state_dir)
+                    || !is_macluster_executable()
+                {
+                    return Ok(None);
+                }
+                Ok(action)
+            },
+            |action| match action {
+                crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
                     println!(
                         "Agent build mismatch detected; entering the cluster update workflow."
                     );
+                    preflight_agent_update_with_compatibility(
+                        "top",
+                        args,
+                        &global,
+                        Some(compatibility),
+                    )
                 }
-                preflight_agent_update_with_compatibility("top", args, &global, Some(compatibility))
-            }
-            Some(crate::mtop::MtopPostAction::RecoverMaintenance) if is_macluster_executable() => {
-                preflight_agent_update("top", args, &global)
-            }
-            Some(crate::mtop::MtopPostAction::UpdateDeferred) => Ok(()),
-            None if is_macluster_executable() => preflight_agent_update("top", args, &global),
-            _ => Ok(()),
-        };
+                crate::mtop::MtopPostAction::RecoverMaintenance => {
+                    preflight_agent_update("top", args, &global)
+                }
+                crate::mtop::MtopPostAction::UpdateDeferred => Ok(()),
+            },
+        );
     }
+
     let view = sample_cluster(
         &config,
         selected_queue.as_ref(),
@@ -4225,6 +4323,31 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
             .map_err(|error| (1, error.to_string()))?;
     }
     Ok(())
+}
+
+// Only startup recovery reopens the TUI. A user-requested exit must not
+// launch a second view or start maintenance after quitting.
+fn run_tui_with_updates(
+    mut view: impl FnMut() -> AppResult<Option<crate::mtop::MtopPostAction>>,
+    mut update: impl FnMut(crate::mtop::MtopPostAction) -> AppResult<()>,
+) -> AppResult<()> {
+    let mut recovered = false;
+    loop {
+        let action = match view()? {
+            None | Some(crate::mtop::MtopPostAction::UpdateDeferred) => return Ok(()),
+            Some(crate::mtop::MtopPostAction::CheckBuilds(ref compatibility))
+                if !compatibility.requires_update() =>
+            {
+                return Ok(());
+            }
+            Some(action) => action,
+        };
+        if recovered {
+            return Err((1, "Agent validation still requires maintenance after an automatic update; inspect `mnode -l` and controller status before retrying".into()));
+        }
+        update(action)?;
+        recovered = true;
+    }
 }
 
 fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
@@ -6454,6 +6577,76 @@ mod tests {
     }
 
     #[test]
+    fn top_reopens_after_update_and_exits_normally_after_quit() {
+        for recovery in [false, true] {
+            let mut draws = 0;
+            let mut updates = 0;
+            let refreshed = std::cell::Cell::new(false);
+            super::run_tui_with_updates(
+                || {
+                    draws += 1;
+                    Ok(if draws == 1 {
+                        Some(if recovery {
+                            crate::mtop::MtopPostAction::RecoverMaintenance
+                        } else {
+                            crate::mtop::MtopPostAction::CheckBuilds(
+                                crate::node_admin::AgentBuildCompatibility {
+                                    stale: vec!["worker".into()],
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                    } else {
+                        assert!(
+                            refreshed.get(),
+                            "update must complete before reentering the view"
+                        );
+                        None
+                    })
+                },
+                |_| {
+                    updates += 1;
+                    refreshed.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(draws, 2);
+            assert_eq!(updates, 1);
+        }
+        super::run_tui_with_updates(|| Ok(None), |_| panic!("quitting must not update")).unwrap();
+        super::run_tui_with_updates(
+            || Ok(Some(crate::mtop::MtopPostAction::UpdateDeferred)),
+            |_| panic!("deferred update must not run after quit"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn top_does_not_loop_when_update_fails_or_does_not_resolve_maintenance() {
+        let mut draws = 0;
+        let result = super::run_tui_with_updates(
+            || {
+                draws += 1;
+                Ok(Some(crate::mtop::MtopPostAction::RecoverMaintenance))
+            },
+            |_| Err((1, "update failed".into())),
+        );
+        assert_eq!(result.unwrap_err().1, "update failed");
+        assert_eq!(draws, 1);
+        let mut updates = 0;
+        let result = super::run_tui_with_updates(
+            || Ok(Some(crate::mtop::MtopPostAction::RecoverMaintenance)),
+            |_| {
+                updates += 1;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(updates, 1);
+    }
+
+    #[test]
     fn agent_update_resumes_controller_before_continuing_requested_command() {
         assert!(controller_should_resume_after_agent_update(
             "submit",
@@ -6935,6 +7128,64 @@ mod tests {
             task_env[ACTIVE_ENV_PREFIX_ENV],
             virtualenv.canonicalize().unwrap().to_string_lossy()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn system_ls_is_not_blocked_by_irrelevant_inherited_compiler_paths() {
+        let root = std::env::temp_dir().join(format!("macluster-system-env-{}", Id128::random()));
+        let (config, _, _) = environment_fixture(&root, &root.join("mamba"));
+        let inherited = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("CPATH".into(), "/unshared/include".into()),
+        ]);
+        let options = crate::arguments::SubmitOptions {
+            wrap: Some("/bin/ls /Volumes/Data".into()),
+            ..Default::default()
+        };
+        assert!(super::is_direct_system_utility(&options, &inherited, &root));
+        let mapped = super::prepare_task_environment_with_policy(
+            &config,
+            inherited.clone(),
+            BTreeMap::new(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!mapped.contains_key("CPATH"));
+        assert!(
+            super::prepare_task_environment_with_policy(
+                &config,
+                inherited.clone(),
+                BTreeMap::new(),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            super::prepare_task_environment_with_policy(
+                &config,
+                inherited.clone(),
+                BTreeMap::from([("CPATH".into(), "/unshared/include".into())]),
+                false,
+                true
+            )
+            .is_err()
+        );
+        for command in [
+            "python build.py",
+            "/bin/sh -c 'cc main.c'",
+            "/bin/ls; cc main.c",
+        ] {
+            let options = crate::arguments::SubmitOptions {
+                wrap: Some(command.into()),
+                ..Default::default()
+            };
+            assert!(!super::is_direct_system_utility(
+                &options, &inherited, &root
+            ));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

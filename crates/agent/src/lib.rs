@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod log_sync;
+mod resources;
 pub mod runner;
 
 use std::{
@@ -199,6 +200,12 @@ fn handle_operation(
     local_node_id: &str,
 ) -> Result<ResponseBody, ProtocolError> {
     match operation {
+        Operation::TaskResources {
+            controller,
+            start_token,
+            job_id,
+        } => resources::query(state_dir, controller, start_token, job_id, local_node_id)
+            .map(ResponseBody::TaskResources),
         Operation::Ping => Ok(ResponseBody::Pong),
         Operation::RecoverJob {
             controller,
@@ -387,6 +394,7 @@ fn node_health(config: &ClusterConfig, local_node_id: &str) -> Result<NodeHealth
         primary_share_ready: verify_share(config, local_node_id).is_ok(),
         shares,
         features: vec![
+            macluster_protocol::resources::TASK_RESOURCE_FEATURE.to_owned(),
             INTERACTIVE_PTY_FEATURE.to_owned(),
             macluster_protocol::types::NAMESPACED_JOBS_FEATURE.to_owned(),
         ],

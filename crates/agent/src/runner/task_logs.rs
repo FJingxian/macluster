@@ -364,6 +364,7 @@ impl TaskLogSession {
             .accounting
             .sample(process_group, self.started_at.elapsed());
         self.record_runner_rss(&mut sample);
+        crate::resources::publish_verbose(&self.local_dir, &self.identity.start_token, &sample);
         if let Ok(mut latest) = self.latest_sample.lock() {
             *latest = Some(sample.clone());
         }
@@ -378,6 +379,7 @@ impl TaskLogSession {
             .accounting
             .sample(process_group, self.started_at.elapsed());
         self.record_runner_rss(&mut sample);
+        crate::resources::publish_verbose(&self.local_dir, &self.identity.start_token, &sample);
         if let Ok(mut latest) = self.latest_sample.lock() {
             *latest = Some(sample.clone());
         }
@@ -1376,11 +1378,12 @@ impl ProcessAccounting {
     }
 }
 
-struct ProcessObservation {
-    pid: i32,
-    start_time: u64,
-    cpu_time_ns: u64,
-    rss_bytes: u64,
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProcessObservation {
+    pub(crate) pid: i32,
+    pub(crate) start_time: u64,
+    pub(crate) cpu_time_ns: u64,
+    pub(crate) rss_bytes: u64,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1407,7 +1410,9 @@ fn process_rusage_words(pid: i32) -> Option<[u64; 24]> {
 }
 
 #[cfg(target_vendor = "apple")]
-fn sample_process_group(process_group: u32) -> Result<(Vec<ProcessObservation>, bool), String> {
+pub(crate) fn sample_process_group(
+    process_group: u32,
+) -> Result<(Vec<ProcessObservation>, bool), String> {
     const PROC_PGRP_ONLY: u32 = 2;
     let mut pids = vec![0_i32; MAX_TRACKED_PROCESSES + 1];
     let bytes = std::mem::size_of_val(pids.as_slice());
@@ -1424,7 +1429,7 @@ fn sample_process_group(process_group: u32) -> Result<(Vec<ProcessObservation>, 
         return Err(io::Error::last_os_error().to_string());
     }
     let count = usize::try_from(listed).unwrap_or_default() / std::mem::size_of::<i32>();
-    let truncated = listed == bytes || count > MAX_TRACKED_PROCESSES;
+    let mut truncated = listed == bytes || count > MAX_TRACKED_PROCESSES;
     let mut observations = Vec::with_capacity(count.min(MAX_TRACKED_PROCESSES));
     for pid in pids.into_iter().take(count.min(MAX_TRACKED_PROCESSES)) {
         if pid <= 0 {
@@ -1433,6 +1438,7 @@ fn sample_process_group(process_group: u32) -> Result<(Vec<ProcessObservation>, 
         // rusage_info_v2 has a 152-byte stable v2 layout; words provide a
         // naturally aligned, bounded result buffer.
         let Some(words) = process_rusage_words(pid) else {
+            truncated = true;
             continue;
         };
         // The stable v2 prefix is UUID, user ns, system ns, six counters,
@@ -1448,7 +1454,9 @@ fn sample_process_group(process_group: u32) -> Result<(Vec<ProcessObservation>, 
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn sample_process_group(_process_group: u32) -> Result<(Vec<ProcessObservation>, bool), String> {
+pub(crate) fn sample_process_group(
+    _process_group: u32,
+) -> Result<(Vec<ProcessObservation>, bool), String> {
     Err("task process accounting is available on macOS only".into())
 }
 

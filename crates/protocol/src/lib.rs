@@ -4,3 +4,5 @@ pub mod control;
 pub mod framing;
 pub mod identifiers;
 pub mod types;
+
+pub mod resources;

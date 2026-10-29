@@ -196,6 +196,7 @@ impl NodeTransport for FakeTransport {
                 },
             )),
             Operation::Ping => Ok(ResponseBody::Pong),
+            Operation::TaskResources { .. } => Err(TransportError::Remote(ProtocolError::NotFound)),
         }
     }
 }

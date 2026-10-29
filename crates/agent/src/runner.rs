@@ -2,7 +2,7 @@
 
 mod interactive;
 mod sdk;
-mod task_logs;
+pub(crate) mod task_logs;
 
 pub fn serve_attach_stdio<R, W>(
     input: &mut R,
@@ -52,6 +52,8 @@ const LOCAL_JOB_LOG_PAYLOADS: &[&str] = &[
     "stderr.log",
     "monitor.log",
     "resources.jsonl",
+    "resource-verbose.json",
+    "resource-cache.json",
     "summary.json",
     "stdout.segments",
     "stderr.segments",

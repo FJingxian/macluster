@@ -550,6 +550,11 @@ pub struct Request {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum Operation {
+    TaskResources {
+        controller: ControllerEpoch,
+        start_token: StartToken,
+        job_id: u64,
+    },
     Ping,
     Status,
     RecoverJob {
@@ -579,16 +584,17 @@ pub enum Operation {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Response {
     pub protocol_version: u16,
     pub request_id: RequestId,
     pub result: Result<ResponseBody, ProtocolError>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum ResponseBody {
+    TaskResources(crate::resources::TaskResourceSample),
     Pong,
     Health(NodeHealth),
     Started(StartResult),

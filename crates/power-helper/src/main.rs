@@ -15,6 +15,8 @@ use std::{
 use macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS;
 use serde::{Deserialize, Serialize};
 
+mod fan;
+
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
 const POWER_CACHE_TTL: Duration = Duration::from_millis(POWER_SAMPLE_CACHE_TTL_MS);
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
@@ -72,12 +74,19 @@ impl GpuSampler {
         Ok(Self { sampler, supported })
     }
 
-    fn sample(&mut self) -> (Result<GpuReading, String>, Option<PowerReading>) {
+    fn sample(
+        &mut self,
+    ) -> (
+        Result<GpuReading, String>,
+        Option<PowerReading>,
+        Option<f32>,
+    ) {
         let metrics = match self.sampler.get_metrics(GPU_SAMPLE_WINDOW_MS) {
             Ok(metrics) => metrics,
             Err(error) => {
                 return (
                     Err(format!("macmon GPU/power sampling failed: {error}")),
+                    None,
                     None,
                 );
             }
@@ -85,6 +94,7 @@ impl GpuSampler {
         (
             gpu_reading(self.supported, metrics.gpu_active_ratio).map_err(str::to_owned),
             macmon_power_reading(metrics.sys_power, metrics.all_power),
+            metrics.temp.cpu_temp_avg,
         )
     }
 }
@@ -98,9 +108,16 @@ impl GpuSampler {
         Err("GPU utilization sampling requires Apple Silicon".into())
     }
 
-    fn sample(&mut self) -> (Result<GpuReading, String>, Option<PowerReading>) {
+    fn sample(
+        &mut self,
+    ) -> (
+        Result<GpuReading, String>,
+        Option<PowerReading>,
+        Option<f32>,
+    ) {
         (
             Err("GPU and macmon power sampling require Apple Silicon".into()),
+            None,
             None,
         )
     }
@@ -161,10 +178,17 @@ struct PowerCache {
     last_error: Option<String>,
     last_good_gpu: Option<(Instant, GpuReading)>,
     gpu_error: Option<String>,
+    last_good_temperature: Option<(Instant, f32)>,
 }
 
 impl PowerCache {
-    fn update(&mut self, sample: PowerSample, gpu: Result<GpuReading, String>, at: Instant) {
+    fn update(
+        &mut self,
+        sample: PowerSample,
+        gpu: Result<GpuReading, String>,
+        temperature: Option<f32>,
+        at: Instant,
+    ) {
         if sample.available
             && sample
                 .watts
@@ -185,6 +209,19 @@ impl PowerCache {
             }
             Err(error) => self.gpu_error = Some(error),
         }
+        if let Some(temperature) =
+            temperature.filter(|value| value.is_finite() && (0.0..=150.0).contains(value))
+        {
+            self.last_good_temperature = Some((at, temperature));
+        }
+    }
+
+    fn temperature(&self, now: Instant) -> Option<f32> {
+        self.last_good_temperature
+            .filter(|(sampled_at, _)| {
+                now.saturating_duration_since(*sampled_at) <= Duration::from_secs(18)
+            })
+            .map(|(_, temperature)| temperature)
     }
 
     fn response(&self, now: Instant) -> PowerSample {
@@ -296,9 +333,9 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
             let mut gpu_sampler = GpuSampler::new();
             loop {
                 let iteration_started = Instant::now();
-                let (gpu, macmon_power) = match &mut gpu_sampler {
+                let (gpu, macmon_power, temperature) = match &mut gpu_sampler {
                     Ok(sampler) => sampler.sample(),
-                    Err(error) => (Err(error.clone()), None),
+                    Err(error) => (Err(error.clone()), None, None),
                 };
                 let sample = macmon_power
                     .map(power_sample_from_reading)
@@ -306,12 +343,14 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
                 let mut cache = sampler_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cache.update(sample, gpu, Instant::now());
+                cache.update(sample, gpu, temperature, Instant::now());
                 drop(cache);
                 thread::sleep(POWER_REFRESH_INTERVAL.saturating_sub(iteration_started.elapsed()));
             }
         })
         .map_err(|error| format!("start power sampler: {error}"))?;
+
+    fan::start(peer_uid, Arc::clone(&cache))?;
 
     for incoming in listener.incoming() {
         let mut stream = incoming.map_err(|error| format!("accept socket client: {error}"))?;
@@ -520,7 +559,12 @@ mod tests {
     fn power_cache_serves_last_success_with_age_after_temporary_refresh_failure() {
         let started = Instant::now();
         let mut cache = PowerCache::default();
-        cache.update(good_sample(), Err("GPU sample pending".into()), started);
+        cache.update(
+            good_sample(),
+            Err("GPU sample pending".into()),
+            None,
+            started,
+        );
         cache.update(
             PowerSample {
                 watts: None,
@@ -535,6 +579,7 @@ mod tests {
                 gpu_reason: None,
             },
             Err("macmon temporarily busy".into()),
+            None,
             started + Duration::from_secs(4),
         );
 
@@ -550,7 +595,12 @@ mod tests {
     fn power_cache_expires_a_last_good_sample_after_sixty_seconds() {
         let started = Instant::now();
         let mut cache = PowerCache::default();
-        cache.update(good_sample(), Err("GPU sample pending".into()), started);
+        cache.update(
+            good_sample(),
+            Err("GPU sample pending".into()),
+            None,
+            started,
+        );
 
         let response = cache.response(started + Duration::from_secs(61));
 
@@ -586,6 +636,7 @@ mod tests {
         cache.update(
             unavailable("powermetrics unavailable".into()),
             Ok(gpu_reading(true, 0.0).unwrap()),
+            None,
             started,
         );
 
@@ -605,10 +656,16 @@ mod tests {
     fn gpu_failure_does_not_expire_a_fresh_power_sample() {
         let started = Instant::now();
         let mut cache = PowerCache::default();
-        cache.update(good_sample(), Ok(gpu_reading(true, 0.5).unwrap()), started);
+        cache.update(
+            good_sample(),
+            Ok(gpu_reading(true, 0.5).unwrap()),
+            None,
+            started,
+        );
         cache.update(
             good_sample(),
             Err("temperature sensor temporarily unavailable".into()),
+            None,
             started + Duration::from_secs(4),
         );
 

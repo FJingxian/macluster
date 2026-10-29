@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_controller::ssh::ConnectionKey;
+use macluster_controller::ssh::{ConnectionKey, SshPool};
 use macluster_controller::transport::{ClusterTransport, NodeTransport};
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
@@ -182,9 +182,9 @@ impl NodeMaintenanceGuard {
         Ok(())
     }
 
-    fn abort_if_unchanged(&mut self) {
+    fn reconcile_after_error(&mut self) -> AppResult<()> {
         let Some(live) = self.live.as_mut() else {
-            return;
+            return Ok(());
         };
         let current_config = fs::read(&live.config_path)
             .ok()
@@ -202,26 +202,78 @@ impl NodeMaintenanceGuard {
             current_config.as_deref(),
             current_journal.as_deref(),
         );
-        if inputs_unchanged {
-            if let Err((_, error)) = reconnect_live_maintenance(live) {
-                eprintln!("macluster: cannot reconnect to abort maintenance: {error}");
-                return;
-            }
+        let config_digest = current_config.as_deref().ok_or_else(|| {
+            (
+                1,
+                "cannot verify cluster config while recovering maintenance".into(),
+            )
+        })?;
+        let journal_digest = current_journal.as_deref().ok_or_else(|| {
+            (
+                1,
+                "cannot verify node admin journal while recovering maintenance".into(),
+            )
+        })?;
+        reconnect_live_maintenance(live)?;
+        let active = live
+            .client
+            .request(ControlCommand::InspectMaintenance)
+            .map_err(control_client_error)?;
+        let ControlPayload::Maintenance(active) = active else {
+            return Err((
+                1,
+                "controller returned an invalid maintenance status during recovery".into(),
+            ));
+        };
+        let Some(active) = active else {
+            remove_maintenance_client_state(&live.state_path)?;
+            live.finished = true;
+            return Ok(());
+        };
+        if active.ticket != live.ticket || active.scope != live.client_state.scope {
+            return Err((
+                1,
+                "a different controller maintenance ticket is active; refusing to alter it".into(),
+            ));
+        }
+
+        let applying = matches!(
+            active.phase,
+            MaintenancePhase::Applying | MaintenancePhase::RecoveryRequired
+        );
+        if applying
+            && (live.client_state.candidate_config_digest.as_deref() != Some(config_digest)
+                || live.client_state.candidate_journal_digest.as_deref() != Some(journal_digest))
+        {
+            return Err((
+                1,
+                "controller maintenance entered config application with a different candidate; rerun the original operation to recover it".into(),
+            ));
+        }
+
+        if inputs_unchanged && !applying {
             match live.client.request(ControlCommand::AbortMaintenance {
                 ticket: live.ticket.clone(),
             }) {
                 Ok(ControlPayload::Maintenance(None)) => {
-                    let _ = remove_maintenance_client_state(&live.state_path);
+                    remove_maintenance_client_state(&live.state_path)?;
                     live.finished = true;
+                    return Ok(());
                 }
-                Ok(_) => eprintln!(
-                    "macluster: controller returned an invalid maintenance abort response"
-                ),
-                Err(error) => {
-                    eprintln!("macluster: could not abort unchanged maintenance ticket: {error}")
+                Ok(_) => {
+                    return Err((
+                        1,
+                        "controller returned an invalid maintenance abort response".into(),
+                    ));
                 }
+                Err(error) => return Err(control_client_error(error)),
             }
         }
+
+        // The command changed its recovery journal or config before failing.
+        // Finalize that exact on-disk candidate through the controller so a
+        // later mnode operation can safely acquire a fresh maintenance ticket.
+        self.complete()
     }
 }
 
@@ -257,7 +309,13 @@ fn finish_node_maintenance_with_success_notice<T>(
             Ok(value)
         }
         Err(error) => {
-            guard.abort_if_unchanged();
+            let mut error = error;
+            if let Err((_, recovery_error)) = guard.reconcile_after_error() {
+                error.1 = format!(
+                    "{}; controller maintenance recovery also failed: {recovery_error}",
+                    error.1
+                );
+            }
             if guard.controller_was_running {
                 eprintln!(
                     "The controller was stopped for maintenance. After resolving the error, run `macluster controller run` to resume scheduling."
@@ -386,6 +444,18 @@ fn try_acquire_live_maintenance(
                 .request(ControlCommand::InspectMaintenance)
                 .map_err(control_client_error)?;
             if let ControlPayload::Maintenance(Some(active)) = active {
+                if previous.binding_digest != binding.binding_digest()
+                    || previous.operation_id != active.ticket.operation_id
+                    || previous.scope != active.scope
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "controller maintenance {} for {:?} does not match the saved maintenance record; refusing to alter it",
+                            active.ticket.operation_id, active.scope
+                        ),
+                    ));
+                }
                 let unchanged = previous.binding_digest == binding.binding_digest()
                     && previous.operation_id == active.ticket.operation_id
                     && previous.scope == active.scope
@@ -444,13 +514,48 @@ fn try_acquire_live_maintenance(
                         previous.operation
                     );
                 } else {
-                    return Err((
-                        1,
-                        format!(
-                            "controller maintenance {} for {:?} is still active; finish or rerun its original operation before starting '{operation}'",
-                            active.ticket.operation_id, active.scope
-                        ),
-                    ));
+                    let applying = matches!(
+                        active.phase,
+                        MaintenancePhase::Applying | MaintenancePhase::RecoveryRequired
+                    );
+                    if applying
+                        && (previous.candidate_config_digest.as_deref()
+                            != Some(current_config_digest.as_str())
+                            || previous.candidate_journal_digest.as_deref()
+                                != Some(current_journal_digest.as_str()))
+                    {
+                        return Err((
+                            1,
+                            format!(
+                                "controller maintenance {} is applying a different config/journal candidate; rerun '{}' to recover it before starting '{operation}'",
+                                active.ticket.operation_id, previous.operation
+                            ),
+                        ));
+                    }
+                    retry_maintenance_completion(&previous.operation, || {
+                        if complete_maintenance_ticket(
+                            &mut client,
+                            &active.ticket,
+                            config_path,
+                            &journal_path,
+                        )? {
+                            return Ok(true);
+                        }
+                        wait_for_live_maintenance(
+                            &mut client,
+                            &active.ticket,
+                            &active.scope,
+                            &previous.operation,
+                            config_path,
+                            &journal_path,
+                        )
+                    })?;
+                    client = ControlClient::connect(&binding, Duration::from_secs(5))
+                        .map_err(control_client_error)?;
+                    eprintln!(
+                        "Recovered interrupted maintenance for {} before starting {operation}.",
+                        previous.operation
+                    );
                 }
             }
             remove_maintenance_client_state(&state_path)?;
@@ -1938,6 +2043,15 @@ pub(crate) fn configured_agent_build_compatibility(
     Ok(compatibility)
 }
 
+/// Check locally available build evidence without contacting any node.
+pub(crate) fn configured_agent_build_mismatch_local(config: &ClusterConfig) -> AppResult<bool> {
+    let digest = current_agent_sha256()?;
+    Ok(config
+        .nodes
+        .values()
+        .any(|node| inspect_configured_agent_build(node, &digest) == AgentBuildState::Stale))
+}
+
 pub(crate) fn configured_agent_build_compatibility_cached(
     config: &ClusterConfig,
     cache_root: &Path,
@@ -2693,6 +2807,7 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                         share_id = Some(value);
                     }
                     "--mount-root" => {
+                        let value = value.trim_end_matches('/').to_owned();
                         if !safe_absolute_remote_path(&value) {
                             return Err((
                                 2,
@@ -3820,6 +3935,7 @@ struct ClientMountRequest {
     source_alias: Option<PathBuf>,
     needs_privileged_mkdir: bool,
     needs_mount: bool,
+    allow_existing_contents: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4188,9 +4304,15 @@ fn client_mount_batch_script(requests: &[ClientMountRequest]) -> Option<String> 
             if request.needs_privileged_mkdir {
                 script.push_str(&format!("/bin/mkdir -p {mount_root}\n"));
             }
-            script.push_str(&format!(
-                "entries=$(/bin/ls -A {mount_root}) || exit 1\n[ -z \"$entries\" ] || {{ echo 'mount point is not empty after preflight' >&2; exit 1; }}\n"
-            ));
+            if request.allow_existing_contents {
+                script.push_str(
+                    "# Existing local files remain underneath this explicitly configured NFS share.\n",
+                );
+            } else {
+                script.push_str(&format!(
+                    "entries=$(/bin/ls -A {mount_root}) || exit 1\n[ -z \"$entries\" ] || {{ echo 'mount point is not empty after preflight' >&2; exit 1; }}\n"
+                ));
+            }
             script.push_str(&format!(
                 "/sbin/mount_nfs -o resvport {} {mount_root}\n",
                 shell_quote(&request.source)
@@ -5061,6 +5183,7 @@ fn scp_to_node(node: &NodeConfig, local_path: &Path, remote_path: &str) -> AppRe
     }
     let mut command = Command::new("/usr/bin/scp");
     node.add_pinned_host_key_args(&mut command);
+    add_node_admin_ssh_pool_args(node, &mut command);
     command.args(["-q", "-P"]);
     command.arg(node.ssh_port.unwrap_or(22).to_string());
     for option in [
@@ -5122,8 +5245,28 @@ pub(crate) fn ssh_output(
     let mut command = Command::new("/usr/bin/ssh");
     command.args(SSH_OPTIONS);
     node.add_ssh_identity_args(&mut command);
+    add_node_admin_ssh_pool_args(node, &mut command);
     command.arg(&node.host).arg(script);
     run_child(command, input, CONNECT_TIMEOUT)
+}
+
+fn add_node_admin_ssh_pool_args(node: &NodeConfig, command: &mut Command) {
+    let namespace = node
+        .remote_config
+        .as_deref()
+        .map(|path| format!("node-admin:{path}"))
+        .unwrap_or_else(|| "node-admin:unscoped".into());
+    let pool = SshPool::new(namespace);
+    let node_id = node
+        .machine_uuid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&node.host);
+    if let Ok(key) = ConnectionKey::for_node(pool.namespace(), node_id, node) {
+        // SSH pooling only saves repeat handshakes. If its private socket path
+        // cannot be established, preserve the original one-shot SSH behavior.
+        let _ = pool.append_args(&key, command);
+    }
 }
 
 pub(crate) fn run_interactive(node: &NodeConfig, script: &str) -> Result<(), String> {
@@ -5138,6 +5281,7 @@ pub(crate) fn run_interactive(node: &NodeConfig, script: &str) -> Result<(), Str
         let mut command = Command::new("/usr/bin/ssh");
         command.args(INTERACTIVE_SSH_OPTIONS);
         node.add_ssh_identity_args(&mut command);
+        add_node_admin_ssh_pool_args(node, &mut command);
         command.arg(&node.host).arg(script);
         command
     };
@@ -6206,6 +6350,7 @@ fn candidate_mount_command(
                 source_alias: None,
                 needs_privileged_mkdir: false,
                 needs_mount: false,
+                allow_existing_contents: false,
             }));
         }
         NamedShareMountStatus::MountedElsewhere(other) => {
@@ -6256,6 +6401,7 @@ fn candidate_mount_command(
         source_alias: None,
         needs_privileged_mkdir,
         needs_mount: true,
+        allow_existing_contents: false,
     }))
 }
 
@@ -7831,6 +7977,27 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
     output
 }
 
+fn probe_node_list(
+    config_path: &Path,
+    namespace: &str,
+    id: &str,
+    node: &NodeConfig,
+) -> (Option<NodeHealth>, bool) {
+    let Ok(node_id) = NodeId::new(id.to_owned()) else {
+        return (None, false);
+    };
+    let mut transport =
+        ClusterTransport::new_with_namespace(config_path.to_path_buf(), namespace.to_owned());
+    transport.timeout = Duration::from_secs(8);
+    match transport.call(&node_id, node, Operation::Health) {
+        Ok(ResponseBody::Health(health)) => (Some(health), true),
+        // An Agent rejection also proves the authenticated bridge answered.
+        Ok(_) | Err(macluster_controller::transport::TransportError::Remote(_)) => (None, true),
+        // Repeating Ping/node-check after a transport failure only repeats the timeout.
+        Err(_) => (None, false),
+    }
+}
+
 fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
     if !config_path.is_file() {
         return Err((
@@ -7851,6 +8018,35 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
     let canonical = config_path.canonicalize().map_err(io_error)?;
     let journal_path = state_dir.join("node-admin.json");
     let state = read_admin_state(&journal_path, &canonical, state_dir)?;
+    let tasks = Mutex::new(VecDeque::from_iter(config.nodes.iter()));
+    let observations = std::thread::scope(|scope| {
+        let handles = (0..config.nodes.len().min(4))
+            .map(|_| {
+                let tasks = &tasks;
+                let namespace = &config.share_uuid;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let Some((id, node)) =
+                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                        else {
+                            break;
+                        };
+                        results.push((
+                            id.clone(),
+                            probe_node_list(config_path, namespace, id, node),
+                        ));
+                    }
+                    results
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<BTreeMap<_, _>>()
+    });
+    let mut observations = observations;
     let mut rows = Vec::new();
     let mut displayed = BTreeSet::new();
     for (id, node) in &config.nodes {
@@ -7864,29 +8060,8 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let check = remote_node_check(node, id).ok();
-        let health = NodeId::new(id.clone()).ok().and_then(|node_id| {
-            let mut transport = ClusterTransport::new_with_namespace(
-                config_path.to_path_buf(),
-                config.share_uuid.clone(),
-            );
-            transport.timeout = Duration::from_secs(8);
-            match transport.call(&node_id, node, Operation::Health) {
-                Ok(ResponseBody::Health(health)) => Some(health),
-                _ => None,
-            }
-        });
-        let bridge_online = NodeId::new(id.clone()).ok().is_some_and(|node_id| {
-            let mut transport = ClusterTransport::new_with_namespace(
-                config_path.to_path_buf(),
-                config.share_uuid.clone(),
-            );
-            transport.timeout = Duration::from_secs(8);
-            transport
-                .call(&node_id, node, Operation::Ping)
-                .is_ok_and(|response| response == ResponseBody::Pong)
-        });
-        let online = check.is_some() || bridge_online;
+        let (health, bridge_online) = observations.remove(id).unwrap_or_default();
+        let online = bridge_online;
         let digest_matches = verified_node_health(&config, id, health.as_ref()).is_some();
         let all_shares_ready = health.as_ref().is_some_and(|health| {
             health.primary_share_ready
@@ -7912,14 +8087,13 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
             .or_else(|| state.operations.values().find(|op| op.node_id == *id))
             .map(|op| op.phase.as_str())
             .unwrap_or("-");
-        let state_name = match check.as_ref() {
+        let state_name = match () {
             _ if matches!(phase, "SETUP_PENDING" | "ADD_COMMITTING") => "SETUP_PENDING",
             _ if matches!(phase, "REMOVAL_PENDING" | "REMOVAL_COMMITTING") => "REMOVAL_PENDING",
             _ if phase == "SYNC_PENDING" => "SYNC_PENDING",
             _ if digest_matches && all_shares_ready && bridge_online => "READY",
-            Some(_) => "ONLINE",
-            None if online => "ONLINE",
-            None => "UNREACHABLE",
+            _ if online => "ONLINE",
+            _ => "UNREACHABLE",
         };
         let user = if node.transport == Transport::Local {
             "local"
@@ -8810,7 +8984,8 @@ fn resolve_share_source(requested: &str, home: &str) -> AppResult<PathBuf> {
             "share source must be absolute, ./relative, or ~/relative".into(),
         ));
     };
-    if !safe_absolute_remote_path(&expanded) || expanded == "/" {
+    let expanded = expanded.trim_end_matches('/');
+    if !safe_absolute_remote_path(expanded) {
         return Err((
             2,
             "share source path is not normalized or contains unsupported characters".into(),
@@ -9270,8 +9445,8 @@ fn preflight_share_clients(config: &ClusterConfig, share: &ShareConfig) -> AppRe
 }
 
 // Read-only: accept the exact NFS mount, or directories that can be used
-// without hiding files. During parent-share migration only known child mount
-// subtrees may be pruned; unrelated files/directories are rejected.
+// without hiding files. Enrollment may explicitly opt into overlaying a
+// same-path named software share; all ordinary share setup remains strict.
 fn preflight_share_mount(
     node: &NodeConfig,
     server: &NodeConfig,
@@ -9279,8 +9454,25 @@ fn preflight_share_mount(
     mount_root: &Path,
     children: &BTreeMap<PathBuf, String>,
 ) -> Result<NamedShareMountStatus, String> {
+    preflight_share_mount_with_overlay(node, server, source_root, mount_root, children, false)
+}
+
+fn preflight_share_mount_with_overlay(
+    node: &NodeConfig,
+    server: &NodeConfig,
+    source_root: &Path,
+    mount_root: &Path,
+    children: &BTreeMap<PathBuf, String>,
+    allow_existing_contents: bool,
+) -> Result<NamedShareMountStatus, String> {
     let source = format!("{}:{}", server.host, source_root.display());
     let mount_text = mount_root.to_string_lossy();
+    if allow_existing_contents && source_root != mount_root {
+        return Err(
+            "existing target contents may only be overlaid when source and mount paths match"
+                .into(),
+        );
+    }
     let output = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| error)?;
     if !output.status.success() {
         return Err(command_error("cannot inspect share client mounts", &output));
@@ -9326,37 +9518,39 @@ fn preflight_share_mount(
         let p = shell_quote(&path.to_string_lossy());
         script.push_str(&format!("if [ -L {p} ]; then echo 'symlink in managed child mount path' >&2; exit 1; fi; if [ -e {p} ] && [ ! -d {p} ]; then echo 'managed child mount path is not a directory' >&2; exit 1; fi\n"));
     }
-    let mut find = vec!["/usr/bin/find".to_owned(), mount_text.to_string()];
-    if !pruned.is_empty() {
-        find.push("(".into());
-        for (index, path) in pruned.iter().enumerate() {
+    if !allow_existing_contents {
+        let mut find = vec!["/usr/bin/find".to_owned(), mount_text.to_string()];
+        if !pruned.is_empty() {
+            find.push("(".into());
+            for (index, path) in pruned.iter().enumerate() {
+                if index > 0 {
+                    find.push("-o".into());
+                }
+                find.extend(["-path".into(), path.to_string_lossy().into_owned()]);
+            }
+            find.extend([")".into(), "-prune".into(), "-o".into()]);
+        }
+        find.extend(["!".into(), "(".into()]);
+        for (index, path) in allowed.iter().enumerate() {
             if index > 0 {
                 find.push("-o".into());
             }
             find.extend(["-path".into(), path.to_string_lossy().into_owned()]);
         }
-        find.extend([")".into(), "-prune".into(), "-o".into()]);
+        find.extend([
+            ")".into(),
+            "!".into(),
+            "-type".into(),
+            "d".into(),
+            "-print".into(),
+            "-prune".into(),
+        ]);
+        let refs = find.iter().map(String::as_str).collect::<Vec<_>>();
+        script.push_str(&format!(
+            "if [ -d \"$root\" ]; then {}; fi\n",
+            shell_join(&refs)
+        ));
     }
-    find.extend(["!".into(), "(".into()]);
-    for (index, path) in allowed.iter().enumerate() {
-        if index > 0 {
-            find.push("-o".into());
-        }
-        find.extend(["-path".into(), path.to_string_lossy().into_owned()]);
-    }
-    find.extend([
-        ")".into(),
-        "!".into(),
-        "-type".into(),
-        "d".into(),
-        "-print".into(),
-        "-prune".into(),
-    ]);
-    let refs = find.iter().map(String::as_str).collect::<Vec<_>>();
-    script.push_str(&format!(
-        "if [ -d \"$root\" ]; then {}; fi\n",
-        shell_join(&refs)
-    ));
     let output = ssh_output(node, &script, None).map_err(|(_, error)| error)?;
     if !output.status.success() {
         return Err(command_error(
@@ -9364,7 +9558,7 @@ fn preflight_share_mount(
             &output,
         ));
     }
-    if !output.stdout.is_empty() {
+    if !allow_existing_contents && !output.stdout.is_empty() {
         return Err(format!(
             "mount point {mount_text} is not empty; refusing to hide existing files or unrelated directories"
         ));
@@ -9400,9 +9594,26 @@ fn prepare_share_mount_request(
     source_root: &Path,
     mount_root: &Path,
 ) -> Result<Option<ClientMountRequest>, String> {
+    prepare_share_mount_request_with_overlay(node, server, source_root, mount_root, false)
+}
+
+fn prepare_share_mount_request_with_overlay(
+    node: &NodeConfig,
+    server: &NodeConfig,
+    source_root: &Path,
+    mount_root: &Path,
+    allow_existing_contents: bool,
+) -> Result<Option<ClientMountRequest>, String> {
     let source = format!("{}:{}", server.host, source_root.display());
     let mount_text = mount_root.to_string_lossy();
-    match preflight_share_mount(node, server, source_root, mount_root, &BTreeMap::new())? {
+    match preflight_share_mount_with_overlay(
+        node,
+        server,
+        source_root,
+        mount_root,
+        &BTreeMap::new(),
+        allow_existing_contents,
+    )? {
         NamedShareMountStatus::Expected => {
             preflight_client_share_alias(node, source_root, mount_root)?;
             if source_root == mount_root {
@@ -9412,6 +9623,7 @@ fn prepare_share_mount_request(
                     source_alias: None,
                     needs_privileged_mkdir: false,
                     needs_mount: false,
+                    allow_existing_contents: false,
                 }));
             }
             let alias_script = client_share_alias_script(source_root, mount_root);
@@ -9423,6 +9635,7 @@ fn prepare_share_mount_request(
                     source_alias: Some(source_root.to_path_buf()),
                     needs_privileged_mkdir: false,
                     needs_mount: false,
+                    allow_existing_contents: false,
                 }));
             }
             if mount_point_permission_error(&String::from_utf8_lossy(&output.stderr)) {
@@ -9432,6 +9645,7 @@ fn prepare_share_mount_request(
                     source_alias: Some(source_root.to_path_buf()),
                     needs_privileged_mkdir: false,
                     needs_mount: false,
+                    allow_existing_contents: false,
                 }));
             }
             return Err(command_error("could not create source path alias", &output));
@@ -9458,7 +9672,14 @@ fn prepare_share_mount_request(
             ));
         }
     }
-    match preflight_share_mount(node, server, source_root, mount_root, &BTreeMap::new())? {
+    match preflight_share_mount_with_overlay(
+        node,
+        server,
+        source_root,
+        mount_root,
+        &BTreeMap::new(),
+        allow_existing_contents,
+    )? {
         NamedShareMountStatus::NotMounted => {}
         NamedShareMountStatus::Expected => {
             return Ok(Some(ClientMountRequest {
@@ -9467,6 +9688,7 @@ fn prepare_share_mount_request(
                 source_alias: (source_root != mount_root).then(|| source_root.to_path_buf()),
                 needs_privileged_mkdir: false,
                 needs_mount: false,
+                allow_existing_contents: false,
             }));
         }
         NamedShareMountStatus::MountedElsewhere(other) => {
@@ -9481,6 +9703,7 @@ fn prepare_share_mount_request(
         source_alias: (source_root != mount_root).then(|| source_root.to_path_buf()),
         needs_privileged_mkdir: privileged_mkdir,
         needs_mount: true,
+        allow_existing_contents,
     }))
 }
 
@@ -9729,12 +9952,30 @@ fn configure_node_nfs_resources_with_claim(
                 prepare_server_alias(server, &share.source_root, &share.mount_root)
                     .map_err(|(_, error)| error)?;
             } else {
-                if let Some(request) = prepare_share_mount_request(
+                let has_nested_share = config.shares.iter().any(|(other_id, other_share)| {
+                    other_id != share_id
+                        && other_share.mount_root != share.mount_root
+                        && other_share.mount_root.starts_with(&share.mount_root)
+                });
+                let allow_existing_contents =
+                    claim.is_some() && !has_nested_share && share.source_root == share.mount_root;
+                let request = prepare_share_mount_request_with_overlay(
                     node,
                     server,
                     &share.source_root,
                     &share.mount_root,
-                )? {
+                    allow_existing_contents,
+                )?;
+                if allow_existing_contents
+                    && request.as_ref().is_some_and(|request| request.needs_mount)
+                {
+                    eprintln!(
+                        "Existing local files under {} are preserved and will be visible again when share '{}' is unmounted.",
+                        share.mount_root.display(),
+                        share_id
+                    );
+                }
+                if let Some(request) = request {
                     mount_requests.push(request);
                 }
                 export_entries.push((
@@ -11784,6 +12025,7 @@ mod tests {
                 source_alias: None,
                 needs_privileged_mkdir: true,
                 needs_mount: true,
+                allow_existing_contents: false,
             },
             ClientMountRequest {
                 source: "192.0.2.1:/Users/operator/mamba".into(),
@@ -11791,6 +12033,7 @@ mod tests {
                 source_alias: Some(PathBuf::from("/Users/operator/mamba")),
                 needs_privileged_mkdir: false,
                 needs_mount: true,
+                allow_existing_contents: false,
             },
         ];
 
@@ -11836,6 +12079,7 @@ mod tests {
                 source_alias: Some(first_alias),
                 needs_privileged_mkdir: false,
                 needs_mount: false,
+                allow_existing_contents: false,
             },
             ClientMountRequest {
                 source: "192.0.2.1:/second".into(),
@@ -11843,6 +12087,7 @@ mod tests {
                 source_alias: Some(second_alias.clone()),
                 needs_privileged_mkdir: false,
                 needs_mount: false,
+                allow_existing_contents: false,
             },
         ];
 
@@ -12734,7 +12979,6 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
 
     #[test]
     fn pending_share_mapping_retains_source_and_target_before_config_commit() {
-        let config = parse_build_test_config();
         let mut operation = update_operation("SETUP_PENDING", "old", "candidate");
         operation.action = "share".into();
         operation.node_id = "login".into();
@@ -14040,6 +14284,51 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
+    fn node_listing_uses_one_successful_health_request() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("macluster");
+        let log = root.join("calls");
+        let health = NodeHealth {
+            machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            execution_uid: 501,
+            execution_digest: "test-digest".into(),
+            primary_share_ready: true,
+            shares: BTreeMap::new(),
+            features: Vec::new(),
+        };
+        let encoded_health =
+            serde_json::to_string(&serde_json::to_string(&health).unwrap()).unwrap();
+        let log_path = serde_json::to_string(log.to_str().unwrap()).unwrap();
+        fs::write(&binary, format!(
+            "#!/usr/bin/python3\nimport json,struct,sys\nwith open({log_path},'a') as f: f.write('call\\n')\nif 'agent-stdio' not in sys.argv: sys.exit(77)\nn=struct.unpack('>I',sys.stdin.buffer.read(4))[0]\nr=json.loads(sys.stdin.buffer.read(n))\nh=json.loads({encoded_health})\np=json.dumps({{'protocol_version':r['protocol_version'],'request_id':r['request_id'],'result':{{'Ok':{{'type':'health','payload':h}}}}}}).encode()\nsys.stdout.buffer.write(struct.pack('>I',len(p))+p)\n"
+        )).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = parse_build_test_config().nodes["login"].clone();
+        node.transport = Transport::Local;
+        node.remote_binary = binary.to_string_lossy().into_owned();
+        let (observed, online) =
+            super::probe_node_list(&root.join("config.toml"), "test", "login", &node);
+        assert_eq!(observed, Some(health));
+        assert!(online);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "call\n");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> {}\nexit 1\n",
+                super::shell_quote(log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let (observed, online) =
+            super::probe_node_list(&root.join("config.toml"), "test", "login", &node);
+        assert!(observed.is_none());
+        assert!(!online);
+        assert_eq!(fs::read_to_string(&log).unwrap(), "call\ncall\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn listing_nodes_without_active_config_tells_user_to_initialize() {
         let root =
             std::env::temp_dir().join(format!("macluster-uninitialized-{}", Id128::random()));
@@ -14285,7 +14574,9 @@ ssh_port = 22
         for path in [
             "relative/path",
             "/",
-            "/Users/Shared/tools/",
+            "/Users//Shared/tools",
+            "/Users/Shared/../tools",
+            "/Users/Shared/./tools",
             "/Users/user name/tools",
         ] {
             let args = [
@@ -14309,6 +14600,40 @@ ssh_port = 22
                 "path {path}: {}",
                 error.1
             );
+        }
+    }
+
+    #[test]
+    fn share_directory_inputs_accept_trailing_slashes() {
+        for endpoint in [
+            "local:/Users/operator/mamba/",
+            "operator@192.0.2.20:/Users/operator/mamba/",
+        ] {
+            for mount in ["/Users/operator/mamba/", "/Users/operator/mamba///"] {
+                let args = ["-a", endpoint, "--share-id", "mamba", "--mount-root", mount]
+                    .map(str::to_owned);
+                let Action::Add(options) = parse_action(&args).unwrap() else {
+                    panic!("expected add action");
+                };
+                assert_eq!(options.mount_root.as_deref(), Some("/Users/operator/mamba"));
+                let source = match options.target {
+                    super::AddTarget::Local { source_path, .. } => source_path.unwrap(),
+                    super::AddTarget::Ssh(endpoint) => endpoint.source_path.unwrap(),
+                };
+                assert_eq!(
+                    super::resolve_share_source(&source, "/Users/operator").unwrap(),
+                    PathBuf::from("/Users/operator/mamba")
+                );
+            }
+        }
+        for source in ["~/mamba/", "./mamba///"] {
+            assert_eq!(
+                super::resolve_share_source(source, "/Users/operator").unwrap(),
+                PathBuf::from("/Users/operator/mamba")
+            );
+        }
+        for source in ["/", "///", "/Users/../mamba/", "/Users//operator/mamba/"] {
+            assert!(super::resolve_share_source(source, "/Users/operator").is_err());
         }
     }
 

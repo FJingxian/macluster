@@ -503,6 +503,43 @@ pub struct LogChunk {
     pub stale: bool,
 }
 
+/// Fan policy selected for one node. `System` yields fans to macOS; `Auto`
+/// and `Power` run temperature curves in the privileged node helper.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FanPolicy {
+    System,
+    Auto,
+    Power,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FanControlStatus {
+    pub policy: FanPolicy,
+    pub supported: bool,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_temperature_deci_celsius: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum FanHelperCommand {
+    Status,
+    Set { policy: FanPolicy },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FanHelperResponse {
+    pub status: FanControlStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Request {
     pub protocol_version: u16,
@@ -536,6 +573,10 @@ pub enum Operation {
         job_id: u64,
         force: bool,
     },
+    QueryFanPolicy,
+    SetFanPolicy {
+        policy: FanPolicy,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -552,6 +593,7 @@ pub enum ResponseBody {
     Health(NodeHealth),
     Started(StartResult),
     Execution(ExecutionStatus),
+    FanControl(FanControlStatus),
     Ack,
 }
 

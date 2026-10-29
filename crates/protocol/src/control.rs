@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     identifiers::{Id128, NodeId, RequestId},
-    types::{ControllerEpoch, JobRecord, JobSpec, JobState, MetricSnapshot, SnapshotRef},
+    types::{
+        ControllerEpoch, FanControlStatus, FanPolicy, JobRecord, JobSpec, JobState, MetricSnapshot,
+        SnapshotRef,
+    },
 };
 
 pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
@@ -177,6 +180,10 @@ pub enum ControlCommand {
         job_id: u64,
         force: bool,
     },
+    FanControl {
+        node_id: Option<NodeId>,
+        policy: Option<FanPolicy>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -202,6 +209,16 @@ pub enum ControlPayload {
     Job(JobRecord),
     Jobs(JobPage),
     Queues(Vec<QueueSummary>),
+    FanControl(Vec<NodeFanControlResult>),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct NodeFanControlResult {
+    pub node_id: NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FanControlStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

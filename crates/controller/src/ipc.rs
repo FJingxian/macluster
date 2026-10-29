@@ -31,6 +31,7 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_PENDING_REQUESTS: usize = 64;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const FAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 const MONITOR_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const BUSY_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -405,6 +406,11 @@ fn serve_connection(
             Ok(Some(request)) => request,
             Ok(None) | Err(_) => return,
         };
+        let response_timeout = if matches!(&request.command, ControlCommand::FanControl { .. }) {
+            FAN_CONTROL_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
         let monitor_session = matches!(
             &request.command,
             ControlCommand::SubscribeMonitor { .. }
@@ -454,7 +460,7 @@ fn serve_connection(
             }
             Err(mpsc::TrySendError::Disconnected(_)) => return,
         }
-        let result = match response_receiver.recv_timeout(REQUEST_TIMEOUT) {
+        let result = match response_receiver.recv_timeout(response_timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ControlError {
                 code: ControlErrorCode::Busy,

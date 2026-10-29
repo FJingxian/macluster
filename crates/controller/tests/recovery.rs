@@ -175,6 +175,26 @@ impl NodeTransport for FakeTransport {
                     features: state.features.clone(),
                 },
             )),
+            Operation::QueryFanPolicy => Ok(ResponseBody::FanControl(
+                macluster_protocol::types::FanControlStatus {
+                    policy: macluster_protocol::types::FanPolicy::System,
+                    supported: false,
+                    active: false,
+                    average_temperature_deci_celsius: None,
+                    target_rpm: None,
+                    message: None,
+                },
+            )),
+            Operation::SetFanPolicy { policy } => Ok(ResponseBody::FanControl(
+                macluster_protocol::types::FanControlStatus {
+                    policy,
+                    supported: false,
+                    active: false,
+                    average_temperature_deci_celsius: None,
+                    target_rpm: None,
+                    message: None,
+                },
+            )),
             Operation::Ping => Ok(ResponseBody::Pong),
         }
     }

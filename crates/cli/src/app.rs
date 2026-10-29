@@ -103,7 +103,18 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         return Err((2, "msub -Is requires terminal stdin and stdout".into()));
     }
     let mut address_migration_deferred = false;
-    if is_macluster_executable() && should_refresh_node_addresses(&command, &args) {
+    let local_read_query = is_read_only_query(&command, &args);
+    let refresh_node_addresses = !local_read_query
+        && is_macluster_executable()
+        && should_refresh_node_addresses(&command, &args);
+    let controller_owns_address_discovery = if refresh_node_addresses {
+        let state_dir = state_root(global.state_dir.as_deref())?;
+        !crate::node_admin::address_migration_pending(&state_dir)
+            && controller_is_running(&global, &state_dir)
+    } else {
+        false
+    };
+    if refresh_node_addresses && !controller_owns_address_discovery {
         let config_path = resolved_config_path(global.config.as_deref());
         let state_dir = state_root(global.state_dir.as_deref())?;
         let can_defer = can_defer_agent_update_for_work(&command, &args);
@@ -183,6 +194,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     {
         preflight_agent_update(&command, &args, &global)?;
     }
+
     match command.as_str() {
         "submit" => submit(global, &args),
         "job" => job(global, &args),
@@ -214,10 +226,23 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             Ok(initialized)
         }
         "node" => node_admin(global, &args),
+        "fans" => fans(global, &args),
         "internal" => internal(global, &args),
         "agent" => Err((1, format!("`{command}` is not implemented yet"))),
         _ => unreachable!(),
     }
+}
+
+// The controller runs the address watcher continuously. When it is healthy,
+// avoid making every CLI invocation repeat the same per-node SSH and subnet
+// discovery work; a durable proposal/migration still takes the normal recovery
+// path above.
+fn controller_is_running(global: &GlobalOptions, state_dir: &Path) -> bool {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let Ok(binding) = ServiceBinding::load(&config_path, state_dir) else {
+        return false;
+    };
+    crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200)).is_ok()
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
@@ -253,6 +278,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
     if matches!(command, "internal" | "agent" | "init") {
+        return false;
+    }
+    if command == "fans"
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
+    {
         return false;
     }
     if command == "controller"
@@ -311,8 +343,9 @@ fn defer_update_without_terminal(
     command: &str,
     args: &[String],
     interactive: bool,
+    requires_privileged_authorization: bool,
 ) -> AppResult<bool> {
-    if interactive {
+    if interactive || !requires_privileged_authorization {
         return Ok(false);
     }
     if can_defer_agent_update_for_work(command, args) {
@@ -328,6 +361,10 @@ fn defer_update_without_terminal(
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "kill" | "top")
+        || command == "fans"
+            && args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
         || command == "node"
             && args
                 .first()
@@ -389,6 +426,14 @@ fn preflight_agent_update_with_compatibility(
             ));
         }
     };
+    if is_read_only_query(command, args)
+        && !checked_compatibility
+            .as_ref()
+            .is_some_and(|compatibility| compatibility.requires_update())
+        && !crate::node_admin::configured_agent_build_mismatch_local(&config)?
+    {
+        return Ok(());
+    }
     let state_dir = state_root(global.state_dir.as_deref())?;
     let node_recovery_pending =
         crate::node_admin::node_admin_recovery_pending(&config_path, &state_dir).map_err(
@@ -402,6 +447,7 @@ fn preflight_agent_update_with_compatibility(
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
     }
+    let mut local_validation = None;
     let (compatibility, compatibility_age_ms, publish_compatibility) = match checked_compatibility {
         Some(_) if command == "top" => {
             let (compatibility, age_ms) =
@@ -415,6 +461,7 @@ fn preflight_agent_update_with_compatibility(
                         format!("cannot revalidate configured Agent builds: {error}"),
                     )
                 })?;
+            local_validation = Some(compatibility.clone());
             (compatibility, age_ms, true)
         }
         Some(compatibility) => (compatibility, 0, true),
@@ -435,6 +482,7 @@ fn preflight_agent_update_with_compatibility(
                             format!("cannot check configured Agent builds: {error}"),
                         )
                     })?;
+                local_validation = Some(compatibility.clone());
                 (compatibility, age_ms, true)
             }
         }
@@ -452,17 +500,22 @@ fn preflight_agent_update_with_compatibility(
     // managed path whose directory hash is current. Reuse the short-lived
     // local validation cache to also verify runtime capabilities before a job
     // can be admitted to a queue that no worker can service.
-    let (local_validation, _) =
-        crate::node_admin::configured_agent_build_compatibility_cached_with_age(
-            &config,
-            &state_dir.join("mtop-cache"),
-        )
-        .map_err(|(code, error)| {
-            (
-                code,
-                format!("cannot validate configured Agent capabilities: {error}"),
+    let local_validation = match local_validation {
+        Some(validation) => validation,
+        None => {
+            crate::node_admin::configured_agent_build_compatibility_cached_with_age(
+                &config,
+                &state_dir.join("mtop-cache"),
             )
-        })?;
+            .map_err(|(code, error)| {
+                (
+                    code,
+                    format!("cannot validate configured Agent capabilities: {error}"),
+                )
+            })?
+            .0
+        }
+    };
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -475,16 +528,6 @@ fn preflight_agent_update_with_compatibility(
     let helper_refresh_pending =
         crate::node_admin::agent_helper_refresh_pending(&state_dir).map_err(|error| (1, error))?;
     let agent_mismatch = compatibility.requires_update() || local_validation.requires_update();
-    if helper_refresh_pending
-        && !agent_mismatch
-        && !recovery_pending
-        && unsafe { libc::isatty(0) } != 1
-    {
-        eprintln!(
-            "A privileged helper refresh is pending; run a macluster command from Terminal to authorize it."
-        );
-        return Ok(());
-    }
     let update_required = recovery_pending || agent_mismatch || helper_refresh_pending;
     if !local_validation.missing_required_features.is_empty() {
         eprintln!(
@@ -507,7 +550,14 @@ fn preflight_agent_update_with_compatibility(
         );
         return Ok(());
     }
-    if update_required && defer_update_without_terminal(command, args, io::stdin().is_terminal())? {
+    if update_required
+        && defer_update_without_terminal(
+            command,
+            args,
+            io::stdin().is_terminal(),
+            helper_refresh_pending && !agent_mismatch && !recovery_pending,
+        )?
+    {
         eprintln!(
             "Agent update needs an interactive Terminal; continuing with `{command}` without updating."
         );
@@ -729,6 +779,7 @@ fn alias_to_command(name: &str) -> Option<&'static str> {
         "agent" => "agent",
         "internal" => "internal",
         "node" | "mnode" => "node",
+        "fans" | "mfans" => "fans",
         _ => return None,
     })
 }
@@ -3183,13 +3234,38 @@ fn validate_shared_output_path(
     ))
 }
 
+fn is_read_only_query(command: &str, args: &[String]) -> bool {
+    matches!(command, "job" | "queue" | "top")
+        || command == "controller" && args.first().is_some_and(|arg| arg == "status")
+        || command == "node"
+            && args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+        || command == "fans"
+            && args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
+}
+
+fn job_listing_uses_local_store(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--all" | "--json" => {}
+            "--state" if args.next().is_some() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]"
+            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n\nTask records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible; reading shared logs still requires access to their storage."
         );
         return Ok(());
     }
@@ -3260,72 +3336,58 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         return Err((2, "use either job ID or --request-id".into()));
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
-    let mut online = online_controller(
-        &resolved_config_path(global.config.as_deref()),
-        &state_dir,
-        true,
-    )?;
-    let storage = Storage::open(&state_dir).map_err(operation_error)?;
+    if job_listing_uses_local_store(args) {
+        let jobs = match fs::symlink_metadata(state_dir.join("controller.sqlite3")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                load_config(global.config.as_deref()).map_err(config_error)?;
+                Vec::new()
+            }
+            Err(error) => return Err((1, format!("cannot inspect job database: {error}"))),
+            Ok(_) => {
+                let storage = ReadOnlyJobStore::open(&state_dir).map_err(operation_error)?;
+                if !all && state_filter.is_none() {
+                    storage.list_active_jobs().map_err(operation_error)?
+                } else {
+                    storage.list_jobs(state_filter).map_err(operation_error)?
+                }
+            }
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&jobs).map_err(|error| (1, error.to_string()))?
+            );
+        } else {
+            print_jobs_table(&jobs);
+        }
+        return Ok(());
+    }
+    let storage = ReadOnlyJobStore::open(&state_dir).map_err(operation_error)?;
     if let Some(id) = log_id {
         if positional.is_some() {
             return Err((2, "use either --log JOBID or a positional job ID".into()));
         }
-        let record = if let Some(controller) = &mut online {
-            query_job(
-                &mut controller.client,
-                ControlCommand::LookupJob { job_id: id },
-            )?
-        } else {
-            storage
-                .get_job(id)
-                .map_err(operation_error)?
-                .ok_or_else(|| (1, format!("job {id} not found")))?
-        };
+        let record = storage
+            .get_job(id)
+            .map_err(operation_error)?
+            .ok_or_else(|| (1, format!("job {id} not found")))?;
         return stream_job_log(&storage, &record, stderr, follow, raw);
     }
     if let Some(request_id) = request_id {
-        let record = if let Some(controller) = &mut online {
-            match query_control(
-                &mut controller.client,
-                ControlCommand::LookupRequest { request_id },
-            )? {
-                ControlPayload::Lookup(Some(job)) => job,
-                ControlPayload::Lookup(None) => {
-                    return Err((1, format!("no job exists for request ID {request_id}")));
-                }
-                _ => return Err((1, "controller returned an invalid job lookup".into())),
-            }
-        } else {
-            storage
-                .get_job_by_request_id(request_id)
-                .map_err(operation_error)?
-                .ok_or_else(|| (1, format!("no job exists for request ID {request_id}")))?
-        };
-        print_job(&record, json)?;
-        return Ok(());
+        let record = storage
+            .get_job_by_request_id(request_id)
+            .map_err(operation_error)?
+            .ok_or_else(|| (1, format!("no job exists for request ID {request_id}")))?;
+        return print_job(&record, json);
     }
     if let Some(id) = positional {
-        let record = if let Some(controller) = &mut online {
-            query_job(
-                &mut controller.client,
-                ControlCommand::LookupJob { job_id: id },
-            )?
-        } else {
-            storage
-                .get_job(id)
-                .map_err(operation_error)?
-                .ok_or_else(|| (1, format!("job {id} not found")))?
-        };
-        print_job(&record, json)?;
-        return Ok(());
+        let record = storage
+            .get_job(id)
+            .map_err(operation_error)?
+            .ok_or_else(|| (1, format!("job {id} not found")))?;
+        return print_job(&record, json);
     }
-    let jobs = if let Some(controller) = &mut online {
-        query_all_jobs(
-            &mut controller.client,
-            state_filter,
-            !all && state_filter.is_none(),
-        )?
-    } else if !all && state_filter.is_none() {
+    let jobs = if !all && state_filter.is_none() {
         storage.list_active_jobs().map_err(operation_error)?
     } else {
         storage.list_jobs(state_filter).map_err(operation_error)?
@@ -3354,7 +3416,7 @@ fn print_job(record: &JobRecord, json: bool) -> AppResult<()> {
 }
 
 fn stream_job_log(
-    storage: &Storage,
+    storage: &ReadOnlyJobStore,
     record: &JobRecord,
     stderr: bool,
     follow: bool,
@@ -3619,7 +3681,9 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("Usage: mqueue [-q|--queue QUEUE] [--jobs] [--json] [--watch SECONDS]");
+        println!(
+            "Usage: mqueue [-q|--queue QUEUE] [--jobs] [--json] [--watch SECONDS]\n\nReads persisted queue counts locally without starting the controller or probing nodes. --watch rereads committed task state at each interval."
+        );
         return Ok(());
     }
     let config = load_config(global.config.as_deref()).map_err(config_error)?;
@@ -3660,81 +3724,59 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         index += 1;
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
-    let mut online = online_controller(
-        &resolved_config_path(global.config.as_deref()),
-        &state_dir,
-        true,
-    )?;
-    let storage = Storage::open(&state_dir).map_err(operation_error)?;
+    if let Some(selected) = &selected
+        && !config.queues.contains_key(selected.as_str())
+    {
+        return Err((2, format!("queue '{selected}' is not configured")));
+    }
     loop {
-        let rows: Vec<QueueRow> = if let Some(controller) = &mut online {
-            let ControlPayload::Queues(queues) =
-                query_control(&mut controller.client, ControlCommand::QueryQueues)?
-            else {
-                return Err((1, "controller returned an invalid queue list".into()));
-            };
-            queues
-                .into_iter()
-                .filter(|queue| {
-                    selected
-                        .as_ref()
-                        .is_none_or(|selected| selected.as_str() == queue.name)
-                })
-                .map(|queue| QueueRow {
-                    name: queue.name,
-                    nodes: queue.nodes,
-                    pending: queue.pending as usize,
-                    running: queue.running as usize,
-                    completed: queue.completed as usize,
-                    failed: queue.failed as usize,
-                })
-                .collect()
-        } else {
-            let counts_by_queue: BTreeMap<_, _> = storage
-                .queue_job_counts()
-                .map_err(operation_error)?
-                .into_iter()
-                .map(|counts| (counts.queue.clone(), counts))
-                .collect();
-            config
-                .queues
-                .keys()
-                .filter(|name| {
-                    selected
-                        .as_ref()
-                        .is_none_or(|selected| selected.as_str() == name.as_str())
-                })
-                .map(|name| {
-                    let counts = counts_by_queue.get(name);
-                    QueueRow {
-                        name: name.clone(),
-                        nodes: config.queue_compute_nodes(name),
-                        pending: counts.map_or(0, |counts| counts.pending as usize),
-                        running: counts.map_or(0, |counts| counts.running as usize),
-                        completed: counts.map_or(0, |counts| counts.completed as usize),
-                        failed: counts.map_or(0, |counts| counts.failed as usize),
-                    }
-                })
-                .collect()
+        let storage = match fs::symlink_metadata(state_dir.join("controller.sqlite3")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err((1, format!("cannot inspect job database: {error}"))),
+            Ok(_) => Some(ReadOnlyJobStore::open(&state_dir).map_err(operation_error)?),
         };
-        let jobs = if show_jobs {
-            if let Some(controller) = &mut online {
-                Some(query_all_jobs(&mut controller.client, None, false)?)
-            } else {
-                Some(storage.list_jobs(None).map_err(operation_error)?)
-            }
+        let counts_by_queue: BTreeMap<_, _> = storage
+            .as_ref()
+            .map(ReadOnlyJobStore::queue_job_counts)
+            .transpose()
+            .map_err(operation_error)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|counts| (counts.queue.clone(), counts))
+            .collect();
+        let rows: Vec<QueueRow> = config
+            .queues
+            .keys()
+            .filter(|name| {
+                selected
+                    .as_ref()
+                    .is_none_or(|selected| selected.as_str() == name.as_str())
+            })
+            .map(|name| {
+                let counts = counts_by_queue.get(name);
+                QueueRow {
+                    name: name.clone(),
+                    nodes: config.queue_compute_nodes(name),
+                    pending: counts.map_or(0, |counts| counts.pending as usize),
+                    running: counts.map_or(0, |counts| counts.running as usize),
+                    completed: counts.map_or(0, |counts| counts.completed as usize),
+                    failed: counts.map_or(0, |counts| counts.failed as usize),
+                }
+            })
+            .collect();
+        let jobs = if show_jobs && !json {
+            Some(
+                storage
+                    .as_ref()
+                    .map(|storage| storage.list_jobs(None))
+                    .transpose()
+                    .map_err(operation_error)?
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };
-        if selected
-            .as_ref()
-            .is_some_and(|selected| !config.queues.contains_key(selected.as_str()))
-        {
-            return Err((
-                2,
-                format!("queue '{}' is not configured", selected.unwrap()),
-            ));
-        }
+        drop(storage);
         if json {
             println!(
                 "{}",
@@ -3812,6 +3854,192 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         };
         thread::sleep(Duration::from_secs(seconds));
         println!();
+    }
+    Ok(())
+}
+
+fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
+    use macluster_protocol::{
+        control::{ControlCommand, ControlPayload},
+        types::FanPolicy,
+    };
+
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!(
+            "Usage: mfans [--status | --reset | --auto | --power] [--node NODE] [--json]\n\nWithout --node, a policy is applied to every registered node. --auto uses a linear CPU temperature curve from 40°C to 80°C; --power uses a logarithmic curve over the same range. --reset returns the fans to macOS system control."
+        );
+        return Ok(());
+    }
+    let mut policy = None;
+    let mut mode_seen = false;
+    let mut status = false;
+    let mut json = false;
+    let mut node_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--status" | "-l" => {
+                if mode_seen || status {
+                    return Err((
+                        2,
+                        "choose only one of --status, --reset, --auto, or --power".into(),
+                    ));
+                }
+                status = true;
+            }
+            "--reset" => {
+                if mode_seen || status {
+                    return Err((2, "choose only one fan policy".into()));
+                }
+                policy = Some(FanPolicy::System);
+                mode_seen = true;
+            }
+            "--auto" => {
+                if mode_seen || status {
+                    return Err((2, "choose only one fan policy".into()));
+                }
+                policy = Some(FanPolicy::Auto);
+                mode_seen = true;
+            }
+            "--power" => {
+                if mode_seen || status {
+                    return Err((2, "choose only one fan policy".into()));
+                }
+                policy = Some(FanPolicy::Power);
+                mode_seen = true;
+            }
+            "--node" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| (2, "--node requires a node ID".into()))?;
+                let parsed = value
+                    .parse::<macluster_protocol::identifiers::NodeId>()
+                    .map_err(|error| (2, error.to_string()))?;
+                if node_id.replace(parsed).is_some() {
+                    return Err((2, "--node may be specified only once".into()));
+                }
+            }
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mfans option '{value}'")));
+            }
+            value => return Err((2, format!("unexpected mfans argument '{value}'"))),
+        }
+        index += 1;
+    }
+    if !status && !mode_seen {
+        return Err((2, "choose --status, --reset, --auto, or --power".into()));
+    }
+    if json && !status {
+        return Err((2, "--json is supported with --status only".into()));
+    }
+
+    let config_path = resolved_config_path(global.config.as_deref());
+    let state_dir = state_root(global.state_dir.as_deref())?;
+    let mut controller = online_controller(&config_path, &state_dir, false)?
+        .ok_or_else(|| (1, "fan control requires the running controller".into()))?;
+    controller
+        .client
+        .set_timeouts(Duration::from_secs(60))
+        .map_err(|error| (1, error.to_string()))?;
+    let payload = query_control(
+        &mut controller.client,
+        ControlCommand::FanControl { node_id, policy },
+    )?;
+    let ControlPayload::FanControl(results) = payload else {
+        return Err((
+            1,
+            "controller returned an invalid fan-control response".into(),
+        ));
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&results).map_err(|error| (1, error.to_string()))?
+        );
+    } else {
+        println!(
+            "{:<18} {:<8} {:<8} {:<8} {:<10} STATUS",
+            "NODE", "POLICY", "STATE", "TEMP", "TARGET RPM"
+        );
+        for result in &results {
+            if let Some(error) = &result.error {
+                println!(
+                    "{:<18} {:<8} {:<8} {:<8} {:<10} {error}",
+                    result.node_id, "ERROR", "-", "-", "-"
+                );
+                continue;
+            }
+            let Some(status) = &result.status else {
+                println!(
+                    "{:<18} {:<8} {:<8} {:<8} {:<10} no fan status returned",
+                    result.node_id, "ERROR", "-", "-", "-"
+                );
+                continue;
+            };
+            if !status.supported {
+                println!(
+                    "{:<18} {:<8} {:<8} {:<8} {:<10} {}",
+                    result.node_id,
+                    "UNAVAILABLE",
+                    "-",
+                    "-",
+                    "-",
+                    status
+                        .message
+                        .as_deref()
+                        .unwrap_or("fan control is unsupported")
+                );
+                continue;
+            }
+            let mode = match status.policy {
+                FanPolicy::System => "SYSTEM",
+                FanPolicy::Auto => "AUTO",
+                FanPolicy::Power => "POWER",
+            };
+            let detail = status.message.as_deref().unwrap_or("");
+            let active = match (status.policy, status.active) {
+                (FanPolicy::System, _) => "DEFAULT",
+                (_, true) => "ACTIVE",
+                (_, false) => "ARMED",
+            };
+            let temperature = status
+                .average_temperature_deci_celsius
+                .map(|value| format!("{:.1}°C", f32::from(value) / 10.0))
+                .unwrap_or_else(|| "N/A".into());
+            let target_rpm = status
+                .target_rpm
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "N/A".into());
+            println!(
+                "{:<18} {:<8} {:<8} {:<8} {:<10} {}",
+                result.node_id, mode, active, temperature, target_rpm, detail
+            );
+        }
+    }
+    let failed = results
+        .iter()
+        .filter(|result| {
+            result.error.is_some()
+                || (policy.is_some()
+                    && result
+                        .status
+                        .as_ref()
+                        .is_none_or(|status| Some(status.policy) != policy))
+        })
+        .count();
+    if failed > 0 {
+        return Err((
+            1,
+            format!(
+                "fan policy operation failed on {failed} of {} node(s)",
+                results.len()
+            ),
+        ));
     }
     Ok(())
 }
@@ -3996,13 +4224,12 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
 fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: macluster controller start|stop|restart|status|app-link\n       macluster controller run [--once] [--interval SECONDS] [--web [--web-port PORT] [--no-open]]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use. Add `--web` to start the read-only browser monitor; if a controller is already running, it starts the monitor there and asks before updating an older controller. `app-link` starts or reuses that monitor and prints a one-use local session URL for the native app."
+            "Usage: macluster controller start|stop|restart|status\n       macluster controller run [--once] [--interval SECONDS] [--web [--web-port PORT] [--no-open]]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use. Add `--web` to start the read-only browser monitor; if a controller is already running, it starts the monitor there and asks before updating an older controller."
         );
         return Ok(());
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
     match args[0].as_str() {
-        "app-link" => controller_app_link(&global, &state_dir),
         "status" => {
             if resolved_config_path(global.config.as_deref()).is_file() {
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
@@ -4036,8 +4263,14 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             } else {
                 println!("Controller service: not configured");
             }
-            let storage = Storage::open(&state_dir).map_err(operation_error)?;
-            let jobs = storage.list_jobs(None).map_err(operation_error)?;
+            let jobs = match fs::symlink_metadata(state_dir.join("controller.sqlite3")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err((1, format!("cannot inspect job database: {error}"))),
+                Ok(_) => ReadOnlyJobStore::open(&state_dir)
+                    .map_err(operation_error)?
+                    .list_active_jobs()
+                    .map_err(operation_error)?,
+            };
             let pending = jobs
                 .iter()
                 .filter(|job| job.state == JobState::Pending)
@@ -4490,35 +4723,6 @@ fn query_control(
         .map_err(|error| (1, error.to_string()))
 }
 
-fn controller_app_link(global: &GlobalOptions, state_dir: &Path) -> AppResult<()> {
-    let config_path = resolved_config_path(global.config.as_deref());
-    let Some(mut online) = online_controller(&config_path, state_dir, true)? else {
-        return Err((
-            1,
-            "controller is manually stopped or its per-user service is unavailable; run `macluster controller start` first".into(),
-        ));
-    };
-    if !controller_supports_web(&online.client) {
-        return Err((
-            1,
-            "the running controller does not support the local monitor API; update it from Terminal with `macluster controller run --web`".into(),
-        ));
-    }
-    online
-        .client
-        .set_timeouts(Duration::from_secs(10))
-        .map_err(|error| (1, error.to_string()))?;
-    let payload = query_control(&mut online.client, ControlCommand::StartWeb { port: None })?;
-    let ControlPayload::WebStarted { port, token, .. } = payload else {
-        return Err((
-            1,
-            "controller returned an invalid native monitor session response".into(),
-        ));
-    };
-    println!("Web monitor URL: http://127.0.0.1:{port}/#{token}");
-    Ok(())
-}
-
 fn start_web_monitor(
     client: &mut crate::control_client::ControlClient,
     port: Option<u16>,
@@ -4615,50 +4819,6 @@ fn schedule_web_monitor_startup(
             }
             eprintln!("macluster: browser monitor startup failed: {last_error}");
         })
-}
-
-fn query_all_jobs(
-    client: &mut crate::control_client::ControlClient,
-    state: Option<JobState>,
-    active_only: bool,
-) -> AppResult<Vec<JobRecord>> {
-    let mut jobs = Vec::new();
-    let mut offset = 0_usize;
-    loop {
-        let payload = query_control(
-            client,
-            ControlCommand::QueryJobs {
-                offset,
-                limit: 256,
-                state,
-                active_only,
-            },
-        )?;
-        let ControlPayload::Jobs(page) = payload else {
-            return Err((1, "controller returned an invalid job page".into()));
-        };
-        jobs.extend(page.jobs);
-        let Some(next) = page.next_offset else {
-            break;
-        };
-        if next <= offset {
-            return Err((1, "controller returned an invalid job page offset".into()));
-        }
-        offset = next;
-    }
-    Ok(jobs)
-}
-
-fn query_job(
-    client: &mut crate::control_client::ControlClient,
-    command: ControlCommand,
-) -> AppResult<JobRecord> {
-    match query_control(client, command)? {
-        ControlPayload::Job(job) => Ok(job),
-        ControlPayload::Lookup(Some(job)) => Ok(job),
-        ControlPayload::Lookup(None) => Err((1, "job was not found".into())),
-        _ => Err((1, "controller returned an invalid job record".into())),
-    }
 }
 
 static CONTROLLER_SHUTDOWN: std::sync::atomic::AtomicBool =
@@ -6181,6 +6341,61 @@ mod tests {
     }
 
     #[test]
+    fn read_only_query_policy_excludes_cluster_mutations() {
+        for (command, args) in [
+            ("job", vec!["--log", "1", "--follow"]),
+            ("queue", vec!["--watch", "1"]),
+            ("top", vec!["--once"]),
+            ("node", vec!["-l"]),
+            ("node", vec!["--list"]),
+            ("fans", vec!["--status"]),
+        ] {
+            assert!(super::is_read_only_query(
+                command,
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+        for (command, args) in [
+            ("submit", vec![]),
+            ("kill", vec!["1"]),
+            ("init", vec![]),
+            ("node", vec!["-a", "local"]),
+            ("node", vec!["-rm", "worker"]),
+            ("fans", vec!["--auto"]),
+        ] {
+            assert!(!super::is_read_only_query(
+                command,
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    #[test]
+    fn local_job_listing_excludes_lookups_and_log_following() {
+        for args in [
+            vec![],
+            vec!["--json"],
+            vec!["--all", "--json"],
+            vec!["--state", "Running"],
+        ] {
+            assert!(super::job_listing_uses_local_store(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+        for args in [
+            vec!["1"],
+            vec!["--log", "1", "--follow"],
+            vec!["--request-id", "id"],
+            vec!["--state"],
+            vec!["--help"],
+        ] {
+            assert!(!super::job_listing_uses_local_store(
+                &args.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    #[test]
     fn pending_node_admin_work_blocks_update_without_controller_prompt() {
         assert!(should_block_agent_update_for_pending_node_recovery(
             "submit", true, true
@@ -6797,7 +7012,7 @@ mod tests {
                 unshared.to_string_lossy().into_owned(),
             ),
         ]);
-        let error = prepare_task_environment(&config, BTreeMap::new(), unshared_env)
+        let error = prepare_task_environment(&config, unshared_env, BTreeMap::new())
             .expect_err("login-only active environment must be rejected");
         assert!(
             error.1.contains("outside every configured shared path"),
@@ -6813,7 +7028,7 @@ mod tests {
             ),
             ("CONDA_PREFIX".into(), active.to_string_lossy().into_owned()),
         ]);
-        let error = prepare_task_environment(&relocated_config, BTreeMap::new(), relocated_env)
+        let error = prepare_task_environment(&relocated_config, relocated_env, BTreeMap::new())
             .expect_err("a relocated software mount cannot preserve environment executables");
         assert!(error.1.contains("same absolute path"), "{error:?}");
         fs::remove_dir_all(root).unwrap();
@@ -8023,13 +8238,13 @@ fn cli_error(error: CliError) -> (i32, String) {
 
 fn print_help() {
     println!(
-        "macluster — macOS cluster task manager\n\nUsage: macluster <submit|job|queue|kill|top|node|controller|init> [OPTIONS]\n\nAliases: msub, mjob, mqueue, mkill, mtop, mnode\nGlobal options: --config PATH, --state-dir PATH"
+        "macluster — macOS cluster task manager\n\nUsage: macluster <submit|job|queue|kill|top|node|fans|controller|init> [OPTIONS]\n\nAliases: msub, mjob, mqueue, mkill, mtop, mnode, mfans\nGlobal options: --config PATH, --state-dir PATH"
     );
 }
 
 fn print_submit_help() {
     println!(
-        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. When a task uses the active VIRTUAL_ENV or CONDA_PREFIX, that environment must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside that environment do not require its interpreter to be shared. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Before every operational command and before `init` with an existing valid config, macluster checks all configured Agent version/hash values and automatically updates every node when a known mismatch exists. If that update stops a running controller, restart it and retry the command. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
+        "Usage: msub [-v|--verbose] [-q QUEUE] [--node NODE] [-J NAME] [-t HH:MM:SS] [--cwd PATH] [-o PATH] [-e PATH] [--env KEY=VALUE] SCRIPT|COMMAND [ARGS...]\n       msub -Is [-q QUEUE] [--node NODE] [OPTIONS] [SCRIPT|COMMAND [ARGS...]]\n       msub [--request-id UUID]\n       msub --wrap COMMAND\n\n-v enables detailed timestamped output and CPU/memory logs for this task; it is off by default. The submitting process's exported environment is forwarded to the task by default; --env overrides individual values. When a task uses the active VIRTUAL_ENV or CONDA_PREFIX, that environment must belong to a registered share mounted at the same absolute path on every node. Its bin/ directory is put first in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside that environment do not require its interpreter to be shared. If PATH is explicitly overridden with --env PATH=..., that filtered PATH stays authoritative. Unshared or relocated active environments are rejected instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths plus standard macOS commands; unshared login-only paths are omitted. Batch and interactive tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs. A command may be passed as argv, for example `msub -Is pip install . --break-system-packages`; flags after the command belong to the task. A single quoted command such as `msub -Is 'pwd; echo done'` retains shell syntax. Use --wrap for explicit raw shell input. Inline commands default to the configured shared root when submitted from outside it; --cwd overrides this. Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Do not run concurrent pip installs into the same shared environment. `-Is` opens an attached interactive shell when no command is provided, or runs the supplied script/command in a remote PTY. It requires terminal stdin and stdout. Task submission and cluster changes validate configured Agent builds and capabilities. Read-only commands check locally available build evidence and enter the update workflow for known mismatches; they do not run remote validation or address discovery first. mjob and mqueue read persisted records without starting the controller. Internal Agent RPCs, the unimplemented `agent` command, and help bypass this check. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs occupy one complete node; core and memory request flags are not supported."
     );
 }
 
@@ -8038,16 +8253,23 @@ mod update_terminal_regressions {
     use super::*;
     #[test]
     fn noninteractive_cancellation_and_inspection_survive_pending_update() {
+        assert_eq!(
+            defer_update_without_terminal("submit", &[], false, false),
+            Ok(false)
+        );
         for command in ["kill", "job", "queue", "top"] {
-            assert_eq!(defer_update_without_terminal(command, &[], false), Ok(true));
+            assert_eq!(
+                defer_update_without_terminal(command, &[], false, true),
+                Ok(true)
+            );
         }
         assert_eq!(
-            defer_update_without_terminal("node", &["-l".into()], false),
+            defer_update_without_terminal("node", &["-l".into()], false, true),
             Ok(true)
         );
-        assert!(defer_update_without_terminal("submit", &[], false).is_err());
+        assert!(defer_update_without_terminal("submit", &[], false, true).is_err());
         assert_eq!(
-            defer_update_without_terminal("submit", &[], true),
+            defer_update_without_terminal("submit", &[], true, true),
             Ok(false)
         );
     }

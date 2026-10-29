@@ -575,6 +575,9 @@ impl ControlApi {
                 .request_cancel(job_id, force)
                 .map(ControlPayload::Job)
                 .map_err(storage_error),
+            ControlCommand::FanControl { .. } => Err(invalid_request(
+                "fan control must be coordinated by the controller runtime",
+            )),
         }
     }
 
@@ -723,7 +726,7 @@ impl ControlApi {
     }
 }
 
-fn invalid_request(message: impl Into<String>) -> ControlError {
+pub(crate) fn invalid_request(message: impl Into<String>) -> ControlError {
     ControlError {
         code: ControlErrorCode::InvalidRequest,
         message: message.into(),

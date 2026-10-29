@@ -63,6 +63,7 @@ impl ControlClient {
                     "monitor.v1".into(),
                     "maintenance.v1".into(),
                     "web.v1".into(),
+                    "fan-control.v1".into(),
                 ],
             },
         )?;

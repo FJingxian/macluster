@@ -22,9 +22,10 @@ use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, read_frame, sha256_hex, write_frame},
     identifiers::{Id128, StartToken},
     types::{
-        ControllerEpoch, ExecutionStatus, INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState,
-        NodeHealth, Operation, PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody,
-        RuntimePhase, SnapshotRef, StartResult,
+        ControllerEpoch, ExecutionStatus, FanControlStatus, FanHelperCommand, FanHelperResponse,
+        INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState, NodeHealth, Operation,
+        PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody, RuntimePhase,
+        SnapshotRef, StartResult,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -248,7 +249,57 @@ fn handle_operation(
         } => {
             cancel_job(controller, start_token, job_id, force, state_dir).map(|_| ResponseBody::Ack)
         }
+        Operation::QueryFanPolicy => {
+            fan_helper_command(FanHelperCommand::Status).map(ResponseBody::FanControl)
+        }
+        Operation::SetFanPolicy { policy } => {
+            fan_helper_command(FanHelperCommand::Set { policy }).map(ResponseBody::FanControl)
+        }
     }
+}
+
+fn fan_helper_command(command: FanHelperCommand) -> Result<FanControlStatus, ProtocolError> {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let mut stream = UnixStream::connect("/var/run/org.macluster.fan.sock")
+        .map_err(|error| ProtocolError::Failed(format!("fan helper is unavailable: {error}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(15))))
+        .map_err(|error| {
+            ProtocolError::Failed(format!("could not set fan helper timeout: {error}"))
+        })?;
+    serde_json::to_writer(&mut stream, &command)
+        .map_err(|error| ProtocolError::Failed(format!("could not encode fan request: {error}")))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| ProtocolError::Failed(format!("could not send fan request: {error}")))?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|error| {
+            ProtocolError::Failed(format!("could not read fan helper response: {error}"))
+        })?;
+    let response: FanHelperResponse = serde_json::from_str(&line)
+        .map_err(|error| ProtocolError::Failed(format!("invalid fan helper response: {error}")))?;
+    if let Some(error) = response.error {
+        return Err(ProtocolError::Failed(error));
+    }
+    if let FanHelperCommand::Set { policy } = command
+        && response.status.policy != policy
+    {
+        return Err(ProtocolError::Failed(
+            response
+                .status
+                .message
+                .unwrap_or_else(|| "fan helper did not accept the requested policy".into()),
+        ));
+    }
+    Ok(response.status)
 }
 
 pub fn validate_node_identity(

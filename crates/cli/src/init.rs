@@ -129,7 +129,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     if let Some(shared_root) = options.shared_root.as_deref() {
         validate_path_relationships(&config_path, &state_dir, shared_root)?;
     }
-    if config_path.exists() || reset::journal_path(&config_path).exists() {
+    let reset_completed = if config_path.exists() || reset::journal_path(&config_path).exists() {
         let Some(next_options) = reset::run(config_path.clone(), state_dir.clone(), options)?
         else {
             // A legacy reset journal may have already installed its saved target.
@@ -137,18 +137,30 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         };
         options = next_options;
         options.force = false;
+        true
     } else if options.force {
         return Err((2, "--force requires an existing cluster or an interrupted reset; run `macluster init` for first-time setup".into()));
-    }
+    } else {
+        false
+    };
     reset::ensure_no_reset_in_progress(&config_path, &state_dir)?;
     if state_dir_has_entries(&state_dir)? {
-        return Err((
-            1,
-            format!(
-                "controller state directory {} is not empty but no active config exists; restore its matching archived config before rerunning `macluster init`",
-                state_dir.display()
-            ),
-        ));
+        if reset_completed {
+            if let Some(archive) = archive_unbound_controller_state(&state_dir)? {
+                println!(
+                    "Preserved the pre-existing unbound controller state at {}.",
+                    archive.display()
+                );
+            }
+        } else {
+            return Err((
+                1,
+                format!(
+                    "controller state directory {} is not empty but no active config exists; restore its matching archived config before rerunning `macluster init`",
+                    state_dir.display()
+                ),
+            ));
+        }
     }
 
     let _maintenance = MaintenanceLock::exclusive_for_creation(&config_path)
@@ -514,14 +526,13 @@ fn finish_remote_init(
     validate_path_relationships(&expected_config, &expected_state, &base_config.shared_root)?;
 
     let existing_config = remote_init_config_matches(&expected_config, &journal)?;
-    if !existing_config && state_dir_has_entries(&expected_state)? {
-        return Err((
-            1,
-            format!(
-                "controller state directory {} is not empty while remote initialization is incomplete; inspect it before continuing",
-                expected_state.display()
-            ),
-        ));
+    if !existing_config {
+        if let Some(archive) = archive_unbound_controller_state(&expected_state)? {
+            println!(
+                "Preserved the pre-existing unbound controller state at {}.",
+                archive.display()
+            );
+        }
     }
     if journal.prepared_config_source.is_none() {
         if existing_config {
@@ -561,14 +572,11 @@ fn finish_remote_init(
     }
 
     if !existing_config {
-        if state_dir_has_entries(&expected_state)? {
-            return Err((
-                1,
-                format!(
-                    "controller state directory {} is not empty while remote initialization is incomplete; inspect it before continuing",
-                    expected_state.display()
-                ),
-            ));
+        if let Some(archive) = archive_unbound_controller_state(&expected_state)? {
+            println!(
+                "Preserved the pre-existing unbound controller state at {}.",
+                archive.display()
+            );
         }
         atomic_create_config(&expected_config, prepared_source.as_bytes())?;
     }
@@ -856,14 +864,13 @@ fn finish_local_init(
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err((1, format!("cannot inspect config destination: {error}"))),
     };
-    if !existing_config && state_dir_has_entries(&expected_state)? {
-        return Err((
-            1,
-            format!(
-                "controller state directory {} is not empty while local initialization is incomplete; inspect it before continuing",
-                expected_state.display()
-            ),
-        ));
+    if !existing_config {
+        if let Some(archive) = archive_unbound_controller_state(&expected_state)? {
+            println!(
+                "Preserved the pre-existing unbound controller state at {}.",
+                archive.display()
+            );
+        }
     }
 
     prepare_local_primary_inner(&config.shared_root, &config.share_uuid, true)?;
@@ -1915,6 +1922,113 @@ fn state_dir_has_entries(path: &Path) -> AppResult<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err((1, error.to_string())),
     }
+}
+
+/// A confirmed local init may race with a stale client recreating the old
+/// controller directory after reset archived it. Keep that directory intact,
+/// but move it out of the way before binding this new cluster to a fresh state
+/// directory. This only runs while resuming/finishing a saved init journal, so
+/// the user has already confirmed creation of the new cluster.
+fn archive_unbound_controller_state(state_dir: &Path) -> AppResult<Option<PathBuf>> {
+    if !state_dir_has_entries(state_dir)? {
+        return Ok(None);
+    }
+
+    let metadata = fs::symlink_metadata(state_dir).map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot inspect pre-existing controller state {}: {error}",
+                state_dir.display()
+            ),
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err((
+            1,
+            format!(
+                "pre-existing controller state path {} is not a real directory; inspect it before continuing",
+                state_dir.display()
+            ),
+        ));
+    }
+
+    let parent = state_dir.parent().ok_or_else(|| {
+        (
+            1,
+            format!(
+                "controller state directory {} has no parent for safe archival",
+                state_dir.display()
+            ),
+        )
+    })?;
+    let archive_root = parent.join("macluster-archive");
+    fs::create_dir_all(&archive_root).map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot create controller state archive {}: {error}",
+                archive_root.display()
+            ),
+        )
+    })?;
+    let archive_metadata = fs::symlink_metadata(&archive_root).map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot inspect controller state archive {}: {error}",
+                archive_root.display()
+            ),
+        )
+    })?;
+    if !archive_metadata.is_dir() || archive_metadata.file_type().is_symlink() {
+        return Err((
+            1,
+            format!(
+                "controller state archive path {} is not a real directory",
+                archive_root.display()
+            ),
+        ));
+    }
+
+    let recovery_dir = archive_root.join(format!("local-init-recovery-{}", Id128::random()));
+    fs::create_dir(&recovery_dir).map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot reserve controller state recovery archive {}: {error}",
+                recovery_dir.display()
+            ),
+        )
+    })?;
+    let archived_state = recovery_dir.join("controller");
+    if let Err(error) = fs::rename(state_dir, &archived_state) {
+        let _ = fs::remove_dir(&recovery_dir);
+        return Err((
+            1,
+            format!(
+                "cannot preserve pre-existing controller state {} at {}: {error}",
+                state_dir.display(),
+                archived_state.display()
+            ),
+        ));
+    }
+
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .and_then(|()| File::open(&archive_root)?.sync_all())
+        .and_then(|()| File::open(&recovery_dir)?.sync_all())
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "controller state was preserved at {}, but the archive could not be flushed: {error}",
+                    archived_state.display()
+                ),
+            )
+        })?;
+
+    Ok(Some(archived_state))
 }
 
 fn create_real_directory_path(path: &Path) -> AppResult<()> {

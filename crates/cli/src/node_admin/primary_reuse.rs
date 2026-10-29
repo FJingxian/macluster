@@ -304,6 +304,7 @@ pub(super) fn plan(
             source_alias: None,
             needs_mount: true,
             needs_privileged_mkdir: true,
+            allow_existing_contents: false,
         },
         preparation,
         backup_path: backup,

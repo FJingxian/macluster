@@ -212,6 +212,70 @@ impl ReadOnlyJobStore {
             .collect()
     }
 
+    /// Include terminal jobs whose output has not finished synchronizing.
+    pub fn list_active_jobs(&self) -> Result<Vec<JobRecord>, SubmitError> {
+        if self.schema_version < 3 {
+            return self.list_monitor_jobs();
+        }
+        self.connection
+            .query_texts(
+                "SELECT payload_json FROM jobs WHERE state IN ('PENDING','STARTING','RUNNING','CANCELLING') OR snapshot_sync_pending=1 OR log_sync_pending=1 ORDER BY id DESC",
+                None,
+            )?
+            .into_iter()
+            .map(|payload| decode_job(&payload))
+            .collect()
+    }
+
+    pub fn get_job(&self, job_id: u64) -> Result<Option<JobRecord>, SubmitError> {
+        self.connection
+            .query_text(
+                "SELECT payload_json FROM jobs WHERE id=?1",
+                Some(job_id.to_string()),
+            )?
+            .map(|payload| decode_job(&payload))
+            .transpose()
+    }
+
+    pub fn get_job_by_request_id(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<JobRecord>, SubmitError> {
+        self.connection
+            .query_text(
+                "SELECT payload_json FROM jobs WHERE request_id=?1",
+                Some(request_id.to_string()),
+            )?
+            .map(|payload| decode_job(&payload))
+            .transpose()
+    }
+
+    pub fn queue_job_counts(&self) -> Result<Vec<QueueJobCounts>, SubmitError> {
+        if self.schema_version >= 3 {
+            return self.connection.query_queue_job_counts();
+        }
+        let mut counts = std::collections::BTreeMap::new();
+        for job in self.list_jobs(None)? {
+            let row = counts
+                .entry(job.spec.queue.to_string())
+                .or_insert_with(|| QueueJobCounts {
+                    queue: job.spec.queue.to_string(),
+                    pending: 0,
+                    running: 0,
+                    completed: 0,
+                    failed: 0,
+                });
+            match job.state {
+                JobState::Pending => row.pending += 1,
+                JobState::Starting | JobState::Running | JobState::Cancelling => row.running += 1,
+                JobState::Completed => row.completed += 1,
+                JobState::Failed => row.failed += 1,
+                _ => {}
+            }
+        }
+        Ok(counts.into_values().collect())
+    }
+
     /// Return whether cluster maintenance must wait for active jobs or output
     /// synchronization. This existence query does not load or deserialize
     /// terminal job history.
@@ -2174,6 +2238,24 @@ mod cancellation_recovery_tests {
     }
 
     #[test]
+    fn readonly_queue_counts_do_not_deserialize_terminal_history() {
+        let root = fresh_root();
+        let storage = Storage::open(&root).unwrap();
+        legacy_cancelled_job(&storage);
+        storage
+            .connection
+            .exec("UPDATE jobs SET state='COMPLETED', payload_json='not-json';")
+            .unwrap();
+        let expected = storage.queue_job_counts().unwrap();
+        assert_eq!(expected[0].completed, 1);
+        let reader = super::ReadOnlyJobStore::open(&root).unwrap();
+        assert_eq!(reader.queue_job_counts().unwrap(), expected);
+        drop(reader);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn active_job_listing_includes_terminal_jobs_with_sync_pending() {
         let root = fresh_root();
         let storage = Storage::open(&root).unwrap();
@@ -2182,6 +2264,9 @@ mod cancellation_recovery_tests {
         let active = storage.list_active_jobs().unwrap();
 
         assert!(active.iter().any(|job| job.id == job_id));
+        let reader = super::ReadOnlyJobStore::open(&root).unwrap();
+        assert_eq!(reader.list_active_jobs().unwrap(), active);
+        drop(reader);
         drop(storage);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2197,6 +2282,9 @@ mod cancellation_recovery_tests {
         let active = storage.list_active_jobs().unwrap();
 
         assert!(active.iter().any(|job| job.id == job_id));
+        let reader = super::ReadOnlyJobStore::open(&root).unwrap();
+        assert_eq!(reader.list_active_jobs().unwrap(), active);
+        drop(reader);
         drop(storage);
         fs::remove_dir_all(root).unwrap();
     }

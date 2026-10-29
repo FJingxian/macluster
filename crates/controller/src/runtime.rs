@@ -375,7 +375,7 @@ impl RuntimeState {
             MaintenanceScope::Cluster => true,
             MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
         };
-        for job in service.storage.list_jobs(None)? {
+        for job in service.storage.list_active_jobs()? {
             let scoped = in_scope(job.node.as_ref());
             let label = match job.state {
                 JobState::Starting | JobState::Running | JobState::Cancelling if scoped => {
@@ -1564,6 +1564,21 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                     Err(error) => Err(web_start_control_error(error)),
                                 }
                             }
+                        } else if let macluster_protocol::control::ControlCommand::FanControl {
+                            node_id,
+                            policy,
+                        } = control_request.command.clone()
+                        {
+                            if policy.is_some_and(|requested| {
+                                requested != macluster_protocol::types::FanPolicy::System
+                            }) && (maintenance_active || reset_policy.is_some())
+                            {
+                                Err(crate::control::maintenance_error(
+                                    "fan policy changes are paused during controller maintenance",
+                                ))
+                            } else {
+                                dispatch_fan_control(service, node_id, policy)
+                            }
                         } else if let macluster_protocol::control::ControlCommand::CompleteMaintenance {
                             ticket,
                             candidate_config_digest,
@@ -1689,7 +1704,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         let address_maintenance = reset_policy.is_none() && !maintenance_active && requested();
         if address_maintenance {
-            let all_jobs = service.storage.list_jobs(None)?;
+            let all_jobs = service.storage.list_active_jobs()?;
             if all_jobs.iter().all(|job| {
                 !matches!(
                     job.state,
@@ -1726,14 +1741,14 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
             runtime.dispatch(service, jobs, &queue_names)?;
         }
         if let Some(policy) = reset_policy {
-            let all_jobs = service.storage.list_jobs(None)?;
+            let all_jobs = service.storage.list_active_jobs()?;
             if reset_drain_complete(&all_jobs, policy) {
                 eprintln!("macluster: reset barrier drained active work; controller is exiting");
                 return Ok(());
             }
         }
         if maintenance_active {
-            let all_jobs = service.storage.list_jobs(None)?;
+            let all_jobs = service.storage.list_active_jobs()?;
             if maintenance_drain_complete(&all_jobs) {
                 eprintln!("macluster: node maintenance drained active work; controller is exiting");
                 return Ok(());
@@ -1741,6 +1756,93 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         waiter.wait_until(runtime.next_deadline(Instant::now()));
     }
+}
+
+fn dispatch_fan_control<T: NodeTransport>(
+    service: &ControllerService<T>,
+    selected_node: Option<NodeId>,
+    policy: Option<macluster_protocol::types::FanPolicy>,
+) -> Result<macluster_protocol::control::ControlPayload, macluster_protocol::control::ControlError>
+{
+    use macluster_protocol::{
+        control::{ControlPayload, NodeFanControlResult},
+        types::{Operation, ResponseBody},
+    };
+
+    let targets = if let Some(node_id) = selected_node {
+        let node = service.config.nodes.get(node_id.as_str()).ok_or_else(|| {
+            crate::control::invalid_request(format!("node '{node_id}' is not in the cluster"))
+        })?;
+        vec![(node_id, node)]
+    } else {
+        if service.config.nodes.len() > 128 {
+            return Err(crate::control::invalid_request(
+                "cluster-wide fan control supports at most 128 nodes per request; target a node individually",
+            ));
+        }
+        service
+            .config
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| NodeId::new(id.clone()).ok().map(|id| (id, node)))
+            .collect::<Vec<_>>()
+    };
+    if targets.is_empty() {
+        return Err(crate::control::invalid_request(
+            "cluster has no registered nodes",
+        ));
+    }
+
+    let targets = std::sync::Arc::new(targets);
+    let next_target = std::sync::atomic::AtomicUsize::new(0);
+    let transport = std::sync::Arc::clone(&service.transport);
+    let results = std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..targets.len().min(8) {
+            let sender = sender.clone();
+            let transport = std::sync::Arc::clone(&transport);
+            let targets = std::sync::Arc::clone(&targets);
+            let next_target = &next_target;
+            scope.spawn(move || {
+                loop {
+                    let index = next_target.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((node_id, node)) = targets.get(index) else {
+                        break;
+                    };
+                    let node_id = node_id.clone();
+                    let operation = match policy {
+                        Some(policy) => Operation::SetFanPolicy { policy },
+                        None => Operation::QueryFanPolicy,
+                    };
+                    let result = match transport.call(&node_id, node, operation) {
+                        Ok(ResponseBody::FanControl(status)) => NodeFanControlResult {
+                            node_id,
+                            status: Some(status),
+                            error: None,
+                        },
+                        Ok(_) => NodeFanControlResult {
+                            node_id,
+                            status: None,
+                            error: Some(
+                                "node agent returned an unexpected fan-control response".into(),
+                            ),
+                        },
+                        Err(error) => NodeFanControlResult {
+                            node_id,
+                            status: None,
+                            error: Some(error.to_string()),
+                        },
+                    };
+                    let _ = sender.send(result);
+                }
+            });
+        }
+        drop(sender);
+        receiver.into_iter().collect::<Vec<_>>()
+    });
+    let mut results = results;
+    results.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    Ok(ControlPayload::FanControl(results))
 }
 
 struct WakeForwarder {

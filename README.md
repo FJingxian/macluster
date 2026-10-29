@@ -154,8 +154,6 @@ Use arrows or `j`/`k` to select a node, Enter for its processes, and `q` to quit
 
 CPU usage can exceed 100%: an eight-logical-CPU Mac can reach 800%. Unavailable hardware readings show `N/A`.
 
-An optional menu bar app adds a native resource window and bounded job log viewer. Build instructions are in [macos/README.md](macos/README.md). Fan readings are shown when available; fan control stays read-only until hardware recovery is verified.
-
 ## Maintain the cluster
 
 | Command | Action |
@@ -164,10 +162,16 @@ An optional menu bar app adds a native resource window and bounded job log viewe
 | `mnode -rm NODE_ID` | Remove an idle node that does not host a share. |
 | `mnode -rm NODE_ID --connect USER@IP[:PORT]` | Remove a moved node using its current SSH address and verify its registered machine identity. |
 | `mnode -rm share:SHARE_ID` | Cancel an incomplete named-share setup. |
+| `mfans --status [--node ID]` | Show fan policy and helper support on all nodes or one node. |
+| `mfans --reset [--node ID]` | Return fans to macOS system control. |
+| `mfans --auto [--node ID]` | Set the linear 40–80°C fan curve. |
+| `mfans --power [--node ID]` | Set the logarithmic 40–80°C fan curve. |
 | `macluster init` | Ask to reset the current cluster, then configure a new one. |
 | `macluster init --force` | Allow reset to abandon unsynchronized output from finished jobs. Active jobs still block reset. |
 | `macluster controller status` | Show whether the local service is ready without starting it. |
 | `macluster controller start/stop/restart` | Manage the login Mac's background controller. |
+
+The fan curve runs locally in each node's privileged helper. Curves activate at 40°C, reach the node's reported fan maximum at 80°C, use a smoothed CPU temperature average, and restore system control when the reading expires. The control path uses Apple's private AppleSMC interface, so write support depends on the Mac model and firmware; unsupported nodes remain under system control. A helper restart restores system control before accepting a new policy.
 
 Reset preserves shared data files and archives old configuration and job state.
 

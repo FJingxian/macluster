@@ -142,6 +142,17 @@ mtop --once
 
 `mtop` 显示任务数、CPU、内存、磁盘 IO、网络，以及硬件支持的 GPU、温度、风扇和功耗数据。
 
+使用 `mfans` 控制支持机型的风扇。`--auto` 按 40–80°C 线性调速，`--power` 使用对数曲线；默认作用于所有已登记节点，添加 `--node NODE_ID` 可只控制一台。`--reset` 恢复 macOS 风扇控制，`--status` 查看当前策略：
+
+~~~sh
+mfans --auto
+mfans --power --node default-a
+mfans --status
+mfans --reset
+~~~
+
+调速循环在每台节点的特权 helper 中本地运行，不会持续通过 SSH 采样。温度数据过期时会恢复系统控制；不支持写入风扇的机型保持系统控制。风扇写入使用 AppleSMC 私有接口，支持情况取决于机型和固件；helper 重启时会先恢复系统控制。
+
 通过 controller 启动只读浏览器面板：
 
 ~~~sh

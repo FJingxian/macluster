@@ -22,6 +22,178 @@ use macluster_protocol::framing::sha256_hex;
 use macluster_protocol::types::JobState;
 
 #[test]
+fn read_queries_do_not_wait_for_controller_or_remote_agents() {
+    use macluster_core::service::ServiceBinding;
+    use macluster_protocol::{identifiers::RequestId, types::JobSpec};
+    use std::os::unix::net::UnixListener;
+    let (root, shared, config) = fixture();
+    let state = root.join("controller");
+    let storage = Storage::open(&state).unwrap();
+    let spec: JobSpec = serde_json::from_value(serde_json::json!({
+        "queue":"mini01", "node":null, "name":"read-query", "cwd":shared,
+        "stdout_path":shared.join("jobs/1/stdout.log"), "stderr_path":shared.join("jobs/1/stderr.log"),
+        "walltime_secs":null, "snapshot":storage.stage_snapshot(b"echo done\n").unwrap(), "mode":"batch", "env":{}
+    })).unwrap();
+    let request_id = RequestId::random();
+    let job = storage.submit_once(request_id, spec).unwrap();
+    drop(storage);
+    let binding = ServiceBinding::load(&config, &state).unwrap();
+    binding.prepare_endpoint_dir().unwrap();
+    let listener = UnixListener::bind(binding.endpoint_path()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let id = job.id.to_string();
+    let request = request_id.to_string();
+    for args in [
+        vec!["mjob"],
+        vec!["mjob", "--json"],
+        vec!["mjob", "--all"],
+        vec!["mjob", "--state", "Pending"],
+        vec!["mjob", &id, "--json"],
+        vec!["mjob", "--request-id", &request, "--json"],
+        vec!["mqueue"],
+        vec!["mqueue", "--json"],
+        vec!["mqueue", "--jobs"],
+        vec!["mqueue", "-q", "mini01", "--json"],
+    ] {
+        let mut command = macluster_command();
+        command.env_remove("MACLUSTER_DISABLE_SERVICE_AUTOSTART");
+        command
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+            ])
+            .args(&args);
+        let output = macluster_controller::transport::run_child_bounded(
+            command,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("local queries must finish without waiting for the controller");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty());
+        if args[0] == "mqueue" && args.contains(&"--json") {
+            let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(rows[0]["pending"], 1);
+            assert_eq!(rows[0]["running"], 0);
+        }
+    }
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    drop(listener);
+    let _ = fs::remove_file(binding.endpoint_path());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn job_listing_before_first_job_does_not_create_controller_state() {
+    let (root, _, config) = fixture();
+    let state = root.join("controller");
+    for command in ["mjob", "mqueue"] {
+        let output = macluster_command()
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                command,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if command == "mjob" {
+            assert_eq!(value, serde_json::json!([]));
+        } else {
+            assert_eq!(value[0]["pending"], 0);
+        }
+        assert!(!state.exists());
+    }
+    let status = macluster_command()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "controller",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(String::from_utf8_lossy(&status.stdout).contains("Pending: 0"));
+    assert!(!state.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn queue_watch_observes_local_commits_without_controller() {
+    use macluster_protocol::{identifiers::RequestId, types::JobSpec};
+    let (root, shared, config) = fixture();
+    let state = root.join("controller");
+    let storage = Storage::open(&state).unwrap();
+    let spec: JobSpec = serde_json::from_value(serde_json::json!({
+        "queue":"mini01", "node":null, "name":"watch", "cwd":shared,
+        "stdout_path":shared.join("stdout.log"), "stderr_path":shared.join("stderr.log"),
+        "walltime_secs":null, "snapshot":storage.stage_snapshot(b"echo done\n").unwrap(), "mode":"batch", "env":{}
+    })).unwrap();
+    let job = storage.submit_once(RequestId::random(), spec).unwrap();
+    let mut child = macluster_command()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "mqueue",
+            "--watch",
+            "1",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for value in serde_json::Deserializer::from_reader(stdout)
+            .into_iter::<serde_json::Value>()
+            .take(2)
+        {
+            if sender.send(value).is_err() {
+                break;
+            }
+        }
+    });
+    let first = receiver.recv_timeout(Duration::from_secs(3));
+    let cancellation = storage.request_cancel(job.id, false);
+    let second = receiver.recv_timeout(Duration::from_secs(3));
+    let _ = child.kill();
+    child.wait().unwrap();
+    reader.join().unwrap();
+    cancellation.unwrap();
+    assert_eq!(first.unwrap().unwrap()[0]["pending"], 1);
+    assert_eq!(second.unwrap().unwrap()[0]["pending"], 0);
+    drop(storage);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn regression_stderr_filter_ignores_stream_markers_in_stdout_body() {
     use macluster_protocol::{
         identifiers::{NodeId, RequestId},

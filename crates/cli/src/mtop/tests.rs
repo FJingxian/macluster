@@ -224,6 +224,34 @@ fn synthetic_login_key_cannot_collide_with_a_configured_node_id() {
 }
 
 #[test]
+fn transient_power_failure_keeps_age_and_error_without_extending_validity() {
+    let started = Instant::now();
+    let mut cache = NodeMetricCache::default();
+    let mut good = metric(Some(10.0), Some(800.0), Some((12.0, "System")));
+    good.power_age_ms = Some(2_000);
+    cache.apply_success(good, started);
+    for second in [4, 10, 30, 59] {
+        let mut next = metric(Some(20.0), Some(800.0), None);
+        next.errors
+            .insert("power".into(), "socket timed out".into());
+        cache.apply_success(next, started + Duration::from_secs(second));
+        let MetricView::Available { snapshot, .. } =
+            cache.view_at(started + Duration::from_secs(second))
+        else {
+            panic!("missing sample")
+        };
+        assert_eq!(snapshot.cpu_percent, Some(20.0));
+        if second <= 58 {
+            assert_eq!(snapshot.power_watts, Some(12.0));
+            assert_eq!(snapshot.power_age_ms, Some((second + 2) * 1000));
+            assert!(snapshot.errors["power"].contains("socket timed out"));
+        } else {
+            assert!(snapshot.power_watts.is_none());
+        }
+    }
+}
+
+#[test]
 fn failed_request_keeps_last_sample_and_marks_it_stale_by_age() {
     let started = Instant::now();
     let mut cache = NodeMetricCache::default();

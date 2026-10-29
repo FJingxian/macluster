@@ -434,6 +434,42 @@ fn init_help_is_available_without_a_cluster_config() {
     assert!(stdout.contains("unsynchronized output may be unavailable"));
 }
 
+#[test]
+fn first_top_can_decline_setup_without_creating_or_resetting_state() {
+    let (root, shared, config) = fixture();
+    fs::remove_file(&config).unwrap();
+    let state = root.join("controller");
+    fs::write(shared.join("keep.txt"), "user data").unwrap();
+    let (status, output) = command_in_pty_with_args(&config, &state, "mtop", &[], b"n\n");
+    assert!(status.success(), "{output}");
+    assert!(output.contains("Configure this Mac now?"), "{output}");
+    assert!(!output.contains("Reset existing cluster"), "{output}");
+    assert!(!config.exists());
+    assert!(!state.exists());
+    assert_eq!(
+        fs::read_to_string(shared.join("keep.txt")).unwrap(),
+        "user data"
+    );
+    for (args, success) in [
+        (vec!["mtop", "--help"], true),
+        (vec!["mtop", "--once"], false),
+    ] {
+        let output = macluster_command()
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), success);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Configure this Mac now?"));
+        assert!(!config.exists());
+        assert!(!state.exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn init_in_pty(
     config: &std::path::Path,
     state: &std::path::Path,
@@ -448,13 +484,23 @@ fn init_in_pty_with_args(
     args: &[String],
     input: &[u8],
 ) -> (std::process::ExitStatus, String) {
+    command_in_pty_with_args(config, state, "init", args, input)
+}
+
+fn command_in_pty_with_args(
+    config: &std::path::Path,
+    state: &std::path::Path,
+    command: &str,
+    args: &[String],
+    input: &[u8],
+) -> (std::process::ExitStatus, String) {
     let (mut master, slave) = open_pty();
     let mut child = macluster_command()
         .arg("--config")
         .arg(config)
         .arg("--state-dir")
         .arg(state)
-        .arg("init")
+        .arg(command)
         .args(args)
         .env_remove("MAMBA_ROOT_PREFIX")
         .env_remove("CONDA_PREFIX")
@@ -2096,6 +2142,76 @@ execution_uid = {}
 }
 
 #[test]
+fn unfinished_enrollment_is_not_listed_as_a_node_and_errors_remain_available() {
+    let (root, _shared, config) = fixture();
+    let source = fs::read_to_string(&config)
+        .unwrap()
+        .replace("transport = \"ssh\"", &format!("transport = \"local\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000099\"\nexecution_uid = {}", unsafe { libc::geteuid() }));
+    let source = source
+        .lines()
+        .map(|line| {
+            if line.starts_with("remote_binary =") {
+                "remote_binary = \"/bin/false\""
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&config, source).unwrap();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("node-admin.json"), serde_json::to_vec(&serde_json::json!({
+        "version":1, "config_path":config.canonicalize().unwrap(), "state_dir":state.canonicalize().unwrap(),
+        "reserved_node_ids":["draft-001"], "machine_uuids":{}, "operations":{
+            "add:operator@192.0.2.50:22": {
+                "id":"test-draft", "action":"add", "node_id":"draft-001",
+                "endpoint":"operator@192.0.2.50:22", "machine_uuid":null,
+                "phase":"SETUP_PENDING", "old_config_sha256":null, "candidate_config_sha256":null,
+                "managed_export":false, "detail":"mount path already contains user files"
+            }
+        }
+    })).unwrap()).unwrap();
+    let original_journal = fs::read(state.join("node-admin.json")).unwrap();
+    for option in ["-l", "--failed"] {
+        let output = macluster_command()
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["mnode", option])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        if option == "-l" {
+            assert!(!text.contains("draft-001"), "{text}");
+            assert!(!text.contains("SETUP_PENDING"), "{text}");
+            assert!(!text.contains("PHASE"), "{text}");
+            assert!(
+                text.contains("mini01-a") && text.contains("OFFLINE"),
+                "{text}"
+            );
+        } else {
+            assert!(
+                text.contains("draft-001")
+                    && text.contains("mount path already contains user files"),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(state.join("node-admin.json")).unwrap(),
+        original_journal
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn operational_command_attempts_orphaned_agent_update_recovery() {
     let (root, _shared, config) = fixture();
     use_cli_binary_build(&config);
@@ -2143,21 +2259,25 @@ fn operational_command_attempts_orphaned_agent_update_recovery() {
     )
     .unwrap();
 
-    let output = macluster_command()
-        .arg("--config")
-        .arg(&config)
-        .arg("--state-dir")
-        .arg(&state)
-        .args(["msub", "--wrap", "echo must-not-submit"])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("all-node update"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for args in [
+        vec!["mtop", "--once"],
+        vec!["msub", "--wrap", "echo must-not-submit"],
+    ] {
+        let output = macluster_command()
+            .arg("--config")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("all-node update"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert!(!state.join("client-submissions").exists());
     assert!(
         !barrier.exists(),

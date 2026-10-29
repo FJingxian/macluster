@@ -117,7 +117,39 @@ pub struct NodeMetricCache {
 }
 
 impl NodeMetricCache {
-    pub fn apply_success(&mut self, snapshot: MetricSnapshot, received_at: Instant) {
+    pub fn apply_success(&mut self, mut snapshot: MetricSnapshot, received_at: Instant) {
+        // CPU/memory can refresh while an independent helper request fails.
+        // Retain the prior power observation only for its original TTL, with
+        // cumulative source age; repeated failures must never refresh its age.
+        if snapshot.power_watts.is_none()
+            && let Some((previous, previous_at)) = &self.last_success
+            && let (Some(watts), Some(scope), Some(age_ms)) = (
+                previous.power_watts,
+                previous.power_scope.as_ref(),
+                previous.power_age_ms,
+            )
+        {
+            let age = Duration::from_millis(age_ms)
+                .saturating_add(received_at.saturating_duration_since(*previous_at));
+            if watts.is_finite()
+                && watts >= 0.0
+                && age
+                    <= Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS)
+            {
+                snapshot.power_watts = Some(watts);
+                snapshot.power_scope = Some(scope.clone());
+                snapshot.power_age_ms = Some(age.as_millis().min(u64::MAX as u128) as u64);
+                snapshot
+                    .errors
+                    .entry("power".into())
+                    .and_modify(|reason| {
+                        reason.push_str("; displaying the last valid power sample")
+                    })
+                    .or_insert_with(|| {
+                        "power refresh unavailable; displaying the last valid power sample".into()
+                    });
+            }
+        }
         self.last_success = Some((snapshot, received_at));
         self.last_error = None;
     }

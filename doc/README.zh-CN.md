@@ -45,6 +45,8 @@ macluster node -a worker@192.0.2.10
 macluster node -l
 ```
 
+节点通过 Agent 和共享存储验证后才会进入正式集群。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
+
 加入节点时会安装 Agent、配置共享空间。若没有 SSH 密钥登录，可在核对指纹并输入远程账户登录密码后安装密钥。NFS 和特权 helper 的配置还可能需要每台相关 Mac 的管理员授权，两者用途不同。
 
 初始化会安装用户级后台 LaunchAgent。关闭终端不影响 controller，注销该 macOS 用户会使服务停止。任务调度需要 controller；查看任务、队列可在它停止时读取已保存的状态。
@@ -139,7 +141,8 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 
 | 命令 | 用途 |
 | --- | --- |
-| `macluster node -l` | 查看节点和通用 NFS 映射 |
+| `macluster node -l` | 查看正式节点（READY / OFFLINE）和通用 NFS 映射 |
+| `macluster node --failed` | 查看未完成的节点或共享操作及错误原因 |
 | `macluster node -rm NODE_ID` | 移除空闲计算节点；托管共享的节点需先迁移存储 |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | 使用新地址连接并核实原机器身份后移除 |
 | `macluster node -rm share:SHARE_ID` | 取消未完成的共享配置 |
@@ -151,6 +154,8 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 | `macluster init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
 
 重置清理托管的 NFS 挂载/导出，并保留共享数据文件；请阅读确认提示。风扇控制使用 AppleSMC 私有接口，支持情况取决于机型，不支持的机器维持系统控制。
+
+本机初始化时会安装功耗采样服务，交互式 `mtop` 也可以单独请求授权来安装或修复；拒绝授权后仍可查看其他资源。功耗读取短暂失败时保留上一笔有效读数，并显示年龄和错误，最长沿用原有的 60 秒有效期。M 系列 MacBook Air 没有风扇，因此风扇转速显示 N/A。
 
 已知 Agent 版本不一致时自动进入更新流程。特权服务具有独立版本，普通 Agent 更新复用当前服务；首次安装、服务升级或修复仍可能需要每台相关机器的管理员授权。程序不保存密码。
 

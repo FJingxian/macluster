@@ -45,7 +45,7 @@ macluster node -a worker@192.0.2.10
 macluster node -l
 ```
 
-Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
+Nodes enter the cluster after enrollment verifies the Agent and shared storage. `node -l` lists registered nodes as READY or OFFLINE; failed enrollment attempts are kept separately for retry. Inspect them with `macluster node --failed`. Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
 
 Initialization installs a per-user background LaunchAgent. Closing Terminal does not stop the controller; logging out of that macOS user session does. Scheduling needs the controller. Job and queue queries can read persisted state while it is stopped.
 
@@ -139,7 +139,8 @@ The browser monitor is read-only and listens on `127.0.0.1`. Add `--no-open` to 
 
 | Command | Purpose |
 | --- | --- |
-| `macluster node -l` | Nodes and common NFS mappings |
+| `macluster node -l` | Registered nodes and common NFS mappings |
+| `macluster node --failed` | Unfinished enrollment/share/removal errors |
 | `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
 | `macluster node -rm share:SHARE_ID` | Cancel incomplete named-share setup |
@@ -151,6 +152,8 @@ The browser monitor is read-only and listens on `127.0.0.1`. Add `--no-open` to 
 | `macluster init --force` | Allow dropping pending output sync for finished jobs; active jobs still block reset |
 
 Reset cleans managed NFS mounts/exports and preserves shared data files. Read its confirmation carefully. Fan control uses a private AppleSMC interface and depends on the Mac model; unsupported nodes remain under system control.
+
+Local initialization installs the power sampler. Interactive `mtop` can separately request authorization to install or repair it; declining still allows monitoring other resources. Brief power-read failures retain the last valid reading with its age and error, for at most the existing 60-second validity window. Apple Silicon MacBook Air models have no fan, so fan speed is N/A.
 
 Agent updates trigger automatically for known build mismatches. Privileged services have independent versions: ordinary Agent updates reuse current services. Initial installation, a service upgrade, or repair can require administrator authorization on each affected Mac. Passwords are not stored.
 

@@ -122,6 +122,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     )?;
     if init_journal.exists() {
         resume_local_init(&config_path, &state_dir)?;
+        setup_login_power_after_init(&config_path);
         return Ok(());
     }
     if remote_journal.exists() {
@@ -314,8 +315,24 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     };
     write_local_init_journal(&config_path, &journal)?;
     finish_local_init(&config_path, &state_dir, &journal)?;
+    setup_login_power_after_init(&config_path);
     println!("Cluster '{}' initialized.", config.name);
     Ok(())
+}
+
+fn setup_login_power_after_init(config_path: &Path) {
+    if std::env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some() {
+        return;
+    }
+    let result = fs::read_to_string(config_path)
+        .map_err(|error| error.to_string())
+        .and_then(|source| ClusterConfig::parse(&source).map_err(|error| error.to_string()))
+        .and_then(|config| node_admin::ensure_local_power_sampler(&config));
+    if let Err(error) = result {
+        eprintln!(
+            "Power sampler setup is incomplete: {error}. Open mtop in Terminal to retry authorization."
+        );
+    }
 }
 
 fn local_init_journal_path(config_path: &Path) -> PathBuf {

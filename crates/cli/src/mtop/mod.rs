@@ -51,13 +51,16 @@ const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) enum MtopPostAction {
     CheckBuilds(crate::node_admin::AgentBuildCompatibility),
     RecoverMaintenance,
+    SetupLocalPower,
     UpdateDeferred,
 }
 
 enum StartupValidation {
     AddressMigration,
+    NodeMaintenancePending,
     Builds(crate::node_admin::AgentBuildCompatibility),
     RecoverMaintenance,
+    SetupLocalPower,
     UpdateDeferred,
 }
 
@@ -177,6 +180,7 @@ pub fn run_interactive(
     selected_queue: Option<String>,
     no_color: bool,
     address_migration_deferred: bool,
+    allow_power_setup: bool,
 ) -> Result<Option<MtopPostAction>, String> {
     static PANIC_HOOK: Once = Once::new();
     PANIC_HOOK.call_once(install_panic_restore_hook);
@@ -287,6 +291,9 @@ pub fn run_interactive(
         .name("mtop-agent-validation".into())
         .spawn(move || {
             let result = (|| {
+                if allow_power_setup && crate::node_admin::local_power_sampler_needs_setup()? {
+                    return Ok(StartupValidation::SetupLocalPower);
+                }
                 if address_migration_deferred
                     || crate::node_admin::address_migration_pending(&validation_state_dir)
                 {
@@ -300,7 +307,10 @@ pub fn run_interactive(
                     &validation_config_path,
                     &validation_state_dir,
                 )?;
-                if node_recovery || update_recovery {
+                if node_recovery {
+                    return Ok(StartupValidation::NodeMaintenancePending);
+                }
+                if update_recovery {
                     let work_pending =
                         crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
                     if should_defer_startup_update(true, false, work_pending) {
@@ -342,6 +352,14 @@ pub fn run_interactive(
                     Ok(Ok(StartupValidation::AddressMigration)) => {
                         validation_finished = true;
                         status_message = Some("Node address recovery needs attention; Agent updates are deferred and monitoring remains available".into());
+                    }
+                    Ok(Ok(StartupValidation::SetupLocalPower)) => {
+                        post_action = Some(MtopPostAction::SetupLocalPower);
+                        break;
+                    }
+                    Ok(Ok(StartupValidation::NodeMaintenancePending)) => {
+                        validation_finished = true;
+                        status_message = Some("Node setup/removal is incomplete; resume its original mnode command. Monitoring remains available".into());
                     }
                     Ok(Ok(StartupValidation::RecoverMaintenance)) => {
                         validation_finished = true;

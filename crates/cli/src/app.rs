@@ -222,6 +222,12 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
             let disabled_for_test = env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some();
             if !help && !disabled_for_test && is_macluster_executable() && config_path.is_file() {
+                let config = load_config(global.config.as_deref()).map_err(config_error)?;
+                if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
+                    eprintln!(
+                        "Power sampler setup is incomplete: {error}. Open mtop in Terminal to retry authorization."
+                    );
+                }
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
                     manager.start(Duration::from_secs(5)).map_err(service_error)
                 }) {
@@ -276,6 +282,9 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "-rm" | "--remove"))
     {
+        return false;
+    }
+    if command == "node" && args.first().is_some_and(|arg| arg == "--failed") {
         return false;
     }
     let help_requested = if command == "submit" {
@@ -375,7 +384,7 @@ fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
         || command == "node"
             && args
                 .first()
-                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
 }
 
 fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
@@ -433,14 +442,6 @@ fn preflight_agent_update_with_compatibility(
             ));
         }
     };
-    if is_read_only_query(command, args)
-        && !checked_compatibility
-            .as_ref()
-            .is_some_and(|compatibility| compatibility.requires_update())
-        && !crate::node_admin::configured_agent_build_mismatch_local(&config)?
-    {
-        return Ok(());
-    }
     let state_dir = state_root(global.state_dir.as_deref())?;
     let node_recovery_pending =
         crate::node_admin::node_admin_recovery_pending(&config_path, &state_dir).map_err(
@@ -451,6 +452,31 @@ fn preflight_agent_update_with_compatibility(
                 )
             },
         )?;
+    let recovery_pending =
+        crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
+            |error| {
+                (
+                    1,
+                    format!("cannot inspect Agent update recovery state: {error}"),
+                )
+            },
+        )?;
+    if !recovery_pending
+        && !node_recovery_pending
+        && is_read_only_query(command, args)
+        && !checked_compatibility
+            .as_ref()
+            .is_some_and(|compatibility| compatibility.requires_update())
+        && !crate::node_admin::configured_agent_build_mismatch_local(&config)?
+    {
+        return Ok(());
+    }
+    if command == "top" && node_recovery_pending {
+        eprintln!(
+            "Node setup or removal is incomplete; resume its original `mnode` command. Monitoring remains available."
+        );
+        return Ok(());
+    }
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
     }
@@ -523,15 +549,6 @@ fn preflight_agent_update_with_compatibility(
             .0
         }
     };
-    let recovery_pending =
-        crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
-            |error| {
-                (
-                    1,
-                    format!("cannot inspect Agent update recovery state: {error}"),
-                )
-            },
-        )?;
     let helper_refresh_pending =
         crate::node_admin::agent_helper_refresh_pending(&state_dir).map_err(|error| (1, error))?;
     let agent_mismatch = compatibility.requires_update() || local_validation.requires_update();
@@ -3450,7 +3467,7 @@ fn is_read_only_query(command: &str, args: &[String]) -> bool {
         || command == "node"
             && args
                 .first()
-                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+                .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
         || command == "fans"
             && args
                 .iter()
@@ -4359,7 +4376,6 @@ fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
 }
 
 fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool) -> AppResult<()> {
-    let config = load_config(global.config.as_deref()).map_err(config_error)?;
     let mut once = false;
     let mut json = false;
     let mut selected_queue = None;
@@ -4392,6 +4408,39 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
         }
         index += 1;
     }
+    let config_path = resolved_config_path(global.config.as_deref());
+    let config_missing = match fs::symlink_metadata(&config_path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err((1, format!("cannot inspect cluster config: {error}"))),
+    };
+    if config_missing && !once && !json && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let state_dir = state_root(global.state_dir.as_deref())?;
+        crate::init::reset::ensure_no_reset_in_progress(&config_path, &state_dir)?;
+        eprint!("Cluster is not initialized. Configure this Mac now? [y/N] ");
+        io::stderr()
+            .flush()
+            .map_err(|error| (1, error.to_string()))?;
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| (1, error.to_string()))?;
+        if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Ok(());
+        }
+        let init_args = vec![
+            "--config".into(),
+            config_path.to_string_lossy().into_owned(),
+            "--state-dir".into(),
+            state_dir.to_string_lossy().into_owned(),
+            "init".into(),
+        ];
+        run("macluster", &init_args)?;
+        if !config_path.is_file() {
+            return Ok(());
+        }
+    }
+    let config = load_config(global.config.as_deref()).map_err(config_error)?;
     if let Some(queue) = &selected_queue {
         if !config.queues.contains_key(queue.as_str()) {
             return Err((2, format!("queue '{queue}' is not configured")));
@@ -4406,6 +4455,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
         io::stdout().is_terminal(),
         term_is_dumb,
     ) {
+        let power_setup_attempted = std::cell::Cell::new(false);
         return run_tui_with_updates(
             || {
                 // Updates may replace Agent paths and synchronized config.
@@ -4423,6 +4473,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                     selected_queue.as_ref().map(ToString::to_string),
                     env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
                     address_migration_deferred,
+                    !power_setup_attempted.get(),
                 )
                 .map_err(|error| (1, error))?;
                 if address_migration_deferred
@@ -4447,6 +4498,16 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                 }
                 crate::mtop::MtopPostAction::RecoverMaintenance => {
                     preflight_agent_update("top", args, &global)
+                }
+                crate::mtop::MtopPostAction::SetupLocalPower => {
+                    power_setup_attempted.set(true);
+                    let config = load_config(global.config.as_deref()).map_err(config_error)?;
+                    if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
+                        eprintln!(
+                            "Power sampler setup remains incomplete: {error}. Monitoring continues; reopen mtop to retry authorization."
+                        );
+                    }
+                    Ok(())
                 }
                 crate::mtop::MtopPostAction::UpdateDeferred => Ok(()),
             },
@@ -4480,6 +4541,7 @@ fn run_tui_with_updates(
     mut update: impl FnMut(crate::mtop::MtopPostAction) -> AppResult<()>,
 ) -> AppResult<()> {
     let mut recovered = false;
+    let mut power_repaired = false;
     loop {
         let action = match view()? {
             None | Some(crate::mtop::MtopPostAction::UpdateDeferred) => return Ok(()),
@@ -4490,6 +4552,14 @@ fn run_tui_with_updates(
             }
             Some(action) => action,
         };
+        if matches!(&action, crate::mtop::MtopPostAction::SetupLocalPower) {
+            if power_repaired {
+                return Err((1, "Power sampler setup did not restore its socket/service; inspect the administrator command output before retrying mtop".into()));
+            }
+            update(action)?;
+            power_repaired = true;
+            continue;
+        }
         if recovered {
             return Err((1, "Agent validation still requires maintenance after an automatic update; inspect `mnode -l` and controller status before retrying".into()));
         }
@@ -6801,6 +6871,35 @@ mod tests {
             |_| panic!("deferred update must not run after quit"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn power_setup_and_agent_recovery_each_run_once_before_reopening_top() {
+        let mut actions = std::collections::VecDeque::from([
+            Some(crate::mtop::MtopPostAction::SetupLocalPower),
+            Some(crate::mtop::MtopPostAction::RecoverMaintenance),
+            None,
+        ]);
+        let mut updates = 0;
+        super::run_tui_with_updates(
+            || Ok(actions.pop_front().unwrap()),
+            |_| {
+                updates += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(updates, 2);
+        let mut repairs = 0;
+        let result = super::run_tui_with_updates(
+            || Ok(Some(crate::mtop::MtopPostAction::SetupLocalPower)),
+            |_| {
+                repairs += 1;
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().1.contains("Power sampler setup"));
+        assert_eq!(repairs, 1);
     }
 
     #[test]

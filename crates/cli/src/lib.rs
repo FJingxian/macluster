@@ -5,6 +5,7 @@ pub mod arguments;
 mod control_client;
 mod embedded_power;
 mod init;
+mod job_resources;
 mod mtop;
 mod nfs_recovery;
 mod node_admin;

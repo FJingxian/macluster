@@ -3261,9 +3261,18 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n\nTask records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible; reading shared logs still requires access to their storage."
+            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\n--metrics subscribes to task process-group CPU/RSS through the running controller. Samples are shared across clients at about five-second intervals. --follow --json emits JSON Lines. First CPU observation is a baseline (null). Historical CPU/memory accounting covers observed intervals, not guaranteed full task lifetime.\n\nTask records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible; reading shared logs still requires access to their storage."
         );
         return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--metrics") {
+        let options = crate::job_resources::parse(args)?;
+        let state_dir = state_root(global.state_dir.as_deref())?;
+        return crate::job_resources::run(
+            &resolved_config_path(global.config.as_deref()),
+            &state_dir,
+            options,
+        );
     }
     let mut all = false;
     let mut json = false;
@@ -4564,6 +4573,7 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                         "snapshot.upload.v1".into(),
                         "agent.compatibility.v1".into(),
                         "monitor.v1".into(),
+                        macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
                         "maintenance.v1".into(),
                         "web.v1".into(),
                     ],
@@ -5759,7 +5769,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         METRICS_FAN_SPEED_FEATURE,
                         INTERACTIVE_PTY_FEATURE,
                         macluster_protocol::types::NAMESPACED_JOBS_FEATURE
-                        , "agent.idle-handoff.v1"
+                        , macluster_protocol::resources::TASK_RESOURCE_FEATURE, "agent.idle-handoff.v1"
                     ]
                 });
                 println!("{}", serde_json::to_string(&report).unwrap());

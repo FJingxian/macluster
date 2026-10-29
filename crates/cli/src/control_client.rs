@@ -61,6 +61,7 @@ impl ControlClient {
                     "snapshot.upload.v1".into(),
                     "agent.compatibility.v1".into(),
                     "monitor.v1".into(),
+                    macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
                     "maintenance.v1".into(),
                     "web.v1".into(),
                     "fan-control.v1".into(),

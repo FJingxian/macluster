@@ -1582,6 +1582,7 @@ fn configure_remote_primary(
         &original_storage,
         &source_root,
         &config.shared_root,
+        &config.share_uuid,
     )
     .map_err(|error| (1, error))?;
     let storage = &original_storage;
@@ -1638,6 +1639,7 @@ fn configure_remote_primary(
         storage,
         &source_root,
         &config.shared_root,
+        &config.share_uuid,
         login_power_setup,
     )
     .map_err(|error| (1, error))?;

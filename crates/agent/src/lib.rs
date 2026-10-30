@@ -375,13 +375,24 @@ fn node_health(config: &ClusterConfig, local_node_id: &str) -> Result<NodeHealth
     let machine_uuid = local_machine_uuid().map_err(|message| {
         AgentError::State(format!("could not read local identity: {message}"))
     })?;
+    node_health_with_mount_provider(config, local_node_id, machine_uuid, current_mount_output)
+}
+
+fn node_health_with_mount_provider(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    machine_uuid: String,
+    mount_provider: impl FnOnce() -> Result<String, AgentError>,
+) -> Result<NodeHealth, AgentError> {
+    let mount_output = mount_provider()?;
     let shares = config
         .shares
         .iter()
         .map(|(id, share)| {
             (
                 id.clone(),
-                verify_named_share(config, local_node_id, share).is_ok(),
+                verify_named_share_with_mount_output(config, local_node_id, share, &mount_output)
+                    .is_ok(),
             )
         })
         .collect();
@@ -391,7 +402,8 @@ fn node_health(config: &ClusterConfig, local_node_id: &str) -> Result<NodeHealth
         execution_digest: config
             .execution_digest()
             .map_err(|error| AgentError::State(error.to_string()))?,
-        primary_share_ready: verify_share(config, local_node_id).is_ok(),
+        primary_share_ready: verify_share_with_mount_output(config, local_node_id, &mount_output)
+            .is_ok(),
         shares,
         features: vec![
             macluster_protocol::resources::TASK_RESOURCE_FEATURE.to_owned(),
@@ -406,9 +418,35 @@ fn verify_named_share(
     local_node_id: &str,
     share: &macluster_core::config::ShareConfig,
 ) -> Result<(), AgentError> {
+    let mount_output = if local_node_id == share.server.as_str() {
+        String::new()
+    } else {
+        current_mount_output()?
+    };
+    verify_named_share_with_mount_output(config, local_node_id, share, &mount_output)
+}
+
+fn verify_named_share_with_mount_output(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    share: &macluster_core::config::ShareConfig,
+    mount_output: &str,
+) -> Result<(), AgentError> {
     let Some(server) = config.nodes.get(share.server.as_str()) else {
         return Err(AgentError::SharedStorage);
     };
+    if local_node_id != share.server.as_str() {
+        return if named_nfs_mount_matches(
+            mount_output,
+            &server.host,
+            &share.source_root,
+            &share.mount_root,
+        ) {
+            Ok(())
+        } else {
+            Err(AgentError::SharedStorage)
+        };
+    }
     let named_share = AgentNamedShare {
         share_uuid: share.share_uuid.clone(),
         server_node_id: share.server.to_string(),
@@ -416,12 +454,26 @@ fn verify_named_share(
         source_root: share.source_root.to_string_lossy().into_owned(),
         mount_root: share.mount_root.to_string_lossy().into_owned(),
     };
-    verify_agent_named_share(local_node_id, &named_share).map(|_| ())
+    verify_agent_named_share_with_mount_output(local_node_id, &named_share, mount_output)
+        .map(|_| ())
 }
 
 fn verify_agent_named_share(
     local_node_id: &str,
     share: &AgentNamedShare,
+) -> Result<PathBuf, AgentError> {
+    let mount_output = if local_node_id == share.server_node_id {
+        String::new()
+    } else {
+        current_mount_output()?
+    };
+    verify_agent_named_share_with_mount_output(local_node_id, share, &mount_output)
+}
+
+fn verify_agent_named_share_with_mount_output(
+    local_node_id: &str,
+    share: &AgentNamedShare,
+    mount_output: &str,
 ) -> Result<PathBuf, AgentError> {
     let source_root = Path::new(&share.source_root);
     let mount_root = Path::new(&share.mount_root);
@@ -446,13 +498,11 @@ fn verify_agent_named_share(
         }
         return Err(AgentError::SharedStorage);
     }
-    let mounts = Command::new("/sbin/mount").output()?;
-    let output = String::from_utf8_lossy(&mounts.stdout);
     let expected = format!(
         "{}:{} on {} (nfs",
         share.server_host, share.source_root, share.mount_root
     );
-    if filesystem == "nfs" && output.lines().any(|line| line.starts_with(&expected)) {
+    if filesystem == "nfs" && mount_output.lines().any(|line| line.starts_with(&expected)) {
         root.canonicalize().map_err(AgentError::Io)
     } else {
         Err(AgentError::SharedStorage)
@@ -1187,21 +1237,40 @@ fn admit_epoch(store: &mut AgentStore, request: ControllerEpoch) -> Result<(), S
 }
 
 fn verify_share(config: &ClusterConfig, local_node_id: &str) -> Result<(), AgentError> {
-    let marker = read_share_marker(&config.shared_root.join(".macluster-share-id"))?;
-    if marker.trim() != config.share_uuid {
-        return Err(AgentError::SharedStorage);
-    }
+    let mount_output = current_mount_output()?;
+    verify_share_with_mount_output(config, local_node_id, &mount_output)
+}
+
+fn current_mount_output() -> Result<String, AgentError> {
+    let mounts = Command::new("/sbin/mount").output()?;
+    Ok(String::from_utf8_lossy(&mounts.stdout).into_owned())
+}
+
+fn verify_share_with_mount_output(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    mount_output: &str,
+) -> Result<(), AgentError> {
     let Some(storage) = config.nodes.get(config.storage_server.as_str()) else {
         return Err(AgentError::SharedStorage);
     };
-    let mounts = Command::new("/sbin/mount").output()?;
-    let mount_output = String::from_utf8_lossy(&mounts.stdout);
     let expected_nfs_mount = primary_nfs_mount_matches(
-        &mount_output,
+        mount_output,
         &storage.host,
         config.primary_source_root(),
         &config.shared_root,
     );
+    if local_node_id != config.storage_server.as_str() {
+        return if expected_nfs_mount {
+            Ok(())
+        } else {
+            Err(AgentError::SharedStorage)
+        };
+    }
+    let marker = read_share_marker(&config.shared_root.join(".macluster-share-id"))?;
+    if marker.trim() != config.share_uuid {
+        return Err(AgentError::SharedStorage);
+    }
     let (filesystem, flags) = filesystem_info(&config.shared_root)?;
     if share_mount_valid(
         local_node_id,
@@ -1230,14 +1299,21 @@ fn verify_record_primary_share(record: &AgentRecord) -> Result<(), AgentError> {
         return Err(AgentError::SharedStorage);
     };
     let root = Path::new(&record.shared_root);
-    let marker = read_share_marker(&root.join(".macluster-share-id"))?;
-    if marker.trim() != share_uuid {
-        return Err(AgentError::SharedStorage);
-    }
     let mounts = Command::new("/sbin/mount").output()?;
     let mount_output = String::from_utf8_lossy(&mounts.stdout);
     let expected_nfs_mount =
         primary_nfs_mount_matches(&mount_output, storage_host, Path::new(source_root), root);
+    if record.node_id != storage_node_id {
+        return if expected_nfs_mount {
+            Ok(())
+        } else {
+            Err(AgentError::SharedStorage)
+        };
+    }
+    let marker = read_share_marker(&root.join(".macluster-share-id"))?;
+    if marker.trim() != share_uuid {
+        return Err(AgentError::SharedStorage);
+    }
     let (filesystem, flags) = filesystem_info(root)?;
     if share_mount_valid(
         &record.node_id,
@@ -1260,6 +1336,20 @@ fn primary_nfs_mount_matches(
 ) -> bool {
     let expected = format!(
         "{storage_host}:{} on {} (nfs",
+        source_root.display(),
+        mount_root.display()
+    );
+    mount_output.lines().any(|line| line.starts_with(&expected))
+}
+
+fn named_nfs_mount_matches(
+    mount_output: &str,
+    server_host: &str,
+    source_root: &Path,
+    mount_root: &Path,
+) -> bool {
+    let expected = format!(
+        "{server_host}:{} on {} (nfs",
         source_root.display(),
         mount_root.display()
     );
@@ -1619,7 +1709,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use macluster_protocol::identifiers::{ControllerUuid, QueueName};
+    use macluster_protocol::identifiers::{ControllerUuid, NodeId, QueueName};
     use std::collections::BTreeMap;
     #[cfg(target_vendor = "apple")]
     use std::os::unix::process::CommandExt;
@@ -2151,6 +2241,94 @@ execution_uid = 501
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/other"),
         ));
+    }
+
+    #[test]
+    fn named_client_health_uses_mount_table_without_reading_the_nfs_path() {
+        let mut config = status_config(Path::new("/tmp/macluster-health-primary"));
+        let server_id = NodeId::new("mini01-a").unwrap();
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        config.shares.insert(
+            "wdisk".into(),
+            macluster_core::config::ShareConfig {
+                server: server_id,
+                source_root: PathBuf::from("/Volumes/archive"),
+                mount_root: PathBuf::from("/definitely/missing/archive"),
+                share_uuid: "00000000-0000-4000-8000-000000000099".into(),
+                allow_existing_contents: false,
+            },
+        );
+        let mount_output =
+            "192.0.2.2:/Volumes/archive on /definitely/missing/archive (nfs, nodev, nosuid)\n";
+
+        let result = verify_named_share_with_mount_output(
+            &config,
+            "login-01",
+            config.shares.get("wdisk").unwrap(),
+            mount_output,
+        );
+
+        assert!(
+            result.is_ok(),
+            "mount health must not open the NFS path: {result:?}"
+        );
+    }
+
+    #[test]
+    fn primary_client_health_uses_mount_table_without_reading_the_nfs_path() {
+        let mut config = status_config(Path::new("/definitely/missing/primary"));
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        config.storage_source_root = Some(PathBuf::from("/Volumes/primary"));
+        let mount_output =
+            "192.0.2.2:/Volumes/primary on /definitely/missing/primary (nfs, nodev, nosuid)\n";
+
+        let result = verify_share_with_mount_output(&config, "login-01", mount_output);
+
+        assert!(
+            result.is_ok(),
+            "primary mount health must not open the NFS path: {result:?}"
+        );
+    }
+
+    #[test]
+    fn node_health_reads_one_mount_snapshot_for_primary_and_named_shares() {
+        let (root, _state_dir, _token, shared) =
+            status_fixture("single-health-mount-snapshot", &boot_id(), None, false);
+        let named = root.join("named-share");
+        fs::create_dir_all(&named).unwrap();
+        fs::write(
+            named.join(".macluster-share-id"),
+            "00000000-0000-4000-8000-000000000002\n",
+        )
+        .unwrap();
+        let mut config = status_config(&shared);
+        config.shares.insert(
+            "named".into(),
+            macluster_core::config::ShareConfig {
+                server: NodeId::new("mini01-a").unwrap(),
+                source_root: named.clone(),
+                mount_root: named,
+                share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                allow_existing_contents: false,
+            },
+        );
+        let mount_reads = std::cell::Cell::new(0);
+
+        let health = node_health_with_mount_provider(
+            &config,
+            "mini01-a",
+            "00000000-0000-4000-8000-000000000010".into(),
+            || {
+                mount_reads.set(mount_reads.get() + 1);
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(mount_reads.get(), 1);
+        assert!(health.primary_share_ready);
+        assert_eq!(health.shares.get("named"), Some(&true));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -262,6 +262,14 @@ pub struct FanReading {
     pub max_rpm: Option<u32>,
 }
 
+/// Capacity information for a locally mounted filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiskCapacity {
+    pub mount_point: String,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MetricSnapshot {
     pub sampled_unix_ms: u64,
@@ -287,6 +295,10 @@ pub struct MetricSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_age_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_disk_capacity: Option<DiskCapacity>,
+    #[serde(default)]
+    pub external_disk_capacities: Vec<DiskCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_source: Option<String>,
@@ -300,7 +312,7 @@ pub struct MetricSnapshot {
 
 #[cfg(test)]
 mod metric_snapshot_tests {
-    use super::MetricSnapshot;
+    use super::{DiskCapacity, MetricSnapshot};
 
     #[test]
     fn metric_snapshot_round_trips_cpu_temperature() {
@@ -411,6 +423,51 @@ mod metric_snapshot_tests {
         assert_eq!(snapshot.gpu_source, None);
         assert_eq!(snapshot.gpu_age_ms, None);
         assert_eq!(snapshot.gpu_window_ms, None);
+        assert_eq!(snapshot.system_disk_capacity, None);
+        assert!(snapshot.external_disk_capacities.is_empty());
+    }
+
+    #[test]
+    fn metric_snapshot_round_trips_system_and_external_disk_capacities() {
+        let snapshot = MetricSnapshot {
+            sampled_unix_ms: 1,
+            cpu_percent: None,
+            cpu_max_percent: None,
+            memory_total_bytes: None,
+            memory_used_bytes: None,
+            swap_used_bytes: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
+            network_rx_bytes_per_sec: None,
+            network_tx_bytes_per_sec: None,
+            power_watts: None,
+            power_scope: None,
+            cpu_temp_celsius: None,
+            fan_speed_rpm: None,
+            fan_readings: None,
+            power_age_ms: None,
+            system_disk_capacity: Some(DiskCapacity {
+                mount_point: "/".into(),
+                used_bytes: 1,
+                total_bytes: 2,
+            }),
+            external_disk_capacities: vec![DiskCapacity {
+                mount_point: "/Volumes/data".into(),
+                used_bytes: 3,
+                total_bytes: 4,
+            }],
+            gpu_percent: None,
+            gpu_source: None,
+            gpu_age_ms: None,
+            gpu_window_ms: None,
+            stale: false,
+            errors: Default::default(),
+        };
+
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let decoded: MetricSnapshot = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

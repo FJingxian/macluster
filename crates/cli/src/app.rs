@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process, thread,
@@ -197,11 +197,9 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             );
         }
     }
-    let defer_mtop_preflight = command == "top" && top_will_use_tui(&args);
     if should_preflight_agent_update(&command, &args)
         && !address_migration_deferred
         && is_macluster_executable()
-        && !defer_mtop_preflight
     {
         preflight_agent_update(&command, &args, &global)?;
     }
@@ -452,6 +450,18 @@ fn preflight_agent_update_with_compatibility(
                 )
             },
         )?;
+    let node_recovery_blocks_update = if node_recovery_pending {
+        crate::node_admin::node_admin_blocks_agent_update(&config_path, &state_dir).map_err(
+            |error| {
+                (
+                    1,
+                    format!("cannot inspect node administration update blockers: {error}"),
+                )
+            },
+        )?
+    } else {
+        false
+    };
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -479,6 +489,11 @@ fn preflight_agent_update_with_compatibility(
     }
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
+    }
+    if node_recovery_pending {
+        eprintln!(
+            "Warning: node administration is unfinished; continuing with `{command}`. Use `mnode --failed` to inspect or recover the pending operation."
+        );
     }
     let mut local_validation = None;
     let (compatibility, compatibility_age_ms, publish_compatibility) = match checked_compatibility {
@@ -589,13 +604,16 @@ fn preflight_agent_update_with_compatibility(
     }
     if should_block_agent_update_for_pending_node_recovery(
         command,
-        node_recovery_pending,
+        node_recovery_blocks_update,
         update_required,
     ) {
         return Err((
             1,
             "Agent update is blocked by an unfinished node administration operation; finish or resolve it with `mnode`, then retry the requested command.".into(),
         ));
+    }
+    if command == "top" && top_will_use_tui(args) && update_required && agent_mismatch {
+        println!("Agent build mismatch detected; entering the cluster update workflow.");
     }
     let update_result = maybe_run_agent_update(update_required, || {
         crate::node_admin::update_all_agents_for_preflight(&config_path, &state_dir)
@@ -4486,9 +4504,6 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
             },
             |action| match action {
                 crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
-                    println!(
-                        "Agent build mismatch detected; entering the cluster update workflow."
-                    );
                     preflight_agent_update_with_compatibility(
                         "top",
                         args,
@@ -5492,6 +5507,8 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
                 .collect::<Option<Vec<_>>>()
                 .and_then(|ages| ages.into_iter().max())
         },
+        system_disk_capacity: None,
+        external_disk_capacities: Vec::new(),
         gpu_percent: None,
         gpu_source: None,
         gpu_age_ms: None,
@@ -5865,6 +5882,7 @@ fn now_unix_ms() -> u64 {
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
+        Some("nfs-admin") => internal_nfs_admin(&args[1..]),
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -6220,6 +6238,42 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
         _ => Err((2, "unknown internal command".into())),
     }
+}
+
+fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
+    if args.len() != 2 || args[0] != "--peer-uid" {
+        return Err((2, "internal nfs-admin requires --peer-uid UID".into()));
+    }
+    let peer_uid = args[1]
+        .parse::<u32>()
+        .map_err(|_| (2, "internal nfs-admin peer UID must be numeric".into()))?;
+    let mut request_bytes = Vec::new();
+    io::stdin()
+        .take(macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut request_bytes)
+        .map_err(|error| (1, format!("cannot read NFS admin request: {error}")))?;
+    let reply = if request_bytes.len() > macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES
+    {
+        macluster_protocol::nfs_admin::NfsAdminReply::failure(
+            "nfs-admin-1",
+            "NFS admin request exceeds the 1 MiB limit",
+        )
+    } else {
+        match serde_json::from_slice::<macluster_protocol::nfs_admin::NfsAdminRequest>(
+            &request_bytes,
+        ) {
+            Ok(request) => crate::node_admin::apply_privileged_nfs_admin_request(request, peer_uid),
+            Err(error) => macluster_protocol::nfs_admin::NfsAdminReply::failure(
+                "nfs-admin-1",
+                format!("invalid NFS admin request: {error}"),
+            ),
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&reply).map_err(|error| (1, error.to_string()))?
+    );
+    Ok(())
 }
 
 fn option_value(args: &[String], option: &str) -> AppResult<Option<String>> {
@@ -6777,12 +6831,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_node_admin_work_blocks_update_without_controller_prompt() {
+    fn only_conflicting_node_admin_work_blocks_agent_update() {
         assert!(should_block_agent_update_for_pending_node_recovery(
             "submit", true, true
         ));
         assert!(!should_block_agent_update_for_pending_node_recovery(
-            "submit", true, false
+            "submit", false, true
         ));
         assert!(!should_block_agent_update_for_pending_node_recovery(
             "node", true, true

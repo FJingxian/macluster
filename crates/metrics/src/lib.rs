@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use macluster_protocol::types::{FanReading, MetricSnapshot};
+use macluster_protocol::types::{DiskCapacity, FanReading, MetricSnapshot};
 
 pub fn sample_local() -> MetricSnapshot {
     macos::sample_local()
@@ -37,6 +37,8 @@ pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
         fan_speed_rpm: None,
         fan_readings: None,
         power_age_ms: None,
+        system_disk_capacity: None,
+        external_disk_capacities: Vec::new(),
         gpu_percent: None,
         gpu_source: None,
         gpu_age_ms: None,
@@ -66,13 +68,15 @@ fn now_ms() -> u64 {
 
 #[cfg(target_vendor = "apple")]
 mod macos {
-    use super::{FanReading, MetricSnapshot, average_fan_speed_rpm, now_ms};
+    use super::{DiskCapacity, FanReading, MetricSnapshot, average_fan_speed_rpm, now_ms};
     use std::{
         collections::BTreeMap,
+        ffi::CStr,
         io::{Read, Write},
+        mem::MaybeUninit,
         os::unix::net::UnixStream,
         process::Command,
-        thread,
+        ptr, thread,
         time::{Duration, Instant},
     };
 
@@ -243,6 +247,7 @@ mod macos {
             }
         };
         let mut power = power_sample(&mut errors);
+        let (system_disk_capacity, external_disk_capacities) = disk_capacity_sample();
         let hardware = sample_hardware_metrics();
         if let Some(error) = hardware.cpu_temp_error.as_ref() {
             errors.insert("cpu_temp".into(), error.clone());
@@ -265,6 +270,8 @@ mod macos {
             fan_speed_rpm: hardware.fan_speed_rpm,
             fan_readings: hardware.fan_readings,
             power_age_ms: power.age_ms,
+            system_disk_capacity,
+            external_disk_capacities,
             gpu_percent: power.gpu_percent,
             gpu_source: power.gpu_source,
             gpu_age_ms: power.gpu_age_ms,
@@ -286,6 +293,7 @@ mod macos {
         };
         let (memory_total_bytes, memory_used_bytes, swap_used_bytes) = memory_sample(&mut errors);
         let mut power = power_sample(&mut errors);
+        let (system_disk_capacity, external_disk_capacities) = disk_capacity_sample();
         let hardware = sample_hardware_metrics();
         if let Some(error) = hardware.cpu_temp_error.as_ref() {
             errors.insert("cpu_temp".into(), error.clone());
@@ -308,6 +316,8 @@ mod macos {
             fan_speed_rpm: hardware.fan_speed_rpm,
             fan_readings: hardware.fan_readings,
             power_age_ms: power.age_ms,
+            system_disk_capacity,
+            external_disk_capacities,
             gpu_percent: power.gpu_percent,
             gpu_source: power.gpu_source,
             gpu_age_ms: power.gpu_age_ms,
@@ -315,6 +325,102 @@ mod macos {
             stale: false,
             errors,
         }
+    }
+
+    const MAX_FILESYSTEMS_TO_INSPECT: usize = 256;
+    const MAX_EXTERNAL_DISKS: usize = 8;
+
+    /// `MNT_NOWAIT` reads the kernel's mounted-filesystem table without asking
+    /// an unresponsive NFS server to refresh its statistics.
+    pub(super) fn disk_capacity_sample() -> (Option<DiskCapacity>, Vec<DiskCapacity>) {
+        let filesystem_count = unsafe { libc::getfsstat(ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+        if filesystem_count <= 0 {
+            return (None, Vec::new());
+        }
+
+        let capacity = (filesystem_count as usize).min(MAX_FILESYSTEMS_TO_INSPECT);
+        let Some(buffer_bytes) = capacity
+            .checked_mul(std::mem::size_of::<libc::statfs>())
+            .filter(|size| *size <= libc::c_int::MAX as usize)
+        else {
+            return (None, Vec::new());
+        };
+        let mut filesystems = Vec::<MaybeUninit<libc::statfs>>::with_capacity(capacity);
+        // SAFETY: `MaybeUninit<statfs>` can be left uninitialized until the
+        // kernel fills each returned entry.
+        unsafe { filesystems.set_len(capacity) };
+        let mounted = unsafe {
+            libc::getfsstat(
+                filesystems.as_mut_ptr().cast::<libc::statfs>(),
+                buffer_bytes as libc::c_int,
+                libc::MNT_NOWAIT,
+            )
+        };
+        if mounted < 0 {
+            return (None, Vec::new());
+        }
+
+        let mut system_disk = None;
+        let mut external_disks = Vec::new();
+        for filesystem in filesystems
+            .into_iter()
+            .take((mounted as usize).min(capacity))
+        {
+            // SAFETY: `getfsstat` initialized each entry counted in `mounted`.
+            let filesystem = unsafe { filesystem.assume_init() };
+            if filesystem.f_flags & libc::MNT_LOCAL as u32 == 0 {
+                continue;
+            }
+            let mount_point = statfs_mount_point(&filesystem);
+            let Some(capacity) = disk_capacity_from_statfs(&filesystem, mount_point.clone()) else {
+                continue;
+            };
+            if mount_point == "/" {
+                system_disk = Some(capacity);
+            } else if is_external_volume_mount(&mount_point) {
+                external_disks.push(capacity);
+            }
+        }
+        external_disks.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
+        external_disks.truncate(MAX_EXTERNAL_DISKS);
+        (system_disk, external_disks)
+    }
+
+    fn disk_capacity_from_statfs(
+        filesystem: &libc::statfs,
+        mount_point: String,
+    ) -> Option<DiskCapacity> {
+        let block_size = u64::from(filesystem.f_bsize);
+        let total_bytes = filesystem.f_blocks.checked_mul(block_size)?;
+        if total_bytes == 0 {
+            return None;
+        }
+        let used_blocks = filesystem.f_blocks.saturating_sub(filesystem.f_bfree);
+        Some(DiskCapacity {
+            mount_point,
+            used_bytes: used_blocks.saturating_mul(block_size).min(total_bytes),
+            total_bytes,
+        })
+    }
+
+    fn statfs_mount_point(filesystem: &libc::statfs) -> String {
+        // Bound parsing to the fixed statfs array even if a kernel entry lacks
+        // a trailing NUL, so a malformed value cannot cause an unbounded read.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                filesystem.f_mntonname.as_ptr().cast::<u8>(),
+                filesystem.f_mntonname.len(),
+            )
+        };
+        CStr::from_bytes_until_nul(bytes)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn is_external_volume_mount(mount_point: &str) -> bool {
+        mount_point
+            .strip_prefix("/Volumes/")
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1058,6 +1164,28 @@ mod tests {
     fn disk_counters_sum_only_storage_driver_statistics() {
         let input = "    \"Statistics\" = {\"Bytes (Read)\"=1100,\"Bytes (Write)\"=2200}\n    \"Statistics\" = {\"Bytes (Read)\"=300,\"Bytes (Write)\"=400}\n";
         assert_eq!(super::macos::parse_ioreg_fixture(input), Some((1400, 2600)));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn disk_capacity_uses_root_and_only_top_level_local_volume_mounts() {
+        let (system_disk, external_disks) = super::macos::disk_capacity_sample();
+
+        let system_disk = system_disk.expect("root filesystem capacity should be available");
+        assert_eq!(system_disk.mount_point, "/");
+        assert!(system_disk.total_bytes > 0);
+        assert!(system_disk.used_bytes <= system_disk.total_bytes);
+        assert!(external_disks.len() <= 8);
+        assert!(external_disks.iter().all(|disk| {
+            super::macos::is_external_volume_mount(&disk.mount_point)
+                && disk.total_bytes > 0
+                && disk.used_bytes <= disk.total_bytes
+        }));
+        assert!(super::macos::is_external_volume_mount("/Volumes/archive"));
+        assert!(!super::macos::is_external_volume_mount("/Volumes"));
+        assert!(!super::macos::is_external_volume_mount(
+            "/Volumes/data/nested"
+        ));
     }
 
     #[test]

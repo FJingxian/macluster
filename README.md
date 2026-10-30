@@ -6,6 +6,10 @@ English · [简体中文](doc/README.zh-CN.md) · [Agent skill](skills/macluster
 
 Written in Rust. One binary to distribute. SSH connects nodes; NFS shares projects, software, and results.
 
+![Live terminal dashboard: node resources and CPU/memory process sorting](doc/assets/mtop.gif)
+
+*Select a Mac, open its processes, and switch between CPU and memory sorting. These are live recordings; identifying details and process names are anonymized.*
+
 ## How it works
 
 ```text
@@ -59,6 +63,10 @@ macluster controller stop
 
 ## Run jobs
 
+![Submit a job, inspect its state and queue, and read its completed output](doc/assets/jobs.gif)
+
+*One workflow: submit → running → completed → captured output.*
+
 ```sh
 macluster submit hostname                       # Batch command
 macluster submit job.sh                         # Batch script
@@ -86,6 +94,10 @@ Detailed timestamped CPU/memory logging is **off by default**; enable it with `s
 **Where files go:** submitting inside a registered share uses that directory. Inline commands submitted outside all shares use the primary shared root; `--cwd PATH` explicitly selects a shared directory. Relative output files are written there. Default captured logs synchronize to the primary share after completion. Compute nodes cannot read arbitrary unshared files on the login Mac.
 
 ## Watch one task's CPU and memory
+
+![Subscribe to a task’s CPU and memory while it runs](doc/assets/profile.gif)
+
+*A live subscription to a short synthetic task. No verbose logging is required; closing the subscription leaves the task running.*
 
 ```sh
 macluster job --metrics 1

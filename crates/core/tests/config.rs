@@ -234,6 +234,53 @@ fn named_share_can_be_mounted_at_its_source_path() {
     );
 }
 
+#[test]
+fn named_share_can_explicitly_preserve_and_overlay_local_mount_contents() {
+    let config_text = format!(
+        "{VALID}\n[shares.homebrew]\nserver = \"mini01-a\"\nsource_root = \"/opt/homebrew\"\nmount_root = \"/opt/homebrew\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\nallow_existing_contents = true\n"
+    );
+
+    let parsed = ClusterConfig::parse(&config_text);
+
+    assert!(
+        parsed.is_ok(),
+        "explicit same-path overlay should be valid: {parsed:?}"
+    );
+}
+
+#[test]
+fn named_share_overlay_rejects_different_source_and_mount_paths() {
+    let config_text = format!(
+        "{VALID}\n[shares.homebrew]\nserver = \"mini01-a\"\nsource_root = \"/opt/homebrew\"\nmount_root = \"/Users/Shared/homebrew\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\nallow_existing_contents = true\n"
+    );
+
+    assert!(matches!(
+        ClusterConfig::parse(&config_text),
+        Err(ConfigError::InvalidSharePath)
+    ));
+}
+
+#[test]
+fn optional_false_overlay_keeps_existing_execution_digest_stable() {
+    let base = format!(
+        "{VALID}\n[shares.homebrew]\nserver = \"mini01-a\"\nsource_root = \"/opt/homebrew\"\nmount_root = \"/opt/homebrew\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\n"
+    );
+    let explicit_false = format!("{base}allow_existing_contents = false\n");
+    let explicit_true = format!("{base}allow_existing_contents = true\n");
+    let old = ClusterConfig::parse(&base).unwrap();
+    let false_config = ClusterConfig::parse(&explicit_false).unwrap();
+    let overlay = ClusterConfig::parse(&explicit_true).unwrap();
+
+    assert_eq!(
+        old.execution_digest().unwrap(),
+        false_config.execution_digest().unwrap()
+    );
+    assert_ne!(
+        old.execution_digest().unwrap(),
+        overlay.execution_digest().unwrap()
+    );
+}
+
 fn extended_config() -> String {
     format!(
         r#"

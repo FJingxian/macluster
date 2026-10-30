@@ -4,7 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use macluster_protocol::types::{JobRecord, JobState};
+use macluster_protocol::types::{DiskCapacity, JobRecord, JobState};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -24,6 +24,8 @@ use super::processes::{ProcessInfo, ProcessSort, ProcessView, sort_processes};
 const POWER_STALE_AFTER: Duration = Duration::from_secs(15);
 const POWER_CACHE_TTL: Duration =
     Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS);
+const DETAIL_BASE_ROWS: u16 = 5;
+const DETAIL_MIN_PROCESS_ROWS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
@@ -508,6 +510,7 @@ enum NodeColumn {
     Task,
     Cpu,
     Memory,
+    SystemDisk,
     Gpu,
     Disk,
     Network,
@@ -518,11 +521,12 @@ enum NodeColumn {
 }
 
 impl NodeColumn {
-    const PRIORITY: [Self; 11] = [
+    const PRIORITY: [Self; 12] = [
         Self::Node,
         Self::Task,
         Self::Cpu,
         Self::Memory,
+        Self::SystemDisk,
         Self::Gpu,
         Self::Disk,
         Self::Network,
@@ -538,6 +542,7 @@ impl NodeColumn {
             Self::Task => "RUN/WAIT",
             Self::Cpu => "CPU%",
             Self::Memory => "MEM(GiB)",
+            Self::SystemDisk => "SYS DISK",
             Self::Gpu => "GPU%",
             Self::Disk => "DISK(R/W)",
             Self::Network => "NET(down/up)",
@@ -554,6 +559,7 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 7,
             Self::Memory => 8,
+            Self::SystemDisk => 8,
             Self::Gpu => 5,
             Self::Disk | Self::Network => 13,
             Self::Power => 6,
@@ -573,6 +579,7 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 8,
             Self::Memory => 11,
+            Self::SystemDisk => 15,
             Self::Gpu => 6,
             Self::Disk | Self::Network => 14,
             Self::Power => 8,
@@ -588,6 +595,7 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 11,
             Self::Memory => 16,
+            Self::SystemDisk => 18,
             Self::Gpu => 7,
             Self::Disk | Self::Network => 20,
             Self::Power => 12,
@@ -657,12 +665,13 @@ fn visible_node_columns(
 
     // If there is still room, grow flexible columns evenly so wide terminals
     // use the available space without allowing a single long name to dominate.
-    const STRETCH_ORDER: [NodeColumn; 8] = [
+    const STRETCH_ORDER: [NodeColumn; 9] = [
         NodeColumn::Node,
         NodeColumn::Queues,
         NodeColumn::Disk,
         NodeColumn::Network,
         NodeColumn::Memory,
+        NodeColumn::SystemDisk,
         NodeColumn::Power,
         NodeColumn::Cpu,
         NodeColumn::CpuTemp,
@@ -799,6 +808,10 @@ fn node_cell_value(
     let cpu = pair_percent(res.cpu_percent, res.cpu_max_percent);
     let cpu_temperature = cpu_temperature_text(res.cpu_temp_celsius);
     let memory = memory_text(&res);
+    let system_disk = disk_capacities(&node.metrics)
+        .0
+        .map(disk_capacity_value)
+        .unwrap_or_else(|| "N/A".into());
     let disk = pair_rate(res.disk_read_bytes_per_sec, res.disk_write_bytes_per_sec);
     let network = pair_rate(res.network_rx_bytes_per_sec, res.network_tx_bytes_per_sec);
     let power = power_cell(&node.metrics);
@@ -818,6 +831,7 @@ fn node_cell_value(
         NodeColumn::Task => format!("{}/{}", tasks.running, tasks.waiting),
         NodeColumn::Cpu => cpu.clone(),
         NodeColumn::Memory => memory.clone(),
+        NodeColumn::SystemDisk => system_disk.clone(),
         NodeColumn::Gpu => gpu.clone(),
         NodeColumn::Disk => disk.clone(),
         NodeColumn::Network => network.clone(),
@@ -938,6 +952,10 @@ fn render_detail(
         })
         .collect::<String>();
     let resources = resources(&node.metrics);
+    let system_disk = disk_capacities(&node.metrics)
+        .0
+        .map(disk_capacity_value)
+        .unwrap_or_else(|| "N/A".into());
     let display_id = if node.identity.role == NodeRole::Login {
         "login"
     } else {
@@ -986,7 +1004,7 @@ fn render_detail(
             fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm)
         )),
         Line::from(format!(
-            "TEMP {}",
+            "TEMP {}   SYS DISK {system_disk}",
             cpu_temperature_text(resources.cpu_temp_celsius)
         )),
         Line::from(format!("CPU · last 60s  {latest}")),
@@ -1066,17 +1084,22 @@ fn render_expanded_detail(
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(" Details · c CPU ↓ · m Memory ↓ · Esc to close ");
     let inner = block.inner(area);
+    let (system_disk, external_disks) = disk_capacities(&node.metrics);
+    let visible_external_disks = external_disks
+        .iter()
+        .take(
+            inner
+                .height
+                .saturating_sub(DETAIL_BASE_ROWS + DETAIL_MIN_PROCESS_ROWS) as usize,
+        )
+        .collect::<Vec<_>>();
     frame.render_widget(block, area);
+    let mut constraints =
+        vec![Constraint::Length(1); DETAIL_BASE_ROWS as usize + visible_external_disks.len()];
+    constraints.push(Constraint::Min(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
+        .constraints(constraints)
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1121,12 +1144,30 @@ fn render_expanded_detail(
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "POWER {}   FAN {}",
+            "POWER {}   FAN {}   {}",
             power_text(&node.metrics),
-            fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm)
+            fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm),
+            system_disk.map_or_else(
+                || "SYS DISK N/A".into(),
+                |disk| disk_capacity_line("SYS DISK", disk)
+            )
         )),
         chunks[3],
     );
+    for (index, disk) in visible_external_disks.iter().enumerate() {
+        let name = disk
+            .mount_point
+            .strip_prefix("/Volumes/")
+            .unwrap_or(&disk.mount_point)
+            .split('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("volume");
+        frame.render_widget(
+            Paragraph::new(disk_capacity_line(&format!("EXT {name}"), disk)),
+            chunks[4 + index],
+        );
+    }
     frame.render_widget(
         Paragraph::new(format!(
             "Jobs {} · RUN/WAIT {}/{} · {}",
@@ -1135,9 +1176,16 @@ fn render_expanded_detail(
             tasks.waiting,
             process_status(&node.processes, process_sort)
         )),
-        chunks[4],
+        chunks[4 + visible_external_disks.len()],
     );
 
+    let preview_cpu = matches!(
+        &node.processes,
+        ProcessView::Available {
+            warning: Some(warning),
+            ..
+        } if warning.starts_with("Preview: ps average CPU%")
+    );
     let mut rows = match &node.processes {
         ProcessView::Available { rows, .. } => rows.clone(),
         ProcessView::Loading | ProcessView::Unavailable { .. } => Vec::new(),
@@ -1148,17 +1196,52 @@ fn render_expanded_detail(
         table_rows,
         [
             Constraint::Length(7),
-            Constraint::Length(8),
+            Constraint::Length(if preview_cpu { 10 } else { 8 }),
             Constraint::Length(9),
             Constraint::Length(12),
             Constraint::Min(8),
         ],
     )
     .header(
-        Row::new(["PID", "CPU%", "MEM", "TIME", "COMMAND"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new([
+            "PID",
+            if preview_cpu { "CPU(avg)%" } else { "CPU%" },
+            "MEM",
+            "TIME",
+            "COMMAND",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     );
-    frame.render_widget(table, chunks[5]);
+    frame.render_widget(table, chunks[5 + visible_external_disks.len()]);
+}
+
+fn disk_capacities(view: &MetricView) -> (Option<&DiskCapacity>, &[DiskCapacity]) {
+    match view {
+        MetricView::Available { snapshot, .. } => (
+            snapshot.system_disk_capacity.as_ref(),
+            &snapshot.external_disk_capacities,
+        ),
+        MetricView::Loading | MetricView::Unavailable { .. } => (None, &[]),
+    }
+}
+
+fn disk_capacity_line(label: &str, disk: &DiskCapacity) -> String {
+    format!("{label} {}", disk_capacity_value(disk))
+}
+
+fn disk_capacity_value(disk: &DiskCapacity) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let (unit, divisor) = if disk.total_bytes as f64 >= TIB {
+        ("TiB", TIB)
+    } else {
+        ("GiB", GIB)
+    };
+    format!(
+        "{:.1}/{:.1} {unit}",
+        disk.used_bytes.min(disk.total_bytes) as f64 / divisor,
+        disk.total_bytes as f64 / divisor
+    )
 }
 
 fn process_status(view: &ProcessView, sort: ProcessSort) -> String {
@@ -1187,7 +1270,13 @@ fn process_status(view: &ProcessView, sort: ProcessSort) -> String {
             };
             let warning = warning
                 .as_deref()
-                .map(|warning| format!(" · refresh failed: {warning}"))
+                .map(|warning| {
+                    if warning.starts_with("Preview:") {
+                        format!(" · {warning}")
+                    } else {
+                        format!(" · refresh failed: {warning}")
+                    }
+                })
                 .unwrap_or_default();
             format!(
                 "Processes · sorted {sort_label} · updated {} ago{freshness}{no_processes}{warning}",
@@ -1234,14 +1323,23 @@ fn power_cell(view: &MetricView) -> String {
 
 pub(super) fn power_text(view: &MetricView) -> String {
     match power_reading(view) {
-        Some((watts, scope, Some(age))) if age < POWER_STALE_AFTER => {
-            format!("{watts:.1} W {scope} · age {}s", age.as_secs())
-        }
         Some((watts, scope, Some(age))) => {
-            format!("{watts:.1} W {scope} · STALE {}s", age.as_secs())
+            let scope = detail_power_scope(scope);
+            let freshness = if age >= POWER_STALE_AFTER { "*" } else { "" };
+            format!("{watts:.1} W{scope}{freshness}")
         }
-        Some((watts, scope, None)) => format!("{watts:.1} W {scope} · age ?"),
+        Some((watts, scope, None)) => {
+            format!("{watts:.1} W{}?", detail_power_scope(scope))
+        }
         None => "N/A".into(),
+    }
+}
+
+fn detail_power_scope(scope: &str) -> String {
+    if scope.eq_ignore_ascii_case("soc") || scope.eq_ignore_ascii_case("system") {
+        String::new()
+    } else {
+        format!(" {scope}")
     }
 }
 

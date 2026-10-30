@@ -52,6 +52,9 @@ pub struct ShareConfig {
     pub source_root: PathBuf,
     pub mount_root: PathBuf,
     pub share_uuid: String,
+    /// Whether this share was explicitly authorized to cover pre-existing
+    /// client files at the same source and mount path.
+    pub allow_existing_contents: bool,
 }
 
 impl NodeConfig {
@@ -239,7 +242,7 @@ pub enum ConfigError {
     #[error("could not calculate execution configuration digest")]
     DigestFailure,
     #[error(
-        "this minimal TOML reader only accepts strings, arrays of strings, and unsigned integers"
+        "this minimal TOML reader only accepts strings, arrays of strings, unsigned integers, and booleans"
     )]
     UnsupportedValue,
 }
@@ -258,6 +261,7 @@ enum Value {
     String(String),
     Strings(Vec<String>),
     Integer(u64),
+    Bool(bool),
 }
 
 type Table = BTreeMap<String, Value>;
@@ -513,6 +517,12 @@ impl ClusterConfig {
                 {
                     return Err(ConfigError::InvalidSharePath);
                 }
+                let allow_existing_contents =
+                    take_optional_bool(&mut table, &section, "allow_existing_contents")?
+                        .unwrap_or(false);
+                if allow_existing_contents && source_raw != mount_raw {
+                    return Err(ConfigError::InvalidSharePath);
+                }
                 let share_uuid = take_string(&mut table, &section, "share_uuid")?;
                 if macluster_protocol::identifiers::Id128::parse(&share_uuid).is_err() {
                     return Err(ConfigError::InvalidShareUuid);
@@ -525,6 +535,7 @@ impl ClusterConfig {
                         source_root: PathBuf::from(source_raw),
                         mount_root: PathBuf::from(mount_raw),
                         share_uuid: share_uuid.to_ascii_lowercase(),
+                        allow_existing_contents,
                     },
                 );
                 continue;
@@ -691,6 +702,11 @@ impl ClusterConfig {
                 share.mount_root.display(),
                 share.share_uuid.to_ascii_lowercase()
             ));
+            // Keep the execution digest stable for every existing config where
+            // the new opt-in field is absent or false.
+            if share.allow_existing_contents {
+                rows.push(format!("share-overlay\0{id}\0true"));
+            }
         }
         if let Some(login_node) = &self.login_node {
             rows.push(format!("login\0{login_node}"));
@@ -817,6 +833,12 @@ fn parse_document(input: &str) -> Result<BTreeMap<String, Table>, ConfigError> {
 }
 
 fn parse_value(value: &str) -> Result<Value, String> {
+    if value == "true" {
+        return Ok(Value::Bool(true));
+    }
+    if value == "false" {
+        return Ok(Value::Bool(false));
+    }
     if value.starts_with('"') {
         let (parsed, consumed) = parse_string_prefix(value)?;
         if !value[consumed..].trim().is_empty() {
@@ -987,6 +1009,21 @@ fn take_optional_integer(
         Some(_) => Err(parse_error(
             0,
             &format!("[{section}] key '{key}' must be an integer"),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn take_optional_bool(
+    table: &mut Table,
+    section: &str,
+    key: &str,
+) -> Result<Option<bool>, ConfigError> {
+    match table.remove(key) {
+        Some(Value::Bool(value)) => Ok(Some(value)),
+        Some(_) => Err(parse_error(
+            0,
+            &format!("[{section}] key '{key}' must be a boolean"),
         )),
         None => Ok(None),
     }

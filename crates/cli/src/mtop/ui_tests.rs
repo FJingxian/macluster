@@ -110,7 +110,15 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
     for (width, expected, hidden) in [
         (
             70,
-            vec!["NODE", "RUN/WAIT", "CPU%", "MEM(GiB)", "GPU%", "DISK(R/W)"],
+            vec![
+                "NODE",
+                "RUN/WAIT",
+                "CPU%",
+                "MEM(GiB)",
+                "SYS DISK",
+                "GPU%",
+                "DISK(R/W)",
+            ],
             "NET(down/up)",
         ),
         (
@@ -120,12 +128,11 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
                 "RUN/WAIT",
                 "CPU%",
                 "MEM(GiB)",
+                "SYS DISK",
                 "GPU%",
                 "DISK(R/W)",
-                "NET(down/up)",
-                "POWER",
             ],
-            "TEMP",
+            "NET(down/up)",
         ),
         (
             88,
@@ -134,13 +141,13 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
                 "RUN/WAIT",
                 "CPU%",
                 "MEM(GiB)",
+                "SYS DISK",
                 "GPU%",
                 "DISK(R/W)",
                 "NET(down/up)",
                 "POWER",
-                "TEMP",
             ],
-            "QUEUES",
+            "TEMP",
         ),
         (
             100,
@@ -149,15 +156,14 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
                 "RUN/WAIT",
                 "CPU%",
                 "MEM(GiB)",
+                "SYS DISK",
                 "GPU%",
                 "DISK(R/W)",
                 "NET(down/up)",
                 "POWER",
                 "TEMP",
-                "QUEUES",
-                "AGE",
             ],
-            "",
+            "QUEUES",
         ),
     ] {
         let lines = rendered_lines(width, 24, &state);
@@ -262,6 +268,62 @@ fn metric_units_are_in_headers_and_table_values_are_compact() {
     assert!(
         compact.contains("MEM(GiB) 4.0/16.0"),
         "compact summary: {compact:?}"
+    );
+}
+
+#[test]
+fn normal_node_table_shows_system_disk_while_external_disks_stay_in_details() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
+        mount_point: "/".into(),
+        used_bytes: 128 * 1024_u64.pow(3),
+        total_bytes: 512 * 1024_u64.pow(3),
+    });
+    snapshot.external_disk_capacities = vec![macluster_protocol::types::DiskCapacity {
+        mount_point: "/Volumes/archive".into(),
+        used_bytes: 2 * 1024_u64.pow(4),
+        total_bytes: 4 * 1024_u64.pow(4),
+    }];
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-a".into());
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-a".into(),
+            host: "192.0.2.11".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: Default::default(),
+    });
+
+    let overview = rendered_lines(160, 24, &state).join("\n");
+    assert!(overview.contains("SYS DISK"), "overview: {overview}");
+    assert!(overview.contains("128.0/512.0 GiB"), "overview: {overview}");
+    assert_eq!(
+        overview.matches("128.0/512.0 GiB").count(),
+        2,
+        "the selected-node summary should also show the system disk before Enter: {overview}"
+    );
+    assert!(!overview.contains("EXT archive"), "overview: {overview}");
+
+    state.expanded = true;
+    let details = rendered_lines(160, 40, &state).join("\n");
+    assert!(
+        details.contains("SYS DISK 128.0/512.0 GiB"),
+        "details: {details}"
+    );
+    assert!(
+        details.contains("EXT archive 2.0/4.0 TiB"),
+        "details: {details}"
     );
 }
 
@@ -840,7 +902,7 @@ fn renderer_keeps_quit_hint_visible_at_low_height() {
 }
 
 #[test]
-fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
+fn power_details_omit_duplicate_age_and_common_scope_labels() {
     let started = std::time::Instant::now();
     let mut snapshot = macluster_metrics::unavailable(1, "fixture");
     snapshot.power_watts = Some(11.2);
@@ -851,7 +913,7 @@ fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
         age: std::time::Duration::from_secs(1),
         stale: false,
     };
-    assert_eq!(power_text(&fresh), "11.2 W SoC · age 3s");
+    assert_eq!(power_text(&fresh), "11.2 W");
     assert!(resources(&fresh).power_fresh);
 
     snapshot.power_age_ms = None;
@@ -860,7 +922,7 @@ fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
         age: started.elapsed(),
         stale: false,
     };
-    assert_eq!(power_text(&unknown_age), "11.2 W SoC · age ?");
+    assert_eq!(power_text(&unknown_age), "11.2 W?");
     assert!(!resources(&unknown_age).power_fresh);
 }
 
@@ -876,7 +938,7 @@ fn cached_power_remains_in_pool_totals_until_the_helper_cache_expires() {
         stale: false,
     };
 
-    assert_eq!(power_text(&cached), "11.2 W System · STALE 31s");
+    assert_eq!(power_text(&cached), "11.2 W*");
     let totals = aggregate_power(&[resources(&cached)]);
     assert_eq!(totals["System"].watts, 11.2);
 
@@ -888,6 +950,128 @@ fn cached_power_remains_in_pool_totals_until_the_helper_cache_expires() {
     };
     assert!(aggregate_power(&[resources(&expired)]).is_empty());
     assert_eq!(power_text(&expired), "N/A");
+}
+
+#[test]
+fn expanded_details_show_one_sample_age_and_no_system_power_scope() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.power_watts = Some(11.2);
+    snapshot.power_scope = Some("System".into());
+    snapshot.power_age_ms = Some(3_000);
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::from_secs(2),
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let lines = rendered_lines(160, 40, &state);
+    let screen = lines.join("\n");
+
+    assert_eq!(screen.matches("sample age").count(), 1, "{screen}");
+    let power_line = lines
+        .iter()
+        .find(|line| line.contains("POWER 11.2 W"))
+        .unwrap();
+    assert!(!power_line.contains("System"), "{power_line}");
+    assert!(!screen.contains("age 5s"), "{screen}");
+}
+
+#[test]
+fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tall() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
+        mount_point: "/".into(),
+        used_bytes: 128 * 1024_u64.pow(3),
+        total_bytes: 512 * 1024_u64.pow(3),
+    });
+    snapshot.external_disk_capacities = vec![macluster_protocol::types::DiskCapacity {
+        mount_point: "/Volumes/archive".into(),
+        used_bytes: 2 * 1024_u64.pow(4),
+        total_bytes: 4 * 1024_u64.pow(4),
+    }];
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let tall = rendered_lines(160, 40, &state).join("\n");
+    let short = rendered_lines(160, 20, &state).join("\n");
+
+    assert!(tall.contains("SYS DISK 128.0/512.0 GiB"), "{tall}");
+    assert!(tall.contains("EXT archive 2.0/4.0 TiB"), "{tall}");
+    assert!(short.contains("SYS DISK 128.0/512.0 GiB"), "{short}");
+    assert!(!short.contains("EXT archive"), "{short}");
+}
+
+#[test]
+fn process_preview_header_identifies_ps_average_until_interval_sample_arrives() {
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Loading,
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Available {
+            rows: vec![ProcessInfo {
+                pid: 42,
+                cpu_percent: 200.0,
+                memory: "32M".into(),
+                cpu_time: "00:01.20".into(),
+                command: "rustc".into(),
+            }],
+            age: std::time::Duration::from_secs(1),
+            stale: false,
+            warning: Some("Preview: ps average CPU%, RSS memory; interval sample pending".into()),
+        },
+    });
+
+    let screen = rendered_lines(160, 40, &state).join("\n");
+
+    assert!(screen.contains("CPU(avg)%"), "{screen}");
+    assert!(!screen.contains("refresh failed: Preview:"), "{screen}");
+    assert!(screen.contains("rustc"), "{screen}");
 }
 
 #[test]

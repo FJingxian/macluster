@@ -248,12 +248,23 @@ fn parse_process_names(input: &str) -> BTreeMap<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::PROCESS_COMMAND;
+    use super::{PROCESS_COMMAND, parse_processes};
+    use std::time::Duration;
 
     #[test]
     fn process_name_lookup_is_limited_to_top_rows() {
         assert!(PROCESS_COMMAND.contains("/bin/ps -p \"$pids\" -o pid=,ucomm="));
         assert!(!PROCESS_COMMAND.contains("/bin/ps -axo pid=,ucomm="));
         assert!(PROCESS_COMMAND.contains("{ table=1; count=0; next }"));
+    }
+
+    #[test]
+    fn live_process_cpu_samples_refresh_every_second_and_keep_multicore_percent() {
+        assert_eq!(super::super::PROCESS_INTERVAL, Duration::from_secs(1));
+        let rows = parse_processes(
+            "PID %CPU MEM TIME COMMAND\n42 420.0 32M 00:01.20 rustc\n__MACLUSTER_PS_NAMES__\n",
+        )
+        .unwrap();
+        assert_eq!(rows[0].cpu_percent, 420.0);
     }
 }

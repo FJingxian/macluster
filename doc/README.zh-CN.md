@@ -6,6 +6,10 @@
 
 使用 Rust 编写，只需分发一个二进制。SSH 连接节点，NFS 共享项目、软件和结果。
 
+![mtop 实时资源监控与进程 CPU、内存排序](assets/mtop.gif)
+
+*选择节点、展开进程，再切换 CPU 或内存排序。演示来自真实集群录制，机器标识和进程名已匿名处理。*
+
 ## 工作方式
 
 ```text
@@ -61,6 +65,10 @@ macluster controller stop
 
 ## 提交任务
 
+![提交任务、查询状态与队列，再读取运行结果](assets/jobs.gif)
+
+*一段完整流程：提交 → 运行 → 完成 → 查看输出。*
+
 ```sh
 macluster submit hostname                       # 批处理命令
 macluster submit job.sh                         # 脚本
@@ -88,6 +96,10 @@ macluster submit -v python analysis.py          # 开启详细资源日志
 **文件放在哪里：**在已注册共享目录内提交，就以该目录为工作目录；在共享目录之外提交内联命令，则使用主共享根目录。`--cwd PATH` 可以显式指定共享目录。相对路径结果写在任务工作目录，默认捕获日志在任务结束后同步到主共享目录。计算节点不能直接读取登录 Mac 上任意未共享的文件。
 
 ## 实时查看单个任务
+
+![订阅运行中任务的 CPU 和内存占用](assets/profile.gif)
+
+*录制使用短时示例任务。无需开启详细日志；关闭订阅后，任务继续运行。*
 
 ```sh
 macluster job --metrics 1

@@ -769,6 +769,7 @@ fn stage_address_agents(
     Ok(candidate)
 }
 
+#[cfg(test)]
 fn address_unmount_script(
     requests: &[ClientUnmountRequest],
     aliases: &[(PathBuf, PathBuf)],
@@ -818,20 +819,31 @@ fn cleanup_address_nfs(
     // point both machines are verified and user tasks are stopped. Match the
     // exact original NFS source/type/target from the mount table before detaching.
     // No shared directories or data files are removed.
-    let script = address_unmount_script(&requests, &aliases);
-    let output = ssh_output(connection, &script, None)?;
-    if !output.status.success() {
-        let error = command_error("cannot detach obsolete NFS mounts", &output);
-        if !mount_point_permission_error(&error) {
-            return Err((1, error));
-        }
-        run_interactive_admin_with_reason(
-            connection,
-            "detach exact obsolete NFS mounts before changing node addresses",
-            &script,
-        )
-        .map_err(|error| (1, error))?;
-    }
+    let mounts = requests
+        .iter()
+        .map(|request| NfsMount {
+            source: request.source.clone(),
+            target: request.mount_root.to_string_lossy().into_owned(),
+            share_uuid: request.share_uuid.clone(),
+            alias: None,
+            allow_existing_contents: false,
+        })
+        .collect::<Vec<_>>();
+    let aliases = aliases
+        .iter()
+        .map(|(path, target)| NfsAlias {
+            path: path.to_string_lossy().into_owned(),
+            target: target.to_string_lossy().into_owned(),
+        })
+        .collect::<Vec<_>>();
+    unmount_managed_nfs(
+        connection,
+        &mounts,
+        &aliases,
+        true,
+        "detach exact obsolete NFS mounts before changing node addresses",
+    )
+    .map_err(|error| (1, error))?;
     let output = ssh_output(connection, "/sbin/mount", None)?;
     if !output.status.success() {
         return Err((
@@ -1387,6 +1399,7 @@ mod tests {
             mount_root: mount_root.clone(),
             share_uuid: "unreadable-marker".into(),
             label: "stale shared root".into(),
+            allow_existing_contents: false,
         };
         let script = address_unmount_script(&[request], &[])
             .replace("/sbin/mount", &shell_quote(&fake_mount.to_string_lossy()))

@@ -624,6 +624,19 @@ mod tests {
     }
 
     #[test]
+    fn live_process_cpu_samples_refresh_every_second_and_keep_multicore_percent() {
+        assert_eq!(
+            super::super::PROCESS_SAMPLE_INTERVAL,
+            Duration::from_secs(1)
+        );
+        let rows = parse_top_processes(
+            "PID %CPU MEM TIME COMMAND\n42 420.0 32M 00:01.20 rustc\n__MACLUSTER_PS_NAMES__\n",
+        )
+        .unwrap();
+        assert_eq!(rows[0].cpu_percent, 420.0);
+    }
+
+    #[test]
     fn parses_the_second_top_sample_joins_names_and_sorts_by_cpu() {
         let rows = parse_top_processes(SAMPLE).unwrap();
         assert_eq!(rows.len(), 3);

@@ -3607,7 +3607,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 serde_json::to_string_pretty(&jobs).map_err(|error| (1, error.to_string()))?
             );
         } else {
-            print_jobs_table(&jobs);
+            print_jobs_table(&jobs, all);
         }
         return Ok(());
     }
@@ -3647,7 +3647,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             serde_json::to_string_pretty(&jobs).map_err(|error| (1, error.to_string()))?
         );
     } else {
-        print_jobs_table(&jobs);
+        print_jobs_table(&jobs, all);
     }
     Ok(())
 }
@@ -3831,41 +3831,80 @@ fn stream_job_log(
     Ok(())
 }
 
-fn print_jobs_table(jobs: &[JobRecord]) {
-    print!("{}", format_jobs_table(jobs));
+fn print_jobs_table(jobs: &[JobRecord], include_end_time: bool) {
+    print!("{}", format_jobs_table(jobs, include_end_time));
 }
 
-fn format_jobs_table(jobs: &[JobRecord]) -> String {
+fn format_local_job_time(unix_ms: u64) -> String {
+    let Ok(seconds) = libc::time_t::try_from(unix_ms / 1_000) else {
+        return "-".into();
+    };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    if unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) }.is_null() {
+        return "-".into();
+    }
+    let local = unsafe { local.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.tm_year.saturating_add(1900),
+        local.tm_mon.saturating_add(1),
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec
+    )
+}
+
+fn format_jobs_table(jobs: &[JobRecord], include_end_time: bool) -> String {
     use std::fmt::Write as _;
 
-    const HEADERS: [&str; 6] = ["JOBID", "STATE", "QUEUE", "NODE", "CREATED(ms)", "NAME"];
-    let rows: Vec<[String; 6]> = jobs
+    let mut headers = vec!["JOBID", "STATE", "QUEUE", "NODE", "SUBMITTED"];
+    if include_end_time {
+        headers.push("ENDED");
+    }
+    headers.push("NAME");
+
+    let rows: Vec<Vec<String>> = jobs
         .iter()
         .map(|job| {
-            [
+            let mut row = vec![
                 job.id.to_string(),
                 format!("{:?}", job.state),
                 job.spec.queue.to_string(),
                 job.node.as_ref().map_or("-", NodeId::as_str).to_owned(),
-                job.created_unix_ms.to_string(),
-                escape(&job.spec.name),
-            ]
+                format_local_job_time(job.created_unix_ms),
+            ];
+            if include_end_time {
+                row.push(
+                    job.finished_unix_ms
+                        .map(format_local_job_time)
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            row.push(escape(&job.spec.name));
+            row
         })
         .collect();
-    let widths: [usize; 5] = std::array::from_fn(|column| {
-        rows.iter()
-            .map(|row| row[column].len())
-            .chain(std::iter::once(HEADERS[column].len()))
-            .max()
-            .unwrap_or(HEADERS[column].len())
-    });
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].len())
+                .chain(std::iter::once(headers[column].len()))
+                .max()
+                .unwrap_or(headers[column].len())
+        })
+        .collect();
 
     let mut output = String::new();
-    for row in std::iter::once(HEADERS.map(str::to_owned)).chain(rows) {
-        for column in 0..5 {
+    for row in
+        std::iter::once(headers.iter().map(|header| (*header).to_owned()).collect()).chain(rows)
+    {
+        for column in 0..row.len().saturating_sub(1) {
             let _ = write!(output, "{:<width$}  ", row[column], width = widths[column]);
         }
-        let _ = writeln!(output, "{}", row[5]);
+        if let Some(last) = row.last() {
+            let _ = writeln!(output, "{last}");
+        }
     }
     output
 }
@@ -4095,7 +4134,7 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                     })
                     .collect();
                 queue_jobs.sort_by_key(|job| job.id);
-                print_jobs_table(&queue_jobs.into_iter().cloned().collect::<Vec<_>>());
+                print_jobs_table(&queue_jobs.into_iter().cloned().collect::<Vec<_>>(), false);
             }
         }
         let Some(seconds) = watch else {
@@ -7053,17 +7092,18 @@ mod tests {
                 "run analysis\tjob",
             ),
         ];
-        let rendered = format_jobs_table(&jobs);
+        let rendered = format_jobs_table(&jobs, false);
         let lines: Vec<_> = rendered.lines().collect();
         let header = lines[0];
         let row = lines[2];
+        let submitted = format_local_job_time(1792831567128);
 
         for (header_cell, row_cell) in [
             ("JOBID", "128"),
             ("STATE", "Cancelled"),
             ("QUEUE", "mini01-long-queue"),
             ("NODE", "mini01-compute-02"),
-            ("CREATED(ms)", "1792831567128"),
+            ("SUBMITTED", submitted.as_str()),
         ] {
             assert_eq!(
                 header.find(header_cell),

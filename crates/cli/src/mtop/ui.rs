@@ -510,7 +510,6 @@ enum NodeColumn {
     Task,
     Cpu,
     Memory,
-    SystemDisk,
     Gpu,
     Disk,
     Network,
@@ -521,12 +520,11 @@ enum NodeColumn {
 }
 
 impl NodeColumn {
-    const PRIORITY: [Self; 12] = [
+    const PRIORITY: [Self; 11] = [
         Self::Node,
         Self::Task,
         Self::Cpu,
         Self::Memory,
-        Self::SystemDisk,
         Self::Gpu,
         Self::Disk,
         Self::Network,
@@ -542,7 +540,6 @@ impl NodeColumn {
             Self::Task => "RUN/WAIT",
             Self::Cpu => "CPU%",
             Self::Memory => "MEM(GiB)",
-            Self::SystemDisk => "SYS DISK",
             Self::Gpu => "GPU%",
             Self::Disk => "DISK(R/W)",
             Self::Network => "NET(down/up)",
@@ -559,7 +556,6 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 7,
             Self::Memory => 8,
-            Self::SystemDisk => 8,
             Self::Gpu => 5,
             Self::Disk | Self::Network => 13,
             Self::Power => 6,
@@ -579,7 +575,6 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 8,
             Self::Memory => 11,
-            Self::SystemDisk => 15,
             Self::Gpu => 6,
             Self::Disk | Self::Network => 14,
             Self::Power => 8,
@@ -595,7 +590,6 @@ impl NodeColumn {
             Self::Task => 8,
             Self::Cpu => 11,
             Self::Memory => 16,
-            Self::SystemDisk => 18,
             Self::Gpu => 7,
             Self::Disk | Self::Network => 20,
             Self::Power => 12,
@@ -665,13 +659,12 @@ fn visible_node_columns(
 
     // If there is still room, grow flexible columns evenly so wide terminals
     // use the available space without allowing a single long name to dominate.
-    const STRETCH_ORDER: [NodeColumn; 9] = [
+    const STRETCH_ORDER: [NodeColumn; 8] = [
         NodeColumn::Node,
         NodeColumn::Queues,
         NodeColumn::Disk,
         NodeColumn::Network,
         NodeColumn::Memory,
-        NodeColumn::SystemDisk,
         NodeColumn::Power,
         NodeColumn::Cpu,
         NodeColumn::CpuTemp,
@@ -808,10 +801,6 @@ fn node_cell_value(
     let cpu = pair_percent(res.cpu_percent, res.cpu_max_percent);
     let cpu_temperature = cpu_temperature_text(res.cpu_temp_celsius);
     let memory = memory_text(&res);
-    let system_disk = disk_capacities(&node.metrics)
-        .0
-        .map(disk_capacity_value)
-        .unwrap_or_else(|| "N/A".into());
     let disk = pair_rate(res.disk_read_bytes_per_sec, res.disk_write_bytes_per_sec);
     let network = pair_rate(res.network_rx_bytes_per_sec, res.network_tx_bytes_per_sec);
     let power = power_cell(&node.metrics);
@@ -831,7 +820,6 @@ fn node_cell_value(
         NodeColumn::Task => format!("{}/{}", tasks.running, tasks.waiting),
         NodeColumn::Cpu => cpu.clone(),
         NodeColumn::Memory => memory.clone(),
-        NodeColumn::SystemDisk => system_disk.clone(),
         NodeColumn::Gpu => gpu.clone(),
         NodeColumn::Disk => disk.clone(),
         NodeColumn::Network => network.clone(),

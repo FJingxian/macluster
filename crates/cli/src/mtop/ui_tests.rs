@@ -110,15 +110,7 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
     for (width, expected, hidden) in [
         (
             70,
-            vec![
-                "NODE",
-                "RUN/WAIT",
-                "CPU%",
-                "MEM(GiB)",
-                "SYS DISK",
-                "GPU%",
-                "DISK(R/W)",
-            ],
+            vec!["NODE", "RUN/WAIT", "CPU%", "MEM(GiB)", "GPU%", "DISK(R/W)"],
             "NET(down/up)",
         ),
         (
@@ -128,20 +120,6 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
                 "RUN/WAIT",
                 "CPU%",
                 "MEM(GiB)",
-                "SYS DISK",
-                "GPU%",
-                "DISK(R/W)",
-            ],
-            "NET(down/up)",
-        ),
-        (
-            88,
-            vec![
-                "NODE",
-                "RUN/WAIT",
-                "CPU%",
-                "MEM(GiB)",
-                "SYS DISK",
                 "GPU%",
                 "DISK(R/W)",
                 "NET(down/up)",
@@ -150,13 +128,12 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
             "TEMP",
         ),
         (
-            100,
+            88,
             vec![
                 "NODE",
                 "RUN/WAIT",
                 "CPU%",
                 "MEM(GiB)",
-                "SYS DISK",
                 "GPU%",
                 "DISK(R/W)",
                 "NET(down/up)",
@@ -164,6 +141,23 @@ fn node_columns_expand_in_priority_order_as_width_allows() {
                 "TEMP",
             ],
             "QUEUES",
+        ),
+        (
+            100,
+            vec![
+                "NODE",
+                "RUN/WAIT",
+                "CPU%",
+                "MEM(GiB)",
+                "GPU%",
+                "DISK(R/W)",
+                "NET(down/up)",
+                "POWER",
+                "TEMP",
+                "QUEUES",
+                "AGE",
+            ],
+            "",
         ),
     ] {
         let lines = rendered_lines(width, 24, &state);
@@ -272,7 +266,7 @@ fn metric_units_are_in_headers_and_table_values_are_compact() {
 }
 
 #[test]
-fn normal_node_table_shows_system_disk_while_external_disks_stay_in_details() {
+fn system_disk_is_shown_in_details_but_not_the_node_table() {
     let mut snapshot = macluster_metrics::unavailable(1, "fixture");
     snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
         mount_point: "/".into(),
@@ -306,12 +300,20 @@ fn normal_node_table_shows_system_disk_while_external_disks_stay_in_details() {
     });
 
     let overview = rendered_lines(160, 24, &state).join("\n");
-    assert!(overview.contains("SYS DISK"), "overview: {overview}");
+    let table_header = overview
+        .lines()
+        .find(|line| line.contains("NODE") && line.contains("CPU"))
+        .expect("node table header");
+    assert!(
+        !table_header.contains("SYS DISK"),
+        "the changing resource table should omit the stable system-disk capacity: {table_header}"
+    );
+    assert!(overview.contains("SYS DISK"), "details: {overview}");
     assert!(overview.contains("128.0/512.0 GiB"), "overview: {overview}");
     assert_eq!(
         overview.matches("128.0/512.0 GiB").count(),
-        2,
-        "the selected-node summary should also show the system disk before Enter: {overview}"
+        1,
+        "system-disk capacity should appear once in the details pane: {overview}"
     );
     assert!(!overview.contains("EXT archive"), "overview: {overview}");
 

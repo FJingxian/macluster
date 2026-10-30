@@ -65,7 +65,7 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-8";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-9";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
 const POWER_LAUNCHD_PATH: &str = "/Library/LaunchDaemons/org.macluster.power.plist";
 const POWER_LAUNCHD_LABEL: &str = "org.macluster.power";
@@ -3187,7 +3187,7 @@ fn node_help(full: bool) -> &'static str {
         return "Usage: mnode -a USER@IPv4[:PORT] [OPTIONS]\n       mnode -a local[:SOURCE_PATH] [OPTIONS]\n       mnode -l | --list\n       mnode --failed\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]]\n       mnode -rm share:SHARE_ID\n\nOptions: --queue QUEUE, --host IPv4, --share-id ID, --mount-root PATH, --overlay-existing\nSSH nodes join the default compute queue. `local` enrolls this Mac as the login node. Use --help for SSH setup, shares, removal, and controller maintenance.";
     }
 
-    "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -l | --list\n       mnode --failed\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nAdd nodes\n  Nodes enter the configured cluster after setup verification. Failed attempts stay outside the node list; use --failed to inspect their errors and retry the original command. Registered nodes show READY or OFFLINE. SSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues.\n\nShares\n  `local` adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. When SOURCE_PATH and --mount-root are the same path, an interactive command asks before the NFS mount can hide existing client files; y continues, while n or Enter cancels. Those local files remain underneath and reappear after unmount. `--overlay-existing` confirms this explicitly for non-interactive setup. Use it for shared tool directories such as Homebrew only when the login node's copy should take priority. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share.\n\nRemove nodes and shares\n  `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources.\n\nController maintenance\n  Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
+    "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -l | --list\n       mnode --failed\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nAdd nodes\n  Nodes enter the configured cluster after setup verification. Failed attempts stay outside the node list; use --failed to inspect their errors and retry the original command. Registered nodes show READY when the Agent, config, and shares are healthy; ONLINE when the Agent responds but health checks are incomplete; OFFLINE when the Agent does not respond. SSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues.\n\nShares\n  `local` adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. When SOURCE_PATH and --mount-root are the same path, an interactive command asks before the NFS mount can hide existing client files; y continues, while n or Enter cancels. Those local files remain underneath and reappear after unmount. `--overlay-existing` confirms this explicitly for non-interactive setup. Use it for shared tool directories such as Homebrew only when the login node's copy should take priority. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share.\n\nRemove nodes and shares\n  `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources.\n\nController maintenance\n  Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
 }
 
 fn read_config(path: &Path) -> AppResult<ClusterConfig> {
@@ -4822,6 +4822,7 @@ fn persistent_mount_batch_script_with_binary(
             binary,
             &request.source,
             &request.mount_root,
+            &request.share_uuid,
             execution_uid,
             request.allow_existing_contents,
         ));
@@ -4879,60 +4880,6 @@ fn mount_batch_rollback_script(requests: &[ClientMountRequest]) -> String {
     script
 }
 
-fn may_replace_unreadable_overlay_mount(error: &str, allow_existing_contents: bool) -> bool {
-    let error = error.to_ascii_lowercase();
-    allow_existing_contents
-        && (error.contains("node transport timed out")
-            || error.contains("stale nfs file handle")
-            || error.contains("resource temporarily unavailable")
-            || error.contains("interrupted system call")
-            || error.contains("input/output error"))
-}
-
-fn detach_stale_overlay_mount(mount: &NfsMount) -> Result<(), String> {
-    let table = local_mount_table()?;
-    match named_share_mount_status(&table, &mount.source, &mount.target) {
-        NamedShareMountStatus::NotMounted => return Ok(()),
-        NamedShareMountStatus::Expected => {}
-        NamedShareMountStatus::MountedElsewhere(source) => {
-            return Err(format!(
-                "mount point {} changed to {source}; refusing to replace it",
-                mount.target
-            ));
-        }
-    }
-    let mut command = Command::new("/usr/sbin/diskutil");
-    command.args(["unmount", "force", &mount.target]);
-    let output = run_child(command, None, Duration::from_secs(30))
-        .map_err(|(_, error)| format!("cannot detach stale NFS mount {}: {error}", mount.target))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot detach stale NFS mount {}: {}",
-            mount.target,
-            command_error("force unmount failed", &output)
-        ));
-    }
-    let table = local_mount_table()?;
-    match named_share_mount_status(&table, &mount.source, &mount.target) {
-        NamedShareMountStatus::NotMounted => Ok(()),
-        NamedShareMountStatus::Expected => Err(format!(
-            "stale NFS mount {} is still active after unmount",
-            mount.target
-        )),
-        NamedShareMountStatus::MountedElsewhere(source) => Err(format!(
-            "mount point {} changed to {source} during stale mount cleanup",
-            mount.target
-        )),
-    }
-}
-
-fn verify_nfs_unmount_marker(
-    force: bool,
-    verify_marker: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
-    if force { Ok(()) } else { verify_marker() }
-}
-
 /// Entry point for the root-owned CLI copy invoked by the authenticated helper socket.
 pub(crate) fn apply_privileged_nfs_admin_request(
     request: NfsAdminRequest,
@@ -4950,7 +4897,7 @@ pub(crate) fn apply_privileged_nfs_admin_request(
                 mounts,
                 aliases,
                 force,
-            } => apply_privileged_nfs_unmounts(&mounts, &aliases, force, peer_uid),
+            } => apply_privileged_nfs_unmounts(&mounts, &aliases, force),
             NfsAdminOperation::RemoveMarker {
                 source_root,
                 share_uuid,
@@ -4987,25 +4934,11 @@ fn apply_privileged_nfs_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(),
     for mount in mounts {
         let target = PathBuf::from(&mount.target);
         let needs_mount = match named_share_mount_status(&table, &mount.source, &mount.target) {
-            NamedShareMountStatus::Expected => {
-                match verify_local_share_marker(&target, &mount.share_uuid, peer_uid) {
-                    Ok(()) => false,
-                    Err(error)
-                        if may_replace_unreadable_overlay_mount(
-                            &error,
-                            mount.allow_existing_contents,
-                        ) =>
-                    {
-                        // A prior interrupted attempt may leave this exact source
-                        // mounted after its export or marker was rolled back. Only
-                        // replace an explicitly overlaid mount after rechecking
-                        // that its source and target still match the request.
-                        detach_stale_overlay_mount(mount)?;
-                        true
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            // The registration flow verifies the UUID on the source server
+            // over SSH. The root helper trusts that request and the exact
+            // source/target mount record; it must not read NFS data, which can
+            // be denied to background helpers by macOS TCC.
+            NamedShareMountStatus::Expected => false,
             NamedShareMountStatus::NotMounted => {
                 validate_local_mount_target(&target, mount.allow_existing_contents)?;
                 true
@@ -5038,9 +4971,8 @@ fn apply_privileged_nfs_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(),
     for mount in mounts {
         match named_share_mount_status(&table, &mount.source, &mount.target) {
             NamedShareMountStatus::Expected => {
-                // The mount script already verified the marker while installing
-                // recovery; existing mounts were verified before the script.
-                // Avoid a second potentially blocking NFS read here.
+                // The helper has persisted the UUID from the validated request
+                // in its root-owned recovery manifest. Avoid NFS file reads.
                 if let Some(alias) = &mount.alias {
                     verify_local_share_alias(Path::new(alias), Path::new(&mount.target))?;
                 }
@@ -5063,17 +4995,12 @@ fn apply_privileged_nfs_unmounts(
     mounts: &[NfsMount],
     aliases: &[NfsAlias],
     force: bool,
-    peer_uid: u32,
 ) -> Result<(), String> {
     let table = local_mount_table()?;
     let mut requests = Vec::with_capacity(mounts.len());
     for mount in mounts {
         match named_share_mount_status(&table, &mount.source, &mount.target) {
-            NamedShareMountStatus::Expected => {
-                verify_nfs_unmount_marker(force, || {
-                    verify_local_share_marker(Path::new(&mount.target), &mount.share_uuid, peer_uid)
-                })?;
-            }
+            NamedShareMountStatus::Expected => {}
             NamedShareMountStatus::NotMounted => {}
             NamedShareMountStatus::MountedElsewhere(source) => {
                 return Err(format!(
@@ -5234,21 +5161,6 @@ fn validate_local_mount_target(target: &Path, allow_existing_contents: bool) -> 
         }
     }
     Ok(())
-}
-
-fn verify_local_share_marker(
-    target: &Path,
-    expected_uuid: &str,
-    peer_uid: u32,
-) -> Result<(), String> {
-    let marker = target.join(".macluster-share-id");
-    if verify_share_marker_with(target, expected_uuid, |path| {
-        crate::nfs_recovery::read_share_marker(path, peer_uid)
-    })? {
-        Ok(())
-    } else {
-        Err(format!("NFS share marker {} is missing", marker.display()))
-    }
 }
 
 fn verify_local_share_alias(alias: &Path, target: &Path) -> Result<(), String> {
@@ -9488,12 +9400,26 @@ fn probe_node_list(
     };
     let mut transport =
         ClusterTransport::new_with_namespace(config_path.to_path_buf(), namespace.to_owned());
-    transport.timeout = Duration::from_secs(8);
+    // Health walks configured share paths. A local disk or NFS mount can
+    // block that walk, so bound it and use the storage-independent Ping as a
+    // fallback before declaring an otherwise reachable node offline.
+    transport.timeout = Duration::from_secs(4);
     match transport.call(&node_id, node, Operation::Health) {
         Ok(ResponseBody::Health(health)) => (Some(health), true),
         // An Agent rejection also proves the authenticated bridge answered.
         Ok(_) | Err(macluster_controller::transport::TransportError::Remote(_)) => (None, true),
-        // Repeating Ping/node-check after a transport failure only repeats the timeout.
+        Err(macluster_controller::transport::TransportError::Timeout) => {
+            transport.timeout = Duration::from_secs(4);
+            match transport.call(&node_id, node, Operation::Ping) {
+                Ok(_) | Err(macluster_controller::transport::TransportError::Remote(_)) => {
+                    (None, true)
+                }
+                // A malformed Agent response still proves that the bridge answered.
+                Err(macluster_controller::transport::TransportError::Protocol(_)) => (None, true),
+                Err(_) => (None, false),
+            }
+        }
+        Err(macluster_controller::transport::TransportError::Protocol(_)) => (None, true),
         Err(_) => (None, false),
     }
 }
@@ -9569,6 +9495,8 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
         });
         let state_name = if digest_matches && all_shares_ready && bridge_online {
             "READY"
+        } else if bridge_online {
+            "ONLINE"
         } else {
             "OFFLINE"
         };
@@ -13354,7 +13282,6 @@ mod tests {
         reset_admin_operations, reset_node_from_endpoint, resume_existing_ssh_add_sync,
         save_admin_state, should_resume_add_operation, shutdown_confirmation_accepted,
         update_recovery, validate_pending_node_identity, validate_storage_root_access,
-        verify_local_share_marker,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -13937,6 +13864,9 @@ exec "$@"
             script.contains("nfs-recovery install") && script.contains("--overlay-existing"),
             "persistent recovery must remember explicit overlay consent: {script}"
         );
+        assert!(script.contains(
+            "nfs-recovery install '192.0.2.1:/opt/homebrew' '/opt/homebrew' '00000000-0000-4000-8000-000000000001' 501 --overlay-existing"
+        ));
     }
 
     #[test]
@@ -14028,30 +13958,6 @@ exec "$@"
             "failed setup left its NFS mount attached"
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unreadable_exact_overlay_mount_can_be_replaced_but_uuid_mismatch_cannot() {
-        assert!(super::may_replace_unreadable_overlay_mount(
-            "cannot read NFS share marker: node transport timed out",
-            true
-        ));
-        assert!(!super::may_replace_unreadable_overlay_mount(
-            "cannot read NFS share marker: node transport timed out",
-            false
-        ));
-        assert!(!super::may_replace_unreadable_overlay_mount(
-            "NFS share marker does not match",
-            true
-        ));
-        assert!(super::may_replace_unreadable_overlay_mount(
-            "Stale NFS file handle",
-            true
-        ));
-        assert!(super::may_replace_unreadable_overlay_mount(
-            "Interrupted system call",
-            true
-        ));
     }
 
     #[test]
@@ -14198,22 +14104,6 @@ exec "$@"
     }
 
     #[test]
-    fn forced_unmount_skips_a_blocked_nfs_marker_read() {
-        let mut marker_was_read = false;
-        super::verify_nfs_unmount_marker(true, || {
-            marker_was_read = true;
-            Err("stale NFS marker read timed out".into())
-        })
-        .expect("force cleanup must rely on the exact mount source and target");
-        assert!(!marker_was_read);
-
-        let error =
-            super::verify_nfs_unmount_marker(false, || Err("NFS marker identity mismatch".into()))
-                .expect_err("normal cleanup must verify the marker");
-        assert!(error.contains("identity mismatch"));
-    }
-
-    #[test]
     fn privileged_marker_removal_requires_the_exact_regular_marker() {
         let root = test_exports_path();
         fs::create_dir_all(&root).expect("create temporary marker root");
@@ -14320,24 +14210,6 @@ exec "$@"
 
         assert!(!output.status.success());
         let error = String::from_utf8_lossy(&output.stderr);
-        assert!(mount_point_permission_error(&error), "{error}");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cleanup_marker_permission_failure_is_reported_for_admin_retry() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = test_exports_path();
-        let mount_root = root.join("protected-mount");
-        fs::create_dir_all(&mount_root).unwrap();
-        fs::write(mount_root.join(".macluster-share-id"), "share-uuid").unwrap();
-        fs::set_permissions(&mount_root, fs::Permissions::from_mode(0o000)).unwrap();
-        let peer_uid = unsafe { libc::geteuid() as u32 };
-        let error = verify_local_share_marker(&mount_root, "share-uuid", peer_uid)
-            .expect_err("inaccessible marker preflight must stop unmount");
-        fs::set_permissions(&mount_root, fs::Permissions::from_mode(0o700)).unwrap();
-
         assert!(mount_point_permission_error(&error), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
@@ -17401,6 +17273,10 @@ ssh_port = 22
         assert!(
             !super::nfs_admin_cli_revision_at_least("nfs-admin-7", super::NFS_ADMIN_CLI_REVISION),
             "the changed root NFS CLI must force a refresh of existing nfs-admin-7 installations"
+        );
+        assert!(
+            !super::nfs_admin_cli_revision_at_least("nfs-admin-8", super::NFS_ADMIN_CLI_REVISION),
+            "the changed root NFS CLI must refresh the currently installed nfs-admin-8"
         );
         assert!(super::nfs_admin_cli_revision_at_least(
             "nfs-admin-7",

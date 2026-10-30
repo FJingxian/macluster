@@ -16,7 +16,7 @@ const ROOT: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs";
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-5";
+const SERVICE_VERSION: &str = "nfs-recovery-7";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -91,6 +91,7 @@ pub(crate) fn install_script(
     binary: &str,
     source: &str,
     target: &Path,
+    uuid: &str,
     execution_uid: Option<u32>,
     allow_existing_contents: bool,
 ) -> String {
@@ -99,10 +100,11 @@ pub(crate) fn install_script(
         .map(|uid| uid.to_string())
         .unwrap_or_else(|| "${SUDO_UID:?missing execution UID}".into());
     format!(
-        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\n/usr/bin/install -o root -g wheel -m 700 {} {dir}/macluster.next\n/bin/mv -f {dir}/macluster.next {dir}/macluster\n{dir}/macluster internal nfs-recovery install {} {} {uid}{}\n",
+        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\n/usr/bin/install -o root -g wheel -m 700 {} {dir}/macluster.next\n/bin/mv -f {dir}/macluster.next {dir}/macluster\n{dir}/macluster internal nfs-recovery install {} {} {} {uid}{}\n",
         quote(binary),
         quote(source),
         quote(&target.to_string_lossy()),
+        quote(uuid),
         if allow_existing_contents {
             " --overlay-existing"
         } else {
@@ -265,19 +267,6 @@ fn nfs_mount_is_not_responding(output: &str, target: &Path) -> bool {
     }
     false
 }
-fn retryable_nfs_io_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "interrupted system call",
-        "stale nfs file handle",
-        "resource temporarily unavailable",
-        "input/output error",
-        "node transport timed out",
-        "not responding",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
-}
 fn ensure_mount(
     source: &str,
     target: &Path,
@@ -289,13 +278,159 @@ fn ensure_mount(
         return Ok(());
     }
     safe_mount_target(target, allow_existing_contents)?;
-    execute(
+    let attempt = execute(
         "/sbin/mount_nfs",
         &["-o", "resvport", source, &target.to_string_lossy()],
-    )?;
+    );
+    if let Err(error) = attempt {
+        if !is_mount_busy_error(&error) {
+            return Err(error);
+        }
+
+        // The kernel may retain a stale vnode for an empty, unmounted local
+        // mountpoint after an earlier NFS failure. Only repair that narrow
+        // case; never remove a mount, local data, or a directory in use.
+        if expected(source, target, &execute("/sbin/mount", &[])?)? {
+            return Ok(());
+        }
+        recreate_empty_mountpoint(source, target, execute)?;
+        if expected(source, target, &execute("/sbin/mount", &[])?)? {
+            return Ok(());
+        }
+        execute(
+            "/sbin/mount_nfs",
+            &["-o", "resvport", source, &target.to_string_lossy()],
+        )
+        .map_err(|retry_error| {
+            format!(
+                "NFS mount remained busy after safely recreating the empty mountpoint: {retry_error}"
+            )
+        })?;
+    }
     if !expected(source, target, &execute("/sbin/mount", &[])?)? {
         return Err("NFS mount did not appear after recovery".into());
     }
+    Ok(())
+}
+fn is_mount_busy_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ["resource busy", "device busy", "mount point is busy"]
+        .iter()
+        .any(|needle| error.contains(needle))
+}
+fn recreate_empty_mountpoint(
+    source: &str,
+    target: &Path,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
+) -> Result<(), String> {
+    use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+    // Check again immediately before touching the directory. A mount that
+    // appeared since the prior check must be left alone.
+    if expected(source, target, &execute("/sbin/mount", &[])?)? {
+        return Ok(());
+    }
+    safe_mount_target(target, true)?;
+    let mut entries = fs::read_dir(target).map_err(|error| error.to_string())?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(format!(
+            "cannot repair busy mount point {} because it contains local files; preserving them",
+            target.display()
+        ));
+    }
+    // Close the directory descriptor before lsof; otherwise the recovery
+    // process would report its own read_dir handle as a user of the path.
+    drop(entries);
+
+    let target_arg = target.to_string_lossy();
+    match execute("/usr/sbin/lsof", &["-nP", "-t", &target_arg]) {
+        Ok(output) if output.trim().is_empty() => {}
+        Err(error) if error.trim().is_empty() => {}
+        Ok(_) => {
+            return Err(format!(
+                "cannot repair busy mount point {} because it is in use by a process",
+                target.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot verify whether a process is using mount point {}: {error}",
+                target.display()
+            ));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(target).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("unsafe mount path {}", target.display()));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("mount point has no parent: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| {
+            format!(
+                "mount point has no final path component: {}",
+                target.display()
+            )
+        })?
+        .to_string_lossy();
+    let backup = parent.join(format!(".{name}.macluster-stale-{}", Id128::random()));
+
+    fs::rename(target, &backup).map_err(|error| {
+        format!(
+            "cannot move stale empty mount point {} aside: {error}",
+            target.display()
+        )
+    })?;
+    if let Err(create_error) = fs::create_dir(target) {
+        if let Err(restore_error) = fs::rename(&backup, target) {
+            return Err(format!(
+                "cannot recreate mount point {} ({create_error}); original empty directory remains at {} because restore failed: {restore_error}",
+                target.display(),
+                backup.display()
+            ));
+        }
+        return Err(format!(
+            "cannot recreate mount point {}: {create_error}",
+            target.display()
+        ));
+    }
+
+    let path = std::ffi::CString::new(target.as_os_str().as_bytes())
+        .map_err(|error| format!("invalid mount path: {error}"))?;
+    if unsafe { libc::chown(path.as_ptr(), metadata.uid(), metadata.gid()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = fs::remove_dir(target);
+        let _ = fs::rename(&backup, target);
+        return Err(format!(
+            "cannot preserve ownership for recreated mount point {}: {error}",
+            target.display()
+        ));
+    }
+    if let Err(error) =
+        fs::set_permissions(target, fs::Permissions::from_mode(metadata.mode() & 0o7777))
+    {
+        let _ = fs::remove_dir(target);
+        let _ = fs::rename(&backup, target);
+        return Err(format!(
+            "cannot preserve permissions for recreated mount point {}: {error}",
+            target.display()
+        ));
+    }
+    fs::remove_dir(&backup).map_err(|error| {
+        format!(
+            "recreated mount point {} but could not remove its empty stale directory {}: {error}",
+            target.display(),
+            backup.display()
+        )
+    })?;
     Ok(())
 }
 fn force_refresh_mount(
@@ -353,15 +488,6 @@ fn refresh_if_not_responding(
     force_refresh_mount(source, target, allow_existing_contents, execute)?;
     Ok(true)
 }
-fn marker(target: &Path, uid: u32) -> Result<String, String> {
-    read_share_marker(target, uid)?.ok_or_else(|| {
-        format!(
-            "NFS share marker {} is missing",
-            target.join(".macluster-share-id").display()
-        )
-    })
-}
-
 /// Read a share marker as the owning account. These paths can be NFS mounts;
 /// never read them directly in the privileged process because a stalled NFS
 /// filesystem can block that process in the kernel indefinitely.
@@ -517,10 +643,9 @@ fn install_manifest_matches_endpoint(
     target: &Path,
 ) -> Result<(), String> {
     if old.source == source && old.target == target {
-        // The share marker for the requested UUID was verified over the new
-        // mount before this check. A retry may have generated a fresh UUID
-        // after an earlier setup was aborted, so the same source/target may
-        // replace its stale recovery identity.
+        // Enrollment verifies the UUID on the NFS source over SSH. A root
+        // LaunchDaemon must not read file data through the NFS mount: macOS
+        // TCC can deny background access and trigger repeated remounts.
         Ok(())
     } else {
         Err("another share owns this NFS recovery target; remove it first".into())
@@ -619,34 +744,6 @@ fn recover_mount(
         manifest.allow_existing_contents,
         &mut execute,
     )?;
-    match verify_recovered_marker(target, &manifest.uuid, &mut execute) {
-        Ok(()) => Ok(()),
-        Err(error) if retryable_nfs_io_error(&error) => {
-            force_refresh_mount(
-                &manifest.source,
-                target,
-                manifest.allow_existing_contents,
-                &mut execute,
-            )?;
-            verify_recovered_marker(target, &manifest.uuid, &mut execute)
-        }
-        Err(error) => Err(error),
-    }
-}
-fn verify_recovered_marker(
-    target: &Path,
-    expected_uuid: &str,
-    execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
-) -> Result<(), String> {
-    let marker = target.join(".macluster-share-id");
-    if execute("/usr/bin/stat", &["-f", "%HT", &marker.to_string_lossy()])?.trim() != "Regular File"
-    {
-        return Err("NFS share marker must be a regular file".into());
-    }
-    let actual = execute("/bin/cat", &[&marker.to_string_lossy()])?;
-    if actual.trim() != expected_uuid {
-        return Err("restored NFS share identity does not match authorization".into());
-    }
     Ok(())
 }
 
@@ -661,7 +758,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let action = args.first().map(String::as_str).unwrap_or("");
     let target = match (action, args.len()) {
         ("recover", 2) => Path::new(&args[1]),
-        ("install", 4 | 5) | ("remove", 4) => Path::new(&args[2]),
+        ("install", 5 | 6) | ("remove", 4) => Path::new(&args[2]),
         ("refresh", 5 | 6) => Path::new(&args[2]),
         _ => return Err("invalid internal NFS recovery arguments".into()),
     };
@@ -673,34 +770,27 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     let manifest_path = dir.join("manifest.json");
     match action {
         "install" => {
-            let allow_existing_contents = match args.get(4).map(String::as_str) {
+            let allow_existing_contents = match args.get(5).map(String::as_str) {
                 None => false,
                 Some("--overlay-existing") => true,
                 Some(_) => return Err("invalid NFS recovery overlay option".into()),
             };
             let source = &args[1];
+            let uuid = Id128::parse(&args[3])
+                .map_err(|error| format!("invalid NFS recovery share UUID: {error}"))?
+                .to_string();
             if !expected(source, target, &mount_table()?)? {
                 return Err("cannot authorize recovery before the NFS mount is verified".into());
             }
-            let execution_uid = args[3]
+            let execution_uid = args[4]
                 .parse::<u32>()
                 .map_err(|_| "invalid NFS recovery execution UID".to_owned())?;
-            let mut execute = |program: &str, arguments: &[&str]| {
-                if matches!(program, "/bin/cat" | "/usr/bin/stat") {
-                    bounded_as_user(program, arguments, execution_uid)
-                } else {
-                    bounded(program, arguments)
-                }
-            };
-            refresh_if_not_responding(source, target, allow_existing_contents, &mut execute)?;
-            let uuid = match marker(target, execution_uid) {
-                Ok(uuid) => uuid,
-                Err(error) if retryable_nfs_io_error(&error) => {
-                    force_refresh_mount(source, target, allow_existing_contents, &mut execute)?;
-                    marker(target, execution_uid)?
-                }
-                Err(error) => return Err(error),
-            };
+            refresh_if_not_responding(
+                source,
+                target,
+                allow_existing_contents,
+                &mut |program, args| bounded(program, args),
+            )?;
             if manifest_path.exists() {
                 let old: Manifest =
                     serde_json::from_slice(&fs::read(&manifest_path).map_err(|e| e.to_string())?)
@@ -961,7 +1051,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert!(version.starts_with("nfs-recovery-"));
+        assert_eq!(version, "nfs-recovery-7");
     }
 
     #[test]
@@ -980,6 +1070,32 @@ mod tests {
         assert!(script.contains("00000000-0000-4000-8000-000000000001"));
         assert!(script.contains("macluster.next"));
         let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[test]
+    fn install_script_passes_the_source_validated_uuid_to_recovery() {
+        let script = install_script(
+            "/Users/operator/.local/bin/macluster",
+            "192.0.2.1:/tools",
+            Path::new("/Users/Shared/tools"),
+            "00000000-0000-4000-8000-000000000001",
+            Some(501),
+            false,
+        );
+
+        assert!(script.contains(
+            "internal nfs-recovery install '192.0.2.1:/tools' '/Users/Shared/tools' '00000000-0000-4000-8000-000000000001' 501"
+        ));
+        assert!(!script.contains("/bin/cat"));
+        let syntax = Command::new("/bin/sh")
             .args(["-n", "-c", &script])
             .output()
             .unwrap();
@@ -1207,6 +1323,194 @@ mod tests {
     }
 
     #[test]
+    fn busy_empty_mountpoint_is_recreated_and_mount_is_retried_once() {
+        use std::os::unix::fs::MetadataExt;
+
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-busy-mountpoint-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let original_metadata = fs::metadata(&target).unwrap();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: unsafe { libc::geteuid() as u32 },
+            allow_existing_contents: false,
+        };
+        let mut mounted = false;
+        let mut mount_attempts = 0;
+        let result = recover_mount(&manifest, |program, _args| match program {
+            "/sbin/mount" => Ok(if mounted {
+                format!("{} on {} (nfs)\n", manifest.source, target.display())
+            } else {
+                String::new()
+            }),
+            "/sbin/mount_nfs" => {
+                mount_attempts += 1;
+                if mount_attempts == 1 {
+                    Err("mount_nfs: Resource busy".into())
+                } else {
+                    mounted = true;
+                    Ok(String::new())
+                }
+            }
+            "/usr/sbin/lsof" => Ok(String::new()),
+            "/usr/bin/nfsstat" => Ok(format!(
+                "{} from {}\n  -- Current mount parameters:\n     Status flags: 0x0\n",
+                target.display(),
+                manifest.source
+            )),
+            _ => panic!("unexpected command {program}"),
+        });
+
+        assert!(
+            result.is_ok(),
+            "busy mountpoint recovery failed: {result:?}"
+        );
+        assert_eq!(mount_attempts, 2, "recovery must retry exactly once");
+        let recreated_metadata = fs::metadata(&target).unwrap();
+        assert_ne!(
+            recreated_metadata.ino(),
+            original_metadata.ino(),
+            "the stale empty mountpoint directory must be replaced"
+        );
+        assert_eq!(recreated_metadata.uid(), original_metadata.uid());
+        assert_eq!(recreated_metadata.gid(), original_metadata.gid());
+        assert_eq!(
+            recreated_metadata.mode() & 0o7777,
+            original_metadata.mode() & 0o7777
+        );
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn busy_mountpoint_with_local_files_is_preserved_without_retry() {
+        use std::os::unix::fs::MetadataExt;
+
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-busy-data-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let local_file = target.join("keep.txt");
+        fs::write(&local_file, b"user data").unwrap();
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: unsafe { libc::geteuid() as u32 },
+            allow_existing_contents: true,
+        };
+        let mut mount_attempts = 0;
+        let error =
+            ensure_mount(
+                &manifest.source,
+                &target,
+                true,
+                &mut |program, _args| match program {
+                    "/sbin/mount" => Ok(String::new()),
+                    "/sbin/mount_nfs" => {
+                        mount_attempts += 1;
+                        Err("mount_nfs: Resource busy".into())
+                    }
+                    "/usr/sbin/lsof" => Ok(String::new()),
+                    _ => panic!("unexpected command {program}"),
+                },
+            )
+            .expect_err("recovery must not replace a mountpoint containing local files");
+
+        assert!(error.contains("contains local files"), "{error}");
+        assert_eq!(mount_attempts, 1);
+        assert_eq!(fs::read(&local_file).unwrap(), b"user data");
+        assert_eq!(fs::metadata(&target).unwrap().ino(), original_inode);
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
+    fn busy_mountpoint_used_by_a_process_is_not_recreated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-busy-process-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        let source = "192.0.2.1:/data";
+        let mut mount_attempts = 0;
+        let error = ensure_mount(
+            source,
+            &target,
+            false,
+            &mut |program, _args| match program {
+                "/sbin/mount" => Ok(String::new()),
+                "/sbin/mount_nfs" => {
+                    mount_attempts += 1;
+                    Err("mount_nfs: Resource busy".into())
+                }
+                "/usr/sbin/lsof" => Ok("worker 123 user cwd DIR 1,1 64 2 /target\n".into()),
+                _ => panic!("unexpected command {program}"),
+            },
+        )
+        .expect_err("recovery must not replace a mountpoint held open by a process");
+
+        assert!(error.contains("in use"), "{error}");
+        assert_eq!(mount_attempts, 1);
+        assert_eq!(fs::metadata(&target).unwrap().ino(), original_inode);
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn busy_mountpoint_that_becomes_a_foreign_mount_is_preserved() {
+        use std::os::unix::fs::MetadataExt;
+
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-busy-foreign-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let original_inode = fs::metadata(&target).unwrap().ino();
+        let source = "192.0.2.1:/expected";
+        let mut mount_checks = 0;
+        let mut mount_attempts = 0;
+        let mut lsof_called = false;
+        let error = ensure_mount(
+            source,
+            &target,
+            false,
+            &mut |program, _args| match program {
+                "/sbin/mount" => {
+                    mount_checks += 1;
+                    Ok(if mount_checks == 1 {
+                        String::new()
+                    } else {
+                        format!("192.0.2.9:/foreign on {} (nfs)\n", target.display())
+                    })
+                }
+                "/sbin/mount_nfs" => {
+                    mount_attempts += 1;
+                    Err("mount_nfs: Resource busy".into())
+                }
+                "/usr/sbin/lsof" => {
+                    lsof_called = true;
+                    Ok(String::new())
+                }
+                _ => panic!("unexpected command {program}"),
+            },
+        )
+        .expect_err("a foreign mount must be treated as a conflict");
+
+        assert!(error.contains("mount conflict"), "{error}");
+        assert_eq!(mount_attempts, 1);
+        assert!(!lsof_called);
+        assert_eq!(fs::metadata(&target).unwrap().ino(), original_inode);
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
     fn nfsstat_unresponsive_status_matches_the_requested_mount_only() {
         let output = concat!(
             "/Users/Shared/macluster from 192.0.2.1:/Users/Shared/macluster\n",
@@ -1302,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_remounts_the_exact_share_after_a_transient_marker_read_error() {
+    fn healthy_recovery_does_not_read_markers_or_recycle_the_mount() {
         let target = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -1357,9 +1661,9 @@ mod tests {
         });
 
         assert!(result.is_ok(), "recovery failed: {result:?}");
-        assert_eq!(unmounts, 1);
-        assert_eq!(mount_attempts, 1);
-        assert_eq!(marker_reads, 2);
+        assert_eq!(unmounts, 0, "a healthy mount must not be force-unmounted");
+        assert_eq!(mount_attempts, 0, "a healthy mount must not be remounted");
+        assert_eq!(marker_reads, 0, "LaunchDaemons must not read NFS files");
         fs::remove_dir(target).unwrap();
     }
 

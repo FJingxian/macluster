@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossterm",
  "libc",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-power-helper"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "macluster-protocol",

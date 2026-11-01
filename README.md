@@ -36,13 +36,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the PATH line to your shell configuration. To distribute the app, copy only `target/release/macluster`; the power/fan helper is embedded. Rust and Python are not required to run macluster. Use a binary supporting the target Mac's CPU architecture.
 
-Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, and `mnode` aliases.
+Copying the binary alone provides `macluster SUBCOMMAND`. Short commands such as `mtop` are symlinks created by the installer. For a downloaded binary, run `packaging/scripts/install-user.sh /path/to/macluster "$HOME/.local/bin"`, then add that directory to `PATH`.
+
+Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, `mnode`, and `mfans` command aliases. Controller commands remain available for manual service maintenance but are omitted from the main help.
 
 ## Start a cluster
 
 ```sh
 # Run on the login Mac. Setup is interactive.
-macluster init --name home --queue default --shared-root /Users/Shared/macluster
+macluster --init --name home --queue default --shared-root /Users/Shared/macluster
 
 # Replace the SSH account and address with your compute Mac.
 macluster node -a worker@192.0.2.10
@@ -138,14 +140,14 @@ Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected f
 ```sh
 macluster top                                  # Terminal dashboard
 macluster top --once                           # One-shot table
-macluster controller run --web                 # Local browser dashboard
+macluster --web 127.0.0.1:8080                 # Local browser dashboard
 ```
 
 In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast preview, then replace it with interval samples. The preview labels its average CPU and RSS memory.
 
 CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, temperature, fan, and power readings depend on hardware/helper support; unavailable readings show `N/A`.
 
-The browser monitor is read-only and listens on `127.0.0.1`. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart.
+The browser monitor is read-only and listens on `127.0.0.1`; `--web` currently accepts loopback addresses only. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart. `mqueue` is also available as `macluster queue`.
 
 ## Maintenance
 

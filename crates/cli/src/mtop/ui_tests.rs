@@ -273,11 +273,18 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
         used_bytes: 128 * 1024_u64.pow(3),
         total_bytes: 512 * 1024_u64.pow(3),
     });
-    snapshot.external_disk_capacities = vec![macluster_protocol::types::DiskCapacity {
-        mount_point: "/Volumes/archive".into(),
-        used_bytes: 2 * 1024_u64.pow(4),
-        total_bytes: 4 * 1024_u64.pow(4),
-    }];
+    snapshot.external_disk_capacities = vec![
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/Recovery".into(),
+            used_bytes: 128 * 1024_u64.pow(3),
+            total_bytes: 512 * 1024_u64.pow(3),
+        },
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/archive".into(),
+            used_bytes: 2 * 1024_u64.pow(4),
+            total_bytes: 4 * 1024_u64.pow(4),
+        },
+    ];
     let mut state = AppState::empty("mini01");
     state.selected_id = Some("mini01-a".into());
     state.nodes.push(super::ui::UiNode {
@@ -327,6 +334,25 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
         details.contains("EXT archive 2.0/4.0 TiB"),
         "details: {details}"
     );
+    assert!(!details.contains("EXT Recovery"), "details: {details}");
+
+    if let MetricView::Available { snapshot, .. } = &mut state.nodes[0].metrics {
+        snapshot.external_disk_capacities[0].used_bytes = 64 * 1024_u64.pow(3);
+        snapshot.external_disk_capacities[0].total_bytes = 256 * 1024_u64.pow(3);
+    }
+    let distinct_recovery = rendered_lines(160, 40, &state).join("\n");
+    assert!(
+        !distinct_recovery.contains("EXT Recovery"),
+        "{distinct_recovery}"
+    );
+
+    if let MetricView::Available { snapshot, .. } = &mut state.nodes[0].metrics {
+        snapshot.system_disk_capacity = None;
+    }
+    state.nodes[0].identity.role = NodeRole::Login;
+    let login_details = rendered_lines(160, 40, &state).join("\n");
+    assert!(!login_details.contains("EXT Recovery"), "{login_details}");
+    assert!(login_details.contains("EXT archive"), "{login_details}");
 }
 
 #[test]
@@ -1002,11 +1028,18 @@ fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tal
         used_bytes: 128 * 1024_u64.pow(3),
         total_bytes: 512 * 1024_u64.pow(3),
     });
-    snapshot.external_disk_capacities = vec![macluster_protocol::types::DiskCapacity {
-        mount_point: "/Volumes/archive".into(),
-        used_bytes: 2 * 1024_u64.pow(4),
-        total_bytes: 4 * 1024_u64.pow(4),
-    }];
+    snapshot.external_disk_capacities = vec![
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/archive".into(),
+            used_bytes: 2 * 1024_u64.pow(4),
+            total_bytes: 4 * 1024_u64.pow(4),
+        },
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/data".into(),
+            used_bytes: 3 * 1024_u64.pow(3),
+            total_bytes: 8 * 1024_u64.pow(3),
+        },
+    ];
     let mut state = AppState::empty("mini01");
     state.selected_id = Some("mini01-c".into());
     state.expanded = true;
@@ -1034,6 +1067,15 @@ fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tal
 
     assert!(tall.contains("SYS DISK 128.0/512.0 GiB"), "{tall}");
     assert!(tall.contains("EXT archive 2.0/4.0 TiB"), "{tall}");
+    let external_disk_lines = tall
+        .lines()
+        .filter(|line| line.contains("EXT "))
+        .collect::<Vec<_>>();
+    assert_eq!(external_disk_lines.len(), 1, "{tall}");
+    assert!(
+        external_disk_lines[0].contains("EXT archive 2.0/4.0 TiB · data 3.0/8.0 GiB"),
+        "{tall}"
+    );
     assert!(short.contains("SYS DISK 128.0/512.0 GiB"), "{short}");
     assert!(!short.contains("EXT archive"), "{short}");
 }

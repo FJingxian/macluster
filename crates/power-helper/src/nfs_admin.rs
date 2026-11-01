@@ -471,8 +471,7 @@ mod tests {
 
     #[test]
     fn expected_mount_requires_exact_source_target_and_nfs_filesystem() {
-        let expected =
-            "192.0.2.1:/Users/Shared/data on /Users/Shared/data (nfs, nodev, nosuid)\n";
+        let expected = "192.0.2.1:/Users/Shared/data on /Users/Shared/data (nfs, nodev, nosuid)\n";
         assert_eq!(
             classify_mount(
                 expected,

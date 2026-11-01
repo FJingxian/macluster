@@ -60,8 +60,9 @@ fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
 }
 
 pub(crate) fn publish_verbose(dir: &Path, token: &str, sample: &impl Serialize) {
-    // Telemetry failure must not fail or delay the workload. One bounded local
-    // overwrite per five-second verbose sample, never a shared NFS write.
+    // Telemetry failure must not fail or delay the workload. Output-driven
+    // verbose samples overwrite one bounded local file at most twice per
+    // second, with a five-second idle fallback; this is never a shared NFS write.
     let _ = write_json(
         &dir.join("resource-verbose.json"),
         &serde_json::json!({"start_token":token,"sample":sample}),

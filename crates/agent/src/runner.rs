@@ -843,6 +843,48 @@ struct TaskResult {
     reason: Option<String>,
 }
 
+const TASK_RESOURCE_OUTPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
+const TASK_RESOURCE_FALLBACK_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+struct TaskResourceSampling {
+    last_sample_at: Instant,
+    next_fallback_at: Instant,
+    first_output_sample_pending: bool,
+}
+
+impl TaskResourceSampling {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_sample_at: now,
+            next_fallback_at: now + TASK_RESOURCE_FALLBACK_SAMPLE_INTERVAL,
+            first_output_sample_pending: true,
+        }
+    }
+
+    fn baseline_sampled(&mut self, now: Instant) {
+        self.record_sample(now);
+    }
+
+    fn should_sample(&mut self, now: Instant, output_changed: bool) -> bool {
+        let output_due = output_changed
+            && (self.first_output_sample_pending
+                || now.saturating_duration_since(self.last_sample_at)
+                    >= TASK_RESOURCE_OUTPUT_SAMPLE_INTERVAL);
+        if output_due || now >= self.next_fallback_at {
+            self.first_output_sample_pending = false;
+            self.record_sample(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_sample(&mut self, now: Instant) {
+        self.last_sample_at = now;
+        self.next_fallback_at = now + TASK_RESOURCE_FALLBACK_SAMPLE_INTERVAL;
+    }
+}
+
 fn monitor_task(
     state_dir: &Path,
     child: &mut Child,
@@ -855,13 +897,14 @@ fn monitor_task(
     let start = continuous_time_ns();
     let timeout = walltime.map(|seconds| u128::from(seconds).saturating_mul(1_000_000_000));
     let mut termination: Option<(JobState, String, Instant)> = None;
-    let mut next_sample = Instant::now();
-    let mut last_output_at = next_sample;
-    let mut last_heartbeat_at = next_sample;
+    let now = Instant::now();
+    let mut resource_sampling = TaskResourceSampling::new(now);
+    let mut last_output_at = now;
+    let mut last_heartbeat_at = now;
     let mut observed_output_bytes = 0;
     if let Some(session) = log_session.as_deref_mut() {
         session.initialize_sample(pgid);
-        next_sample += Duration::from_secs(5);
+        resource_sampling.baseline_sampled(Instant::now());
     }
     loop {
         if let Some(session) = log_session.as_deref_mut() {
@@ -881,13 +924,13 @@ fn monitor_task(
             }
             let now = Instant::now();
             let output_bytes = session.output_bytes();
-            if output_bytes != observed_output_bytes {
+            let output_changed = output_bytes != observed_output_bytes;
+            if output_changed {
                 observed_output_bytes = output_bytes;
                 last_output_at = now;
             }
-            if now >= next_sample {
+            if resource_sampling.should_sample(now, output_changed) {
                 session.sample(pgid);
-                next_sample = now + Duration::from_secs(5);
             }
             if now.duration_since(last_output_at) >= Duration::from_secs(5)
                 && now.duration_since(last_heartbeat_at) >= Duration::from_secs(5)
@@ -1641,6 +1684,18 @@ mod tests {
         collections::BTreeMap,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn verbose_resource_sampling_tracks_output_with_a_silent_fallback() {
+        let started = Instant::now();
+        let mut schedule = TaskResourceSampling::new(started);
+
+        assert!(schedule.should_sample(started + Duration::from_millis(100), true));
+        assert!(!schedule.should_sample(started + Duration::from_millis(200), true));
+        assert!(schedule.should_sample(started + Duration::from_millis(600), true));
+        assert!(!schedule.should_sample(started + Duration::from_secs(5), false));
+        assert!(schedule.should_sample(started + Duration::from_millis(5_600), false));
+    }
 
     #[test]
     fn shebang_selects_interpreter_and_default_uses_bash() {

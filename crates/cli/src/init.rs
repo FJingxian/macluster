@@ -1846,10 +1846,49 @@ fn print_help(full: bool) {
 
 fn init_help(full: bool) -> &'static str {
     if !full {
-        return "Usage: macluster init [--name NAME] [--queue QUEUE] [--shared-root PATH] [--host IPv4] [--primary-nfs USER@IPv4[:PORT]:SOURCE_PATH]\n\nFirst run sets this Mac as login/storage and creates an empty compute queue. Add compute Macs with `mnode -a USER@IPv4[:PORT]`. An existing config starts the reset confirmation flow. Use --help for share setup and reset details.";
+        return r#"Usage
+  macluster init [OPTIONS]
+
+Creates a cluster with this Mac as login and storage. The compute queue starts
+empty; add Macs with `mnode -a USER@IPv4[:PORT]`.
+
+OPTIONS
+  --name, --queue, --shared-root, --host, --primary-nfs
+
+An existing cluster starts the reset confirmation flow. Use --help for details."#;
     }
 
-    "Usage: macluster init [--force] [--name NAME] [--queue QUEUE] [--shared-root PATH] [--host IPv4] [--primary-nfs USER@IPv4[:PORT]:SOURCE_PATH]\n\nFirst setup\n  The login Mac is the control and default storage node; the compute queue starts empty. Init offers detected Mamba/Conda, virtualenv, and Homebrew roots as named NFS software shares, then lets you add custom software or compiler toolchain roots. Each share mounts at its original absolute path on every node. Add compute Macs with `mnode -a USER@IPv4[:PORT]`.\n\nStorage\n  --primary-nfs selects a remote macOS NFS source. That storage node stays outside compute queues.\n\nReset\n  With an existing cluster, init asks whether to reset (Y/N, default N), removes verified managed NFS resources, archives old state, then continues with new cluster setup. Shared data files are preserved. --force abandons pending snapshot/log synchronization for terminal jobs, so unsynchronized output may be unavailable. Active jobs still block reset. --force requires an existing cluster or interrupted reset. Rerun `macluster init` to resume cleanup after it has started."
+    r#"Usage
+  macluster init [--force] [OPTIONS]
+
+OPTIONS
+  --name NAME              Set the cluster name.
+  --queue QUEUE            Name the default compute queue.
+  --shared-root PATH       Choose the primary shared directory.
+  --host IPv4              Select this Mac's cluster address.
+  --primary-nfs ENDPOINT   Use a remote macOS NFS storage source.
+  --force                  Discard pending logs from finished jobs during reset.
+
+FIRST SETUP
+  This Mac becomes the login and default storage node; the compute queue starts
+  empty. Init can detect Mamba/Conda, virtualenv, and Homebrew roots, then lets
+  you add other software or compiler paths as named NFS shares. Shares mount at
+  the same absolute path on every node. Add compute Macs with `mnode -a`.
+
+STORAGE
+  --primary-nfs selects a remote NFS server and exported path. That server
+  stays outside compute queues.
+
+RESET
+  If an existing cluster is configured, init asks whether to reset (Y/N, default N).
+  It removes verified managed NFS resources and archives old state, then
+  continues with cluster setup. Shared data files are preserved. `--force`
+  discards pending snapshot/log synchronization for finished jobs; their
+  unsynchronized output may be unavailable. Active jobs still block reset.
+  Use `macluster init` again to resume interrupted cleanup.
+
+EXAMPLE
+  macluster init --name home-macluster"#
 }
 
 fn validate_name(name: &str) -> AppResult<()> {

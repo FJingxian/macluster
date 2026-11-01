@@ -1264,7 +1264,7 @@ pub(crate) fn find_controller_process(
         [] if config_holders.is_empty() || controller_holders.is_empty() => Ok(None),
         [] => Err((
             1,
-            "the config and controller locks are held, but their common owner is not a verified `macluster controller run` process; no process was stopped".into(),
+            "the config and controller locks are held, but their common owner is not a verified controller process for this user and cluster; no process was stopped".into(),
         )),
         _ => Err((
             1,
@@ -1395,7 +1395,12 @@ fn controller_command_matches(
             .split_whitespace()
             .collect::<Vec<_>>()
             .windows(2)
-            .any(|arguments| arguments == ["controller", "run"])
+            .any(|arguments| {
+                // Manual recovery uses `controller run`; LaunchAgent starts
+                // the same service through `internal controller-service`.
+                arguments == ["controller", "run"]
+                    || arguments == ["internal", "controller-service"]
+            })
 }
 
 pub(crate) fn stop_controller_process(
@@ -2009,10 +2014,7 @@ fn is_uncommitted_enrollment(config: &ClusterConfig, operation: &NodeOperation) 
 }
 
 fn is_uncommitted_named_share_setup(config: &ClusterConfig, operation: &NodeOperation) -> bool {
-    if operation.action != "share"
-        || operation.phase != "SETUP_PENDING"
-        || operation.candidate_config_sha256.is_some()
-    {
+    if operation.action != "share" || operation.phase != "SETUP_PENDING" {
         return false;
     }
     parse_pending_named_share_endpoint(&operation.endpoint).is_ok_and(
@@ -2069,21 +2071,46 @@ pub(crate) fn node_admin_blocks_agent_update(
     }
     let state =
         read_admin_state(&journal_path, &canonical, state_dir).map_err(|(_, error)| error)?;
-    Ok(state
-        .operations
-        .values()
-        .any(|operation| node_admin_operation_blocks_agent_update(&config, &digest, operation)))
+    let update_operation = state.operations.get("update:all");
+    Ok(state.operations.values().any(|operation| {
+        node_admin_operation_blocks_agent_update(&config, &digest, operation, update_operation)
+    }))
 }
 
 fn node_admin_operation_blocks_agent_update(
     config: &ClusterConfig,
     config_digest: &str,
     operation: &NodeOperation,
+    update_operation: Option<&NodeOperation>,
 ) -> bool {
-    !matches!(operation.phase.as_str(), "READY" | "REMOVED" | "ABORTED")
+    operation.action != "update"
+        && !matches!(operation.phase.as_str(), "READY" | "REMOVED" | "ABORTED")
         && !is_uncommitted_enrollment(config, operation)
         && !(is_uncommitted_named_share_setup(config, operation)
             && operation.old_config_sha256.as_deref() == Some(config_digest))
+        && !can_resume_config_sync_during_agent_update(operation, config_digest, update_operation)
+}
+
+fn can_resume_config_sync_during_agent_update(
+    operation: &NodeOperation,
+    config_digest: &str,
+    update_operation: Option<&NodeOperation>,
+) -> bool {
+    if operation.action == "update" || operation.phase != "SYNC_PENDING" {
+        return false;
+    }
+    let Some(operation_candidate) = operation.candidate_config_sha256.as_deref() else {
+        return false;
+    };
+    if operation_candidate == config_digest {
+        return true;
+    }
+    update_operation.is_some_and(|update| {
+        update.action == "update"
+            && matches!(update.phase.as_str(), "UPDATE_COMMITTING" | "SYNC_PENDING")
+            && update.candidate_config_sha256.as_deref() == Some(config_digest)
+            && update.old_config_sha256.as_deref() == Some(operation_candidate)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2143,11 +2170,17 @@ fn ensure_no_pending_admin_operation_for_config(
     config: &ClusterConfig,
     config_digest: &str,
 ) -> AppResult<()> {
+    let update_operation = state.operations.get("update:all");
     let mut active = state.clone();
     active.operations.retain(|_, operation| {
         !is_uncommitted_enrollment(config, operation)
             && !(is_uncommitted_named_share_setup(config, operation)
                 && operation.old_config_sha256.as_deref() == Some(config_digest))
+            && !can_resume_config_sync_during_agent_update(
+                operation,
+                config_digest,
+                update_operation,
+            )
     });
     ensure_no_pending_admin_operation(&active)
 }
@@ -2946,15 +2979,31 @@ fn finish_update_sync(
     // managed resources, and a later explicit add can reuse the draft.
     let current_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
     if operation.candidate_config_sha256.as_deref() == Some(current_digest.as_str()) {
+        let old_digest = operation.old_config_sha256.as_deref();
+        let mut state_changed = false;
         for draft in state.operations.values_mut() {
             if (is_uncommitted_enrollment(config, draft)
                 || is_uncommitted_named_share_setup(config, draft))
-                && draft.old_config_sha256 == operation.old_config_sha256
+                && draft.old_config_sha256.as_deref() == old_digest
             {
                 draft.old_config_sha256 = Some(current_digest.clone());
+                state_changed = true;
+            } else if draft.action != "update"
+                && draft.phase == "SYNC_PENDING"
+                && draft.candidate_config_sha256.as_deref() == old_digest
+            {
+                // This update will publish the new active config to every
+                // configured peer. Rebase pending node/share config-sync
+                // records before the remote sync, so an interrupted update
+                // can safely resume it instead of being fenced by a stale
+                // candidate digest.
+                draft.candidate_config_sha256 = Some(current_digest.clone());
+                state_changed = true;
             }
         }
-        save_admin_state(journal_path, state)?;
+        if state_changed {
+            save_admin_state(journal_path, state)?;
+        }
     }
     if let Err(error) = sync_remote_configs(config, source, state_dir, &operation.id, None) {
         operation.phase = "SYNC_PENDING".into();
@@ -2967,6 +3016,20 @@ fn finish_update_sync(
                 "Agent paths are active locally, but peer config sync is pending: {error}. Rerun the requested command to resume the update."
             ),
         ));
+    }
+    for pending in state.operations.values_mut() {
+        if pending.action == "update"
+            || pending.phase != "SYNC_PENDING"
+            || pending.candidate_config_sha256.as_deref() != Some(current_digest.as_str())
+        {
+            continue;
+        }
+        pending.phase = if pending.action == "remove" {
+            "REMOVED".into()
+        } else {
+            "READY".into()
+        };
+        pending.detail = None;
     }
     operation.phase = "READY".into();
     operation.detail = None;
@@ -3184,10 +3247,84 @@ fn print_help(full: bool) {
 
 fn node_help(full: bool) -> &'static str {
     if !full {
-        return "Usage: mnode -a USER@IPv4[:PORT] [OPTIONS]\n       mnode -a local[:SOURCE_PATH] [OPTIONS]\n       mnode -l | --list\n       mnode --failed\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]]\n       mnode -rm share:SHARE_ID\n\nOptions: --queue QUEUE, --host IPv4, --share-id ID, --mount-root PATH, --overlay-existing\nSSH nodes join the default compute queue. `local` enrolls this Mac as the login node. Use --help for SSH setup, shares, removal, and controller maintenance.";
+        return r#"Usage
+  mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
+  mnode -a local[:SOURCE_PATH] [OPTIONS]
+  mnode -l|--list
+  mnode --failed
+  mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
+  mnode -rm share:SHARE_ID
+
+OPTIONS
+  --queue QUEUE       Choose a compute queue.
+  --host IPv4         Select the login Mac's cluster address.
+  --share-id ID       Name an additional NFS share.
+  --mount-root PATH   Choose its client mount path.
+  --overlay-existing  Keep client files under the NFS mount.
+
+EXAMPLES
+  mnode -a user@192.0.2.10
+  mnode -a local
+
+Use --help for share, SSH, and removal details."#;
     }
 
-    "Usage: mnode -a USER@IPv4[:PORT][:SOURCE_PATH] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -a local[:SOURCE_PATH] [--host IPv4] [--queue QUEUE] [--share-id ID] [--mount-root PATH] [--overlay-existing]\n       mnode -l | --list\n       mnode --failed\n       mnode -rm NODE_ID [--connect USER@IPv4[:PORT]] | --remove NODE_ID\n       mnode -rm share:SHARE_ID\n\nAdd nodes\n  Nodes enter the configured cluster after setup verification. Failed attempts stay outside the node list; use --failed to inspect their errors and retry the original command. Registered nodes show READY when the Agent, config, and shares are healthy; ONLINE when the Agent responds but health checks are incomplete; OFFLINE when the Agent does not respond. SSH-added Macs join the default compute queue unless --queue selects another queue. If key login is not configured, mnode can install a dedicated SSH key after you accept the host fingerprint and enter the remote account password once. Administrator prompts identify the Mac and operation; a separate administrator password may be needed on each affected Mac. The configured login Mac stays outside compute queues.\n\nShares\n  `local` adds this Mac without SSH. SOURCE_PATH registers an additional named share and requires --share-id. --mount-root selects its path on every client; without it the path is /Users/Shared/macluster-shares/<share-id>. When SOURCE_PATH and --mount-root are the same path, an interactive command asks before the NFS mount can hide existing client files; y continues, while n or Enter cancels. Those local files remain underneath and reappear after unmount. `--overlay-existing` confirms this explicitly for non-interactive setup. Use it for shared tool directories such as Homebrew only when the login node's copy should take priority. Use `mnode -a local` without SOURCE_PATH to enroll this Mac as the login node and mount the configured primary share.\n\nRemove nodes and shares\n  `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node at its current address, verifies its registered machine UUID before cleanup, and retains the original NFS client address for export cleanup. The connection is saved for interrupted-removal retries; host-key verification remains enabled. `mnode -rm share:SHARE_ID` cancels an incomplete named-share setup and removes only exact macluster-managed resources.\n\nController maintenance\n  Add/remove and share changes fence submissions. If the controller is running, mnode asks before stopping it; y stops it immediately, n cancels. Running jobs are not killed, but mnode stops if active jobs or output sync remain. Restart it with `macluster controller run` after the command exits."
+    r#"Usage
+  mnode -a|--add USER@IPv4[:PORT][:SOURCE_PATH] [OPTIONS]
+  mnode -a local[:SOURCE_PATH] [OPTIONS]
+  mnode -l|--list
+  mnode --failed
+  mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
+  mnode -rm share:SHARE_ID
+
+OPTIONS
+  --queue QUEUE       Choose a compute queue.
+  --host IPv4         Select the login Mac's cluster address.
+  --share-id ID       Name an additional NFS share.
+  --mount-root PATH   Choose its client mount path.
+  --overlay-existing  Keep client files underneath the NFS mount.
+  --connect USER@IP   Reach a moved node at its current address.
+
+EXAMPLES
+  mnode -a user@192.0.2.10
+  mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
+  mnode -a local
+  mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
+  mnode -rm default-001
+
+ADD NODES
+  Setup is verified before a node is listed. Failed attempts stay outside the
+  list; inspect them with --failed and retry the original command. READY means
+  the Agent, config, and shares are healthy; ONLINE means the Agent responds
+  but checks are incomplete; OFFLINE means it does not respond.
+  SSH Macs join the default compute queue unless --queue is set. If key login
+  is not configured, mnode can install a dedicated SSH key after you verify
+  the host fingerprint and enter the SSH account password once. Strict
+  host-key verification remains enabled. Administrator authorization may be needed
+  separately on each Mac. The configured login Mac stays outside compute queues.
+
+SHARES
+  `local` enrolls this Mac without SSH. Add `:SOURCE_PATH` to share a directory;
+  set --share-id to name it. By default, clients mount it at
+  /Users/Shared/macluster-shares/<share-id>; --mount-root chooses another path.
+  If source and mount paths are the same, mnode asks before hiding files already
+  on clients. y continues; n or Enter cancels. Hidden files reappear after
+  unmount. `--overlay-existing` confirms the same action for non-interactive
+  setup. Use it for Homebrew only when the login Mac's copy should take priority.
+  `mnode -a local` without SOURCE_PATH enrolls this Mac as the login node and
+  mounts the configured primary share.
+
+REMOVE NODES
+  `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node, verifies
+  its machine UUID, and preserves the previous address for NFS export cleanup.
+  The connection is saved for interrupted-removal retries. Host-key
+  verification stays enabled. `mnode -rm share:SHARE_ID` removes only exact
+  macluster-managed resources and can cancel incomplete share setup.
+
+CONTROLLER MAINTENANCE
+  Node and share changes pause submissions. If the controller is running,
+  mnode asks before stopping it. Running jobs are not killed, but active jobs
+  or output sync can pause maintenance. Restart with `macluster controller run`."#
 }
 
 fn read_config(path: &Path) -> AppResult<ClusterConfig> {
@@ -13294,7 +13431,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt},
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Command, Stdio},
         thread,
         time::Duration,
@@ -13302,6 +13439,24 @@ mod tests {
 
     fn test_exports_path() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-exports-{}.test", Id128::random()))
+    }
+
+    fn wait_for_exclusive_maintenance_lock(config: &Path) -> std::io::Result<MaintenanceLock> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match MaintenanceLock::exclusive(config) {
+                Ok(lock) => return Ok(lock),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // Match the production shutdown path: retry transient
+                    // flock contention until the previous owner has released it.
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[test]
@@ -15048,6 +15203,13 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             501,
             "/usr/local/bin/macluster --config /tmp/cluster.toml controller run"
         ));
+        assert!(controller_command_matches(
+            PathBuf::from("/Users/example/Library/Application Support/macluster/service/macluster")
+                .as_path(),
+            501,
+            501,
+            "/Users/example/Library/Application Support/macluster/service/macluster --config /Users/example/.config/macluster/config.toml --state-dir /Users/example/Library/Application Support/macluster/controller internal controller-service"
+        ));
         assert!(!controller_command_matches(
             PathBuf::from("/usr/local/bin/macluster").as_path(),
             502,
@@ -15159,7 +15321,9 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(result.is_err());
         assert!(!barrier.exists());
         drop(controller_lock);
-        assert!(MaintenanceLock::exclusive(&config).is_ok());
+        let lock = wait_for_exclusive_maintenance_lock(&config)
+            .expect("declining must release the shared config lock");
+        drop(lock);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -15251,8 +15415,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             |_| panic!("a preconfirmed update must not prompt a second time"),
             |_, _| Ok(Some(12345)),
             |config, _, _, _| {
-                stop_lock.lock().unwrap().take();
-                MaintenanceLock::exclusive(config).map_err(|error| (1, error.to_string()))
+                drop(stop_lock.lock().unwrap().take());
+                wait_for_exclusive_maintenance_lock(config).map_err(|error| (1, error.to_string()))
             },
         )
         .unwrap();
@@ -15292,8 +15456,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             |config, _, pid, operation| {
                 assert_eq!(pid, 12345);
                 assert_eq!(operation, "Agent update");
-                stop_lock.lock().unwrap().take();
-                MaintenanceLock::exclusive(config).map_err(|error| (1, error.to_string()))
+                drop(stop_lock.lock().unwrap().take());
+                wait_for_exclusive_maintenance_lock(config).map_err(|error| (1, error.to_string()))
             },
         )
         .unwrap();
@@ -17752,7 +17916,9 @@ execution_uid = 501
         pending_share.endpoint =
             "share:cargo:login:/Users/operator/.cargo:/Users/operator/.cargo:overlay-existing"
                 .into();
-        pending_share.candidate_config_sha256 = None;
+        let mut committed_sync = update_operation("SYNC_PENDING", "old", "old");
+        committed_sync.action = "share".into();
+        committed_sync.node_id = "login".into();
         let mut state = AdminState {
             version: 1,
             config_path: root.join("config.toml").to_string_lossy().into_owned(),
@@ -17764,6 +17930,7 @@ execution_uid = 501
                 ("add:draft".into(), draft),
                 ("add:foreign".into(), foreign),
                 ("share:cargo".into(), pending_share),
+                ("share:sync".into(), committed_sync),
             ]),
         };
         super::finish_update_sync(
@@ -17796,6 +17963,13 @@ execution_uid = 501
             Some(digest.as_str())
         );
         assert_eq!(state.operations["share:cargo"].phase, "SETUP_PENDING");
+        assert_eq!(state.operations["share:sync"].phase, "READY");
+        assert_eq!(
+            state.operations["share:sync"]
+                .candidate_config_sha256
+                .as_deref(),
+            Some(digest.as_str())
+        );
         assert_eq!(state.operations["update:all"].phase, "READY");
         fs::remove_dir_all(root).unwrap();
     }
@@ -17811,10 +17985,9 @@ execution_uid = 501
             "share:cargo:{}:/Users/operator/.cargo:/Users/operator/.cargo:overlay-existing",
             config.storage_server
         );
-        share.candidate_config_sha256 = None;
         assert!(super::is_uncommitted_named_share_setup(&config, &share));
         assert!(!super::node_admin_operation_blocks_agent_update(
-            &config, digest, &share
+            &config, digest, &share, None
         ));
         let state = AdminState {
             version: 1,
@@ -17826,17 +17999,56 @@ execution_uid = 501
         };
         super::ensure_no_pending_admin_operation_for_config(&state, &config, digest).unwrap();
 
+        let update = update_operation("SYNC_PENDING", "old-config", digest);
+        assert!(!super::node_admin_operation_blocks_agent_update(
+            &config,
+            digest,
+            &update,
+            Some(&update)
+        ));
+
         let mut removal = share.clone();
         removal.action = "remove".into();
         assert!(super::node_admin_operation_blocks_agent_update(
-            &config, digest, &removal
+            &config, digest, &removal, None
         ));
         let mut stale_share = share;
         stale_share.old_config_sha256 = Some("stale-config".into());
         assert!(super::node_admin_operation_blocks_agent_update(
             &config,
             digest,
-            &stale_share
+            &stale_share,
+            None
+        ));
+
+        let mut pending_sync = removal.clone();
+        pending_sync.action = "share".into();
+        pending_sync.phase = "SYNC_PENDING".into();
+        pending_sync.candidate_config_sha256 = Some(digest.into());
+        assert!(!super::node_admin_operation_blocks_agent_update(
+            &config,
+            digest,
+            &pending_sync,
+            None
+        ));
+        let state = AdminState {
+            version: 1,
+            config_path: String::new(),
+            state_dir: String::new(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::new(),
+            operations: BTreeMap::from([("share:sync".into(), pending_sync.clone())]),
+        };
+        super::ensure_no_pending_admin_operation_for_config(&state, &config, digest).unwrap();
+
+        let update = update_operation("UPDATE_COMMITTING", "stale-config", digest);
+        let mut pre_rebased_sync = pending_sync;
+        pre_rebased_sync.candidate_config_sha256 = Some("stale-config".into());
+        assert!(!super::node_admin_operation_blocks_agent_update(
+            &config,
+            digest,
+            &pre_rebased_sync,
+            Some(&update)
         ));
     }
 

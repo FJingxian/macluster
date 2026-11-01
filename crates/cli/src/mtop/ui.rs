@@ -1073,17 +1073,13 @@ fn render_expanded_detail(
         .title(" Details · c CPU ↓ · m Memory ↓ · Esc to close ");
     let inner = block.inner(area);
     let (system_disk, external_disks) = disk_capacities(&node.metrics);
-    let visible_external_disks = external_disks
-        .iter()
-        .take(
-            inner
-                .height
-                .saturating_sub(DETAIL_BASE_ROWS + DETAIL_MIN_PROCESS_ROWS) as usize,
-        )
-        .collect::<Vec<_>>();
+    let external_disk_line = (inner.height > DETAIL_BASE_ROWS + DETAIL_MIN_PROCESS_ROWS)
+        .then(|| external_disk_capacity_line(external_disks, inner.width as usize))
+        .flatten();
+    let external_disk_rows = usize::from(external_disk_line.is_some());
     frame.render_widget(block, area);
     let mut constraints =
-        vec![Constraint::Length(1); DETAIL_BASE_ROWS as usize + visible_external_disks.len()];
+        vec![Constraint::Length(1); DETAIL_BASE_ROWS as usize + external_disk_rows];
     constraints.push(Constraint::Min(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1142,19 +1138,8 @@ fn render_expanded_detail(
         )),
         chunks[3],
     );
-    for (index, disk) in visible_external_disks.iter().enumerate() {
-        let name = disk
-            .mount_point
-            .strip_prefix("/Volumes/")
-            .unwrap_or(&disk.mount_point)
-            .split('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("volume");
-        frame.render_widget(
-            Paragraph::new(disk_capacity_line(&format!("EXT {name}"), disk)),
-            chunks[4 + index],
-        );
+    if let Some(line) = external_disk_line {
+        frame.render_widget(Paragraph::new(line), chunks[4]);
     }
     frame.render_widget(
         Paragraph::new(format!(
@@ -1164,7 +1149,7 @@ fn render_expanded_detail(
             tasks.waiting,
             process_status(&node.processes, process_sort)
         )),
-        chunks[4 + visible_external_disks.len()],
+        chunks[4 + external_disk_rows],
     );
 
     let preview_cpu = matches!(
@@ -1200,7 +1185,7 @@ fn render_expanded_detail(
         ])
         .style(Style::default().add_modifier(Modifier::BOLD)),
     );
-    frame.render_widget(table, chunks[5 + visible_external_disks.len()]);
+    frame.render_widget(table, chunks[5 + external_disk_rows]);
 }
 
 fn disk_capacities(view: &MetricView) -> (Option<&DiskCapacity>, &[DiskCapacity]) {
@@ -1215,6 +1200,34 @@ fn disk_capacities(view: &MetricView) -> (Option<&DiskCapacity>, &[DiskCapacity]
 
 fn disk_capacity_line(label: &str, disk: &DiskCapacity) -> String {
     format!("{label} {}", disk_capacity_value(disk))
+}
+
+fn external_disk_capacity_line(disks: &[DiskCapacity], max_width: usize) -> Option<String> {
+    let entries = disks
+        .iter()
+        .filter(|disk| !is_recovery_volume(disk))
+        .map(|disk| {
+            let name = disk
+                .mount_point
+                .strip_prefix("/Volumes/")
+                .unwrap_or(&disk.mount_point)
+                .split('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("volume");
+            format!("{name} {}", disk_capacity_value(disk))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(truncate(&format!("EXT {}", entries.join(" · ")), max_width))
+}
+
+fn is_recovery_volume(disk: &DiskCapacity) -> bool {
+    disk.mount_point
+        .strip_prefix("/Volumes/")
+        .is_some_and(|name| name.eq_ignore_ascii_case("Recovery"))
 }
 
 fn disk_capacity_value(disk: &DiskCapacity) -> String {

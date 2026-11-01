@@ -357,12 +357,21 @@ struct ProbePermit;
 
 impl ProbePermit {
     fn acquire() -> Result<Self, TransportError> {
-        OUTSTANDING_PROBES
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_OUTSTANDING_PROBES).then_some(active + 1)
-            })
-            .map(|_| Self)
-            .map_err(|_| TransportError::Capacity)
+        let mut active = OUTSTANDING_PROBES.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_OUTSTANDING_PROBES {
+                return Err(TransportError::Capacity);
+            }
+            match OUTSTANDING_PROBES.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self),
+                Err(actual) => active = actual,
+            }
+        }
     }
 }
 

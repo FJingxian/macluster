@@ -1388,13 +1388,18 @@ async fn isolated_log_read<T: Send + 'static>(
     timeout: Duration,
     read: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    slots
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_LOG_READS).then_some(active + 1)
-        })
-        .map_err(|_| {
-            ApiError::too_many("Log readers are busy; shared storage may be unavailable.")
-        })?;
+    let mut active = slots.load(Ordering::Acquire);
+    loop {
+        if active >= MAX_LOG_READS {
+            return Err(ApiError::too_many(
+                "Log readers are busy; shared storage may be unavailable.",
+            ));
+        }
+        match slots.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => active = actual,
+        }
+    }
     let permit = LogReadPermit(slots);
     let (send, receive) = oneshot::channel();
     thread::Builder::new()

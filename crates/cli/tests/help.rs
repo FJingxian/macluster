@@ -78,7 +78,7 @@ fn main_help_is_a_command_index_with_examples() {
     assert!(output.contains("queue (mqueue)"), "{output}");
     assert!(output.contains("macluster --init"), "{output}");
     assert!(
-        output.contains("macluster --web 127.0.0.1:PORT"),
+        output.contains("macluster --web [127.0.0.1[:PORT]]"),
         "{output}"
     );
     assert!(!output.contains("macluster controller"), "{output}");
@@ -88,7 +88,7 @@ fn main_help_is_a_command_index_with_examples() {
 fn top_level_init_and_web_shortcuts_have_help() {
     assert!(help(&["--init", "--help"]).contains("FIRST SETUP"));
     let web = help(&["--web", "--help"]);
-    assert!(web.contains("127.0.0.1:PORT"), "{web}");
+    assert!(web.contains("127.0.0.1[:PORT]"), "{web}");
     assert!(web.contains("local-only"), "{web}");
 }
 

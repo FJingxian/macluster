@@ -142,14 +142,15 @@ macluster submit -Is pip install -e .
 ```sh
 macluster top                                  # 终端面板
 macluster top --once                           # 单次表格
-macluster --web 127.0.0.1:8080                 # 本机浏览器面板
+macluster --web                                # 本机浏览器面板，自动选择端口
+macluster --web 127.0.0.1:8080                 # 可选指定本机 IP 和端口
 ```
 
 终端中，方向键或 `j`/`k` 选择节点，Enter 打开/收起进程详情，`c` 按 CPU 排序，`m` 按内存排序，`q` 退出。进程先显示快速预览，再更新为区间采样结果；预览会注明 CPU 是平均值、内存是 RSS。
 
 CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。GPU、温度、风扇、功耗取决于硬件与 helper 支持情况，无法获取时显示 `N/A`。
 
-浏览器面板只读，监听 `127.0.0.1`；当前 `--web` 只接受回环地址。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
+浏览器面板只读，监听 `127.0.0.1`；`--web` 的本机 IP 和端口都可省略，省略端口时会自动选择空闲端口。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
 
 ## 管理和维护
 

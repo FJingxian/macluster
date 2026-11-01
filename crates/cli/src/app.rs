@@ -818,43 +818,36 @@ fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
 }
 
 fn parse_web_shortcut_args(args: &[String]) -> AppResult<Vec<String>> {
-    let Some(address) = args.first() else {
-        return Err((
-            2,
-            "usage: macluster --web 127.0.0.1:PORT [--no-open]".into(),
-        ));
-    };
-    let Some((host, port)) = address.rsplit_once(':') else {
-        return Err((
-            2,
-            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
-        ));
-    };
-    let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
-        (
-            2,
-            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
-        )
-    })?;
-    if host != std::net::Ipv4Addr::LOCALHOST {
-        return Err((
-            2,
-            "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
-        ));
+    let mut normalized = vec!["run".into(), "--web".into()];
+    let mut option_index = 0;
+    if let Some(address) = args.first().filter(|argument| !argument.starts_with('-')) {
+        let (host, port) = address
+            .rsplit_once(':')
+            .map_or((address.as_str(), None), |(host, port)| (host, Some(port)));
+        let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
+            (
+                2,
+                format!("invalid web address '{address}'; expected 127.0.0.1 or 127.0.0.1:PORT"),
+            )
+        })?;
+        if host != std::net::Ipv4Addr::LOCALHOST {
+            return Err((
+                2,
+                "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
+            ));
+        }
+        if let Some(port) = port {
+            let port = port.parse::<u16>().map_err(|_| {
+                (
+                    2,
+                    format!("invalid web port '{port}'; expected a number from 0 to 65535"),
+                )
+            })?;
+            normalized.extend(["--web-port".into(), port.to_string()]);
+        }
+        option_index = 1;
     }
-    let port = port.parse::<u16>().map_err(|_| {
-        (
-            2,
-            format!("invalid web port '{port}'; expected a number from 0 to 65535"),
-        )
-    })?;
-    let mut normalized = vec![
-        "run".into(),
-        "--web".into(),
-        "--web-port".into(),
-        port.to_string(),
-    ];
-    for argument in &args[1..] {
+    for argument in &args[option_index..] {
         if argument == "--no-open" {
             normalized.push(argument.clone());
         } else {
@@ -868,7 +861,7 @@ fn web_shortcut_help(mode: HelpMode) -> &'static str {
     match mode {
         HelpMode::Short => {
             r#"Usage
-  macluster --web 127.0.0.1:PORT [--no-open]
+  macluster --web [127.0.0.1[:PORT]] [--no-open]
 
 Open the read-only browser monitor.
 
@@ -876,13 +869,16 @@ The monitor is local-only."#
         }
         HelpMode::Long => {
             r#"Usage
-  macluster --web 127.0.0.1:PORT [--no-open]
+  macluster --web [127.0.0.1[:PORT]] [--no-open]
 
 OPTIONS
-  127.0.0.1:PORT  Choose the local monitor port; use 0 for an automatic port.
+  127.0.0.1       Optional loopback address; omitted ports are selected automatically.
+  :PORT           Optional local port; use 0 for an automatic port.
   --no-open       Print the monitor address without opening a browser.
 
 EXAMPLES
+  macluster --web
+  macluster --web 127.0.0.1 --no-open
   macluster --web 127.0.0.1:8080
   macluster --web 127.0.0.1:0 --no-open
 
@@ -5539,7 +5535,7 @@ impl ControllerSignalGuard {
     fn install() -> AppResult<Self> {
         CONTROLLER_SHUTDOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = controller_signal_handler as usize;
+        action.sa_sigaction = controller_signal_handler as *const () as usize;
         action.sa_flags = 0;
         unsafe { libc::sigemptyset(&mut action.sa_mask) };
         let mut old_term: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -6933,13 +6929,25 @@ mod tests {
     #[test]
     fn web_shortcut_only_accepts_loopback_and_maps_controller_options() {
         assert_eq!(
+            super::parse_web_shortcut_args(&[]).unwrap(),
+            ["run", "--web"]
+        );
+        assert_eq!(
+            super::parse_web_shortcut_args(&["127.0.0.1".into()]).unwrap(),
+            ["run", "--web"]
+        );
+        assert_eq!(
+            super::parse_web_shortcut_args(&["--no-open".into()]).unwrap(),
+            ["run", "--web", "--no-open"]
+        );
+        assert_eq!(
             super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--no-open".into(),])
                 .unwrap(),
             ["run", "--web", "--web-port", "8080", "--no-open"]
         );
+        assert!(super::parse_web_shortcut_args(&["192.0.2.10".into()]).is_err());
         assert!(super::parse_web_shortcut_args(&["192.0.2.10:8080".into()]).is_err());
         assert!(super::parse_web_shortcut_args(&["127.0.0.1:nope".into()]).is_err());
-        assert!(super::parse_web_shortcut_args(&[]).is_err());
         assert!(
             super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--unknown".into(),])
                 .is_err()
@@ -9234,7 +9242,7 @@ macOS cluster task manager
 Usage
   macluster [GLOBAL OPTIONS] COMMAND [OPTIONS]
   macluster --init [OPTIONS]
-  macluster --web 127.0.0.1:PORT [--no-open]
+  macluster --web [127.0.0.1[:PORT]] [--no-open]
   msub|mjob|mqueue|mkill|mtop|mnode|mfans [OPTIONS]
 
 COMMANDS
@@ -9258,6 +9266,8 @@ GLOBAL OPTIONS
 
 EXAMPLES
   macluster --init
+  macluster --web
+  macluster --web 127.0.0.1
   macluster --web 127.0.0.1:8080
   msub -q default python analysis.py
   mtop

@@ -12,6 +12,7 @@ mod node_admin;
 pub mod service;
 mod ssh_bootstrap;
 mod terminal;
+mod update_signing;
 
 /// Run a command using an explicit invocation name and argument list. The
 /// invocation name may be `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, `mnode`, or `mfans`.

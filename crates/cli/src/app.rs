@@ -234,12 +234,6 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
             let disabled_for_test = env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some();
             if !help && !disabled_for_test && is_macluster_executable() && config_path.is_file() {
-                let config = load_config(global.config.as_deref()).map_err(config_error)?;
-                if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
-                    eprintln!(
-                        "Power sampler setup is incomplete: {error}. Open mtop in Terminal to retry authorization."
-                    );
-                }
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
                     manager.start(Duration::from_secs(5)).map_err(service_error)
                 }) {
@@ -4781,7 +4775,9 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                 crate::mtop::MtopPostAction::SetupLocalPower => {
                     power_setup_attempted.set(true);
                     let config = load_config(global.config.as_deref()).map_err(config_error)?;
-                    if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
+                    if let Err(error) =
+                        crate::node_admin::ensure_local_power_sampler(&config, &state_dir)
+                    {
                         eprintln!(
                             "Power sampler setup remains incomplete: {error}. Monitoring continues; reopen mtop to retry authorization."
                         );
@@ -6598,7 +6594,7 @@ fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
     let reply = if request_bytes.len() > macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES
     {
         macluster_protocol::nfs_admin::NfsAdminReply::failure(
-            "nfs-admin-1",
+            macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
             "NFS admin request exceeds the 1 MiB limit",
         )
     } else {
@@ -6607,7 +6603,7 @@ fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
         ) {
             Ok(request) => crate::node_admin::apply_privileged_nfs_admin_request(request, peer_uid),
             Err(error) => macluster_protocol::nfs_admin::NfsAdminReply::failure(
-                "nfs-admin-1",
+                macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
                 format!("invalid NFS admin request: {error}"),
             ),
         }

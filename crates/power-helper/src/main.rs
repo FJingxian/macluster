@@ -16,6 +16,7 @@ use macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS;
 use serde::{Deserialize, Serialize};
 
 mod fan;
+mod helper_update;
 mod nfs_admin;
 
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";

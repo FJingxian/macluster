@@ -37,6 +37,7 @@ use macluster_protocol::{
         MaintenanceTicket,
     },
     framing::sha256_hex,
+    helper_update::{HelperArtifact, HelperComponent, HelperUpdateManifest},
     identifiers::{Id128, NodeId, QueueName},
     nfs_admin::{
         NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply, NfsAdminRequest, NfsAlias,
@@ -65,7 +66,8 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-9";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-11";
+const POWER_HELPER_REVISION: &str = "power-2";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
 const POWER_LAUNCHD_PATH: &str = "/Library/LaunchDaemons/org.macluster.power.plist";
 const POWER_LAUNCHD_LABEL: &str = "org.macluster.power";
@@ -2874,7 +2876,7 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             .operations
             .insert(operation_key.to_owned(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        match refresh_agent_helpers_for_update(&candidate_config, &operation.id) {
+        match refresh_agent_helpers_for_update(&candidate_config, &operation.id, state_dir) {
             Ok(deferred) => helper_refresh_deferred = Some(deferred),
             Err((code, error)) => {
                 operation.phase = "UPDATE_FAILED".into();
@@ -4108,6 +4110,26 @@ pub(crate) struct PowerHelperSetup {
     staged_binary: String,
     staged_admin_cli: String,
     staged_plist: String,
+    staged_trust_key: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct UpdateTrust {
+    cluster_id: String,
+    public_key: [u8; 32],
+}
+
+pub(crate) fn ensure_update_trust(
+    state_dir: &Path,
+    cluster_id: &str,
+) -> Result<UpdateTrust, String> {
+    fs::create_dir_all(state_dir)
+        .map_err(|error| format!("cannot create cluster state directory: {error}"))?;
+    let key = crate::update_signing::ensure_cluster_update_key(state_dir, cluster_id)?;
+    Ok(UpdateTrust {
+        cluster_id: key.cluster_id().to_owned(),
+        public_key: key.public_key_bytes(),
+    })
 }
 
 pub(crate) fn prepare_power_helper(
@@ -4116,12 +4138,121 @@ pub(crate) fn prepare_power_helper(
     remote_arch: &str,
     operation_id: &str,
 ) -> Result<Option<PowerHelperSetup>, String> {
+    prepare_power_helper_with_trust(node, execution_uid, remote_arch, operation_id, None)
+}
+
+fn remote_update_trust_matches(node: &NodeConfig, trust: &UpdateTrust) -> Result<bool, String> {
+    let trust_dir = "/Library/PrivilegedHelperTools/org.macluster.update";
+    let safe_files = ssh_output(
+        node,
+        &format!(
+            "[ ! -L {dir} ] && [ ! -L {key} ] && [ ! -L {cluster} ] && [ -d {dir} ] && [ -f {key} ] && [ -f {cluster} ]",
+            dir = shell_quote(trust_dir),
+            key = shell_quote(&format!("{trust_dir}/public-key")),
+            cluster = shell_quote(&format!("{trust_dir}/cluster-id")),
+        ),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    if !safe_files.status.success() {
+        return Ok(false);
+    }
+    let public_key = ssh_output(
+        node,
+        &shell_join(&[
+            "/bin/cat",
+            "/Library/PrivilegedHelperTools/org.macluster.update/public-key",
+        ]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let cluster_id = ssh_output(
+        node,
+        &shell_join(&[
+            "/bin/cat",
+            "/Library/PrivilegedHelperTools/org.macluster.update/cluster-id",
+        ]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let metadata = ssh_output(
+        node,
+        &shell_join(&[
+            "/usr/bin/stat",
+            "-f",
+            "%u %Lp",
+            "/Library/PrivilegedHelperTools/org.macluster.update/public-key",
+        ]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let cluster_metadata = ssh_output(
+        node,
+        &shell_join(&[
+            "/usr/bin/stat",
+            "-f",
+            "%u %Lp",
+            "/Library/PrivilegedHelperTools/org.macluster.update/cluster-id",
+        ]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let directory_metadata = ssh_output(
+        node,
+        &shell_join(&[
+            "/usr/bin/stat",
+            "-f",
+            "%u %Lp",
+            "/Library/PrivilegedHelperTools/org.macluster.update",
+        ]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    Ok(public_key.status.success()
+        && public_key.stdout == trust.public_key
+        && cluster_id.status.success()
+        && cluster_id.stdout == format!("{}\n", trust.cluster_id).as_bytes()
+        && metadata.status.success()
+        && String::from_utf8_lossy(&metadata.stdout).trim() == "0 644"
+        && cluster_metadata.status.success()
+        && String::from_utf8_lossy(&cluster_metadata.stdout).trim() == "0 644"
+        && directory_metadata.status.success()
+        && String::from_utf8_lossy(&directory_metadata.stdout).trim() == "0 755")
+}
+
+pub(crate) fn prepare_power_helper_with_trust(
+    node: &NodeConfig,
+    execution_uid: u32,
+    remote_arch: &str,
+    operation_id: &str,
+    trust: Option<&UpdateTrust>,
+) -> Result<Option<PowerHelperSetup>, String> {
+    prepare_power_helper_force_with_trust(
+        node,
+        execution_uid,
+        remote_arch,
+        operation_id,
+        trust,
+        false,
+    )
+}
+
+fn prepare_power_helper_force_with_trust(
+    node: &NodeConfig,
+    execution_uid: u32,
+    remote_arch: &str,
+    operation_id: &str,
+    trust: Option<&UpdateTrust>,
+    force: bool,
+) -> Result<Option<PowerHelperSetup>, String> {
     prepare_power_helper_with_admin_revision(
         node,
         execution_uid,
         remote_arch,
         operation_id,
         NFS_ADMIN_CLI_REVISION,
+        trust,
+        force,
     )
 }
 
@@ -4131,6 +4262,8 @@ fn prepare_power_helper_with_admin_revision(
     remote_arch: &str,
     operation_id: &str,
     required_admin_revision: &str,
+    trust: Option<&UpdateTrust>,
+    force: bool,
 ) -> Result<Option<PowerHelperSetup>, String> {
     if execution_uid == 0 {
         return Err("the cluster execution account must not be root".into());
@@ -4196,6 +4329,18 @@ fn prepare_power_helper_with_admin_revision(
         None,
     )
     .map_err(|(_, error)| error)?;
+    let trust_ready = match trust {
+        Some(trust) => remote_update_trust_matches(node, trust)?,
+        None => true,
+    };
+    let trust_is_pinned = trust.is_some() && trust_ready;
+    if !power_helper_admin_setup_allowed(trust_is_pinned, force) {
+        // A node already enrolled for signed helper updates must never fall
+        // back to a per-operation administrator install. Routine refreshes go
+        // through the privileged update socket; force is reserved for an
+        // explicit repair action.
+        return Ok(None);
+    }
     let installed = String::from_utf8_lossy(&installed_digest.stdout)
         .split_whitespace()
         .next()
@@ -4206,13 +4351,15 @@ fn prepare_power_helper_with_admin_revision(
     );
     let admin_cli_is_safe = admin_cli_metadata.status.success()
         && root_admin_cli_metadata_is_safe(&String::from_utf8_lossy(&admin_cli_metadata.stdout));
-    if installed
+    if !force
+        && installed
         && admin_version_matches
         && admin_cli_is_safe
         && installed_plist.status.success()
         && installed_plist.stdout == plist.as_bytes()
         && socket_ready.status.success()
         && admin_socket_ready.status.success()
+        && trust_ready
     {
         return Ok(None);
     }
@@ -4224,7 +4371,10 @@ fn prepare_power_helper_with_admin_revision(
     let staged_binary = format!("/tmp/macluster-power-{operation_id}.bin");
     let staged_admin_cli = format!("/tmp/macluster-nfs-admin-{operation_id}.bin");
     let staged_plist = format!("/tmp/macluster-power-{operation_id}.plist");
+    let staged_trust_key = trust.map(|_| format!("/tmp/macluster-update-key-{operation_id}.bin"));
     let local_plist = std::env::temp_dir().join(format!("macluster-power-{operation_id}.plist"));
+    let local_trust_key = trust
+        .map(|_| std::env::temp_dir().join(format!("macluster-update-key-{operation_id}.bin")));
     let write_result = (|| -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -4238,38 +4388,67 @@ fn prepare_power_helper_with_admin_revision(
         let _ = fs::remove_file(&local_plist);
         return Err(format!("could not stage LaunchDaemon plist: {error}"));
     }
+    if let (Some(trust), Some(path)) = (trust, local_trust_key.as_ref()) {
+        let write_result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?;
+            file.write_all(&trust.public_key)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&local_plist);
+            let _ = fs::remove_file(path);
+            return Err(format!(
+                "could not stage cluster updater public key: {error}"
+            ));
+        }
+    }
     let stage_result = (|| -> AppResult<PowerHelperSetup> {
         scp_to_node(node, helper.path(), &staged_binary)?;
         scp_to_node(node, &admin_cli, &staged_admin_cli)?;
         scp_to_node(node, &local_plist, &staged_plist)?;
-        let script = power_helper_install_script_with_admin_revision(
+        if let (Some(local), Some(remote)) = (local_trust_key.as_ref(), staged_trust_key.as_ref()) {
+            scp_to_node(node, local, remote)?;
+        }
+        let script = power_helper_install_script_with_updater(
             &staged_binary,
             &staged_admin_cli,
             &staged_plist,
             &digest,
             &admin_cli_digest,
             required_admin_revision,
+            trust.map(|trust| (staged_trust_key.as_deref().unwrap(), trust)),
         );
         Ok(PowerHelperSetup {
             script,
             staged_binary: staged_binary.clone(),
             staged_admin_cli: staged_admin_cli.clone(),
             staged_plist: staged_plist.clone(),
+            staged_trust_key: staged_trust_key.clone(),
         })
     })();
     let _ = fs::remove_file(&local_plist);
+    if let Some(path) = &local_trust_key {
+        let _ = fs::remove_file(path);
+    }
     match stage_result {
         Ok(setup) => Ok(Some(setup)),
         Err((_, error)) => {
+            let mut cleanup = vec![
+                "/bin/rm".to_owned(),
+                "-f".to_owned(),
+                staged_binary.clone(),
+                staged_admin_cli.clone(),
+                staged_plist.clone(),
+            ];
+            cleanup.extend(staged_trust_key.iter().cloned());
             let _ = ssh_output(
                 node,
-                &shell_join(&[
-                    "/bin/rm",
-                    "-f",
-                    &staged_binary,
-                    &staged_admin_cli,
-                    &staged_plist,
-                ]),
+                &shell_join(&cleanup.iter().map(String::as_str).collect::<Vec<_>>()),
                 None,
             );
             Err(error)
@@ -4304,41 +4483,86 @@ fn root_admin_cli_metadata_is_safe(metadata: &str) -> bool {
 }
 
 pub(crate) fn cleanup_power_helper_stage(node: &NodeConfig, setup: &PowerHelperSetup) {
+    let mut paths = vec![
+        "/bin/rm".to_owned(),
+        "-f".to_owned(),
+        setup.staged_binary.clone(),
+        setup.staged_admin_cli.clone(),
+        setup.staged_plist.clone(),
+    ];
+    paths.extend(setup.staged_trust_key.iter().cloned());
     let _ = ssh_output(
         node,
-        &shell_join(&[
-            "/bin/rm",
-            "-f",
-            &setup.staged_binary,
-            &setup.staged_admin_cli,
-            &setup.staged_plist,
-        ]),
+        &shell_join(&paths.iter().map(String::as_str).collect::<Vec<_>>()),
         None,
     );
 }
 
 pub(crate) fn local_power_sampler_needs_setup() -> Result<bool, String> {
-    use std::os::unix::fs::FileTypeExt;
-    let socket = fs::symlink_metadata("/var/run/org.macluster.power.sock")
-        .map(|metadata| metadata.file_type().is_socket())
-        .unwrap_or(false);
-    if !socket {
+    if !local_power_sampler_socket_ready() {
         return Ok(true);
     }
-    let expected = crate::embedded_power::digest()?;
-    if local_sha256(Path::new(POWER_HELPER_PATH)).ok().as_deref() != Some(expected.as_str()) {
-        return Ok(true);
-    }
-    let plist = power_launch_daemon_plist(unsafe { libc::geteuid() });
-    Ok(fs::read(POWER_LAUNCHD_PATH).ok().as_deref() != Some(plist.as_bytes()))
+    Ok(!local_power_sampler_files_current()?)
 }
 
-pub(crate) fn ensure_local_power_sampler(config: &ClusterConfig) -> Result<(), String> {
-    let login = config
+fn local_power_sampler_socket_ready() -> bool {
+    path_is_unix_socket(Path::new("/var/run/org.macluster.power.sock"))
+}
+
+fn path_is_unix_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+fn local_power_sampler_files_current() -> Result<bool, String> {
+    let expected = crate::embedded_power::digest()?;
+    let installed_digest = local_sha256(Path::new(POWER_HELPER_PATH)).ok();
+    let plist = power_launch_daemon_plist(unsafe { libc::geteuid() });
+    let installed_plist = fs::read(POWER_LAUNCHD_PATH).ok();
+    Ok(power_sampler_files_match(
+        &expected,
+        installed_digest.as_deref(),
+        plist.as_bytes(),
+        installed_plist.as_deref(),
+    ))
+}
+
+fn power_sampler_files_match(
+    expected_digest: &str,
+    installed_digest: Option<&str>,
+    expected_plist: &[u8],
+    installed_plist: Option<&[u8]>,
+) -> bool {
+    installed_digest == Some(expected_digest) && installed_plist == Some(expected_plist)
+}
+
+fn wait_for_local_power_sampler_socket() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !local_power_sampler_socket_ready() {
+        if Instant::now() >= deadline {
+            return Err(
+                "the signed power-helper update completed, but its LaunchDaemon socket did not return; no additional administrator prompt was issued".into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_local_power_sampler(
+    config: &ClusterConfig,
+    state_dir: &Path,
+) -> Result<(), String> {
+    if !local_power_sampler_needs_setup()? {
+        return Ok(());
+    }
+    let (login_id, login) = config
         .login_node
         .as_ref()
-        .and_then(|id| config.nodes.get(id.as_str()))
-        .filter(|node| node.transport == Transport::Local)
+        .and_then(|id| config.nodes.get_key_value(id.as_str()))
+        .filter(|(_, node)| node.transport == Transport::Local)
         .ok_or_else(|| {
             "power sampler setup requires this Mac to be the local login node".to_owned()
         })?;
@@ -4351,12 +4575,61 @@ pub(crate) fn ensure_local_power_sampler(config: &ClusterConfig) -> Result<(), S
             "local login identity does not match this Mac/account; power setup was skipped".into(),
         );
     }
-    ensure_power_helper(
+    let architecture = std::env::consts::ARCH;
+    let operation_id = Id128::random().to_string();
+    let signing_key =
+        crate::update_signing::ensure_cluster_update_key(state_dir, &config.share_uuid)?;
+    let trust = UpdateTrust {
+        cluster_id: signing_key.cluster_id().to_owned(),
+        public_key: signing_key.public_key_bytes(),
+    };
+    ensure_update_capability(login, login_id, uid, architecture, &operation_id, &trust)?;
+    if let Some((request, stage_dir)) = stage_signed_helper_update(
+        config,
+        login_id,
         login,
         uid,
-        std::env::consts::ARCH,
-        &Id128::random().to_string(),
-    )
+        architecture,
+        state_dir,
+        &operation_id,
+        &signing_key,
+    )? {
+        let result = request_nfs_admin_service(login, &request).and_then(|reply| match reply {
+            Some(()) => Ok(()),
+            None => Err("signed helper updater is unavailable after enrollment".into()),
+        });
+        cleanup_helper_update_stage(login, &stage_dir);
+        result?;
+        wait_for_current_nfs_admin_service(login)?;
+    }
+    if local_power_sampler_files_current()? && !local_power_sampler_socket_ready() {
+        wait_for_local_power_sampler_socket()?;
+    }
+    if !local_power_sampler_needs_setup()? {
+        return Ok(());
+    }
+
+    // The signed updater handles routine binary and recovery-helper refreshes.
+    // A mismatched or missing LaunchDaemon is an enrollment repair and remains
+    // an explicit administrator action.
+    let Some(setup) = prepare_power_helper_force_with_trust(
+        login,
+        uid,
+        architecture,
+        &operation_id,
+        Some(&trust),
+        true,
+    )?
+    else {
+        return Err("power sampler still needs setup but its repair plan is empty".into());
+    };
+    let result = run_interactive_admin_with_reason(
+        login,
+        "repair the local mtop LaunchDaemon after enrollment",
+        &setup.script,
+    );
+    cleanup_power_helper_stage(login, &setup);
+    result
 }
 
 fn ensure_power_helper(
@@ -4380,7 +4653,9 @@ fn ensure_power_helper(
 fn prepare_power_helpers_for_nodes(
     config: &ClusterConfig,
     operation_id: &str,
+    state_dir: &Path,
     excluded_machine_uuid: Option<&str>,
+    trust: Option<&UpdateTrust>,
 ) -> BTreeMap<String, PowerHelperSetup> {
     let mut setups = BTreeMap::new();
     for (node_id, node) in &config.nodes {
@@ -4405,7 +4680,55 @@ fn prepare_power_helpers_for_nodes(
                 }
             }
         };
-        match prepare_power_helper(node, uid, &arch, operation_id) {
+        if let Some(trust) = trust {
+            let trusted = remote_update_trust_matches(node, trust);
+            let updater = if matches!(&trusted, Ok(true)) {
+                Some(request_nfs_admin_service(
+                    node,
+                    &NfsAdminRequest {
+                        operation: NfsAdminOperation::Ping,
+                    },
+                ))
+            } else {
+                None
+            };
+            let updater_ready = matches!(&updater, Some(Ok(Some(()))));
+            match power_helper_node_action(trusted.as_ref().copied().map_err(|_| ()), updater_ready)
+            {
+                PowerHelperNodeAction::UseSignedUpdater => {
+                    // Existing capable nodes receive helper updates through
+                    // their signed socket operation, including protocol
+                    // upgrades that the older service can self-apply.
+                    if let Err(error) = refresh_privileged_helpers_for_node(
+                        config,
+                        node_id,
+                        node,
+                        state_dir,
+                        operation_id,
+                    ) {
+                        eprintln!(
+                            "Privileged helper update for {node_id} was deferred: {error}; no administrator prompt was issued."
+                        );
+                    }
+                    continue;
+                }
+                PowerHelperNodeAction::Defer => {
+                    let detail = match (&trusted, &updater) {
+                        (Err(error), _) => format!("cannot verify updater enrollment: {error}"),
+                        (_, Some(Err(error))) => {
+                            format!("privileged updater is unavailable: {error}")
+                        }
+                        _ => "privileged updater is restarting or unavailable".to_owned(),
+                    };
+                    eprintln!(
+                        "Power sampler setup for {node_id} was deferred ({detail}); updater trust is pinned, so no administrator prompt was issued."
+                    );
+                    continue;
+                }
+                PowerHelperNodeAction::Bootstrap => {}
+            }
+        }
+        match prepare_power_helper_with_trust(node, uid, &arch, operation_id, trust) {
             Ok(Some(setup)) => {
                 setups.insert(node_id.clone(), setup);
             }
@@ -4436,6 +4759,7 @@ fn power_helper_install_script(
     )
 }
 
+#[cfg(test)]
 fn power_helper_install_script_with_admin_revision(
     staged_binary: &str,
     staged_admin_cli: &str,
@@ -4444,14 +4768,110 @@ fn power_helper_install_script_with_admin_revision(
     admin_cli_digest: &str,
     admin_cli_revision: &str,
 ) -> String {
+    power_helper_install_script_with_updater(
+        staged_binary,
+        staged_admin_cli,
+        staged_plist,
+        helper_digest,
+        admin_cli_digest,
+        admin_cli_revision,
+        None,
+    )
+}
+
+fn power_helper_install_script_with_updater(
+    staged_binary: &str,
+    staged_admin_cli: &str,
+    staged_plist: &str,
+    helper_digest: &str,
+    admin_cli_digest: &str,
+    admin_cli_revision: &str,
+    trust: Option<(&str, &UpdateTrust)>,
+) -> String {
     let staged_binary = shell_quote(staged_binary);
     let staged_admin_cli = shell_quote(staged_admin_cli);
     let staged_plist = shell_quote(staged_plist);
     let helper_digest = shell_quote(helper_digest);
     let admin_cli_digest = shell_quote(admin_cli_digest);
     let admin_cli_revision = shell_quote(admin_cli_revision);
+    let power_revision = shell_quote(POWER_HELPER_REVISION);
+    let (trust_install, trust_cleanup) = if let Some((staged_key, trust)) = trust {
+        let staged_key = shell_quote(staged_key);
+        let cluster_id = shell_quote(&trust.cluster_id);
+        let public_key_digest = shell_quote(
+            &macluster_protocol::framing::sha256_hex(&trust.public_key)
+                .expect("SHA-256 is available"),
+        );
+        (
+            format!(
+                r#"if [ ! -f {staged_key} ] || [ -L {staged_key} ]; then echo 'cluster updater public key staging file is unsafe' >&2; exit 1; fi
+actual=$(/usr/bin/shasum -a 256 {staged_key})
+[ "${{actual%% *}}" = {public_key_digest} ] || {{ echo 'cluster updater public key checksum mismatch' >&2; exit 1; }}
+if [ -L /Library/PrivilegedHelperTools/org.macluster.update ] || {{ [ -e /Library/PrivilegedHelperTools/org.macluster.update ] && [ ! -d /Library/PrivilegedHelperTools/org.macluster.update ]; }}; then echo 'unsafe existing cluster updater trust directory' >&2; exit 1; fi
+/bin/mkdir -p /Library/PrivilegedHelperTools/org.macluster.update
+/usr/sbin/chown root:wheel /Library/PrivilegedHelperTools/org.macluster.update
+/bin/chmod 755 /Library/PrivilegedHelperTools/org.macluster.update
+if [ -L /Library/PrivilegedHelperTools/org.macluster.update/public-key ] || [ -L /Library/PrivilegedHelperTools/org.macluster.update/cluster-id ]; then echo 'unsafe existing cluster updater trust file' >&2; exit 1; fi
+if [ -f /Library/PrivilegedHelperTools/org.macluster.update/public-key ]; then /usr/bin/cmp -s {staged_key} /Library/PrivilegedHelperTools/org.macluster.update/public-key || {{ echo 'another cluster update key is already pinned; detach/reset this node before enrolling it into a different cluster' >&2; exit 1; }}; else /usr/bin/install -o root -g wheel -m 644 {staged_key} /Library/PrivilegedHelperTools/org.macluster.update/public-key; fi
+/usr/sbin/chown root:wheel /Library/PrivilegedHelperTools/org.macluster.update/public-key
+/bin/chmod 644 /Library/PrivilegedHelperTools/org.macluster.update/public-key
+cluster_id_temp=$(/usr/bin/mktemp -t org.macluster.update.cluster-id.XXXXXX)
+printf '%s\n' {cluster_id} > "$cluster_id_temp"
+if [ -f /Library/PrivilegedHelperTools/org.macluster.update/cluster-id ]; then /usr/bin/cmp -s "$cluster_id_temp" /Library/PrivilegedHelperTools/org.macluster.update/cluster-id || {{ /bin/rm -f "$cluster_id_temp"; echo 'another cluster identity is already pinned; detach/reset this node before enrolling it into a different cluster' >&2; exit 1; }}; else /usr/bin/install -o root -g wheel -m 644 "$cluster_id_temp" /Library/PrivilegedHelperTools/org.macluster.update/cluster-id; fi
+/usr/sbin/chown root:wheel /Library/PrivilegedHelperTools/org.macluster.update/cluster-id
+/bin/chmod 644 /Library/PrivilegedHelperTools/org.macluster.update/cluster-id
+/bin/rm -f "$cluster_id_temp"
+if [ ! -f /Library/PrivilegedHelperTools/org.macluster.update/sequence ]; then sequence_temp=$(/usr/bin/mktemp -t org.macluster.update.sequence.XXXXXX); printf '0\n' > "$sequence_temp"; /usr/bin/install -o root -g wheel -m 600 "$sequence_temp" /Library/PrivilegedHelperTools/org.macluster.update/sequence; /bin/rm -f "$sequence_temp"; fi
+if [ ! -f /Library/PrivilegedHelperTools/org.macluster.update/power.revision ]; then revision_temp=$(/usr/bin/mktemp -t org.macluster.update.power-revision.XXXXXX); printf '%s\n' {power_revision} > "$revision_temp"; /usr/bin/install -o root -g wheel -m 600 "$revision_temp" /Library/PrivilegedHelperTools/org.macluster.update/power.revision; /bin/rm -f "$revision_temp"; fi"#
+            ),
+            format!("/bin/rm -f {staged_key}\n"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        "set -e\nif [ ! -f {staged_binary} ] || [ -L {staged_binary} ]; then echo 'power helper staging file is not a regular file' >&2; exit 1; fi\nif [ ! -f {staged_admin_cli} ] || [ -L {staged_admin_cli} ]; then echo 'NFS admin staging file is not a regular file' >&2; exit 1; fi\nactual=$(/usr/bin/shasum -a 256 {staged_binary})\nif [ \"${{actual%% *}}\" != {helper_digest} ]; then echo 'power helper checksum mismatch; installation cancelled' >&2; exit 1; fi\nactual=$(/usr/bin/shasum -a 256 {staged_admin_cli})\nif [ \"${{actual%% *}}\" != {admin_cli_digest} ]; then echo 'NFS admin checksum mismatch; installation cancelled' >&2; exit 1; fi\n/bin/launchctl bootout system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1 || true\nattempt=0\nwhile /bin/launchctl print system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1; do\n  attempt=$((attempt + 1))\n  if [ \"$attempt\" -ge 20 ]; then echo 'old privileged helper did not stop' >&2; exit 1; fi\n  /bin/sleep 0.25\ndone\nfor socket in /var/run/org.macluster.power.sock {NFS_ADMIN_SOCKET_PATH}; do\n  if [ -S \"$socket\" ]; then /bin/rm \"$socket\"; elif [ -e \"$socket\" ]; then echo \"refusing to replace non-socket $socket\" >&2; exit 1; fi\ndone\n/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons\n/usr/bin/install -o root -g wheel -m 755 {staged_binary} {POWER_HELPER_PATH}\n/usr/bin/install -o root -g wheel -m 755 {staged_admin_cli} {NFS_ADMIN_CLI_PATH}\nversion_temp=/tmp/org.macluster.nfs-admin.version.$$\ntrap '/bin/rm -f \"$version_temp\"' EXIT HUP INT TERM\nprintf '%s\\n' {admin_cli_revision} > \"$version_temp\"\n/usr/bin/install -o root -g wheel -m 644 \"$version_temp\" {NFS_ADMIN_VERSION_PATH}\n/usr/bin/install -o root -g wheel -m 644 {staged_plist} {POWER_LAUNCHD_PATH}\n/bin/rm -f {staged_binary} {staged_admin_cli} {staged_plist}\nattempt=0\nwhile ! bootstrap_error=$(/bin/launchctl bootstrap system {POWER_LAUNCHD_PATH} 2>&1); do\n  attempt=$((attempt + 1))\n  if [ \"$attempt\" -ge 20 ]; then printf '%s\\n' \"$bootstrap_error\" >&2; exit 1; fi\n  /bin/sleep 0.25\ndone\n/bin/launchctl kickstart -k system/{POWER_LAUNCHD_LABEL}\nattempt=0\nwhile [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S {NFS_ADMIN_SOCKET_PATH} ]; do\n  attempt=$((attempt + 1))\n  if [ \"$attempt\" -ge 20 ]; then echo 'privileged helper sockets did not become ready' >&2; exit 1; fi\n  /bin/sleep 0.25\ndone\n"
+        r#"set -e
+if [ ! -f {staged_binary} ] || [ -L {staged_binary} ]; then echo 'power helper staging file is not a regular file' >&2; exit 1; fi
+if [ ! -f {staged_admin_cli} ] || [ -L {staged_admin_cli} ]; then echo 'NFS admin staging file is not a regular file' >&2; exit 1; fi
+actual=$(/usr/bin/shasum -a 256 {staged_binary})
+if [ "${{actual%% *}}" != {helper_digest} ]; then echo 'power helper checksum mismatch; installation cancelled' >&2; exit 1; fi
+actual=$(/usr/bin/shasum -a 256 {staged_admin_cli})
+if [ "${{actual%% *}}" != {admin_cli_digest} ]; then echo 'NFS admin checksum mismatch; installation cancelled' >&2; exit 1; fi
+/bin/launchctl bootout system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1 || true
+attempt=0
+while /bin/launchctl print system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 20 ]; then echo 'old privileged helper did not stop' >&2; exit 1; fi
+  /bin/sleep 0.25
+done
+for socket in /var/run/org.macluster.power.sock {NFS_ADMIN_SOCKET_PATH}; do
+  if [ -S "$socket" ]; then /bin/rm "$socket"; elif [ -e "$socket" ]; then echo "refusing to replace non-socket $socket" >&2; exit 1; fi
+done
+/bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons
+/usr/bin/install -o root -g wheel -m 755 {staged_binary} {POWER_HELPER_PATH}
+/usr/bin/install -o root -g wheel -m 755 {staged_admin_cli} {NFS_ADMIN_CLI_PATH}
+version_temp=/tmp/org.macluster.nfs-admin.version.$$
+trap '/bin/rm -f "$version_temp"' EXIT HUP INT TERM
+printf '%s\n' {admin_cli_revision} > "$version_temp"
+/usr/bin/install -o root -g wheel -m 644 "$version_temp" {NFS_ADMIN_VERSION_PATH}
+/usr/bin/install -o root -g wheel -m 644 {staged_plist} {POWER_LAUNCHD_PATH}
+/bin/rm -f {staged_binary} {staged_admin_cli} {staged_plist}
+attempt=0
+while ! bootstrap_error=$(/bin/launchctl bootstrap system {POWER_LAUNCHD_PATH} 2>&1); do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 20 ]; then printf '%s\n' "$bootstrap_error" >&2; exit 1; fi
+  /bin/sleep 0.25
+done
+/bin/launchctl kickstart -k system/{POWER_LAUNCHD_LABEL}
+attempt=0
+while [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S {NFS_ADMIN_SOCKET_PATH} ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 20 ]; then echo 'privileged helper sockets did not become ready' >&2; exit 1; fi
+  /bin/sleep 0.25
+done
+{trust_install}
+{trust_cleanup}
+"#
     )
 }
 
@@ -5057,6 +5477,13 @@ pub(crate) fn apply_privileged_nfs_admin_request(
                     nfs_exports_update_commands(&candidate, &expected_original, &operation_id)?;
                 run_privileged_nfs_script(&script, "updating managed NFS exports")
             }
+            NfsAdminOperation::UpdateHelpers { .. } => {
+                Err("helper updates must use the authenticated privileged updater service".into())
+            }
+            NfsAdminOperation::ForgetClusterUpdater { .. } => Err(
+                "cluster updater trust must be removed through the authenticated privileged service"
+                    .into(),
+            ),
         }
     })();
     match result {
@@ -5342,6 +5769,7 @@ fn client_nfs_recovery_version_probe_script(mounts: &[ClientUnmountRequest]) -> 
     Some(script)
 }
 
+#[cfg(test)]
 fn client_nfs_recovery_refresh_script(
     config: &ClusterConfig,
     node_id: &str,
@@ -5375,38 +5803,7 @@ fn client_nfs_recovery_refresh_script(
     Ok((!script.is_empty()).then_some(script))
 }
 
-fn prepare_nfs_recovery_refresh_for_update(
-    config: &ClusterConfig,
-    node_id: &str,
-) -> Result<Option<String>, String> {
-    let Some(node) = config.nodes.get(node_id) else {
-        return Err(format!("unknown node {node_id}"));
-    };
-    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
-    let Some(probe) = client_nfs_recovery_version_probe_script(&mounts) else {
-        return Ok(None);
-    };
-    let output = ssh_output(node, &probe, None).map_err(|(_, error)| error)?;
-    if !output.status.success() {
-        return Err(command_error(
-            "cannot inspect NFS recovery helper versions",
-            &output,
-        ));
-    }
-    let mut stale_mounts = BTreeSet::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let index = line
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| format!("invalid NFS recovery version probe response: {line}"))?;
-        if index >= mounts.len() {
-            return Err("NFS recovery version probe returned an invalid mount index".into());
-        }
-        stale_mounts.insert(index);
-    }
-    client_nfs_recovery_refresh_script(config, node_id, &stale_mounts)
-}
-
+#[cfg(test)]
 fn agent_update_admin_script(
     power_script: Option<&str>,
     nfs_recovery_script: Option<&str>,
@@ -5424,10 +5821,149 @@ fn agent_update_admin_script(
     Some(script)
 }
 
-fn prepare_node_power_helper_for_update(
-    node: &NodeConfig,
+fn refresh_agent_helpers_for_update(
+    config: &ClusterConfig,
     operation_id: &str,
-) -> Result<Option<PowerHelperSetup>, String> {
+    state_dir: &Path,
+) -> AppResult<bool> {
+    refresh_agent_helpers_with_signed_updater(config, operation_id, state_dir)
+}
+
+fn refresh_agent_helpers_with_signed_updater(
+    config: &ClusterConfig,
+    operation_id: &str,
+    state_dir: &Path,
+) -> AppResult<bool> {
+    let signing_key =
+        crate::update_signing::ensure_cluster_update_key(state_dir, &config.share_uuid)
+            .map_err(|error| (1, error))?;
+    let trust = UpdateTrust {
+        cluster_id: signing_key.cluster_id().to_owned(),
+        public_key: signing_key.public_key_bytes(),
+    };
+    let mut deferred = false;
+    for (node_id, node) in &config.nodes {
+        let (uid, arch) = match update_node_facts(node) {
+            Ok(facts) => facts,
+            Err(error) => {
+                deferred = true;
+                eprintln!("Privileged helper update on {node_id} is pending: {error}");
+                continue;
+            }
+        };
+        let update = PrivilegedHelperUpdate {
+            config,
+            node_id,
+            node,
+            uid,
+            arch: &arch,
+            state_dir,
+            operation_id,
+            signing_key: &signing_key,
+            trust: &trust,
+        };
+        if let Err(error) = refresh_one_privileged_helper_bundle(&update) {
+            if !io::stdin().is_terminal() && admin_authorization_required(&error) {
+                deferred = true;
+                eprintln!(
+                    "One-time administrator authorization is required to enable passwordless helper updates on {node_id}; rerun from Terminal."
+                );
+                continue;
+            }
+            return Err((
+                1,
+                format!("could not update privileged helpers on {node_id}: {error}"),
+            ));
+        }
+    }
+    Ok(deferred)
+}
+
+/// Bring the persistent privileged service on one already verified node up to
+/// this CLI's protocol version. This is used by reset and removal, which bypass
+/// the normal command preflight so they can recover a partially updated cluster.
+pub(crate) fn refresh_privileged_helpers_for_node(
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+    state_dir: &Path,
+    operation_id: &str,
+) -> Result<(), String> {
+    if !privileged_service_needs_refresh(current_nfs_admin_ping(node)?.as_ref()) {
+        return Ok(());
+    }
+    let signing_key =
+        crate::update_signing::ensure_cluster_update_key(state_dir, &config.share_uuid)?;
+    let trust = UpdateTrust {
+        cluster_id: signing_key.cluster_id().to_owned(),
+        public_key: signing_key.public_key_bytes(),
+    };
+    let (uid, arch) = update_node_facts(node)?;
+    let update = PrivilegedHelperUpdate {
+        config,
+        node_id,
+        node,
+        uid,
+        arch: &arch,
+        state_dir,
+        operation_id,
+        signing_key: &signing_key,
+        trust: &trust,
+    };
+    refresh_one_privileged_helper_bundle(&update)
+}
+
+struct PrivilegedHelperUpdate<'a> {
+    config: &'a ClusterConfig,
+    node_id: &'a str,
+    node: &'a NodeConfig,
+    uid: u32,
+    arch: &'a str,
+    state_dir: &'a Path,
+    operation_id: &'a str,
+    signing_key: &'a crate::update_signing::UpdateSigningKey,
+    trust: &'a UpdateTrust,
+}
+
+fn refresh_one_privileged_helper_bundle(update: &PrivilegedHelperUpdate<'_>) -> Result<(), String> {
+    ensure_update_capability(
+        update.node,
+        update.node_id,
+        update.uid,
+        update.arch,
+        update.operation_id,
+        update.trust,
+    )?;
+    let Some((request, stage_dir)) = stage_signed_helper_update(
+        update.config,
+        update.node_id,
+        update.node,
+        update.uid,
+        update.arch,
+        update.state_dir,
+        update.operation_id,
+        update.signing_key,
+    )?
+    else {
+        if privileged_service_needs_refresh(current_nfs_admin_ping(update.node)?.as_ref()) {
+            return Err(format!(
+                "node {} has an old privileged service but no signed helper payload is available; rerun the cluster update from the current macluster build",
+                update.node_id
+            ));
+        }
+        return Ok(());
+    };
+    let result = match request_nfs_admin_service(update.node, &request) {
+        Ok(Some(())) => Ok(()),
+        Ok(None) => Err("signed helper updater is not available after enrollment".into()),
+        Err(error) => Err(error),
+    };
+    cleanup_helper_update_stage(update.node, &stage_dir);
+    result?;
+    wait_for_current_nfs_admin_service(update.node)
+}
+
+fn update_node_facts(node: &NodeConfig) -> Result<(u32, String), String> {
     let (uid, arch) = if node.transport == Transport::Local {
         (
             node.execution_uid
@@ -5438,18 +5974,260 @@ fn prepare_node_power_helper_for_update(
         let facts = read_remote_facts(node).map_err(|(_, error)| error)?;
         (facts.uid, facts.arch)
     };
-    prepare_power_helper(node, uid, &arch, operation_id)
+    if node.execution_uid.is_some_and(|expected| expected != uid) {
+        return Err("node execution UID changed; refusing privileged helper update".into());
+    }
+    Ok((uid, arch))
 }
 
-fn refresh_agent_helpers_for_update(config: &ClusterConfig, operation_id: &str) -> AppResult<bool> {
-    refresh_agent_helpers_for_update_with(
-        config,
-        operation_id,
-        prepare_node_power_helper_for_update,
-        prepare_nfs_recovery_refresh_for_update,
+fn ensure_update_capability(
+    node: &NodeConfig,
+    node_id: &str,
+    uid: u32,
+    arch: &str,
+    operation_id: &str,
+    trust: &UpdateTrust,
+) -> Result<(), String> {
+    let trusted = remote_update_trust_matches(node, trust)?;
+    let ping = request_nfs_admin_service(
+        node,
+        &NfsAdminRequest {
+            operation: NfsAdminOperation::Ping,
+        },
+    )?;
+    match update_capability_action(trusted, ping.is_some()) {
+        UpdateCapabilityAction::Ready => return Ok(()),
+        UpdateCapabilityAction::WaitForRestart => {
+            wait_for_current_nfs_admin_service(node).map_err(|error| {
+                format!(
+                    "node {node_id} is enrolled for passwordless helper updates, but its privileged service did not recover: {error}; no additional administrator prompt was issued"
+                )
+            })?;
+            return Ok(());
+        }
+        UpdateCapabilityAction::Bootstrap => {}
+    }
+    let Some(setup) =
+        prepare_power_helper_force_with_trust(node, uid, arch, operation_id, Some(trust), true)?
+    else {
+        return Err(format!(
+            "node {node_id} needs one-time updater enrollment, but its installer reported no changes"
+        ));
+    };
+    let result = run_interactive_admin_with_reason(
+        node,
+        "one-time setup of passwordless signed helper updates",
+        &setup.script,
+    );
+    cleanup_power_helper_stage(node, &setup);
+    result?;
+    if !remote_update_trust_matches(node, trust)? {
+        return Err(format!("node {node_id} did not pin the cluster update key"));
+    }
+    match request_nfs_admin_service(
+        node,
+        &NfsAdminRequest {
+            operation: NfsAdminOperation::Ping,
+        },
+    )? {
+        Some(()) => Ok(()),
+        None => Err(format!(
+            "node {node_id} updater did not start after one-time setup"
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateCapabilityAction {
+    Ready,
+    WaitForRestart,
+    Bootstrap,
+}
+
+fn update_capability_action(trusted: bool, ping_available: bool) -> UpdateCapabilityAction {
+    match (trusted, ping_available) {
+        (true, true) => UpdateCapabilityAction::Ready,
+        (true, false) => UpdateCapabilityAction::WaitForRestart,
+        (false, _) => UpdateCapabilityAction::Bootstrap,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PowerHelperNodeAction {
+    Bootstrap,
+    UseSignedUpdater,
+    Defer,
+}
+
+fn power_helper_node_action(
+    trusted: Result<bool, ()>,
+    updater_available: bool,
+) -> PowerHelperNodeAction {
+    match trusted {
+        Ok(false) => PowerHelperNodeAction::Bootstrap,
+        Ok(true) if updater_available => PowerHelperNodeAction::UseSignedUpdater,
+        Ok(true) | Err(()) => PowerHelperNodeAction::Defer,
+    }
+}
+
+fn power_helper_admin_setup_allowed(trust_pinned: bool, force: bool) -> bool {
+    force || !trust_pinned
+}
+
+fn stage_signed_helper_update(
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+    uid: u32,
+    arch: &str,
+    state_dir: &Path,
+    operation_id: &str,
+    signing_key: &crate::update_signing::UpdateSigningKey,
+) -> Result<Option<(NfsAdminRequest, String)>, String> {
+    let operation_id = Id128::parse(operation_id)
+        .map_err(|_| "helper update operation ID is invalid".to_owned())?
+        .to_string();
+    let mut artifacts = Vec::new();
+    let mut sources = BTreeMap::<String, PathBuf>::new();
+
+    let power_helper = crate::embedded_power::ExtractedHelper::new()?;
+    let power_digest = crate::embedded_power::digest()?;
+    let installed_power = ssh_output(
+        node,
+        &shell_join(&["/usr/bin/shasum", "-a", "256", POWER_HELPER_PATH]),
+        None,
     )
+    .map_err(|(_, error)| error)?;
+    let installed_power_output = String::from_utf8_lossy(&installed_power.stdout);
+    let installed_power_digest = installed_power_output.split_whitespace().next();
+    if !installed_power.status.success() || installed_power_digest != Some(power_digest.as_str()) {
+        let stage_name = format!("payload-{power_digest}");
+        artifacts.push(HelperArtifact {
+            component: HelperComponent::PowerSampler,
+            revision: POWER_HELPER_REVISION.into(),
+            sha256: power_digest.clone(),
+            stage_name: stage_name.clone(),
+        });
+        sources.insert(stage_name, power_helper.path().to_path_buf());
+    }
+
+    let local_cli = select_local_binary(arch).map_err(|(_, error)| error)?;
+    let local_cli_digest = local_sha256(&local_cli).map_err(|(_, error)| error)?;
+    let admin_version = ssh_output(
+        node,
+        &shell_join(&["/bin/cat", NFS_ADMIN_VERSION_PATH]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let installed_admin_version = String::from_utf8_lossy(&admin_version.stdout);
+    let installed_admin = ssh_output(
+        node,
+        &shell_join(&["/usr/bin/shasum", "-a", "256", NFS_ADMIN_CLI_PATH]),
+        None,
+    )
+    .map_err(|(_, error)| error)?;
+    let installed_admin_output = String::from_utf8_lossy(&installed_admin.stdout);
+    let installed_admin_digest = installed_admin_output.split_whitespace().next();
+    if !nfs_admin_cli_revision_at_least(installed_admin_version.trim(), NFS_ADMIN_CLI_REVISION)
+        || installed_admin_digest != Some(local_cli_digest.as_str())
+    {
+        let stage_name = format!("payload-{local_cli_digest}");
+        artifacts.push(HelperArtifact {
+            component: HelperComponent::NfsAdminCli,
+            revision: NFS_ADMIN_CLI_REVISION.into(),
+            sha256: local_cli_digest.clone(),
+            stage_name: stage_name.clone(),
+        });
+        sources.insert(stage_name, local_cli.clone());
+    }
+
+    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
+    if let Some(probe) = client_nfs_recovery_version_probe_script(&mounts) {
+        let output = ssh_output(node, &probe, None).map_err(|(_, error)| error)?;
+        if !output.status.success() {
+            return Err(command_error(
+                "cannot inspect NFS recovery helper versions",
+                &output,
+            ));
+        }
+        let mut stale = BTreeSet::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let index = line
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("invalid NFS recovery version probe response: {line}"))?;
+            if index >= mounts.len() {
+                return Err("NFS recovery version probe returned an invalid mount index".into());
+            }
+            stale.insert(index);
+        }
+        for index in stale {
+            let mount = &mounts[index];
+            let stage_name = format!("payload-{local_cli_digest}");
+            artifacts.push(HelperArtifact {
+                component: HelperComponent::NfsRecovery {
+                    target: mount.mount_root.to_string_lossy().into_owned(),
+                    share_uuid: mount.share_uuid.clone(),
+                },
+                revision: crate::nfs_recovery::helper_version(),
+                sha256: local_cli_digest.clone(),
+                stage_name: stage_name.clone(),
+            });
+            sources.insert(stage_name, local_cli.clone());
+        }
+    }
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+
+    let sequence = crate::update_signing::next_cluster_update_sequence(state_dir)?;
+    let manifest = HelperUpdateManifest {
+        format_version: 1,
+        cluster_id: signing_key.cluster_id().to_owned(),
+        sequence,
+        architecture: if arch == "aarch64" { "arm64" } else { arch }.to_owned(),
+        artifacts,
+    };
+    manifest.validate()?;
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
+    let signature = signing_key.sign_manifest(&manifest_bytes);
+    let stage_dir = format!("/tmp/macluster-update-{operation_id}");
+    let mkdir = format!(
+        "umask 077; /bin/mkdir -p {} && /bin/chmod 700 {}",
+        shell_quote(&stage_dir),
+        shell_quote(&stage_dir)
+    );
+    let output = ssh_output(node, &mkdir, None).map_err(|(_, error)| error)?;
+    if !output.status.success() {
+        return Err(command_error(
+            "cannot create private helper update staging directory",
+            &output,
+        ));
+    }
+    for (stage_name, source) in &sources {
+        scp_to_node(node, source, &format!("{stage_dir}/{stage_name}"))
+            .map_err(|(_, error)| error)?;
+    }
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::UpdateHelpers {
+            manifest: manifest_bytes,
+            signature: signature.to_vec(),
+            stage_dir: stage_dir.clone(),
+        },
+    };
+    request.validate(uid)?;
+    Ok(Some((request, stage_dir)))
 }
 
+fn cleanup_helper_update_stage(node: &NodeConfig, stage_dir: &str) {
+    let _ = ssh_output(
+        node,
+        &format!("/bin/rm -rf {}", shell_quote(stage_dir)),
+        None,
+    );
+}
+
+#[cfg(test)]
 fn refresh_agent_helpers_for_update_with(
     config: &ClusterConfig,
     operation_id: &str,
@@ -5465,6 +6243,7 @@ fn refresh_agent_helpers_for_update_with(
     )
 }
 
+#[cfg(test)]
 fn refresh_agent_helpers_with_admin(
     config: &ClusterConfig,
     operation_id: &str,
@@ -7419,47 +8198,6 @@ fn run_interactive_admin_with_reason(
     run_interactive_admin(node, script)
 }
 
-fn ensure_nfs_admin_service(node: &NodeConfig) -> Result<bool, String> {
-    ensure_nfs_admin_service_with_revision(node, NFS_ADMIN_CLI_REVISION)
-}
-
-fn ensure_nfs_admin_service_with_revision(
-    node: &NodeConfig,
-    required_admin_revision: &str,
-) -> Result<bool, String> {
-    let (uid, arch) = if node.transport == Transport::Local {
-        (
-            node.execution_uid
-                .unwrap_or_else(|| unsafe { libc::geteuid() }),
-            std::env::consts::ARCH.to_owned(),
-        )
-    } else {
-        let facts = read_remote_facts(node).map_err(|(_, error)| error)?;
-        (facts.uid, facts.arch)
-    };
-    if node.execution_uid.is_some_and(|expected| expected != uid) {
-        return Err("node execution account changed; refusing NFS helper setup".into());
-    }
-    let operation_id = Id128::random().to_string();
-    let Some(setup) = prepare_power_helper_with_admin_revision(
-        node,
-        uid,
-        &arch,
-        &operation_id,
-        required_admin_revision,
-    )?
-    else {
-        return Ok(false);
-    };
-    let result = run_interactive_admin_with_reason(
-        node,
-        "install the persistent NFS administrator service (one-time setup for this Mac)",
-        &setup.script,
-    );
-    cleanup_power_helper_stage(node, &setup);
-    result.map(|()| true)
-}
-
 /// `None` means this node has an older or missing helper and the caller should
 /// use the explicit sudo compatibility path. A rejected request is an error,
 /// never a reason to retry the same mutation through another path.
@@ -7479,6 +8217,9 @@ fn request_nfs_admin_service(
     .map_err(|(_, error)| error)?;
     if let Ok(reply) = serde_json::from_slice::<NfsAdminReply>(&output.stdout) {
         if reply.service_version != NFS_ADMIN_SERVICE_VERSION {
+            if let Some(result) = stale_nfs_admin_reply(&reply, &request.operation) {
+                return result;
+            }
             return Err(format!(
                 "NFS administrator service version {} does not match this client {}; rerun the operation to update the helper",
                 reply.service_version, NFS_ADMIN_SERVICE_VERSION
@@ -7505,6 +8246,118 @@ fn request_nfs_admin_service(
     ))
 }
 
+fn current_nfs_admin_ping(node: &NodeConfig) -> Result<Option<NfsAdminReply>, String> {
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::Ping,
+    };
+    let peer_uid = nfs_admin_peer_uid(node)?;
+    request.validate(peer_uid)?;
+    let bytes = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+    let output = ssh_output_with_timeout(
+        node,
+        &format!("{} --nfs-admin", shell_quote(POWER_HELPER_PATH)),
+        Some(&bytes),
+        ADMIN_COMMAND_LIMIT,
+    )
+    .map_err(|(_, error)| error)?;
+    if let Ok(reply) = serde_json::from_slice::<NfsAdminReply>(&output.stdout) {
+        return Ok(Some(reply));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(78)
+        || output.status.code() == Some(127)
+        || stderr.contains("usage: macluster-power")
+        || stderr.contains("command not found")
+    {
+        return Ok(None);
+    }
+    Err(command_error(
+        "cannot inspect the privileged NFS service version",
+        &output,
+    ))
+}
+
+fn wait_for_current_nfs_admin_service(node: &NodeConfig) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let last_status = match current_nfs_admin_ping(node) {
+            Ok(Some(reply)) if !privileged_service_needs_refresh(Some(&reply)) => return Ok(()),
+            Ok(Some(reply)) => reply.error.unwrap_or_else(|| {
+                format!("service version {} is still running", reply.service_version)
+            }),
+            Ok(None) => "the privileged helper socket is restarting".into(),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "privileged helper did not reach service version {NFS_ADMIN_SERVICE_VERSION}: {last_status}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn privileged_service_needs_refresh(reply: Option<&NfsAdminReply>) -> bool {
+    !reply.is_some_and(|reply| reply.ok && reply.service_version == NFS_ADMIN_SERVICE_VERSION)
+}
+
+fn stale_nfs_admin_reply(
+    reply: &NfsAdminReply,
+    operation: &NfsAdminOperation,
+) -> Option<Result<Option<()>, String>> {
+    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-3" {
+        return Some(Ok(None));
+    }
+    if reply.service_version != "nfs-admin-2" || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-3" {
+        return None;
+    }
+    if !reply.ok {
+        return Some(Err(reply.error.clone().unwrap_or_else(|| {
+            "nfs-admin-2 rejected a request during its signed self-update".into()
+        })));
+    }
+    match operation {
+        // nfs-admin-2 already understands signed self-update. Its daemon
+        // restarts into nfs-admin-3 after installing the new power helper.
+        NfsAdminOperation::Ping | NfsAdminOperation::UpdateHelpers { .. } => Some(Ok(Some(()))),
+        _ => Some(Err(
+            "NFS administrator service version nfs-admin-2 must be refreshed before this operation; rerun the command after the automatic helper update".into(),
+        )),
+    }
+}
+
+pub(crate) fn forget_cluster_update_trust(
+    node: &NodeConfig,
+    cluster_id: &str,
+) -> Result<(), String> {
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::ForgetClusterUpdater {
+            cluster_id: cluster_id.to_owned(),
+        },
+    };
+    match request_nfs_admin_service(node, &request)? {
+        Some(()) => Ok(()),
+        None => {
+            let trust_dir = "/Library/PrivilegedHelperTools/org.macluster.update";
+            let script = format!(
+                "if [ -e {path} ] || [ -L {path} ]; then exit 0; else exit 1; fi",
+                path = shell_quote(trust_dir)
+            );
+            let output = ssh_output(node, &script, None).map_err(|(_, error)| error)?;
+            if output.status.code() == Some(1) {
+                Ok(())
+            } else if output.status.success() {
+                Err("the node still has pinned cluster updater trust, but its privileged service cannot remove it; refresh the helper and retry".into())
+            } else {
+                Err(command_error(
+                    "cannot inspect pinned cluster updater trust",
+                    &output,
+                ))
+            }
+        }
+    }
+}
+
 fn run_nfs_admin_service_operation(
     node: &NodeConfig,
     request: &NfsAdminRequest,
@@ -7512,15 +8365,10 @@ fn run_nfs_admin_service_operation(
 ) -> Result<(), String> {
     let peer_uid = nfs_admin_peer_uid(node)?;
     request.validate(peer_uid)?;
-    let required_admin_revision = NFS_ADMIN_CLI_REVISION;
-    let provisioned = ensure_nfs_admin_service_with_revision(node, required_admin_revision)?;
     match request_nfs_admin_service(node, request)? {
         Some(()) => Ok(()),
-        None if provisioned => Err(format!(
-            "NFS administrator service did not start after setup while attempting to {purpose}; rerun the same command to resume"
-        )),
         None => Err(format!(
-            "NFS administrator service is unavailable while attempting to {purpose}; rerun the same command to install or repair it"
+            "NFS administrator service is unavailable while attempting to {purpose}; run `mtop` from Terminal to finish the one-time helper enrollment or automatic update, then retry"
         )),
     }
 }
@@ -8057,6 +8905,7 @@ fn abort_pending_enrollment(
     state: &mut AdminState,
     journal_path: &Path,
     config: &ClusterConfig,
+    state_dir: &Path,
     node_id: &str,
 ) -> AppResult<bool> {
     let Some((key, mut operation)) = state
@@ -8118,6 +8967,22 @@ fn abort_pending_enrollment(
         };
         operation.machine_uuid = Some(actual_uuid.clone());
         state.machine_uuids.insert(node_id.to_owned(), actual_uuid);
+        operation.detail = Some("checking the privileged helper before NFS cleanup".into());
+        state.operations.insert(key.clone(), operation.clone());
+        save_admin_state(journal_path, state)?;
+        if let Err(error) =
+            refresh_privileged_helpers_for_node(config, node_id, &node, state_dir, &operation.id)
+        {
+            operation.detail = Some(error.clone());
+            state.operations.insert(key.clone(), operation.clone());
+            save_admin_state(journal_path, state)?;
+            return Err((
+                1,
+                format!(
+                    "cannot abort {node_id} while its privileged helper is unresolved: {error}. Rerun `mnode -rm {node_id}` after updating the helper."
+                ),
+            ));
+        }
         operation.detail = Some("cleaning exact client NFS mounts and aliases before abort".into());
         state.operations.insert(key.clone(), operation.clone());
         save_admin_state(journal_path, state)?;
@@ -8129,6 +8994,17 @@ fn abort_pending_enrollment(
                 1,
                 format!(
                     "cannot abort {node_id} while client NFS cleanup is unresolved: {error}. Rerun `mnode -rm {node_id}` after resolving it."
+                ),
+            ));
+        }
+        if let Err(error) = forget_cluster_update_trust(&node, &config.share_uuid) {
+            operation.detail = Some(error.clone());
+            state.operations.insert(key.clone(), operation.clone());
+            save_admin_state(journal_path, state)?;
+            return Err((
+                1,
+                format!(
+                    "cannot abort {node_id} while its cluster updater trust is unresolved: {error}. Rerun `mnode -rm {node_id}` after refreshing the privileged helper."
                 ),
             ));
         }
@@ -8851,7 +9727,13 @@ fn remove_node(
                                 ),
                             ));
                         }
-                        if abort_pending_enrollment(&mut state, &journal_path, &config, node_id)? {
+                        if abort_pending_enrollment(
+                            &mut state,
+                            &journal_path,
+                            &config,
+                            state_dir,
+                            node_id,
+                        )? {
                             return Ok(());
                         }
                         return Err((
@@ -9008,6 +9890,25 @@ fn remove_node(
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
+        if let Err(error) = refresh_privileged_helpers_for_node(
+            &config,
+            node_id,
+            &connection_node,
+            state_dir,
+            &operation.id,
+        ) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "cannot refresh the privileged helper on {node_id} before removal: {error}. Rerun `mnode -rm {node_id}` to resume."
+                ),
+            ));
+        }
         if config
             .queues
             .values()
@@ -9042,6 +9943,20 @@ fn remove_node(
                 1,
                 format!(
                     "{node_id} is detached from queues but client NFS cleanup is pending: {error}. Rerun `mnode -rm {node_id}`."
+                ),
+            ));
+        }
+
+        if let Err(error) = forget_cluster_update_trust(&connection_node, &config.share_uuid) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "{node_id} is detached from queues, but its cluster update trust could not be removed: {error}. Rerun `mnode -rm {node_id}` after updating or repairing its privileged helper."
                 ),
             ));
         }
@@ -9802,6 +10717,7 @@ fn pending_local_share_retry_node(
 
 fn add_node(config_path: &Path, state_dir: &Path, mut options: AddOptions) -> AppResult<()> {
     confirm_overlay_existing(&mut options)?;
+    fs::create_dir_all(state_dir).map_err(io_error)?;
     match options.target {
         AddTarget::Ssh(endpoint) => {
             let source_path = endpoint.source_path.clone();
@@ -11463,15 +12379,11 @@ fn run_client_mount_batch_with_preparation(
     purpose: &str,
 ) -> Result<(), String> {
     if power_script.is_none() && preparation.is_empty() && !requests.is_empty() {
-        let provisioned = ensure_nfs_admin_service(node)?;
         match request_nfs_admin_service(node, &client_mount_admin_request(requests))? {
             Some(()) => return Ok(()),
-            None if provisioned => {
-                return Err("NFS administrator service did not start after setup; rerun the same mnode command to resume".into());
-            }
             None => {
                 return Err(
-                    "NFS administrator service is unavailable; refusing a second privileged mount path. Rerun the same mnode command to repair it".into(),
+                    "NFS administrator service is unavailable; refusing a second privileged mount path. Run `mtop` from Terminal to finish the one-time helper enrollment or automatic update, then retry".into(),
                 );
             }
         }
@@ -12019,6 +12931,8 @@ fn add_local_node(
         let config_path = config_path.canonicalize().map_err(io_error)?;
         let source = fs::read_to_string(&config_path).map_err(io_error)?;
         let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let update_trust =
+            ensure_update_trust(state_dir, &config.share_uuid).map_err(|error| (1, error))?;
         let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
         if !config.queues.contains_key(queue_name) {
             return Err((2, format!("queue '{queue_name}' is not configured")));
@@ -12162,16 +13076,23 @@ fn add_local_node(
         let existing_power_setups = if defer_queue_for_share {
             BTreeMap::new()
         } else {
-            prepare_power_helpers_for_nodes(&staged_config, &operation.id, Some(&machine_uuid))
+            prepare_power_helpers_for_nodes(
+                &staged_config,
+                &operation.id,
+                state_dir,
+                Some(&machine_uuid),
+                Some(&update_trust),
+            )
         };
         let power_setup = if defer_queue_for_share {
             None
         } else {
-            match prepare_power_helper(
+            match prepare_power_helper_with_trust(
                 &local_node,
                 execution_uid,
                 std::env::consts::ARCH,
                 &operation.id,
+                Some(&update_trust),
             ) {
                 Ok(setup) => setup,
                 Err(error) => {
@@ -12577,6 +13498,8 @@ fn add_ssh_node(
         let config_source = fs::read_to_string(&config_path).map_err(io_error)?;
         let config =
             ClusterConfig::parse(&config_source).map_err(|error| (2, error.to_string()))?;
+        let update_trust =
+            ensure_update_trust(state_dir, &config.share_uuid).map_err(|error| (1, error))?;
         let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
         if !config.queues.contains_key(queue_name) {
             return Err((2, format!("queue '{queue_name}' is not configured")));
@@ -12748,14 +13671,19 @@ fn add_ssh_node(
                     handoff,
                 )
                 .map_err(|error| (1, error))?;
-                let power_setup =
-                    prepare_power_helper(existing_node, facts.uid, &facts.arch, &operation_id)
-                        .map_err(|error| {
-                            (
-                                1,
-                                format!("cannot prepare power sampler on {existing_id}: {error}"),
-                            )
-                        })?;
+                let power_setup = prepare_power_helper_with_trust(
+                    existing_node,
+                    facts.uid,
+                    &facts.arch,
+                    &operation_id,
+                    Some(&update_trust),
+                )
+                .map_err(|error| {
+                    (
+                        1,
+                        format!("cannot prepare power sampler on {existing_id}: {error}"),
+                    )
+                })?;
                 configure_node_nfs_resources(
                     &config,
                     existing_id,
@@ -13091,16 +14019,26 @@ fn add_ssh_node(
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
 
-        let existing_power_setups =
-            prepare_power_helpers_for_nodes(&config, &operation.id, Some(&machine_uuid));
-        let power_setup =
-            match prepare_power_helper(&node_config, facts.uid, &facts.arch, &operation.id) {
-                Ok(setup) => setup,
-                Err(error) => {
-                    eprintln!("Power sampler setup for {node_id} was skipped: {error}");
-                    None
-                }
-            };
+        let existing_power_setups = prepare_power_helpers_for_nodes(
+            &config,
+            &operation.id,
+            state_dir,
+            Some(&machine_uuid),
+            Some(&update_trust),
+        );
+        let power_setup = match prepare_power_helper_with_trust(
+            &node_config,
+            facts.uid,
+            &facts.arch,
+            &operation.id,
+            Some(&update_trust),
+        ) {
+            Ok(setup) => setup,
+            Err(error) => {
+                eprintln!("Power sampler setup for {node_id} was skipped: {error}");
+                None
+            }
+        };
         operation.client_setup_attempted = Some(true);
         operation.detail = Some("client NFS resources are being configured".into());
         state
@@ -17471,7 +18409,201 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
         );
         assert!(script.contains(super::NFS_ADMIN_CLI_REVISION));
-        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-1");
+        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-3");
+    }
+
+    #[test]
+    fn older_signed_updater_can_self_upgrade_without_admin_fallback() {
+        let reply = |version: &str, ok: bool| super::NfsAdminReply {
+            ok,
+            service_version: version.into(),
+            error: None,
+        };
+        let ping = NfsAdminOperation::Ping;
+        let update = NfsAdminOperation::UpdateHelpers {
+            manifest: b"signed".to_vec(),
+            signature: vec![0; 64],
+            stage_dir: "/tmp/macluster-update-00000000-0000-4000-8000-000000000001".into(),
+        };
+        let forget = NfsAdminOperation::ForgetClusterUpdater {
+            cluster_id: "00000000-0000-4000-8000-000000000001".into(),
+        };
+
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-1", true), &ping)
+                .unwrap()
+                .unwrap(),
+            None,
+            "the pre-updater service must use the one-time enrollment migration"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-2", true), &ping)
+                .unwrap()
+                .unwrap(),
+            Some(()),
+            "nfs-admin-2 can authenticate the signed self-upgrade path without sudo"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-2", true), &update)
+                .unwrap()
+                .unwrap(),
+            Some(())
+        );
+        assert!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-2", true), &forget)
+                .unwrap()
+                .is_err()
+        );
+        assert!(super::stale_nfs_admin_reply(&reply("nfs-admin-9", true), &ping).is_none());
+    }
+
+    #[test]
+    fn reset_and_removal_refresh_stale_or_missing_privileged_services() {
+        let reply = |version: &str, ok: bool| super::NfsAdminReply {
+            ok,
+            service_version: version.into(),
+            error: None,
+        };
+        assert!(super::privileged_service_needs_refresh(None));
+        assert!(super::privileged_service_needs_refresh(Some(&reply(
+            "nfs-admin-2",
+            true
+        ))));
+        assert!(super::privileged_service_needs_refresh(Some(&reply(
+            super::NFS_ADMIN_SERVICE_VERSION,
+            false,
+        ))));
+        assert!(!super::privileged_service_needs_refresh(Some(&reply(
+            super::NFS_ADMIN_SERVICE_VERSION,
+            true,
+        ))));
+    }
+
+    #[test]
+    fn pinned_updater_never_falls_back_to_another_admin_prompt() {
+        use super::UpdateCapabilityAction::{Bootstrap, Ready, WaitForRestart};
+
+        assert_eq!(super::update_capability_action(true, true), Ready);
+        assert_eq!(super::update_capability_action(true, false), WaitForRestart);
+        assert_eq!(super::update_capability_action(false, true), Bootstrap);
+        assert_eq!(super::update_capability_action(false, false), Bootstrap);
+    }
+
+    #[test]
+    fn update_trust_creation_refuses_to_reuse_a_key_from_another_cluster() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let first =
+            super::ensure_update_trust(&root, "00000000-0000-4000-8000-000000000001").unwrap();
+        let repeated =
+            super::ensure_update_trust(&root, "00000000-0000-4000-8000-000000000001").unwrap();
+        assert_eq!(first.public_key, repeated.public_key);
+        assert!(super::ensure_update_trust(&root, "00000000-0000-4000-8000-000000000002").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn power_sampler_socket_check_distinguishes_sockets_from_files() {
+        use std::os::unix::net::UnixListener;
+
+        let root = PathBuf::from(format!("/tmp/mcs-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let socket = root.join("sample.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let regular = root.join("regular-file");
+        fs::write(&regular, b"not a socket").unwrap();
+
+        assert!(super::path_is_unix_socket(&socket));
+        assert!(!super::path_is_unix_socket(&regular));
+        assert!(!super::path_is_unix_socket(&root.join("missing")));
+
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn power_sampler_file_check_requires_matching_binary_and_launch_definition() {
+        assert!(super::power_sampler_files_match(
+            "expected-digest",
+            Some("expected-digest"),
+            b"expected plist",
+            Some(b"expected plist"),
+        ));
+        assert!(!super::power_sampler_files_match(
+            "expected-digest",
+            Some("old-digest"),
+            b"expected plist",
+            Some(b"expected plist"),
+        ));
+        assert!(!super::power_sampler_files_match(
+            "expected-digest",
+            Some("expected-digest"),
+            b"expected plist",
+            None,
+        ));
+    }
+
+    #[test]
+    fn pinned_power_helpers_do_not_use_the_admin_installer_for_routine_setup() {
+        assert!(!super::power_helper_admin_setup_allowed(true, false));
+        assert!(super::power_helper_admin_setup_allowed(true, true));
+        assert!(super::power_helper_admin_setup_allowed(false, false));
+    }
+
+    #[test]
+    fn enrolled_power_helpers_defer_instead_of_bootstrapping_when_updater_is_unavailable() {
+        use super::PowerHelperNodeAction::{Bootstrap, Defer, UseSignedUpdater};
+
+        assert_eq!(
+            super::power_helper_node_action(Ok(true), true),
+            UseSignedUpdater
+        );
+        assert_eq!(super::power_helper_node_action(Ok(true), false), Defer);
+        assert_eq!(super::power_helper_node_action(Err(()), false), Defer);
+        assert_eq!(super::power_helper_node_action(Ok(false), false), Bootstrap);
+    }
+
+    #[test]
+    fn bootstrap_pins_the_cluster_update_public_key_and_identity() {
+        let trust = super::UpdateTrust {
+            cluster_id: "00000000-0000-4000-8000-000000000001".into(),
+            public_key: [7; 32],
+        };
+        let script = super::power_helper_install_script_with_updater(
+            "/tmp/power.bin",
+            "/tmp/nfs-admin.bin",
+            "/tmp/power.plist",
+            "power-digest",
+            "admin-digest",
+            super::NFS_ADMIN_CLI_REVISION,
+            Some(("/tmp/update-key.bin", &trust)),
+        );
+        assert!(script.contains("org.macluster.update/public-key"));
+        assert!(script.contains("org.macluster.update/cluster-id"));
+        assert!(script.contains(&trust.cluster_id));
+        assert!(script.contains(super::POWER_HELPER_REVISION));
+        assert!(script.contains("another cluster update key is already pinned"));
+        assert!(
+            script.contains("/bin/chmod 755 /Library/PrivilegedHelperTools/org.macluster.update")
+        );
+        assert!(script.contains("/usr/bin/mktemp -t org.macluster.update.cluster-id.XXXXXX"));
+        let sockets_ready = script
+            .find("while [ ! -S /var/run/org.macluster.power.sock")
+            .unwrap();
+        let trust_commit = script.find("cluster_id_temp=$(").unwrap();
+        assert!(
+            sockets_ready < trust_commit,
+            "the installer must not pin updater trust until the privileged sockets are ready"
+        );
+        let syntax = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
     }
 
     #[test]

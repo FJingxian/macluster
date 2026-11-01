@@ -2,13 +2,14 @@
 
 use std::{collections::BTreeSet, path::Path};
 
+use crate::helper_update::MAX_HELPER_UPDATE_MANIFEST_BYTES;
 use crate::identifiers::Id128;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_NFS_ADMIN_REQUEST_BYTES: usize = 1024 * 1024;
 /// Wire version for requests handled by the privileged NFS service. Keep this
 /// independent from the installed root-owned CLI implementation revision.
-pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-1";
+pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-3";
 const MAX_BATCH_ITEMS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,6 +48,17 @@ pub enum NfsAdminOperation {
         operation_id: String,
         expected_original: String,
         candidate: String,
+    },
+    /// Install a signed bundle from a private `/tmp/macluster-update-<uuid>` directory.
+    /// Artifact names are derived from their signed manifest order by the root service.
+    UpdateHelpers {
+        manifest: Vec<u8>,
+        signature: Vec<u8>,
+        stage_dir: String,
+    },
+    /// Forget the pinned key for one cluster after an explicit node removal or reset.
+    ForgetClusterUpdater {
+        cluster_id: String,
     },
 }
 
@@ -157,6 +169,32 @@ impl NfsAdminRequest {
                 Id128::parse(operation_id)
                     .map_err(|_| "NFS export operation ID is invalid".to_owned())?;
                 validate_export_transition(expected_original, candidate)
+            }
+            NfsAdminOperation::UpdateHelpers {
+                manifest,
+                signature,
+                stage_dir,
+            } => {
+                if manifest.is_empty() || manifest.len() > MAX_HELPER_UPDATE_MANIFEST_BYTES {
+                    return Err("helper update manifest exceeds its size limit".into());
+                }
+                if signature.len() != 64 {
+                    return Err("helper update signature must contain exactly 64 bytes".into());
+                }
+                let operation_id = stage_dir
+                    .strip_prefix("/tmp/macluster-update-")
+                    .ok_or_else(|| "helper update stage directory is invalid".to_owned())?;
+                Id128::parse(operation_id)
+                    .map_err(|_| "helper update stage directory is invalid".to_owned())?;
+                Ok(())
+            }
+            NfsAdminOperation::ForgetClusterUpdater { cluster_id } => {
+                let parsed = Id128::parse(cluster_id)
+                    .map_err(|_| "cluster updater identity is invalid".to_owned())?;
+                if parsed.to_string() != *cluster_id {
+                    return Err("cluster updater identity must be canonical".into());
+                }
+                Ok(())
             }
         }
     }
@@ -312,6 +350,31 @@ mod tests {
     use super::{NfsAdminOperation, NfsAdminRequest, NfsMount, validate_export_transition};
 
     #[test]
+    fn forget_cluster_update_trust_is_bound_to_a_canonical_cluster_id() {
+        let valid = NfsAdminRequest {
+            operation: NfsAdminOperation::ForgetClusterUpdater {
+                cluster_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+            },
+        };
+        valid.validate(501).unwrap();
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<NfsAdminRequest>(&encoded).unwrap(),
+            valid
+        );
+
+        for cluster_id in ["not-a-uuid", "D7ADD7D9-272F-4DC0-93CD-C62C4Cdd0F41"] {
+            let request = NfsAdminRequest {
+                operation: NfsAdminOperation::ForgetClusterUpdater {
+                    cluster_id: cluster_id.into(),
+                },
+            };
+            assert!(request.validate(501).is_err());
+        }
+        assert!(valid.validate(0).is_err());
+    }
+
+    #[test]
     fn typed_mount_request_round_trips_and_validates() {
         let request = NfsAdminRequest {
             operation: NfsAdminOperation::Mount {
@@ -425,6 +488,41 @@ mod tests {
             },
         };
         assert!(request.validate(501).is_err());
+    }
+
+    #[test]
+    fn helper_update_request_is_bounded_and_confined_to_a_private_operation_directory() {
+        let valid = NfsAdminRequest {
+            operation: NfsAdminOperation::UpdateHelpers {
+                manifest: b"{}".to_vec(),
+                signature: vec![0; 64],
+                stage_dir: "/tmp/macluster-update-00000000-0000-4000-8000-000000000001".into(),
+            },
+        };
+        valid.validate(501).unwrap();
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<NfsAdminRequest>(&encoded).unwrap(),
+            valid
+        );
+
+        for (signature, stage_dir) in [
+            (
+                vec![0; 63],
+                "/tmp/macluster-update-00000000-0000-4000-8000-000000000001",
+            ),
+            (vec![0; 64], "/tmp/macluster-update-../../etc"),
+            (vec![0; 64], "/tmp/other"),
+        ] {
+            let request = NfsAdminRequest {
+                operation: NfsAdminOperation::UpdateHelpers {
+                    manifest: b"{}".to_vec(),
+                    signature,
+                    stage_dir: stage_dir.into(),
+                },
+            };
+            assert!(request.validate(501).is_err());
+        }
     }
 
     #[test]

@@ -1991,11 +1991,29 @@ fn cleanup_batches<'a>(
         batch.add_node(&alias.server_id, &alias.server);
         batch.aliases.push((index, alias));
     }
+    for (node_id, node) in &plan.nodes {
+        if journal.is_completed(&format!("updater-trust:{node_id}")) {
+            continue;
+        }
+        let batch = batches
+            .entry(cleanup_batch_key(node))
+            .or_insert_with(|| CleanupBatch {
+                node,
+                nodes: Vec::new(),
+                mounts: Vec::new(),
+                exports: Vec::new(),
+                aliases: Vec::new(),
+            });
+        batch.add_node(node_id, node);
+    }
     batches
 }
 
 fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) -> AppResult<()> {
     quiesce_publishers(journal, plan, path)?;
+    let old_config =
+        ClusterConfig::parse(&journal.old_config).map_err(|error| (1, error.to_string()))?;
+    let cluster_id = old_config.share_uuid.clone();
     for (_, batch) in cleanup_batches(journal, plan) {
         let node = batch.node;
         let node_id = batch
@@ -2005,6 +2023,33 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
             .unwrap_or("unknown node");
         for (id, identity) in &batch.nodes {
             plan.verify_node(id, identity)?;
+        }
+        let privileged_cleanup_pending = !batch.mounts.is_empty()
+            || !batch.exports.is_empty()
+            || !batch.aliases.is_empty()
+            || batch
+                .nodes
+                .iter()
+                .any(|(id, _)| !journal.is_completed(&format!("updater-trust:{id}")));
+        if privileged_cleanup_pending {
+            if let Some((id, identity)) = batch.nodes.first() {
+                plan.verify_node(id, identity)?;
+                node_admin::refresh_privileged_helpers_for_node(
+                    &old_config,
+                    id,
+                    identity,
+                    Path::new(&journal.state_dir),
+                    &journal.id,
+                )
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot refresh the privileged helper on {id} before reset cleanup: {error}"
+                        ),
+                    )
+                })?;
+            }
         }
         let mut protocol_mounts = Vec::new();
         if !batch.mounts.is_empty() {
@@ -2126,6 +2171,20 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                 )
             })?;
         }
+        for (id, identity) in &batch.nodes {
+            let step = format!("updater-trust:{id}");
+            if journal.is_completed(&step) {
+                continue;
+            }
+            plan.verify_node(id, identity)?;
+            node_admin::forget_cluster_update_trust(identity, &cluster_id).map_err(|error| {
+                (
+                    1,
+                    format!("cannot remove the cluster updater trust from {id}: {error}"),
+                )
+            })?;
+            journal.mark_completed(step);
+        }
         let mut completed_mounts = BTreeSet::new();
         for mount in &batch.mounts {
             if completed_mounts.insert(mount.node_id.as_str()) {
@@ -2138,7 +2197,11 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
         for (index, server_id) in completed_aliases {
             journal.mark_completed(format!("alias:{server_id}:{index}"));
         }
-        if !batch.mounts.is_empty() || !batch.exports.is_empty() || !batch.aliases.is_empty() {
+        if !batch.mounts.is_empty()
+            || !batch.exports.is_empty()
+            || !batch.aliases.is_empty()
+            || !batch.nodes.is_empty()
+        {
             save_journal(path, journal, false)?;
         }
     }
@@ -3134,6 +3197,7 @@ fn install_target(journal: &mut ResetJournal, path: &Path) -> AppResult<()> {
                 &mut config,
                 primary,
                 &journal.id,
+                &state_dir,
             )?;
         } else {
             super::prepare_local_primary_for_reset(&config.shared_root, &config.share_uuid)?;
@@ -4232,6 +4296,46 @@ mod tests {
     }
 
     #[test]
+    fn reset_cleanup_batches_include_nodes_until_updater_trust_is_forgotten() {
+        use macluster_core::config::{NodeConfig, Transport};
+        use std::collections::BTreeSet;
+
+        let node = |host: &str| NodeConfig {
+            host: host.into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("operator".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let plan = ResetPlan {
+            nodes: BTreeMap::from([
+                ("worker-001".into(), node("192.0.2.11")),
+                ("worker-002".into(), node("192.0.2.12")),
+            ]),
+            active_nodes: BTreeSet::new(),
+            known_uuids: BTreeMap::new(),
+            mounts: Vec::new(),
+            exports: BTreeMap::new(),
+            markers: BTreeMap::new(),
+            aliases: Vec::new(),
+            remote_configs: Vec::new(),
+            remote_agent_states: Vec::new(),
+        };
+        let mut journal = journal();
+        let batches = cleanup_batches(&journal, &plan);
+        assert_eq!(batches.len(), 2);
+
+        journal.mark_completed("updater-trust:worker-001");
+        let batches = cleanup_batches(&journal, &plan);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches.values().next().unwrap().nodes[0].0, "worker-002");
+    }
+
+    #[test]
     fn reset_groups_mount_export_and_alias_cleanup_per_mac() {
         use macluster_core::config::{NodeConfig, Transport};
 
@@ -4888,6 +4992,7 @@ mod tests {
         fs::write(&config, old_config).unwrap();
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join("jobs.db"), b"old jobs").unwrap();
+        fs::write(state.join("cluster-update.key"), b"private-key-fixture").unwrap();
         write_owned_idle_agent_state(&local_agent_state, "00000000-0000-4000-8000-000000000001");
         let agent_bytes = fs::read(local_agent_state.join("agent-state.json")).unwrap();
         let binding = super::binding_path(&config);
@@ -4921,6 +5026,11 @@ mod tests {
         assert_eq!(
             fs::read(archive.join("controller/jobs.db")).unwrap(),
             b"old jobs"
+        );
+        assert_eq!(
+            fs::read(archive.join("controller/cluster-update.key")).unwrap(),
+            b"private-key-fixture",
+            "reset must archive the old signing key along with controller state"
         );
         assert_eq!(
             fs::read(archive.join("agent-local-state/agent-state.json")).unwrap(),

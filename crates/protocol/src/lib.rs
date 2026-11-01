@@ -2,6 +2,7 @@
 
 pub mod control;
 pub mod framing;
+pub mod helper_update;
 pub mod identifiers;
 pub mod types;
 

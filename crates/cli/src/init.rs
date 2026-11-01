@@ -122,7 +122,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     )?;
     if init_journal.exists() {
         resume_local_init(&config_path, &state_dir)?;
-        setup_login_power_after_init(&config_path);
+        setup_login_power_after_init(&config_path, &state_dir);
         return Ok(());
     }
     if remote_journal.exists() {
@@ -315,19 +315,19 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     };
     write_local_init_journal(&config_path, &journal)?;
     finish_local_init(&config_path, &state_dir, &journal)?;
-    setup_login_power_after_init(&config_path);
+    setup_login_power_after_init(&config_path, &state_dir);
     println!("Cluster '{}' initialized.", config.name);
     Ok(())
 }
 
-fn setup_login_power_after_init(config_path: &Path) {
+fn setup_login_power_after_init(config_path: &Path, state_dir: &Path) {
     if std::env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some() {
         return;
     }
     let result = fs::read_to_string(config_path)
         .map_err(|error| error.to_string())
         .and_then(|source| ClusterConfig::parse(&source).map_err(|error| error.to_string()))
-        .and_then(|config| node_admin::ensure_local_power_sampler(&config));
+        .and_then(|config| node_admin::ensure_local_power_sampler(&config, state_dir));
     if let Err(error) = result {
         eprintln!(
             "Power sampler setup is incomplete: {error}. Open mtop in Terminal to retry authorization."
@@ -583,9 +583,18 @@ fn finish_remote_init(
     })?;
     validate_remote_init_topology(&config, &journal.primary_nfs)?;
     let existing_config = remote_init_config_matches(&expected_config, &journal)?;
+    // Create updater trust before the first privileged install so both the
+    // remote NFS server and this login Mac are enrolled by that one-time setup.
+    let update_trust = node_admin::ensure_update_trust(&expected_state, &config.share_uuid)
+        .map_err(|error| (1, format!("cannot prepare cluster update trust: {error}")))?;
 
     if remote_init_requires_nfs_setup(journal.phase) {
-        configure_remote_primary(&config, &journal.primary_nfs, &config.share_uuid)?;
+        configure_remote_primary(
+            &config,
+            &journal.primary_nfs,
+            &config.share_uuid,
+            Some(&update_trust),
+        )?;
         journal.phase = RemoteInitPhase::NfsReady;
         write_remote_init_journal(&expected_config, &journal, false)?;
     }
@@ -902,6 +911,14 @@ fn finish_local_init(
             format!("cluster config was written, but state binding failed: {error}"),
         )
     })?;
+    crate::update_signing::ensure_cluster_update_key(&expected_state, &config.share_uuid).map_err(
+        |error| {
+            (
+                1,
+                format!("cannot prepare cluster update signing key: {error}"),
+            )
+        },
+    )?;
 
     let journal_path = local_init_journal_path(&expected_config);
     fs::remove_file(&journal_path).map_err(|error| {
@@ -1547,6 +1564,7 @@ fn configure_remote_primary(
     config: &ClusterConfig,
     primary: &RemoteNfs,
     operation_id: &str,
+    update_trust: Option<&node_admin::UpdateTrust>,
 ) -> AppResult<()> {
     let original_storage = config
         .nodes
@@ -1595,14 +1613,22 @@ fn configure_remote_primary(
         facts.uid,
         facts.gid,
     )?;
-    let storage_power_setup =
-        match node_admin::prepare_power_helper(storage, facts.uid, &facts.arch, operation_id) {
-            Ok(setup) => setup,
-            Err(error) => {
-                eprintln!("Power sampler setup for {STORAGE_NODE_ID} was skipped: {error}");
-                None
-            }
-        };
+    let storage_power_setup = match match update_trust {
+        Some(trust) => node_admin::prepare_power_helper_with_trust(
+            storage,
+            facts.uid,
+            &facts.arch,
+            operation_id,
+            Some(trust),
+        ),
+        None => node_admin::prepare_power_helper(storage, facts.uid, &facts.arch, operation_id),
+    } {
+        Ok(setup) => setup,
+        Err(error) => {
+            eprintln!("Power sampler setup for {STORAGE_NODE_ID} was skipped: {error}");
+            None
+        }
+    };
     let export_request = node_admin::NfsExportRequest {
         root: source_root.to_string_lossy().into_owned(),
         client_ip: login_host,
@@ -1622,12 +1648,21 @@ fn configure_remote_primary(
     }
     export_result.map_err(|error| (1, error))?;
     let login_uid = unsafe { libc::geteuid() };
-    let login_power_setup = match node_admin::prepare_power_helper(
-        login_node,
-        login_uid,
-        std::env::consts::ARCH,
-        operation_id,
-    ) {
+    let login_power_setup = match match update_trust {
+        Some(trust) => node_admin::prepare_power_helper_with_trust(
+            login_node,
+            login_uid,
+            std::env::consts::ARCH,
+            operation_id,
+            Some(trust),
+        ),
+        None => node_admin::prepare_power_helper(
+            login_node,
+            login_uid,
+            std::env::consts::ARCH,
+            operation_id,
+        ),
+    } {
         Ok(setup) => setup,
         Err(error) => {
             eprintln!("Power sampler setup for {LOGIN_NODE_ID} was skipped: {error}");
@@ -1670,6 +1705,7 @@ pub(super) fn prepare_remote_primary_for_reset(
     config: &mut ClusterConfig,
     primary: &RemoteNfs,
     operation_id: &str,
+    state_dir: &Path,
 ) -> AppResult<()> {
     let (staged_source, staged_config) = node_admin::stage_current_agents(
         config,
@@ -1680,7 +1716,9 @@ pub(super) fn prepare_remote_primary_for_reset(
     .map_err(|(_, error)| (1, error))?;
     *config_source = staged_source;
     *config = staged_config;
-    configure_remote_primary(config, primary, operation_id)
+    let update_trust = node_admin::ensure_update_trust(state_dir, &config.share_uuid)
+        .map_err(|error| (1, format!("cannot prepare cluster update trust: {error}")))?;
+    configure_remote_primary(config, primary, operation_id, Some(&update_trust))
 }
 
 fn verify_nfs_roundtrip(
@@ -2503,6 +2541,10 @@ mod tests {
                 .with_file_name("config.toml.macluster.state-dir")
                 .exists()
         );
+        let update_key = state.join("cluster-update.key");
+        let key_metadata = fs::metadata(&update_key).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(key_metadata.permissions().mode() & 0o777, 0o600);
 
         fs::remove_dir_all(root).unwrap();
     }

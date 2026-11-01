@@ -399,6 +399,7 @@ fn generated_launch_agent_uses_the_stable_binary_and_binding() {
                 .to_string()
         )
     );
+    assert!(plist.contains("<string>internal</string><string>controller-service</string>"));
     assert!(plist.contains("controller-service"));
     assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
 }

@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Component, Path, PathBuf},
     process, thread,
@@ -81,7 +81,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             print_help();
             return Ok(());
         };
-        let command_arg = &args[command_index];
+        let command_arg = args[command_index].clone();
         if command_arg == "--help" || command_arg == "-h" {
             print_help();
             return Ok(());
@@ -94,14 +94,28 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             );
             return Ok(());
         }
-        command = alias_to_command(command_arg).map(str::to_owned);
-        if command.is_some() {
+        if command_arg == "--init" {
+            command = Some("init".into());
             args.remove(command_index);
+        } else if command_arg == "--web" {
+            if let Some(mode) = help_mode(&args[command_index + 1..]) {
+                println!("{}", web_shortcut_help(mode));
+                return Ok(());
+            }
+            let controller_args = parse_web_shortcut_args(&args[command_index + 1..])?;
+            args.truncate(command_index);
+            args.extend(controller_args);
+            command = Some("controller".into());
         } else {
-            return Err((
-                2,
-                format!("unknown command '{command_arg}'; try `macluster --help`"),
-            ));
+            command = alias_to_command(&command_arg).map(str::to_owned);
+            if command.is_some() {
+                args.remove(command_index);
+            } else {
+                return Err((
+                    2,
+                    format!("unknown command '{command_arg}'; try `macluster --help`"),
+                ));
+            }
         }
     }
     let command = command.expect("argv0 alias or parsed subcommand is present");
@@ -197,11 +211,9 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             );
         }
     }
-    let defer_mtop_preflight = command == "top" && top_will_use_tui(&args);
     if should_preflight_agent_update(&command, &args)
         && !address_migration_deferred
         && is_macluster_executable()
-        && !defer_mtop_preflight
     {
         preflight_agent_update(&command, &args, &global)?;
     }
@@ -452,6 +464,18 @@ fn preflight_agent_update_with_compatibility(
                 )
             },
         )?;
+    let node_recovery_blocks_update = if node_recovery_pending {
+        crate::node_admin::node_admin_blocks_agent_update(&config_path, &state_dir).map_err(
+            |error| {
+                (
+                    1,
+                    format!("cannot inspect node administration update blockers: {error}"),
+                )
+            },
+        )?
+    } else {
+        false
+    };
     let recovery_pending =
         crate::node_admin::agent_update_recovery_pending(&config_path, &state_dir).map_err(
             |error| {
@@ -479,6 +503,11 @@ fn preflight_agent_update_with_compatibility(
     }
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
         return Ok(());
+    }
+    if node_recovery_pending {
+        eprintln!(
+            "Warning: node administration is unfinished; continuing with `{command}`. Use `mnode --failed` to inspect or recover the pending operation."
+        );
     }
     let mut local_validation = None;
     let (compatibility, compatibility_age_ms, publish_compatibility) = match checked_compatibility {
@@ -589,13 +618,16 @@ fn preflight_agent_update_with_compatibility(
     }
     if should_block_agent_update_for_pending_node_recovery(
         command,
-        node_recovery_pending,
+        node_recovery_blocks_update,
         update_required,
     ) {
         return Err((
             1,
             "Agent update is blocked by an unfinished node administration operation; finish or resolve it with `mnode`, then retry the requested command.".into(),
         ));
+    }
+    if command == "top" && top_will_use_tui(args) && update_required && agent_mismatch {
+        println!("Agent build mismatch detected; entering the cluster update workflow.");
     }
     let update_result = maybe_run_agent_update(update_required, || {
         crate::node_admin::update_all_agents_for_preflight(&config_path, &state_dir)
@@ -789,6 +821,81 @@ fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
         }
     }
     Ok(None)
+}
+
+fn parse_web_shortcut_args(args: &[String]) -> AppResult<Vec<String>> {
+    let Some(address) = args.first() else {
+        return Err((
+            2,
+            "usage: macluster --web 127.0.0.1:PORT [--no-open]".into(),
+        ));
+    };
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return Err((
+            2,
+            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
+        ));
+    };
+    let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        (
+            2,
+            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
+        )
+    })?;
+    if host != std::net::Ipv4Addr::LOCALHOST {
+        return Err((
+            2,
+            "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
+        ));
+    }
+    let port = port.parse::<u16>().map_err(|_| {
+        (
+            2,
+            format!("invalid web port '{port}'; expected a number from 0 to 65535"),
+        )
+    })?;
+    let mut normalized = vec![
+        "run".into(),
+        "--web".into(),
+        "--web-port".into(),
+        port.to_string(),
+    ];
+    for argument in &args[1..] {
+        if argument == "--no-open" {
+            normalized.push(argument.clone());
+        } else {
+            return Err((2, format!("unknown macluster --web option '{argument}'")));
+        }
+    }
+    Ok(normalized)
+}
+
+fn web_shortcut_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  macluster --web 127.0.0.1:PORT [--no-open]
+
+Open the read-only browser monitor.
+
+The monitor is local-only."#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  macluster --web 127.0.0.1:PORT [--no-open]
+
+OPTIONS
+  127.0.0.1:PORT  Choose the local monitor port; use 0 for an automatic port.
+  --no-open       Print the monitor address without opening a browser.
+
+EXAMPLES
+  macluster --web 127.0.0.1:8080
+  macluster --web 127.0.0.1:0 --no-open
+
+SECURITY
+  The monitor is local-only. Non-loopback addresses are rejected."#
+        }
+    }
 }
 
 fn alias_to_command(name: &str) -> Option<&'static str> {
@@ -2021,7 +2128,7 @@ fn is_direct_system_utility(
     };
     if !matches!(
         name,
-        "ls" | "pwd" | "echo" | "whoami" | "id" | "true" | "false"
+        "ls" | "pwd" | "echo" | "printf" | "whoami" | "id" | "true" | "false"
     ) {
         return false;
     }
@@ -2048,7 +2155,7 @@ fn is_direct_system_utility(
                 && p.file_name().and_then(OsStr::to_str).is_some_and(|n| {
                     matches!(
                         n,
-                        "ls" | "pwd" | "echo" | "whoami" | "id" | "true" | "false"
+                        "ls" | "pwd" | "echo" | "printf" | "whoami" | "id" | "true" | "false"
                     )
                 })
         })
@@ -3589,7 +3696,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 serde_json::to_string_pretty(&jobs).map_err(|error| (1, error.to_string()))?
             );
         } else {
-            print_jobs_table(&jobs);
+            print_jobs_table(&jobs, all);
         }
         return Ok(());
     }
@@ -3629,7 +3736,7 @@ fn job(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             serde_json::to_string_pretty(&jobs).map_err(|error| (1, error.to_string()))?
         );
     } else {
-        print_jobs_table(&jobs);
+        print_jobs_table(&jobs, all);
     }
     Ok(())
 }
@@ -3813,41 +3920,80 @@ fn stream_job_log(
     Ok(())
 }
 
-fn print_jobs_table(jobs: &[JobRecord]) {
-    print!("{}", format_jobs_table(jobs));
+fn print_jobs_table(jobs: &[JobRecord], include_end_time: bool) {
+    print!("{}", format_jobs_table(jobs, include_end_time));
 }
 
-fn format_jobs_table(jobs: &[JobRecord]) -> String {
+fn format_local_job_time(unix_ms: u64) -> String {
+    let Ok(seconds) = libc::time_t::try_from(unix_ms / 1_000) else {
+        return "-".into();
+    };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    if unsafe { libc::localtime_r(&seconds, local.as_mut_ptr()) }.is_null() {
+        return "-".into();
+    }
+    let local = unsafe { local.assume_init() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.tm_year.saturating_add(1900),
+        local.tm_mon.saturating_add(1),
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min,
+        local.tm_sec
+    )
+}
+
+fn format_jobs_table(jobs: &[JobRecord], include_end_time: bool) -> String {
     use std::fmt::Write as _;
 
-    const HEADERS: [&str; 6] = ["JOBID", "STATE", "QUEUE", "NODE", "CREATED(ms)", "NAME"];
-    let rows: Vec<[String; 6]> = jobs
+    let mut headers = vec!["JOBID", "STATE", "QUEUE", "NODE", "SUBMITTED"];
+    if include_end_time {
+        headers.push("ENDED");
+    }
+    headers.push("NAME");
+
+    let rows: Vec<Vec<String>> = jobs
         .iter()
         .map(|job| {
-            [
+            let mut row = vec![
                 job.id.to_string(),
                 format!("{:?}", job.state),
                 job.spec.queue.to_string(),
                 job.node.as_ref().map_or("-", NodeId::as_str).to_owned(),
-                job.created_unix_ms.to_string(),
-                escape(&job.spec.name),
-            ]
+                format_local_job_time(job.created_unix_ms),
+            ];
+            if include_end_time {
+                row.push(
+                    job.finished_unix_ms
+                        .map(format_local_job_time)
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
+            row.push(escape(&job.spec.name));
+            row
         })
         .collect();
-    let widths: [usize; 5] = std::array::from_fn(|column| {
-        rows.iter()
-            .map(|row| row[column].len())
-            .chain(std::iter::once(HEADERS[column].len()))
-            .max()
-            .unwrap_or(HEADERS[column].len())
-    });
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].len())
+                .chain(std::iter::once(headers[column].len()))
+                .max()
+                .unwrap_or(headers[column].len())
+        })
+        .collect();
 
     let mut output = String::new();
-    for row in std::iter::once(HEADERS.map(str::to_owned)).chain(rows) {
-        for column in 0..5 {
+    for row in
+        std::iter::once(headers.iter().map(|header| (*header).to_owned()).collect()).chain(rows)
+    {
+        for column in 0..row.len().saturating_sub(1) {
             let _ = write!(output, "{:<width$}  ", row[column], width = widths[column]);
         }
-        let _ = writeln!(output, "{}", row[5]);
+        if let Some(last) = row.last() {
+            let _ = writeln!(output, "{last}");
+        }
     }
     output
 }
@@ -3908,13 +4054,8 @@ fn format_job_details(record: &JobRecord) -> String {
 }
 
 fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!(
-            "Usage: mqueue [-q|--queue QUEUE] [--jobs] [--json] [--watch SECONDS]\n\nReads persisted queue counts locally without starting the controller or probing nodes. --watch rereads committed task state at each interval."
-        );
+    if let Some(mode) = help_mode(args) {
+        println!("{}", queue_help(mode));
         return Ok(());
     }
     let config = load_config(global.config.as_deref()).map_err(config_error)?;
@@ -4077,7 +4218,7 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                     })
                     .collect();
                 queue_jobs.sort_by_key(|job| job.id);
-                print_jobs_table(&queue_jobs.into_iter().cloned().collect::<Vec<_>>());
+                print_jobs_table(&queue_jobs.into_iter().cloned().collect::<Vec<_>>(), false);
             }
         }
         let Some(seconds) = watch else {
@@ -4087,6 +4228,43 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         println!();
     }
     Ok(())
+}
+
+fn queue_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  mqueue [-q QUEUE] [--jobs] [--json] [--watch SECONDS]
+
+OPTIONS
+  -q, --queue QUEUE   Show one queue.
+  --jobs              Include its jobs.
+  --watch SECONDS     Refresh from saved task state.
+  --json              Print JSON.
+
+EXAMPLE
+  mqueue -q default --jobs"#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  mqueue [-q QUEUE] [--jobs] [--json] [--watch SECONDS]
+
+OPTIONS
+  -q, --queue QUEUE   Show one queue.
+  --jobs              Include job rows in the table.
+  --watch SECONDS     Reread committed task state at this interval.
+  --json              Print queue counts as JSON.
+
+EXAMPLES
+  mqueue
+  mqueue -q default --jobs
+  mqueue --watch 5
+
+NOTES
+  Reads saved queue counts locally. It does not start the controller or
+  probe nodes. A stopped controller leaves the last saved counts visible."#
+        }
+    }
 }
 
 fn help_mode(args: &[String]) -> Option<HelpMode> {
@@ -4102,10 +4280,51 @@ fn help_mode(args: &[String]) -> Option<HelpMode> {
 fn job_help(mode: HelpMode) -> &'static str {
     match mode {
         HelpMode::Short => {
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\nUse --log to read task output and --metrics to watch CPU/RSS. Use --help for sampling details."
+            r#"Usage
+  mjob [JOBID] [OPTIONS]
+  mjob --log JOBID [OPTIONS]
+  mjob --metrics JOBID [OPTIONS]
+
+OPTIONS
+  --all, --state STATE   Filter the job list.
+  --log JOBID            Read task output.
+  --metrics JOBID        Watch task CPU and memory.
+  --json                 Print machine-readable output.
+
+EXAMPLE
+  mjob --log 42 --follow"#
         }
         HelpMode::Long => {
-            "Usage: mjob [JOBID] [--all] [--state STATE] [--json]\n       mjob --request-id UUID\n       mjob --log JOBID [--raw] [--stderr] [--follow]\n       mjob --metrics JOBID [--follow] [--json]\n\nMetrics\n  --metrics subscribes to task process-group CPU/RSS through the running controller. Samples are shared across clients at about five-second intervals. --follow --json emits JSON Lines. The first CPU observation is a baseline (null). Historical CPU and memory accounting covers observed intervals, not guaranteed full task lifetime.\n\nStorage\n  Task records are read from the local controller database without starting the controller. A stopped controller leaves the last persisted state visible. Reading shared logs still requires access to their storage."
+            r#"Usage
+  mjob [JOBID] [--all] [--state STATE] [--json]
+  mjob --request-id UUID
+  mjob --log JOBID [--raw] [--stderr] [--follow]
+  mjob --metrics JOBID [--follow] [--json]
+
+OPTIONS
+  --all                 Include completed jobs.
+  --state STATE         Filter by job state.
+  --request-id UUID     Find a job by submission request ID.
+  --log JOBID           Show stdout; add --stderr for stderr.
+  --raw                 Print log bytes without a pager or formatting.
+  --follow              Follow output or resource samples.
+  --metrics JOBID       Subscribe to task process-group CPU and RSS.
+  --json                Print JSON; with --metrics --follow, emit JSON Lines.
+
+EXAMPLES
+  mjob 42
+  mjob --log 42 --follow
+  mjob --metrics 42 --follow --json
+
+METRICS
+  Samples are shared across clients at about five-second intervals. The first
+  CPU sample is a baseline (null). CPU and memory totals cover observed
+  intervals, not necessarily the task's full lifetime.
+
+STORAGE
+  Job records come from the local controller database; queries do not start
+  the controller. A stopped controller leaves the last saved state visible.
+  Reading shared logs still requires access to their storage."#
         }
     }
 }
@@ -4116,13 +4335,8 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         types::FanPolicy,
     };
 
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!(
-            "Usage: mfans [--status | --reset | --auto | --power] [--node NODE] [--json]\n\nWithout --node, a policy is applied to every registered node. --auto uses a linear CPU temperature curve from 40°C to 80°C; --power uses a logarithmic curve over the same range. --reset returns the fans to macOS system control."
-        );
+    if let Some(mode) = help_mode(args) {
+        println!("{}", fans_help(mode));
         return Ok(());
     }
     let mut policy = None;
@@ -4297,6 +4511,50 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     Ok(())
 }
 
+fn fans_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  mfans --status [--node NODE] [--json]
+  mfans --reset|--auto|--power [--node NODE]
+
+OPTIONS
+  --status   Show fan policy and readings.
+  --reset    Return fans to macOS control.
+  --auto     Use the linear temperature curve.
+  --power    Use the logarithmic temperature curve.
+  --node NODE  Apply to one node; otherwise use all nodes.
+  --json     Print status as JSON.
+
+EXAMPLE
+  mfans --auto --node default-001"#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  mfans --status [--node NODE] [--json]
+  mfans --reset|--auto|--power [--node NODE]
+
+OPTIONS
+  --status             Show fan policy and readings.
+  --reset              Return fans to macOS system control.
+  --auto               Increase fan speed linearly with CPU temperature.
+  --power              Increase fan speed on a logarithmic curve.
+  --node NODE          Apply to one node. Without it, apply to all nodes.
+  --json               Print status as JSON; valid with --status.
+
+POLICY
+  Both curves activate from 40°C and reach maximum speed at 80°C. Fan
+  adjustments use averaged temperature and a dead band to avoid rapid changes.
+
+EXAMPLES
+  mfans --status
+  mfans --auto
+  mfans --power --node default-001
+  mfans --reset"#
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct QueueRow {
     name: String,
@@ -4308,11 +4566,8 @@ struct QueueRow {
 }
 
 fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!("Usage: mkill [--force] JOBID [JOBID ...]");
+    if let Some(mode) = help_mode(args) {
+        println!("{}", kill_help(mode));
         return Ok(());
     }
     let mut force = false;
@@ -4375,6 +4630,35 @@ fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     }
 }
 
+fn kill_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  mkill [--force] JOBID [JOBID ...]
+
+Cancel one or more jobs by ID.
+
+EXAMPLE
+  mkill 42 43"#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  mkill [--force] JOBID [JOBID ...]
+
+OPTIONS
+  --force   Force cancellation instead of waiting for the task to stop itself.
+
+EXAMPLES
+  mkill 42
+  mkill --force 42 43
+
+NOTES
+  Cancellation is sent to the controller when it is running; otherwise it is
+  recorded locally for the next controller reconciliation."#
+        }
+    }
+}
+
 fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool) -> AppResult<()> {
     let mut once = false;
     let mut json = false;
@@ -4383,9 +4667,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" => {
-                println!(
-                    "Usage: mtop [--once] [--json] [-q QUEUE]\nShows login-node and configured compute-node CPU, memory, disk I/O, network, and power readings. On a terminal it refreshes the current screen; redirected output prints one snapshot."
-                );
+                println!("{}", top_help(help_mode(args).unwrap_or(HelpMode::Short)));
                 return Ok(());
             }
             "--once" => once = true,
@@ -4486,9 +4768,6 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
             },
             |action| match action {
                 crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
-                    println!(
-                        "Agent build mismatch detected; entering the cluster update workflow."
-                    );
                     preflight_agent_update_with_compatibility(
                         "top",
                         args,
@@ -4534,6 +4813,41 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
     Ok(())
 }
 
+fn top_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  mtop [--once|--json] [-q QUEUE]
+
+Shows CPU, memory, disk I/O, network, and power for cluster nodes.
+Use --help for display and sampling details."#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  mtop [--once|--json] [-q QUEUE]
+
+OPTIONS
+  --once          Print one resource snapshot.
+  --json          Print one snapshot as JSON.
+  -q, --queue     Show nodes in one queue.
+
+DISPLAY
+  On a terminal, mtop refreshes the current screen. Press Enter on a node to
+  open details and see its processes. Redirected output prints one snapshot.
+
+EXAMPLES
+  mtop
+  mtop --once
+  mtop --json
+  mtop -q default
+
+NOTES
+  Values depend on hardware and installed helpers. Unsupported power, GPU,
+  temperature, or fan readings are shown as N/A."#
+        }
+    }
+}
+
 // Only startup recovery reopens the TUI. A user-requested exit must not
 // launch a second view or start maintenance after quitting.
 fn run_tui_with_updates(
@@ -4569,10 +4883,13 @@ fn run_tui_with_updates(
 }
 
 fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
-    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!(
-            "Usage: macluster controller start|stop|restart|status\n       macluster controller run [--once] [--interval SECONDS] [--web [--web-port PORT] [--no-open]]\n\nThe controller runs as a per-user LaunchAgent after cluster initialization. `run` remains available for foreground use. Add `--web` to start the read-only browser monitor; if a controller is already running, it starts the monitor there and asks before updating an older controller."
-        );
+    let requested_help = if args.is_empty() {
+        Some(HelpMode::Short)
+    } else {
+        help_mode(args)
+    };
+    if let Some(mode) = requested_help {
+        println!("{}", controller_help(mode));
         return Ok(());
     }
     let state_dir = state_root(global.state_dir.as_deref())?;
@@ -4995,6 +5312,47 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             }
         }
         value => Err((2, format!("unknown controller command '{value}'"))),
+    }
+}
+
+fn controller_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  macluster controller start|stop|restart|status
+  macluster controller run [OPTIONS]
+
+EXAMPLE
+  macluster controller status"#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  macluster controller start|stop|restart|status
+  macluster controller run [--once] [--interval SECONDS]
+  macluster controller run --web [--web-port PORT] [--no-open]
+
+COMMANDS
+  start      Start the per-user background service.
+  stop       Stop the service.
+  restart    Restart the service.
+  status     Show service and controller readiness.
+  run        Run in the foreground; --once performs one scheduler pass.
+
+WEB MONITOR
+  --web            Serve the read-only browser monitor on localhost.
+  --web-port PORT  Choose its local port.
+  --no-open        Print the address without opening a browser.
+
+EXAMPLES
+  macluster controller start
+  macluster controller status
+  macluster controller run --web
+
+NOTES
+  After cluster initialization, the controller runs as a per-user LaunchAgent.
+  If it is already running, `run --web` starts the monitor there. An older
+  controller may ask before restarting to enable the monitor."#
+        }
     }
 }
 
@@ -5492,6 +5850,8 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
                 .collect::<Option<Vec<_>>>()
                 .and_then(|ages| ages.into_iter().max())
         },
+        system_disk_capacity: None,
+        external_disk_capacities: Vec::new(),
         gpu_percent: None,
         gpu_source: None,
         gpu_age_ms: None,
@@ -5865,6 +6225,7 @@ fn now_unix_ms() -> u64 {
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
+        Some("nfs-admin") => internal_nfs_admin(&args[1..]),
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -6222,6 +6583,42 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     }
 }
 
+fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
+    if args.len() != 2 || args[0] != "--peer-uid" {
+        return Err((2, "internal nfs-admin requires --peer-uid UID".into()));
+    }
+    let peer_uid = args[1]
+        .parse::<u32>()
+        .map_err(|_| (2, "internal nfs-admin peer UID must be numeric".into()))?;
+    let mut request_bytes = Vec::new();
+    io::stdin()
+        .take(macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut request_bytes)
+        .map_err(|error| (1, format!("cannot read NFS admin request: {error}")))?;
+    let reply = if request_bytes.len() > macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES
+    {
+        macluster_protocol::nfs_admin::NfsAdminReply::failure(
+            "nfs-admin-1",
+            "NFS admin request exceeds the 1 MiB limit",
+        )
+    } else {
+        match serde_json::from_slice::<macluster_protocol::nfs_admin::NfsAdminRequest>(
+            &request_bytes,
+        ) {
+            Ok(request) => crate::node_admin::apply_privileged_nfs_admin_request(request, peer_uid),
+            Err(error) => macluster_protocol::nfs_admin::NfsAdminReply::failure(
+                "nfs-admin-1",
+                format!("invalid NFS admin request: {error}"),
+            ),
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&reply).map_err(|error| (1, error.to_string()))?
+    );
+    Ok(())
+}
+
 fn option_value(args: &[String], option: &str) -> AppResult<Option<String>> {
     for (index, argument) in args.iter().enumerate() {
         if argument == option {
@@ -6538,6 +6935,22 @@ mod tests {
     };
 
     #[test]
+    fn web_shortcut_only_accepts_loopback_and_maps_controller_options() {
+        assert_eq!(
+            super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--no-open".into(),])
+                .unwrap(),
+            ["run", "--web", "--web-port", "8080", "--no-open"]
+        );
+        assert!(super::parse_web_shortcut_args(&["192.0.2.10:8080".into()]).is_err());
+        assert!(super::parse_web_shortcut_args(&["127.0.0.1:nope".into()]).is_err());
+        assert!(super::parse_web_shortcut_args(&[]).is_err());
+        assert!(
+            super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--unknown".into(),])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn interactive_completion_recovers_and_reads_terminal_state() {
         let job = std::cell::RefCell::new(sample_job(1, JobState::Running, "mini01", None, "wrap"));
         let attempts = std::cell::Cell::new(0);
@@ -6777,12 +7190,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_node_admin_work_blocks_update_without_controller_prompt() {
+    fn only_conflicting_node_admin_work_blocks_agent_update() {
         assert!(should_block_agent_update_for_pending_node_recovery(
             "submit", true, true
         ));
         assert!(!should_block_agent_update_for_pending_node_recovery(
-            "submit", true, false
+            "submit", false, true
         ));
         assert!(!should_block_agent_update_for_pending_node_recovery(
             "node", true, true
@@ -6999,17 +7412,18 @@ mod tests {
                 "run analysis\tjob",
             ),
         ];
-        let rendered = format_jobs_table(&jobs);
+        let rendered = format_jobs_table(&jobs, false);
         let lines: Vec<_> = rendered.lines().collect();
         let header = lines[0];
         let row = lines[2];
+        let submitted = super::format_local_job_time(1792831567128);
 
         for (header_cell, row_cell) in [
             ("JOBID", "128"),
             ("STATE", "Cancelled"),
             ("QUEUE", "mini01-long-queue"),
             ("NODE", "mini01-compute-02"),
-            ("CREATED(ms)", "1792831567128"),
+            ("SUBMITTED", submitted.as_str()),
         ] {
             assert_eq!(
                 header.find(header_cell),
@@ -7466,6 +7880,48 @@ mod tests {
                 &options, &inherited, &root
             ));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_printf_drops_irrelevant_unshared_rustup_home_but_rejects_explicit_path() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-printf-env-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let (config, _, _) = environment_fixture(&root, &root.join("mamba"));
+        let inherited = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("RUSTUP_HOME".into(), "/unshared/rustup".into()),
+        ]);
+        let options = crate::arguments::SubmitOptions {
+            wrap: Some("printf smoke-run".into()),
+            ..Default::default()
+        };
+
+        assert!(super::is_direct_system_utility(&options, &inherited, &root));
+        let mapped = super::prepare_task_environment_with_policy(
+            &config,
+            inherited.clone(),
+            BTreeMap::new(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!mapped.contains_key("RUSTUP_HOME"));
+        assert!(
+            super::prepare_task_environment_with_policy(
+                &config,
+                inherited,
+                BTreeMap::from([("RUSTUP_HOME".into(), "/unshared/rustup".into())]),
+                false,
+                true,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -8776,7 +9232,41 @@ fn cli_error(error: CliError) -> (i32, String) {
 
 fn print_help() {
     println!(
-        "macluster — macOS cluster task manager\n\nUsage: macluster <submit|job|queue|kill|top|node|fans|controller|init> [OPTIONS]\n\nAliases: msub, mjob, mqueue, mkill, mtop, mnode, mfans\nGlobal options: --config PATH, --state-dir PATH"
+        r#"macluster
+macOS cluster task manager
+
+Usage
+  macluster [GLOBAL OPTIONS] COMMAND [OPTIONS]
+  macluster --init [OPTIONS]
+  macluster --web 127.0.0.1:PORT [--no-open]
+  msub|mjob|mqueue|mkill|mtop|mnode|mfans [OPTIONS]
+
+COMMANDS
+  init (--init)   Create or reset a cluster.
+  submit (msub)   Submit a task or open an interactive session.
+  job (mjob)      List jobs, read logs, or watch task resources.
+  queue (mqueue)  Show queue membership and job counts.
+  kill (mkill)    Cancel one or more jobs.
+  top (mtop)      View node resources in a live display.
+  node (mnode)    Add, list, and remove nodes or shared paths.
+  fans (mfans)    Inspect or set node fan policies.
+
+WEB MONITOR
+  --web starts the read-only monitor through the background service.
+  It listens on 127.0.0.1 only.
+
+GLOBAL OPTIONS
+  --config PATH      Use a cluster config file.
+  --state-dir PATH   Use a service state directory.
+  -V, --version      Print the version.
+
+EXAMPLES
+  macluster --init
+  macluster --web 127.0.0.1:8080
+  msub -q default python analysis.py
+  mtop
+
+Run `macluster COMMAND --help` for command details."#
     );
 }
 
@@ -8787,10 +9277,83 @@ fn print_submit_help(mode: HelpMode) {
 fn submit_help(mode: HelpMode) -> &'static str {
     match mode {
         HelpMode::Short => {
-            "Usage: msub [OPTIONS] SCRIPT|COMMAND [ARGS...]\n       msub -Is [OPTIONS] [COMMAND [ARGS...]]\n       msub --wrap COMMAND\n       msub --request-id UUID\n\nOptions: -q/--queue, --node, -J/--name, -t/--time, --cwd, -o/--output,\n         -e/--error, --env KEY=VALUE, -v/--verbose\n-Is runs an attached PTY task. Omit COMMAND to open a shell. Pass a command as arguments or as one quoted shell command. Use --help for environment, paths, logging, and job behavior."
+            r#"Usage
+  msub [OPTIONS] COMMAND [ARGS...]
+  msub -Is [OPTIONS] [COMMAND [ARGS...]]
+  msub --wrap COMMAND
+
+OPTIONS
+  -q, --queue QUEUE   Choose a queue.
+  --node NODE         Run on one node.
+  -J, --name NAME     Name the job.
+  -t, --time TIME     Set a wall-time limit.
+  --cwd PATH          Set the working directory.
+  -o, --output PATH   Set stdout destination.
+  -e, --error PATH    Set stderr destination.
+  --env KEY=VALUE     Override one environment variable.
+  -v, --verbose       Save timestamped output and resource samples.
+
+EXAMPLES
+  msub -Is python --version
+
+COMMAND may be a script path or a command. Use --help for environment and
+working-directory rules."#
         }
         HelpMode::Long => {
-            "Usage: msub [OPTIONS] SCRIPT|COMMAND [ARGS...]\n       msub -Is [OPTIONS] [COMMAND [ARGS...]]\n       msub --wrap COMMAND\n       msub --request-id UUID\n\nOptions\n  -v, --verbose       Record timestamped output and CPU/memory usage for this task. Off by default. For -Is, print client-side phase timings.\n  -q, --queue QUEUE   Select a queue.\n  --node NODE         Pin the task to one compute node.\n  -J, --name NAME     Set the task name.\n  -t, --time TIME     Set a wall-time limit (HH:MM:SS).\n  --cwd PATH          Set the working directory.\n  -o, --output PATH   Set stdout destination.\n  -e, --error PATH    Set stderr destination.\n  --env KEY=VALUE     Override one task environment variable.\n  -Is                 Run in an attached PTY; with no command, open a shell.\n  --wrap COMMAND      Run one raw shell command.\n  --request-id UUID   Look up or replay a submission request.\n\nCommands and working directory\n  Pass a command as arguments, for example `msub -Is pip install . --break-system-packages`. A single quoted command such as `msub -Is 'pwd; echo done'` keeps shell syntax. Flags after the command belong to the task. Inline commands submitted outside a shared path use the configured shared root; --cwd overrides it.\n\nEnvironment\n  Exported variables from the submitting process are forwarded; --env overrides individual values. An active VIRTUAL_ENV or CONDA_PREFIX must be shared at the same absolute path on every node. Its bin directory takes priority in PATH; when both are active, PATH order selects the environment. Simple commands resolved outside the active environment do not require its interpreter to be shared. An explicit --env PATH=... remains authoritative after filtering. Unshared or relocated active environments fail instead of falling back to compute-local tools. PATH otherwise keeps registered shared paths and standard macOS commands; unshared login-only paths are omitted. Tasks do not read compute-node shell startup files. Node-local HOME, user, temporary-directory, and SSH-agent values are not copied. Avoid exporting secrets to jobs.\n\nExecution and updates\n  Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set. Avoid concurrent pip installs into the same shared environment. Interactive tasks require terminal stdin and stdout. Ctrl-C while waiting cancels the job; after attachment it is sent to the foreground process. Jobs use one whole node; core and memory request flags are unsupported. Submissions and cluster changes validate Agent builds and capabilities. Read-only commands use local build evidence and enter the update workflow for known mismatches without remote validation or address discovery. mjob and mqueue read persisted records without starting the controller."
+            r#"Usage
+  msub [OPTIONS] COMMAND [ARGS...]
+  msub -Is [OPTIONS] [COMMAND [ARGS...]]
+  msub --wrap COMMAND
+  msub --request-id UUID
+
+OPTIONS
+  -q, --queue QUEUE   Choose a queue.
+  --node NODE         Pin the job to one compute node.
+  -J, --name NAME     Set the job name.
+  -t, --time TIME     Set a wall-time limit (HH:MM:SS).
+  --cwd PATH          Set the working directory.
+  -o, --output PATH   Set stdout destination.
+  -e, --error PATH    Set stderr destination.
+  --env KEY=VALUE     Override one environment variable.
+  -v, --verbose       Save timestamped output and CPU/memory samples. Off by
+                      default. With -Is, also print client-side phase timings.
+  -Is                 Attach to a PTY. Without a command, open a shell.
+  --wrap COMMAND      Run one raw shell command.
+  --request-id UUID   Look up or replay a submission request.
+
+EXAMPLES
+  msub -q default python analysis.py
+  msub -Is python --version
+  msub -Is 'pwd; echo done'
+  msub --wrap 'echo done > result.txt'
+
+WORKING DIRECTORY
+  The command runs in the submitted path when it is inside a registered share.
+  Otherwise, inline commands use the configured shared root. --cwd overrides
+  this default. Relative output paths are created in the job working directory.
+  Flags after COMMAND belong to the task; use --wrap for shell syntax.
+
+ENVIRONMENT
+  Exported variables from the submitting shell are forwarded; --env overrides
+  individual values. An active VIRTUAL_ENV or CONDA_PREFIX must be shared at
+  the same absolute path on every node. Its bin directory takes priority in
+  PATH. An unshared or relocated active environment fails instead of falling
+  back to compute-local tools. Unshared login-only PATH entries are omitted;
+  standard macOS commands remain available. Tasks do not read compute-node
+  shell startup files or inherit node-local HOME, USER, TMPDIR, or SSH-agent
+  values. Avoid exporting secrets to jobs.
+
+EXECUTION
+  Interactive jobs need terminal stdin and stdout. Ctrl-C while waiting cancels
+  the job; after attachment, it is sent to the foreground process. Each job
+  uses one whole node; core and memory request flags are not supported. Verbose
+  logging adds sampling overhead. With -v, task RSS is sampled when output
+  changes, at most every 500 ms, and every 5 seconds while output is quiet.
+  CPU% is estimated from counters between samples; memory uses a current RSS snapshot.
+  Cargo uses a reusable node-local target cache unless CARGO_TARGET_DIR is set.
+  Avoid concurrent pip installs into one shared environment. Submissions check
+  Agent versions; mjob and mqueue read saved records without starting the
+  controller."#
         }
     }
 }

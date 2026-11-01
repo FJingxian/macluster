@@ -663,7 +663,8 @@ fn broken_address_migration_fixture() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         .unwrap()
         .1
         .trim()
-        .trim_matches('"');
+        .trim_matches('"')
+        .to_owned();
     let source = fs::read_to_string(&config).unwrap();
     let source = source.replace(
         "transport = \"ssh\"",
@@ -961,10 +962,21 @@ fn job_queue_and_kill_help_are_available_without_cluster_state() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("Usage:"),
+            String::from_utf8_lossy(&output.stdout).contains("Usage"),
             "{command} help output missing usage"
         );
     }
+}
+
+#[test]
+fn top_level_web_rejects_non_loopback_before_loading_cluster_state() {
+    let output = macluster_command()
+        .args(["--web", "192.0.2.10:8080"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("only supports 127.0.0.1"), "{stderr}");
 }
 
 #[test]
@@ -2208,6 +2220,85 @@ fn unfinished_enrollment_is_not_listed_as_a_node_and_errors_remain_available() {
         fs::read(state.join("node-admin.json")).unwrap(),
         original_journal
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mnode_reports_online_when_agent_answers_but_share_health_fails() {
+    let (root, shared, _config) = fixture();
+    let identity = Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .unwrap();
+    assert!(identity.status.success());
+    let machine_uuid = String::from_utf8_lossy(&identity.stdout)
+        .lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .unwrap()
+        .rsplit_once('=')
+        .unwrap()
+        .1
+        .trim()
+        .trim_matches('"')
+        .to_owned();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_macluster"));
+
+    let config = root.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[cluster]
+name = "test"
+default_queue = "compute"
+login_node = "login-01"
+shared_root = "{}"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "login-01"
+protocol_version = 1
+
+[queues.compute]
+nodes = ["login-01"]
+scheduler = "fifo"
+
+[nodes.login-01]
+host = "127.0.0.1"
+transport = "local"
+remote_binary = "{}"
+machine_uuid = "{}"
+execution_uid = {}
+"#,
+            shared.display(),
+            binary.display(),
+            machine_uuid,
+            unsafe { libc::geteuid() }
+        ),
+    )
+    .unwrap();
+
+    let output = macluster_command()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            root.join("controller").to_str().unwrap(),
+            "mnode",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("login-01") && text.contains("ONLINE"),
+        "{text}"
+    );
+    assert!(!text.contains("OFFLINE"), "{text}");
+
     fs::remove_dir_all(root).unwrap();
 }
 

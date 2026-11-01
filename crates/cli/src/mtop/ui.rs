@@ -4,7 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use macluster_protocol::types::{JobRecord, JobState};
+use macluster_protocol::types::{DiskCapacity, JobRecord, JobState};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -24,6 +24,8 @@ use super::processes::{ProcessInfo, ProcessSort, ProcessView, sort_processes};
 const POWER_STALE_AFTER: Duration = Duration::from_secs(15);
 const POWER_CACHE_TTL: Duration =
     Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS);
+const DETAIL_BASE_ROWS: u16 = 5;
+const DETAIL_MIN_PROCESS_ROWS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
@@ -938,6 +940,10 @@ fn render_detail(
         })
         .collect::<String>();
     let resources = resources(&node.metrics);
+    let system_disk = disk_capacities(&node.metrics)
+        .0
+        .map(disk_capacity_value)
+        .unwrap_or_else(|| "N/A".into());
     let display_id = if node.identity.role == NodeRole::Login {
         "login"
     } else {
@@ -986,7 +992,7 @@ fn render_detail(
             fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm)
         )),
         Line::from(format!(
-            "TEMP {}",
+            "TEMP {}   SYS DISK {system_disk}",
             cpu_temperature_text(resources.cpu_temp_celsius)
         )),
         Line::from(format!("CPU · last 60s  {latest}")),
@@ -1066,17 +1072,18 @@ fn render_expanded_detail(
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(" Details · c CPU ↓ · m Memory ↓ · Esc to close ");
     let inner = block.inner(area);
+    let (system_disk, external_disks) = disk_capacities(&node.metrics);
+    let external_disk_line = (inner.height > DETAIL_BASE_ROWS + DETAIL_MIN_PROCESS_ROWS)
+        .then(|| external_disk_capacity_line(external_disks, inner.width as usize))
+        .flatten();
+    let external_disk_rows = usize::from(external_disk_line.is_some());
     frame.render_widget(block, area);
+    let mut constraints =
+        vec![Constraint::Length(1); DETAIL_BASE_ROWS as usize + external_disk_rows];
+    constraints.push(Constraint::Min(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
+        .constraints(constraints)
         .split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1121,12 +1128,19 @@ fn render_expanded_detail(
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "POWER {}   FAN {}",
+            "POWER {}   FAN {}   {}",
             power_text(&node.metrics),
-            fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm)
+            fan_speed_detail_text(&node.metrics, resources.fan_speed_rpm),
+            system_disk.map_or_else(
+                || "SYS DISK N/A".into(),
+                |disk| disk_capacity_line("SYS DISK", disk)
+            )
         )),
         chunks[3],
     );
+    if let Some(line) = external_disk_line {
+        frame.render_widget(Paragraph::new(line), chunks[4]);
+    }
     frame.render_widget(
         Paragraph::new(format!(
             "Jobs {} · RUN/WAIT {}/{} · {}",
@@ -1135,9 +1149,16 @@ fn render_expanded_detail(
             tasks.waiting,
             process_status(&node.processes, process_sort)
         )),
-        chunks[4],
+        chunks[4 + external_disk_rows],
     );
 
+    let preview_cpu = matches!(
+        &node.processes,
+        ProcessView::Available {
+            warning: Some(warning),
+            ..
+        } if warning.starts_with("Preview: ps average CPU%")
+    );
     let mut rows = match &node.processes {
         ProcessView::Available { rows, .. } => rows.clone(),
         ProcessView::Loading | ProcessView::Unavailable { .. } => Vec::new(),
@@ -1148,17 +1169,80 @@ fn render_expanded_detail(
         table_rows,
         [
             Constraint::Length(7),
-            Constraint::Length(8),
+            Constraint::Length(if preview_cpu { 10 } else { 8 }),
             Constraint::Length(9),
             Constraint::Length(12),
             Constraint::Min(8),
         ],
     )
     .header(
-        Row::new(["PID", "CPU%", "MEM", "TIME", "COMMAND"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new([
+            "PID",
+            if preview_cpu { "CPU(avg)%" } else { "CPU%" },
+            "MEM",
+            "TIME",
+            "COMMAND",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     );
-    frame.render_widget(table, chunks[5]);
+    frame.render_widget(table, chunks[5 + external_disk_rows]);
+}
+
+fn disk_capacities(view: &MetricView) -> (Option<&DiskCapacity>, &[DiskCapacity]) {
+    match view {
+        MetricView::Available { snapshot, .. } => (
+            snapshot.system_disk_capacity.as_ref(),
+            &snapshot.external_disk_capacities,
+        ),
+        MetricView::Loading | MetricView::Unavailable { .. } => (None, &[]),
+    }
+}
+
+fn disk_capacity_line(label: &str, disk: &DiskCapacity) -> String {
+    format!("{label} {}", disk_capacity_value(disk))
+}
+
+fn external_disk_capacity_line(disks: &[DiskCapacity], max_width: usize) -> Option<String> {
+    let entries = disks
+        .iter()
+        .filter(|disk| !is_recovery_volume(disk))
+        .map(|disk| {
+            let name = disk
+                .mount_point
+                .strip_prefix("/Volumes/")
+                .unwrap_or(&disk.mount_point)
+                .split('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("volume");
+            format!("{name} {}", disk_capacity_value(disk))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(truncate(&format!("EXT {}", entries.join(" · ")), max_width))
+}
+
+fn is_recovery_volume(disk: &DiskCapacity) -> bool {
+    disk.mount_point
+        .strip_prefix("/Volumes/")
+        .is_some_and(|name| name.eq_ignore_ascii_case("Recovery"))
+}
+
+fn disk_capacity_value(disk: &DiskCapacity) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let (unit, divisor) = if disk.total_bytes as f64 >= TIB {
+        ("TiB", TIB)
+    } else {
+        ("GiB", GIB)
+    };
+    format!(
+        "{:.1}/{:.1} {unit}",
+        disk.used_bytes.min(disk.total_bytes) as f64 / divisor,
+        disk.total_bytes as f64 / divisor
+    )
 }
 
 fn process_status(view: &ProcessView, sort: ProcessSort) -> String {
@@ -1187,7 +1271,13 @@ fn process_status(view: &ProcessView, sort: ProcessSort) -> String {
             };
             let warning = warning
                 .as_deref()
-                .map(|warning| format!(" · refresh failed: {warning}"))
+                .map(|warning| {
+                    if warning.starts_with("Preview:") {
+                        format!(" · {warning}")
+                    } else {
+                        format!(" · refresh failed: {warning}")
+                    }
+                })
                 .unwrap_or_default();
             format!(
                 "Processes · sorted {sort_label} · updated {} ago{freshness}{no_processes}{warning}",
@@ -1234,14 +1324,23 @@ fn power_cell(view: &MetricView) -> String {
 
 pub(super) fn power_text(view: &MetricView) -> String {
     match power_reading(view) {
-        Some((watts, scope, Some(age))) if age < POWER_STALE_AFTER => {
-            format!("{watts:.1} W {scope} · age {}s", age.as_secs())
-        }
         Some((watts, scope, Some(age))) => {
-            format!("{watts:.1} W {scope} · STALE {}s", age.as_secs())
+            let scope = detail_power_scope(scope);
+            let freshness = if age >= POWER_STALE_AFTER { "*" } else { "" };
+            format!("{watts:.1} W{scope}{freshness}")
         }
-        Some((watts, scope, None)) => format!("{watts:.1} W {scope} · age ?"),
+        Some((watts, scope, None)) => {
+            format!("{watts:.1} W{}?", detail_power_scope(scope))
+        }
         None => "N/A".into(),
+    }
+}
+
+fn detail_power_scope(scope: &str) -> String {
+    if scope.eq_ignore_ascii_case("soc") || scope.eq_ignore_ascii_case("system") {
+        String::new()
+    } else {
+        format!(" {scope}")
     }
 }
 

@@ -6,6 +6,10 @@
 
 使用 Rust 编写，只需分发一个二进制。SSH 连接节点，NFS 共享项目、软件和结果。
 
+![mtop 实时资源监控与进程 CPU、内存排序](assets/mtop.gif)
+
+*选择节点、展开进程，再切换 CPU 或内存排序。演示来自真实集群录制，机器标识和进程名已匿名处理。*
+
 ## 工作方式
 
 ```text
@@ -32,13 +36,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 将 PATH 这一行加入 shell 配置，方便后续使用。分发时只需复制 `target/release/macluster`，功耗/风扇 helper 已内嵌。运行 macluster 不需要安装 Rust 或 Python；二进制需要支持目标机器的 CPU 架构。
 
-下文使用完整命令；安装脚本也提供 `msub`、`mjob`、`mqueue`、`mkill`、`mtop`、`mnode` 别名。
+只复制二进制时可以运行 `macluster 子命令`；`mtop` 这类短命令是安装脚本创建的软链接。使用下载的二进制时，运行 `packaging/scripts/install-user.sh /path/to/macluster "$HOME/.local/bin"`，然后将该目录加入 PATH。
+
+下文使用完整命令；安装脚本也提供 `msub`、`mjob`、`mqueue`、`mkill`、`mtop`、`mnode`、`mfans` 别名。controller 服务命令仍可用于手动维护，但不再显示在主帮助中。
 
 ## 创建集群
 
 ```sh
 # 在登录 Mac 上执行，按交互提示完成配置。
-macluster init --name home --queue default --shared-root /Users/Shared/macluster
+macluster --init --name home --queue default --shared-root /Users/Shared/macluster
 
 # 将示例中的 SSH 账户和地址换成计算节点的信息。
 macluster node -a worker@192.0.2.10
@@ -60,6 +66,10 @@ macluster controller stop
 `controller run` 用于前台排查。仅需启动服务时不要重新执行 `init`：已有配置时，它会询问是否重置集群。
 
 ## 提交任务
+
+![提交任务、查询状态与队列，再读取运行结果](assets/jobs.gif)
+
+*一段完整流程：提交 → 运行 → 完成 → 查看输出。*
 
 ```sh
 macluster submit hostname                       # 批处理命令
@@ -88,6 +98,10 @@ macluster submit -v python analysis.py          # 开启详细资源日志
 **文件放在哪里：**在已注册共享目录内提交，就以该目录为工作目录；在共享目录之外提交内联命令，则使用主共享根目录。`--cwd PATH` 可以显式指定共享目录。相对路径结果写在任务工作目录，默认捕获日志在任务结束后同步到主共享目录。计算节点不能直接读取登录 Mac 上任意未共享的文件。
 
 ## 实时查看单个任务
+
+![订阅运行中任务的 CPU 和内存占用](assets/profile.gif)
+
+*录制使用短时示例任务。无需开启详细日志；关闭订阅后，任务继续运行。*
 
 ```sh
 macluster job --metrics 1
@@ -128,14 +142,14 @@ macluster submit -Is pip install -e .
 ```sh
 macluster top                                  # 终端面板
 macluster top --once                           # 单次表格
-macluster controller run --web                 # 本机浏览器面板
+macluster --web 127.0.0.1:8080                 # 本机浏览器面板
 ```
 
 终端中，方向键或 `j`/`k` 选择节点，Enter 打开/收起进程详情，`c` 按 CPU 排序，`m` 按内存排序，`q` 退出。进程先显示快速预览，再更新为区间采样结果；预览会注明 CPU 是平均值、内存是 RSS。
 
 CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。GPU、温度、风扇、功耗取决于硬件与 helper 支持情况，无法获取时显示 `N/A`。
 
-浏览器面板只读，监听 `127.0.0.1`。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。
+浏览器面板只读，监听 `127.0.0.1`；当前 `--web` 只接受回环地址。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
 
 ## 管理和维护
 

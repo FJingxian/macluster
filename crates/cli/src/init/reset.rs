@@ -16,6 +16,7 @@ use macluster_core::{
 use macluster_protocol::{
     framing::sha256_hex,
     identifiers::Id128,
+    nfs_admin::{NfsAlias, NfsMount},
     types::{ExecutionStatus, JobState, RuntimePhase},
 };
 use serde::{Deserialize, Serialize};
@@ -1539,20 +1540,17 @@ impl ResetPlan {
         for marker in self.markers.values() {
             if let Err(error) = inspect_marker(marker) {
                 if permission_error(&error) {
-                    announce_reset_admin(
-                        &marker.server_id,
+                    node_admin::check_managed_nfs_marker(
                         &marker.server,
-                        "verify a protected managed NFS marker",
-                    );
-                    node_admin::run_interactive_admin(
-                        &marker.server,
-                        &marker_check_script(marker, false),
+                        &marker.source_root.to_string_lossy(),
+                        &marker.share_uuid,
+                        &format!("verify the managed NFS marker for {}", marker.label),
                     )
                     .map_err(|admin_error| {
                         (
                             1,
                             format!(
-                                "cannot verify share marker on {} with administrator access: {admin_error}",
+                                "cannot verify share marker on {}: {admin_error}",
                                 marker.server_id
                             ),
                         )
@@ -1576,20 +1574,18 @@ impl ResetPlan {
                     alias.server_id
                 ),
                 Err((_, error)) if permission_error(&error) => {
-                    announce_reset_admin(
-                        &alias.server_id,
+                    node_admin::check_managed_nfs_alias(
                         &alias.server,
-                        "verify a protected NFS path alias",
-                    );
-                    node_admin::run_interactive_admin(
-                        &alias.server,
-                        &alias_preflight_script(alias),
+                        &alias.mount_root.to_string_lossy(),
+                        &alias.source_root.to_string_lossy(),
+                        alias.committed,
+                        &format!("verify the managed NFS alias on {}", alias.server_id),
                     )
                     .map_err(|admin_error| {
                         (
                             1,
                             format!(
-                                "cannot verify NFS alias {} on {} with administrator access: {admin_error}",
+                                "cannot verify NFS alias {} on {}: {admin_error}",
                                 alias.mount_root.display(),
                                 alias.server_id
                             ),
@@ -1688,6 +1684,7 @@ fn mount_conflict(output: &str, host: &str, source_root: &Path, mount_root: &Pat
     expected_mounts > 0 && (expected_mounts != 1 || mounts_at_path != 1)
 }
 
+#[cfg(test)]
 fn reset_mount_unmount_step(source: &str, mount_root: &Path) -> String {
     let awk = node_admin::shell_quote(node_admin::client_mount_status_awk_script());
     let source = node_admin::shell_quote(source);
@@ -1999,8 +1996,6 @@ fn cleanup_batches<'a>(
 
 fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) -> AppResult<()> {
     quiesce_publishers(journal, plan, path)?;
-    let original_config = ClusterConfig::parse(&journal.old_config)
-        .map_err(|error| (1, format!("saved old config is invalid: {error}")))?;
     for (_, batch) in cleanup_batches(journal, plan) {
         let node = batch.node;
         let node_id = batch
@@ -2011,18 +2006,7 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
         for (id, identity) in &batch.nodes {
             plan.verify_node(id, identity)?;
         }
-        let mut privileged_script = String::from("set -e\n");
-        let mut has_privileged_changes = false;
-        let mut admin_actions = Vec::new();
-        // Disable recovery even when a share is already unmounted, before any cleanup.
-        for mount in &batch.mounts {
-            privileged_script.push_str(&crate::nfs_recovery::cleanup_script(
-                &format!("{}:{}", mount.server_host, mount.source_root.display()),
-                &mount.mount_root,
-                &mount.share_uuid,
-            ));
-            has_privileged_changes = true;
-        }
+        let mut protocol_mounts = Vec::new();
         if !batch.mounts.is_empty() {
             let output = node_admin::ssh_output(node, "/sbin/mount", None)?;
             if !output.status.success() {
@@ -2032,14 +2016,7 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                 ));
             }
             let mount_table = String::from_utf8_lossy(&output.stdout);
-            let mut targets = Vec::new();
             for mount in &batch.mounts {
-                let expected = mount_matches(
-                    &mount_table,
-                    &mount.server_host,
-                    &mount.source_root,
-                    &mount.mount_root,
-                );
                 if mount_conflict(
                     &mount_table,
                     &mount.server_host,
@@ -2054,57 +2031,26 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                         ),
                     ));
                 }
-                if expected && !targets.contains(&mount.mount_root) {
-                    targets.push(mount.mount_root.clone());
-                }
-            }
-            if !targets.is_empty() {
-                has_privileged_changes = true;
-                admin_actions.push("unmount managed NFS shares");
-                for mount in batch
-                    .mounts
-                    .iter()
-                    .filter(|mount| targets.contains(&mount.mount_root))
-                {
-                    privileged_script.push_str(&reset_mount_unmount_step(
-                        &format!("{}:{}", mount.server_host, mount.source_root.display()),
-                        &mount.mount_root,
-                    ));
-                }
-            }
-            for mount in &batch.mounts {
-                if mount.mount_root != original_config.shared_root {
-                    continue;
-                }
-                let probe = node_admin::primary_restore_probe(
-                    &mount.mount_root,
-                    &original_config.share_uuid,
-                );
-                let present = node_admin::ssh_output(node, &probe, None)?;
-                if present.status.success() {
-                    has_privileged_changes = true;
-                    admin_actions.push("restore preserved local primary data");
-                    privileged_script.push_str(&node_admin::primary_restore_script(
-                        &mount.mount_root,
-                        &original_config.share_uuid,
-                    ));
-                } else if present.status.code() != Some(1) {
-                    return Err((
-                        1,
-                        format!("cannot inspect preserved primary directory on {node_id}"),
-                    ));
-                }
+                // Include unmounted targets too so the administrator service can
+                // disable an exact persistent recovery entry during reset.
+                protocol_mounts.push(NfsMount {
+                    source: format!("{}:{}", mount.server_host, mount.source_root.display()),
+                    target: mount.mount_root.to_string_lossy().into_owned(),
+                    share_uuid: mount.share_uuid.clone(),
+                    alias: None,
+                    allow_existing_contents: false,
+                });
             }
         }
 
-        let mut removed_any_export = false;
+        let mut export_update = None;
         if !batch.exports.is_empty() {
             let (original, transaction_pending) =
                 node_admin::read_nfs_exports_update_baseline(node).map_err(|(_, error)| {
                     (1, format!("cannot inspect exports on {node_id}: {error}"))
                 })?;
             let mut candidate = original.clone();
-            removed_any_export |= transaction_pending;
+            let mut removed_any_export = transaction_pending;
             for (server_id, group) in &batch.exports {
                 let (updated, removed) =
                     remove_managed_exports(&candidate, &group.specs).map_err(|error| {
@@ -2122,21 +2068,12 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                 }
             }
             if removed_any_export {
-                admin_actions.push("remove managed NFS exports and reload NFS");
-                let update_commands =
-                    node_admin::nfs_exports_update_commands(&candidate, &original, &journal.id)
-                        .map_err(|error| {
-                            (
-                                1,
-                                format!("cannot prepare NFS export update on {node_id}: {error}"),
-                            )
-                        })?;
-                privileged_script.push_str(&update_commands);
-                has_privileged_changes = true;
+                export_update = Some((candidate, original));
             }
         }
 
         let mut completed_aliases = Vec::new();
+        let mut protocol_aliases = Vec::new();
         for (index, alias) in &batch.aliases {
             plan.verify_node(&alias.server_id, &alias.server)?;
             let cleanup_alias = match alias_is_exact(alias) {
@@ -2145,38 +2082,47 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
                 Err((_, error)) => return Err((1, error)),
             };
             if cleanup_alias {
-                admin_actions.push("remove managed NFS aliases");
-                privileged_script.push_str(&alias_cleanup_script(alias));
-                has_privileged_changes = true;
+                protocol_aliases.push(NfsAlias {
+                    path: alias.source_root.to_string_lossy().into_owned(),
+                    target: alias.mount_root.to_string_lossy().into_owned(),
+                });
             }
             completed_aliases.push((*index, alias.server_id.clone()));
         }
 
-        if has_privileged_changes {
+        if !protocol_mounts.is_empty() || !protocol_aliases.is_empty() {
             for (id, identity) in &batch.nodes {
                 plan.verify_node(id, identity)?;
             }
-            let account = if node.transport == Transport::Local {
-                std::env::var("USER").unwrap_or_else(|_| "current local user".into())
-            } else {
-                node.ssh_user
-                    .clone()
-                    .unwrap_or_else(|| "default SSH user".into())
-            };
-            let connection = if node.transport == Transport::Local {
-                "local"
-            } else {
-                "SSH"
-            };
-            eprintln!(
-                "Reset administrator access: node {node_id}, {account}@{} ({connection}).\n  Operation: {}.\n  If prompted, enter this Mac's administrator password. Authorization is separate for each Mac; valid sudo credentials may skip the prompt.",
-                node.host,
-                admin_actions.join("; ")
-            );
-            node_admin::run_interactive_admin(node, &privileged_script).map_err(|error| {
+            node_admin::unmount_managed_nfs(
+                node,
+                &protocol_mounts,
+                &protocol_aliases,
+                false,
+                &format!("clean managed NFS resources during reset on {node_id}"),
+            )
+            .map_err(|error| {
                 (
                     1,
                     format!("cannot clean managed NFS resources on {node_id}: {error}"),
+                )
+            })?;
+        }
+        if let Some((candidate, original)) = export_update {
+            for (id, identity) in &batch.nodes {
+                plan.verify_node(id, identity)?;
+            }
+            node_admin::update_nfs_exports(
+                node,
+                &candidate,
+                &original,
+                &journal.id,
+                &format!("remove managed NFS exports during reset on {node_id}"),
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!("cannot clean managed NFS exports on {node_id}: {error}"),
                 )
             })?;
         }
@@ -2644,20 +2590,6 @@ fn permission_error(error: &str) -> bool {
     error.contains("Permission denied") || error.contains("Operation not permitted")
 }
 
-fn announce_reset_admin(node_id: &str, node: &NodeConfig, purpose: &str) {
-    let account = if node.transport == Transport::Local {
-        std::env::var("USER").unwrap_or_else(|_| "current account".into())
-    } else {
-        node.ssh_user
-            .clone()
-            .unwrap_or_else(|| "default SSH account".into())
-    };
-    eprintln!(
-        "Reset administrator authorization may be requested on node {node_id}, {account}@{} to {purpose}. If prompted, enter this Mac's administrator password.",
-        node.host
-    );
-}
-
 fn remote_path_type(node: &NodeConfig, path: &Path) -> Result<Option<String>, String> {
     let quoted = node_admin::shell_quote(&path.to_string_lossy());
     let output =
@@ -2708,37 +2640,6 @@ fn inspect_marker(marker: &MarkerSpec) -> Result<(), String> {
             path.display()
         )),
     }
-}
-
-fn marker_check_script(marker: &MarkerSpec, remove: bool) -> String {
-    let path = node_admin::shell_quote(
-        &marker
-            .source_root
-            .join(".macluster-share-id")
-            .to_string_lossy(),
-    );
-    let uuid = node_admin::shell_quote(&marker.share_uuid);
-    let action = if remove {
-        "/bin/rm \"$marker_path\""
-    } else {
-        ":"
-    };
-    format!(
-        "set -eu\nmarker_path={path}\nexpected_uuid={uuid}\nif marker_type=$(/usr/bin/stat -f '%HT' \"$marker_path\" 2>&1); then\n  [ \"$marker_type\" = 'Regular File' ] || {{ echo 'share marker is not a regular file; refusing reset' >&2; exit 1; }}\n  if marker_contents=$(/bin/cat \"$marker_path\" 2>&1); then [ \"$marker_contents\" = \"$expected_uuid\" ] || {{ echo 'share marker UUID changed; refusing reset' >&2; exit 1; }}; else echo \"$marker_contents\" >&2; exit 1; fi\n  {action}\nelse\n  case \"$marker_type\" in *'No such file or directory'*) : ;; *) echo \"$marker_type\" >&2; exit 1 ;; esac\nfi\n"
-    )
-}
-
-fn alias_preflight_script(alias: &AliasSpec) -> String {
-    let path = node_admin::shell_quote(&alias.mount_root.to_string_lossy());
-    let target = node_admin::shell_quote(&alias.source_root.to_string_lossy());
-    let expected_alias = if alias.committed {
-        "echo 'managed alias changed; refusing reset' >&2; exit 1"
-    } else {
-        ":"
-    };
-    format!(
-        "set -eu\nalias_path={path}\ntarget_path={target}\nif alias_type=$(/usr/bin/stat -f '%HT' \"$alias_path\" 2>&1); then\n  if [ \"$alias_type\" = 'Symbolic Link' ]; then if alias_target=$(/usr/bin/readlink \"$alias_path\" 2>&1); then [ \"$alias_target\" = \"$target_path\" ] || {{ {expected_alias}; }}; else echo \"$alias_target\" >&2; exit 1; fi\n  elif [ \"$alias_type\" != 'No such file or directory' ]; then {expected_alias}; fi\nelse\n  case \"$alias_type\" in *'No such file or directory'*) : ;; *) echo \"$alias_type\" >&2; exit 1 ;; esac\nfi\n"
-    )
 }
 
 fn alias_is_exact(alias: &AliasSpec) -> AppResult<bool> {
@@ -2792,6 +2693,7 @@ fn alias_is_exact(alias: &AliasSpec) -> AppResult<bool> {
     }
 }
 
+#[cfg(test)]
 fn alias_cleanup_script(alias: &AliasSpec) -> String {
     let path = node_admin::shell_quote(&alias.mount_root.to_string_lossy());
     let target = node_admin::shell_quote(&alias.source_root.to_string_lossy());
@@ -2847,40 +2749,18 @@ fn remove_alias(alias: &AliasSpec) -> AppResult<()> {
 
 fn remove_marker(marker: &MarkerSpec) -> AppResult<()> {
     let path = marker.source_root.join(".macluster-share-id");
-    let script = marker_check_script(marker, true);
-    let output = node_admin::ssh_output(&marker.server, &script, None)?;
-    if !output.status.success() {
-        let detail = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        if permission_error(&detail) {
-            announce_reset_admin(
-                &marker.server_id,
-                &marker.server,
-                "remove a protected managed NFS marker",
-            );
-            node_admin::run_interactive_admin(&marker.server, &script).map_err(|error| {
-                (
-                    1,
-                    format!(
-                        "marker {} could not be removed with administrator access: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
-        } else {
-            return Err((
-                1,
-                format!(
-                    "marker {} no longer matches the reset UUID or could not be removed: {detail}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
+    node_admin::remove_managed_nfs_marker(
+        &marker.server,
+        &marker.source_root.to_string_lossy(),
+        &marker.share_uuid,
+        &format!("remove the managed NFS marker for {}", marker.label),
+    )
+    .map_err(|error| {
+        (
+            1,
+            format!("marker {} could not be removed: {error}", path.display()),
+        )
+    })
 }
 
 fn archive_old_cluster(journal: &mut ResetJournal, path: &Path) -> AppResult<()> {
@@ -3289,6 +3169,7 @@ struct ManagedExportSpec {
     client_ip: String,
 }
 
+#[cfg(test)]
 fn mount_matches(output: &str, host: &str, source_root: &Path, mount_root: &Path) -> bool {
     let source = format!("{host}:{}", source_root.display());
     matches!(
@@ -4068,16 +3949,13 @@ mod tests {
         let marker_path = protected.join(".macluster-share-id");
         let share_uuid = "00000000-0000-4000-8000-000000000001";
         fs::write(&marker_path, share_uuid).unwrap();
-        let marker = super::MarkerSpec {
-            server_id: "login-01".into(),
-            server: test_config("test", share_uuid).nodes["login-01"].clone(),
-            source_root: protected.clone(),
-            share_uuid: share_uuid.into(),
-            label: "primary".into(),
-        };
-
         fs::set_permissions(&protected, fs::Permissions::from_mode(0)).unwrap();
-        let result = super::remove_marker(&marker);
+        let peer_uid = unsafe { libc::geteuid() as u32 };
+        let result = crate::node_admin::apply_privileged_nfs_remove_marker(
+            &protected.to_string_lossy(),
+            share_uuid,
+            peer_uid,
+        );
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(
@@ -4241,7 +4119,13 @@ mod tests {
             super::remove_alias(alias).unwrap();
         }
         for marker in plan.markers.values() {
-            super::remove_marker(marker).unwrap();
+            let peer_uid = unsafe { libc::geteuid() as u32 };
+            crate::node_admin::apply_privileged_nfs_remove_marker(
+                &marker.source_root.to_string_lossy(),
+                &marker.share_uuid,
+                peer_uid,
+            )
+            .unwrap();
         }
         assert_eq!(
             fs::read_to_string(project.join("project.txt")).unwrap(),
@@ -4669,6 +4553,7 @@ mod tests {
                 source_root: std::path::PathBuf::from("/Volumes/Tools"),
                 mount_root: std::path::PathBuf::from("/Users/Shared/tools"),
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                allow_existing_contents: false,
             },
         );
         let machine_uuid = crate::node_admin::local_platform_uuid().unwrap();

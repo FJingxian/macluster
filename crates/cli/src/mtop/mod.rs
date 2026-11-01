@@ -46,7 +46,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_POLL: Duration = Duration::from_millis(100);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const ONE_SHOT_DEADLINE: Duration = Duration::from_secs(10);
-const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
+const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) enum MtopPostAction {
     CheckBuilds(crate::node_admin::AgentBuildCompatibility),
@@ -62,6 +62,26 @@ enum StartupValidation {
     RecoverMaintenance,
     SetupLocalPower,
     UpdateDeferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPreparation {
+    UpdateAgents,
+    SetupLocalPower,
+    Continue,
+}
+
+fn startup_preparation(
+    agent_update_required: bool,
+    local_power_setup_required: bool,
+) -> StartupPreparation {
+    if agent_update_required {
+        StartupPreparation::UpdateAgents
+    } else if local_power_setup_required {
+        StartupPreparation::SetupLocalPower
+    } else {
+        StartupPreparation::Continue
+    }
 }
 
 fn should_defer_startup_update(
@@ -291,9 +311,6 @@ pub fn run_interactive(
         .name("mtop-agent-validation".into())
         .spawn(move || {
             let result = (|| {
-                if allow_power_setup && crate::node_admin::local_power_sampler_needs_setup()? {
-                    return Ok(StartupValidation::SetupLocalPower);
-                }
                 if address_migration_deferred
                     || crate::node_admin::address_migration_pending(&validation_state_dir)
                 {
@@ -323,12 +340,23 @@ pub fn run_interactive(
                     &validation_state_dir.join("mtop-cache"),
                 )
                 .map_err(|(_, error)| error)?;
-                if compatibility.requires_update() {
-                    let work_pending =
-                        crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
-                    if should_defer_startup_update(false, true, work_pending) {
-                        return Ok(StartupValidation::UpdateDeferred);
+                let local_power_setup_required =
+                    allow_power_setup && crate::node_admin::local_power_sampler_needs_setup()?;
+                match startup_preparation(
+                    compatibility.requires_update(),
+                    local_power_setup_required,
+                ) {
+                    StartupPreparation::UpdateAgents => {
+                        let work_pending =
+                            crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
+                        if should_defer_startup_update(false, true, work_pending) {
+                            return Ok(StartupValidation::UpdateDeferred);
+                        }
                     }
+                    StartupPreparation::SetupLocalPower => {
+                        return Ok(StartupValidation::SetupLocalPower);
+                    }
+                    StartupPreparation::Continue => {}
                 }
                 Ok(StartupValidation::Builds(compatibility))
             })();

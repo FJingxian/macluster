@@ -15,7 +15,7 @@ install -m 755 "$binary" "$prefix/macluster"
 if [ -L "$prefix/mupdate" ] && [ "$(readlink "$prefix/mupdate")" = "macluster" ]; then
   rm "$prefix/mupdate"
 fi
-for alias in msub mjob mqueue mkill mtop mnode; do
+for alias in msub mjob mqueue mkill mtop mnode mfans; do
   ln -sf macluster "$prefix/$alias"
 done
 printf 'Installed macluster (with embedded power helper) and command aliases in %s\n' "$prefix"

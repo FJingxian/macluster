@@ -301,6 +301,7 @@ pub(super) fn plan(
         request: ClientMountRequest {
             source: nfs_mount_source(storage, source_root),
             mount_root: mount_root.to_owned(),
+            share_uuid: namespace.to_owned(),
             source_alias: None,
             needs_mount: true,
             needs_privileged_mkdir: true,

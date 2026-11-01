@@ -63,6 +63,22 @@ fn node_task_counts_include_active_and_node_pinned_pending_jobs() {
 }
 
 #[test]
+fn cluster_agent_update_precedes_local_power_setup() {
+    assert_eq!(
+        super::startup_preparation(true, true),
+        super::StartupPreparation::UpdateAgents
+    );
+    assert_eq!(
+        super::startup_preparation(false, true),
+        super::StartupPreparation::SetupLocalPower
+    );
+    assert_eq!(
+        super::startup_preparation(false, false),
+        super::StartupPreparation::Continue
+    );
+}
+
+#[test]
 fn controller_monitor_request_latency_reaches_node_details() {
     let received_at = Instant::now();
     let row = NodeMonitorRow {

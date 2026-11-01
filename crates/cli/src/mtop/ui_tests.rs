@@ -266,6 +266,96 @@ fn metric_units_are_in_headers_and_table_values_are_compact() {
 }
 
 #[test]
+fn system_disk_is_shown_in_details_but_not_the_node_table() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
+        mount_point: "/".into(),
+        used_bytes: 128 * 1024_u64.pow(3),
+        total_bytes: 512 * 1024_u64.pow(3),
+    });
+    snapshot.external_disk_capacities = vec![
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/Recovery".into(),
+            used_bytes: 128 * 1024_u64.pow(3),
+            total_bytes: 512 * 1024_u64.pow(3),
+        },
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/archive".into(),
+            used_bytes: 2 * 1024_u64.pow(4),
+            total_bytes: 4 * 1024_u64.pow(4),
+        },
+    ];
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-a".into());
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-a".into(),
+            host: "192.0.2.11".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: Default::default(),
+    });
+
+    let overview = rendered_lines(160, 24, &state).join("\n");
+    let table_header = overview
+        .lines()
+        .find(|line| line.contains("NODE") && line.contains("CPU"))
+        .expect("node table header");
+    assert!(
+        !table_header.contains("SYS DISK"),
+        "the changing resource table should omit the stable system-disk capacity: {table_header}"
+    );
+    assert!(overview.contains("SYS DISK"), "details: {overview}");
+    assert!(overview.contains("128.0/512.0 GiB"), "overview: {overview}");
+    assert_eq!(
+        overview.matches("128.0/512.0 GiB").count(),
+        1,
+        "system-disk capacity should appear once in the details pane: {overview}"
+    );
+    assert!(!overview.contains("EXT archive"), "overview: {overview}");
+
+    state.expanded = true;
+    let details = rendered_lines(160, 40, &state).join("\n");
+    assert!(
+        details.contains("SYS DISK 128.0/512.0 GiB"),
+        "details: {details}"
+    );
+    assert!(
+        details.contains("EXT archive 2.0/4.0 TiB"),
+        "details: {details}"
+    );
+    assert!(!details.contains("EXT Recovery"), "details: {details}");
+
+    if let MetricView::Available { snapshot, .. } = &mut state.nodes[0].metrics {
+        snapshot.external_disk_capacities[0].used_bytes = 64 * 1024_u64.pow(3);
+        snapshot.external_disk_capacities[0].total_bytes = 256 * 1024_u64.pow(3);
+    }
+    let distinct_recovery = rendered_lines(160, 40, &state).join("\n");
+    assert!(
+        !distinct_recovery.contains("EXT Recovery"),
+        "{distinct_recovery}"
+    );
+
+    if let MetricView::Available { snapshot, .. } = &mut state.nodes[0].metrics {
+        snapshot.system_disk_capacity = None;
+    }
+    state.nodes[0].identity.role = NodeRole::Login;
+    let login_details = rendered_lines(160, 40, &state).join("\n");
+    assert!(!login_details.contains("EXT Recovery"), "{login_details}");
+    assert!(login_details.contains("EXT archive"), "{login_details}");
+}
+
+#[test]
 fn node_columns_grow_to_fit_visible_content_and_shrink_on_narrow_terminals() {
     let mut state = AppState::empty("mini01");
     state.nodes.push(super::ui::UiNode {
@@ -840,7 +930,7 @@ fn renderer_keeps_quit_hint_visible_at_low_height() {
 }
 
 #[test]
-fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
+fn power_details_omit_duplicate_age_and_common_scope_labels() {
     let started = std::time::Instant::now();
     let mut snapshot = macluster_metrics::unavailable(1, "fixture");
     snapshot.power_watts = Some(11.2);
@@ -851,7 +941,7 @@ fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
         age: std::time::Duration::from_secs(1),
         stale: false,
     };
-    assert_eq!(power_text(&fresh), "11.2 W SoC · age 3s");
+    assert_eq!(power_text(&fresh), "11.2 W");
     assert!(resources(&fresh).power_fresh);
 
     snapshot.power_age_ms = None;
@@ -860,7 +950,7 @@ fn power_age_is_shown_and_unknown_age_is_excluded_from_pool_totals() {
         age: started.elapsed(),
         stale: false,
     };
-    assert_eq!(power_text(&unknown_age), "11.2 W SoC · age ?");
+    assert_eq!(power_text(&unknown_age), "11.2 W?");
     assert!(!resources(&unknown_age).power_fresh);
 }
 
@@ -876,7 +966,7 @@ fn cached_power_remains_in_pool_totals_until_the_helper_cache_expires() {
         stale: false,
     };
 
-    assert_eq!(power_text(&cached), "11.2 W System · STALE 31s");
+    assert_eq!(power_text(&cached), "11.2 W*");
     let totals = aggregate_power(&[resources(&cached)]);
     assert_eq!(totals["System"].watts, 11.2);
 
@@ -888,6 +978,144 @@ fn cached_power_remains_in_pool_totals_until_the_helper_cache_expires() {
     };
     assert!(aggregate_power(&[resources(&expired)]).is_empty());
     assert_eq!(power_text(&expired), "N/A");
+}
+
+#[test]
+fn expanded_details_show_one_sample_age_and_no_system_power_scope() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.power_watts = Some(11.2);
+    snapshot.power_scope = Some("System".into());
+    snapshot.power_age_ms = Some(3_000);
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::from_secs(2),
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let lines = rendered_lines(160, 40, &state);
+    let screen = lines.join("\n");
+
+    assert_eq!(screen.matches("sample age").count(), 1, "{screen}");
+    let power_line = lines
+        .iter()
+        .find(|line| line.contains("POWER 11.2 W"))
+        .unwrap();
+    assert!(!power_line.contains("System"), "{power_line}");
+    assert!(!screen.contains("age 5s"), "{screen}");
+}
+
+#[test]
+fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tall() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
+        mount_point: "/".into(),
+        used_bytes: 128 * 1024_u64.pow(3),
+        total_bytes: 512 * 1024_u64.pow(3),
+    });
+    snapshot.external_disk_capacities = vec![
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/archive".into(),
+            used_bytes: 2 * 1024_u64.pow(4),
+            total_bytes: 4 * 1024_u64.pow(4),
+        },
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/data".into(),
+            used_bytes: 3 * 1024_u64.pow(3),
+            total_bytes: 8 * 1024_u64.pow(3),
+        },
+    ];
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let tall = rendered_lines(160, 40, &state).join("\n");
+    let short = rendered_lines(160, 20, &state).join("\n");
+
+    assert!(tall.contains("SYS DISK 128.0/512.0 GiB"), "{tall}");
+    assert!(tall.contains("EXT archive 2.0/4.0 TiB"), "{tall}");
+    let external_disk_lines = tall
+        .lines()
+        .filter(|line| line.contains("EXT "))
+        .collect::<Vec<_>>();
+    assert_eq!(external_disk_lines.len(), 1, "{tall}");
+    assert!(
+        external_disk_lines[0].contains("EXT archive 2.0/4.0 TiB · data 3.0/8.0 GiB"),
+        "{tall}"
+    );
+    assert!(short.contains("SYS DISK 128.0/512.0 GiB"), "{short}");
+    assert!(!short.contains("EXT archive"), "{short}");
+}
+
+#[test]
+fn process_preview_header_identifies_ps_average_until_interval_sample_arrives() {
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-c".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-c".into(),
+            host: "192.0.2.12".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Loading,
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: ProcessView::Available {
+            rows: vec![ProcessInfo {
+                pid: 42,
+                cpu_percent: 200.0,
+                memory: "32M".into(),
+                cpu_time: "00:01.20".into(),
+                command: "rustc".into(),
+            }],
+            age: std::time::Duration::from_secs(1),
+            stale: false,
+            warning: Some("Preview: ps average CPU%, RSS memory; interval sample pending".into()),
+        },
+    });
+
+    let screen = rendered_lines(160, 40, &state).join("\n");
+
+    assert!(screen.contains("CPU(avg)%"), "{screen}");
+    assert!(!screen.contains("refresh failed: Preview:"), "{screen}");
+    assert!(screen.contains("rustc"), "{screen}");
 }
 
 #[test]

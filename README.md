@@ -6,6 +6,10 @@ English · [简体中文](doc/README.zh-CN.md) · [Agent skill](skills/macluster
 
 Written in Rust. One binary to distribute. SSH connects nodes; NFS shares projects, software, and results.
 
+![Live terminal dashboard: node resources and CPU/memory process sorting](doc/assets/mtop.gif)
+
+*Select a Mac, open its processes, and switch between CPU and memory sorting. These are live recordings; identifying details and process names are anonymized.*
+
 ## How it works
 
 ```text
@@ -32,13 +36,15 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Add the PATH line to your shell configuration. To distribute the app, copy only `target/release/macluster`; the power/fan helper is embedded. Rust and Python are not required to run macluster. Use a binary supporting the target Mac's CPU architecture.
 
-Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, and `mnode` aliases.
+Copying the binary alone provides `macluster SUBCOMMAND`. Short commands such as `mtop` are symlinks created by the installer. For a downloaded binary, run `packaging/scripts/install-user.sh /path/to/macluster "$HOME/.local/bin"`, then add that directory to `PATH`.
+
+Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, `mnode`, and `mfans` command aliases. Controller commands remain available for manual service maintenance but are omitted from the main help.
 
 ## Start a cluster
 
 ```sh
 # Run on the login Mac. Setup is interactive.
-macluster init --name home --queue default --shared-root /Users/Shared/macluster
+macluster --init --name home --queue default --shared-root /Users/Shared/macluster
 
 # Replace the SSH account and address with your compute Mac.
 macluster node -a worker@192.0.2.10
@@ -58,6 +64,10 @@ macluster controller stop
 `controller run` runs in the foreground for troubleshooting. Do not initialize again just to start the controller: when a configuration exists, `init` offers to reset it.
 
 ## Run jobs
+
+![Submit a job, inspect its state and queue, and read its completed output](doc/assets/jobs.gif)
+
+*One workflow: submit → running → completed → captured output.*
 
 ```sh
 macluster submit hostname                       # Batch command
@@ -86,6 +96,10 @@ Detailed timestamped CPU/memory logging is **off by default**; enable it with `s
 **Where files go:** submitting inside a registered share uses that directory. Inline commands submitted outside all shares use the primary shared root; `--cwd PATH` explicitly selects a shared directory. Relative output files are written there. Default captured logs synchronize to the primary share after completion. Compute nodes cannot read arbitrary unshared files on the login Mac.
 
 ## Watch one task's CPU and memory
+
+![Subscribe to a task’s CPU and memory while it runs](doc/assets/profile.gif)
+
+*A live subscription to a short synthetic task. No verbose logging is required; closing the subscription leaves the task running.*
 
 ```sh
 macluster job --metrics 1
@@ -126,14 +140,14 @@ Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected f
 ```sh
 macluster top                                  # Terminal dashboard
 macluster top --once                           # One-shot table
-macluster controller run --web                 # Local browser dashboard
+macluster --web 127.0.0.1:8080                 # Local browser dashboard
 ```
 
 In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast preview, then replace it with interval samples. The preview labels its average CPU and RSS memory.
 
 CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, temperature, fan, and power readings depend on hardware/helper support; unavailable readings show `N/A`.
 
-The browser monitor is read-only and listens on `127.0.0.1`. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart.
+The browser monitor is read-only and listens on `127.0.0.1`; `--web` currently accepts loopback addresses only. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart. `mqueue` is also available as `macluster queue`.
 
 ## Maintenance
 

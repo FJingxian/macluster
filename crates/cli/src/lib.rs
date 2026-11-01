@@ -14,7 +14,7 @@ mod ssh_bootstrap;
 mod terminal;
 
 /// Run a command using an explicit invocation name and argument list. The
-/// invocation name may be `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, or `mnode`.
+/// invocation name may be `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, `mnode`, or `mfans`.
 pub fn run_with(program: &str, args: &[String]) -> i32 {
     match app::run(program, args) {
         Ok(()) => 0,

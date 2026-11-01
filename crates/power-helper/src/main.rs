@@ -16,6 +16,7 @@ use macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS;
 use serde::{Deserialize, Serialize};
 
 mod fan;
+mod nfs_admin;
 
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
 const POWER_CACHE_TTL: Duration = Duration::from_millis(POWER_SAMPLE_CACHE_TTL_MS);
@@ -293,15 +294,20 @@ fn main() {
             .parse::<libc::uid_t>()
             .map_err(|_| "--serve requires a numeric peer UID".to_owned())
             .and_then(serve),
+        [command] if command == "--nfs-admin" => nfs_admin::client(),
         [command] if command == "--version" => {
             println!("macluster-power {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: macluster-power [--version | --serve PEER_UID]".to_owned()),
+        _ => Err("usage: macluster-power [--version | --serve PEER_UID | --nfs-admin]".to_owned()),
     };
     if let Err(error) = result {
         eprintln!("macluster-power: {error}");
-        std::process::exit(1);
+        std::process::exit(if error.starts_with("NFS_ADMIN_UNAVAILABLE:") {
+            78
+        } else {
+            1
+        });
     }
 }
 
@@ -312,6 +318,7 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
     if peer_uid == 0 {
         return Err("peer UID must be a non-root account".into());
     }
+    nfs_admin::start(peer_uid)?;
     let path = Path::new(POWER_SOCKET);
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {

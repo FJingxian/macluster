@@ -23,7 +23,7 @@ use self::{processes::ProcessSampler, sampler::MetricSampler};
 
 const MONITOR_LEASE: Duration = Duration::from_secs(30);
 const METRIC_INTERVAL: Duration = Duration::from_secs(2);
-const PROCESS_INTERVAL: Duration = Duration::from_secs(2);
+const PROCESS_INTERVAL: Duration = Duration::from_secs(1);
 const METRIC_STALE_AFTER: Duration = Duration::from_secs(6);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
 const MAX_MONITOR_ERROR_BYTES: usize = 1_024;
@@ -427,6 +427,18 @@ fn bound_metric_snapshot(mut snapshot: MetricSnapshot) -> MetricSnapshot {
                 fan.max_rpm = None;
             }
         }
+    }
+    if let Some(disk) = snapshot.system_disk_capacity.as_mut() {
+        disk.mount_point = bound_text(std::mem::take(&mut disk.mount_point), 128);
+        disk.used_bytes = disk.used_bytes.min(disk.total_bytes);
+    }
+    snapshot
+        .external_disk_capacities
+        .retain(|disk| disk.total_bytes > 0);
+    snapshot.external_disk_capacities.truncate(8);
+    for disk in &mut snapshot.external_disk_capacities {
+        disk.mount_point = bound_text(std::mem::take(&mut disk.mount_point), 128);
+        disk.used_bytes = disk.used_bytes.min(disk.total_bytes);
     }
     snapshot
 }

@@ -2031,6 +2031,36 @@ fn prepare_task_environment_with_policy(
         .map(|prefix| validate_active_environment(config, prefix))
         .transpose()?;
 
+    let cargo_offline = task_env
+        .get("CARGO_NET_OFFLINE")
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+    if cargo_offline
+        && !explicit_env_keys.iter().any(|key| key == "CARGO_HOME")
+        && task_env
+            .get("CARGO_HOME")
+            .is_none_or(|value| value.is_empty())
+        && let Some(home) = env::var_os("HOME").map(PathBuf::from)
+        && let Some(cargo_home) = configured_shared_cargo_home(config, &home)
+    {
+        task_env.insert(
+            "CARGO_HOME".into(),
+            cargo_home.to_string_lossy().into_owned(),
+        );
+    }
+
+    if let Some(prefix) = selected_prefix.as_deref()
+        && let Some(python) = active_environment_python(prefix)
+    {
+        let python = python.to_string_lossy().into_owned();
+        for key in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+            if !explicit_env_keys.iter().any(|explicit| explicit == key)
+                && task_env.get(key).is_none_or(|value| value.is_empty())
+            {
+                task_env.insert(key.into(), python.clone());
+            }
+        }
+    }
+
     let login_path = task_env.get("PATH").cloned().unwrap_or_default();
     let mut unused_build_keys = Vec::new();
     for (key, value) in &mut task_env {
@@ -2109,6 +2139,35 @@ fn prepare_task_environment_with_policy(
         };
     }
     Ok(task_env)
+}
+
+fn configured_shared_cargo_home(config: &ClusterConfig, login_home: &Path) -> Option<PathBuf> {
+    if !login_home.is_absolute() {
+        return None;
+    }
+    let cargo_home = login_home.join(".cargo");
+    (cargo_home.is_dir() && remap_shared_path(config, &cargo_home).is_some()).then_some(cargo_home)
+}
+
+fn active_environment_python(prefix: &Path) -> Option<PathBuf> {
+    let bin = prefix.join("bin");
+    ["python3", "python"]
+        .iter()
+        .map(|name| bin.join(name))
+        .find(|path| path.is_file())
+        .or_else(|| {
+            fs::read_dir(&bin)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|name| name.starts_with("python3."))
+                        && path.is_file()
+                })
+                .min()
+        })
 }
 
 // Only known system utilities qualify. Scripts, shell expressions, Python,

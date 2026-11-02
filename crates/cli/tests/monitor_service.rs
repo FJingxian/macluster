@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_controller::monitor::{MetricSampleFn, MonitorHub, ProcessSampleFn};
+use macluster_controller::monitor::{
+    InitialMetricSampleFn, MetricSampleFn, MonitorHub, ProcessSampleFn,
+};
 use macluster_core::config::ClusterConfig;
 use macluster_protocol::{
     identifiers::{Id128, NodeId},
@@ -79,6 +81,67 @@ fn two_monitor_subscribers_share_one_metric_sample_without_real_ssh() {
             .is_some_and(|latency| latency >= 20),
         "controller monitor row should include the measured node request latency: {worker:?}"
     );
+}
+
+#[test]
+fn first_monitor_sample_is_fast_then_replaced_by_a_full_background_sample() {
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let full_phases = Arc::clone(&phases);
+    let sample_metrics: Arc<MetricSampleFn> = Arc::new(move |_, _| {
+        full_phases.lock().unwrap().push(false);
+        thread::sleep(Duration::from_millis(100));
+        Ok(snapshot())
+    });
+    let initial_phases = Arc::clone(&phases);
+    let initial_metrics: Arc<InitialMetricSampleFn> = Arc::new(move |_, _| {
+        initial_phases.lock().unwrap().push(true);
+        let mut fast = snapshot();
+        fast.cpu_percent = None;
+        Ok((fast, true))
+    });
+    let sample_processes: Arc<ProcessSampleFn> = Arc::new(|_, _| Ok(Vec::new()));
+    let mut hub = MonitorHub::with_progressive_samplers(
+        config(),
+        sample_metrics,
+        initial_metrics,
+        sample_processes,
+    );
+    let node: NodeId = "worker".parse().unwrap();
+    hub.subscribe(Id128::random(), vec![node.clone()], Instant::now());
+
+    let initial_deadline = Instant::now() + Duration::from_secs(1);
+    let initial = loop {
+        let page = hub.snapshot(0, 0, Instant::now());
+        if let Some(row) = page.nodes.iter().find(|row| {
+            row.node_id == node
+                && row.metrics.power_watts == Some(19.0)
+                && row.metrics.cpu_percent.is_none()
+        }) {
+            break Some(row.clone());
+        }
+        if Instant::now() >= initial_deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
+    assert!(initial.is_some(), "fast first sample was not exposed");
+
+    let full_deadline = Instant::now() + Duration::from_secs(1);
+    let mut full_seen = false;
+    while !full_seen && Instant::now() < full_deadline {
+        let page = hub.snapshot(0, 0, Instant::now());
+        full_seen = page.nodes.iter().any(|row| {
+            row.node_id == node
+                && row.metrics.power_watts == Some(19.0)
+                && row.metrics.cpu_percent == Some(42.0)
+        });
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        full_seen,
+        "background full sample did not replace the fast sample"
+    );
+    assert_eq!(*phases.lock().unwrap(), vec![true, false]);
 }
 
 #[test]

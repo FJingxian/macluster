@@ -31,6 +31,10 @@ const MAX_METRIC_ERROR_FIELDS: usize = 64;
 
 pub type MetricSampleFn =
     dyn Fn(&NodeId, &NodeConfig) -> Result<MetricSnapshot, String> + Send + Sync + 'static;
+/// `needs_full_sample` indicates that the initial snapshot is partial and a
+/// regular full sample should immediately follow it.
+pub type InitialMetricSampleFn =
+    dyn Fn(&NodeId, &NodeConfig) -> Result<(MetricSnapshot, bool), String> + Send + Sync + 'static;
 pub type ProcessSampleFn =
     dyn Fn(&NodeId, &NodeConfig) -> Result<Vec<ProcessRow>, String> + Send + Sync + 'static;
 
@@ -76,11 +80,20 @@ impl MonitorHub {
     pub fn new(config: ClusterConfig, namespace: String) -> Self {
         let metric_pool = crate::ssh::SshPool::new(namespace.clone());
         let process_pool = metric_pool.clone();
-        let metric_sample: Arc<MetricSampleFn> =
-            Arc::new(move |node_id, node| sampler::sample_node(node_id, node, &metric_pool));
+        let initial_pool = metric_pool.clone();
+        let metric_sample: Arc<MetricSampleFn> = Arc::new(move |node_id, node| {
+            sampler::sample_node(node_id, node, &metric_pool, false).map(|(snapshot, _)| snapshot)
+        });
+        let initial_metric_sample: Arc<InitialMetricSampleFn> =
+            Arc::new(move |node_id, node| sampler::sample_node(node_id, node, &initial_pool, true));
         let process_sample: Arc<ProcessSampleFn> =
             Arc::new(move |node_id, node| processes::sample_node(node_id, node, &process_pool));
-        Self::with_samplers(config, metric_sample, process_sample)
+        Self::with_progressive_samplers(
+            config,
+            metric_sample,
+            initial_metric_sample,
+            process_sample,
+        )
     }
 
     /// Inject deterministic probes for service-level regression tests and
@@ -88,6 +101,27 @@ impl MonitorHub {
     pub fn with_samplers(
         config: ClusterConfig,
         metric_sample: Arc<MetricSampleFn>,
+        process_sample: Arc<ProcessSampleFn>,
+    ) -> Self {
+        let initial_metric_sample = Arc::clone(&metric_sample);
+        let initial_metric_sample: Arc<InitialMetricSampleFn> = Arc::new(move |node_id, node| {
+            initial_metric_sample(node_id, node).map(|snapshot| (snapshot, false))
+        });
+        Self::with_progressive_samplers(
+            config,
+            metric_sample,
+            initial_metric_sample,
+            process_sample,
+        )
+    }
+
+    /// Construct a monitor with separate first-sample and full-sample probes.
+    /// Existing callers can keep using `with_samplers`; this method lets
+    /// production and deterministic tests publish fast initial data.
+    pub fn with_progressive_samplers(
+        config: ClusterConfig,
+        metric_sample: Arc<MetricSampleFn>,
+        initial_metric_sample: Arc<InitialMetricSampleFn>,
         process_sample: Arc<ProcessSampleFn>,
     ) -> Self {
         let metric_cache = config
@@ -107,7 +141,7 @@ impl MonitorHub {
             subscriptions: HashMap::new(),
             metric_cache,
             process_cache,
-            metric_sampler: MetricSampler::new(metric_sample),
+            metric_sampler: MetricSampler::new(metric_sample, initial_metric_sample),
             process_sampler: ProcessSampler::new(process_sample),
             job_counts: HashMap::new(),
             sequence: 1,
@@ -317,15 +351,19 @@ impl MonitorHub {
             .flat_map(|subscription| subscription.nodes.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut active_nodes = active_nodes.into_iter().collect::<Vec<_>>();
+        let mut metric_last_scheduled = None;
+        let mut metric_offset = 0;
         if !active_nodes.is_empty() {
-            let offset = self.metric_cursor % active_nodes.len();
-            active_nodes.rotate_left(offset);
-            self.metric_cursor = (offset + 1) % active_nodes.len();
+            metric_offset = self.metric_cursor % active_nodes.len();
+            active_nodes.rotate_left(metric_offset);
         }
-        for node_id in active_nodes {
+        for (index, node_id) in active_nodes.iter().enumerate() {
+            if !self.metric_sampler.has_capacity() {
+                break;
+            }
             let due = self
                 .metric_cache
-                .get(&node_id)
+                .get(node_id)
                 .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next));
             if !due {
                 continue;
@@ -333,11 +371,27 @@ impl MonitorHub {
             let Some(node) = self.config.nodes.get(node_id.as_str()) else {
                 continue;
             };
-            if self.metric_sampler.request(node_id.clone(), node.clone())
-                && let Some(cache) = self.metric_cache.get_mut(&node_id)
-            {
+            let initial = self
+                .metric_cache
+                .get(node_id)
+                .is_some_and(|cache| cache.snapshot.is_none());
+            let requested = if initial {
+                self.metric_sampler
+                    .request_initial(node_id.clone(), node.clone())
+            } else {
+                self.metric_sampler.request(node_id.clone(), node.clone())
+            };
+            if requested && let Some(cache) = self.metric_cache.get_mut(&node_id) {
                 cache.next_sample_at = Some(now + METRIC_INTERVAL);
+                metric_last_scheduled = Some(index);
             }
+        }
+        if !active_nodes.is_empty() {
+            self.metric_cursor = advance_cursor_after_batch(
+                metric_offset,
+                active_nodes.len(),
+                metric_last_scheduled,
+            );
         }
 
         for result in self.process_sampler.poll() {
@@ -374,15 +428,19 @@ impl MonitorHub {
             .filter_map(|subscription| subscription.processes.clone())
             .collect::<BTreeSet<_>>();
         let mut watched = watched.iter().cloned().collect::<Vec<_>>();
+        let mut process_last_scheduled = None;
+        let mut process_offset = 0;
         if !watched.is_empty() {
-            let offset = self.process_cursor % watched.len();
-            watched.rotate_left(offset);
-            self.process_cursor = (offset + 1) % watched.len();
+            process_offset = self.process_cursor % watched.len();
+            watched.rotate_left(process_offset);
         }
-        for node_id in watched {
+        for (index, node_id) in watched.iter().enumerate() {
+            if !self.process_sampler.has_capacity() {
+                break;
+            }
             let due = self
                 .process_cache
-                .get(&node_id)
+                .get(node_id)
                 .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next));
             if !due {
                 continue;
@@ -394,11 +452,37 @@ impl MonitorHub {
                 && let Some(cache) = self.process_cache.get_mut(&node_id)
             {
                 cache.next_sample_at = Some(now + PROCESS_INTERVAL);
-            }
-            if !self.process_sampler.has_capacity() {
-                break;
+                process_last_scheduled = Some(index);
             }
         }
+        if !watched.is_empty() {
+            self.process_cursor =
+                advance_cursor_after_batch(process_offset, watched.len(), process_last_scheduled);
+        }
+    }
+}
+
+fn advance_cursor_after_batch(start: usize, len: usize, last_scheduled: Option<usize>) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (start + last_scheduled.map_or(1, |index| index.saturating_add(1))) % len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_cursor_after_batch;
+
+    #[test]
+    fn cursor_advances_past_the_last_scheduled_node_in_a_rotated_batch() {
+        assert_eq!(advance_cursor_after_batch(0, 5, Some(2)), 3);
+        assert_eq!(advance_cursor_after_batch(4, 5, Some(1)), 1);
+    }
+
+    #[test]
+    fn cursor_advances_one_position_when_no_node_was_scheduled() {
+        assert_eq!(advance_cursor_after_batch(2, 5, None), 3);
+        assert_eq!(advance_cursor_after_batch(0, 0, None), 0);
     }
 }
 

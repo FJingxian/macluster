@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS;
+use macluster_protocol::types::{FanReading, POWER_SAMPLE_CACHE_TTL_MS};
 use serde::{Deserialize, Serialize};
 
 mod fan;
@@ -42,6 +42,12 @@ struct PowerSample {
     gpu_window_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gpu_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_temp_celsius: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fan_readings: Option<Vec<FanReading>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hardware_age_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,12 +88,14 @@ impl GpuSampler {
         Result<GpuReading, String>,
         Option<PowerReading>,
         Option<f32>,
+        Option<Vec<FanReading>>,
     ) {
         let metrics = match self.sampler.get_metrics(GPU_SAMPLE_WINDOW_MS) {
             Ok(metrics) => metrics,
             Err(error) => {
                 return (
                     Err(format!("macmon GPU/power sampling failed: {error}")),
+                    None,
                     None,
                     None,
                 );
@@ -97,6 +105,17 @@ impl GpuSampler {
             gpu_reading(self.supported, metrics.gpu_active_ratio).map_err(str::to_owned),
             macmon_power_reading(metrics.sys_power, metrics.all_power),
             metrics.temp.cpu_temp_avg,
+            Some(
+                metrics
+                    .fans
+                    .iter()
+                    .map(|fan| FanReading {
+                        name: fan.name.clone(),
+                        rpm: fan.rpm,
+                        max_rpm: fan.max_rpm,
+                    })
+                    .collect(),
+            ),
         )
     }
 }
@@ -116,9 +135,11 @@ impl GpuSampler {
         Result<GpuReading, String>,
         Option<PowerReading>,
         Option<f32>,
+        Option<Vec<FanReading>>,
     ) {
         (
             Err("GPU and macmon power sampling require Apple Silicon".into()),
+            None,
             None,
             None,
         )
@@ -153,6 +174,9 @@ fn power_sample_from_reading(reading: PowerReading) -> PowerSample {
         gpu_age_ms: None,
         gpu_window_ms: None,
         gpu_reason: None,
+        cpu_temp_celsius: None,
+        fan_readings: None,
+        hardware_age_ms: None,
     }
 }
 
@@ -181,14 +205,28 @@ struct PowerCache {
     last_good_gpu: Option<(Instant, GpuReading)>,
     gpu_error: Option<String>,
     last_good_temperature: Option<(Instant, f32)>,
+    last_good_fans: Option<(Instant, Vec<FanReading>)>,
+    last_hardware_sample: Option<Instant>,
 }
 
 impl PowerCache {
+    #[cfg(test)]
     fn update(
         &mut self,
         sample: PowerSample,
         gpu: Result<GpuReading, String>,
         temperature: Option<f32>,
+        at: Instant,
+    ) {
+        self.update_with_hardware(sample, gpu, temperature, None, at);
+    }
+
+    fn update_with_hardware(
+        &mut self,
+        sample: PowerSample,
+        gpu: Result<GpuReading, String>,
+        temperature: Option<f32>,
+        fans: Option<Vec<FanReading>>,
         at: Instant,
     ) {
         if sample.available
@@ -215,6 +253,10 @@ impl PowerCache {
             temperature.filter(|value| value.is_finite() && (0.0..=150.0).contains(value))
         {
             self.last_good_temperature = Some((at, temperature));
+        }
+        if let Some(fans) = fans {
+            self.last_good_fans = Some((at, fans));
+            self.last_hardware_sample = Some(at);
         }
     }
 
@@ -275,6 +317,20 @@ impl PowerCache {
                     .clone()
                     .unwrap_or_else(|| "initial GPU sample is pending".into()),
             );
+        }
+        if let Some(sampled_at) = self.last_hardware_sample {
+            let age = now.saturating_duration_since(sampled_at);
+            if age <= Duration::from_secs(18) {
+                response.hardware_age_ms = Some(duration_ms(age));
+                response.cpu_temp_celsius = self.temperature(now).map(f64::from);
+                response.fan_readings = self
+                    .last_good_fans
+                    .as_ref()
+                    .filter(|(fan_sampled_at, _)| {
+                        now.saturating_duration_since(*fan_sampled_at) <= Duration::from_secs(18)
+                    })
+                    .map(|(_, fans)| fans.clone());
+            }
         }
         response
     }
@@ -341,9 +397,9 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
             let mut gpu_sampler = GpuSampler::new();
             loop {
                 let iteration_started = Instant::now();
-                let (gpu, macmon_power, temperature) = match &mut gpu_sampler {
+                let (gpu, macmon_power, temperature, fans) = match &mut gpu_sampler {
                     Ok(sampler) => sampler.sample(),
-                    Err(error) => (Err(error.clone()), None, None),
+                    Err(error) => (Err(error.clone()), None, None, None),
                 };
                 let sample = macmon_power
                     .map(power_sample_from_reading)
@@ -351,7 +407,7 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
                 let mut cache = sampler_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cache.update(sample, gpu, temperature, Instant::now());
+                cache.update_with_hardware(sample, gpu, temperature, fans, Instant::now());
                 drop(cache);
                 thread::sleep(POWER_REFRESH_INTERVAL.saturating_sub(iteration_started.elapsed()));
             }
@@ -456,6 +512,9 @@ fn sample_powermetrics() -> PowerSample {
                 gpu_age_ms: None,
                 gpu_window_ms: None,
                 gpu_reason: None,
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             };
         }
         failures.push(format!("{samplers}: no supported power scope in output"));
@@ -510,6 +569,9 @@ fn unavailable(reason: String) -> PowerSample {
         gpu_age_ms: None,
         gpu_window_ms: None,
         gpu_reason: None,
+        cpu_temp_celsius: None,
+        fan_readings: None,
+        hardware_age_ms: None,
     }
 }
 
@@ -590,6 +652,34 @@ mod tests {
         assert_eq!(response.gpu_percent, Some(50.0));
     }
 
+    #[test]
+    fn power_helper_reuses_cached_temperature_and_fan_readings() {
+        let started = Instant::now();
+        let mut cache = PowerCache::default();
+        cache.update_with_hardware(
+            good_sample(),
+            Ok(gpu_reading(true, 0.5).unwrap()),
+            Some(47.5),
+            Some(vec![macluster_protocol::types::FanReading {
+                name: "Fan 1".into(),
+                rpm: 1_800,
+                max_rpm: Some(5_000),
+            }]),
+            started,
+        );
+
+        let response = cache.response(started + Duration::from_secs(4));
+
+        assert_eq!(response.cpu_temp_celsius, Some(47.5));
+        assert_eq!(response.hardware_age_ms, Some(4_000));
+        assert_eq!(response.fan_readings.unwrap()[0].rpm, 1_800);
+
+        let expired = cache.response(started + Duration::from_secs(19));
+        assert_eq!(expired.hardware_age_ms, None);
+        assert_eq!(expired.cpu_temp_celsius, None);
+        assert_eq!(expired.fan_readings, None);
+    }
+
     fn good_sample() -> PowerSample {
         PowerSample {
             watts: Some(3.5),
@@ -602,6 +692,9 @@ mod tests {
             gpu_age_ms: None,
             gpu_window_ms: None,
             gpu_reason: None,
+            cpu_temp_celsius: None,
+            fan_readings: None,
+            hardware_age_ms: None,
         }
     }
 
@@ -627,6 +720,9 @@ mod tests {
                 gpu_age_ms: None,
                 gpu_window_ms: None,
                 gpu_reason: None,
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             },
             Err("macmon temporarily busy".into()),
             None,
@@ -804,6 +900,9 @@ mod tests {
             gpu_age_ms: None,
             gpu_window_ms: None,
             gpu_reason: None,
+            cpu_temp_celsius: None,
+            fan_readings: None,
+            hardware_age_ms: None,
         };
 
         let response = add_cache_age(cached.clone(), Duration::from_millis(1400));

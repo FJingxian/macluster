@@ -275,6 +275,10 @@ pub struct MetricSnapshot {
     pub sampled_unix_ms: u64,
     pub cpu_percent: Option<f64>,
     pub cpu_max_percent: Option<f64>,
+    /// Per-logical-processor utilization, scaled independently from 0 to 100.
+    /// Older Agents omit this optional detail metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_cpu_percent: Option<Vec<f64>>,
     pub memory_total_bytes: Option<u64>,
     pub memory_used_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
@@ -433,6 +437,7 @@ mod metric_snapshot_tests {
             sampled_unix_ms: 1,
             cpu_percent: None,
             cpu_max_percent: None,
+            logical_cpu_percent: None,
             memory_total_bytes: None,
             memory_used_bytes: None,
             swap_used_bytes: None,

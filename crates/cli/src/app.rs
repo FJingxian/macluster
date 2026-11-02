@@ -5813,6 +5813,7 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
         sampled_unix_ms: now_unix_ms(),
         cpu_percent: sum(|metric| metric.cpu_percent),
         cpu_max_percent: sum(|metric| metric.cpu_max_percent),
+        logical_cpu_percent: None,
         memory_total_bytes: sum_u64(|metric| metric.memory_total_bytes),
         memory_used_bytes: sum_u64(|metric| metric.memory_used_bytes),
         swap_used_bytes: sum_u64(|metric| metric.swap_used_bytes),

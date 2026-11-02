@@ -120,6 +120,16 @@ pub struct QueueJobCounts {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MonitorJobCounts {
+    /// Unpinned pending jobs, grouped by queue.
+    pub pending_by_queue: HashMap<String, u32>,
+    /// Pinned pending jobs, grouped by requested node.
+    pub pending_by_node: HashMap<String, u32>,
+    /// Starting, running, and cancelling jobs, grouped by assigned node.
+    pub running_by_node: HashMap<String, u32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct JobStorageLimitReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
@@ -134,11 +144,13 @@ pub struct JobStorageLimitReport {
 pub struct ReadOnlyJobStore {
     connection: Connection,
     schema_version: u32,
+    root: PathBuf,
 }
 
 impl ReadOnlyJobStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SubmitError> {
-        let database = root.as_ref().join("controller.sqlite3");
+        let root = root.as_ref().canonicalize()?;
+        let database = root.join("controller.sqlite3");
         let connection = Connection::open_read_only(&database, 500)?;
         let version = connection.query_text(
             "SELECT value FROM schema_meta WHERE key='schema_version'",
@@ -147,6 +159,7 @@ impl ReadOnlyJobStore {
         let schema_version = match version.as_deref() {
             Some("2") => 2,
             Some("3") => 3,
+            Some("4") => 4,
             value => {
                 return Err(SubmitError::Database(format!(
                     "monitor cannot read controller schema version {}",
@@ -157,7 +170,21 @@ impl ReadOnlyJobStore {
         Ok(Self {
             connection,
             schema_version,
+            root,
         })
+    }
+
+    /// Measure cluster-managed job state through this read-only connection.
+    /// The filesystem tree walk is safe to run outside the controller's
+    /// serialized mutation path because this method does not prune or modify
+    /// any files or database records.
+    pub fn measure_job_storage_usage(
+        &self,
+        shared_root: &Path,
+        namespace: Id128,
+    ) -> Result<u64, SubmitError> {
+        let jobs = self.list_jobs(None)?;
+        job_storage_bytes(&self.root, shared_root, namespace, &jobs)
     }
 
     pub fn list_jobs(&self, state: Option<JobState>) -> Result<Vec<JobRecord>, SubmitError> {
@@ -348,7 +375,7 @@ impl Storage {
             None
         };
         if let Some(value) = version.as_deref()
-            && !matches!(value, "1" | "2" | "3")
+            && !matches!(value, "1" | "2" | "3" | "4")
         {
             return Err(SubmitError::Database(format!(
                 "unsupported schema version {value:?}"
@@ -363,7 +390,7 @@ impl Storage {
         if version.is_none() {
             connection.exec(
                 "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', '3');
+                 INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4');
                  CREATE TABLE jobs (
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    request_id TEXT NOT NULL UNIQUE,
@@ -374,6 +401,7 @@ impl Storage {
                    assigned_node TEXT,
                    created_unix_ms INTEGER NOT NULL,
                    queue TEXT NOT NULL,
+                   requested_node TEXT,
                    snapshot_sync_pending INTEGER NOT NULL DEFAULT 0,
                    log_sync_pending INTEGER NOT NULL DEFAULT 0
                  );
@@ -385,7 +413,7 @@ impl Storage {
                    reason TEXT
                  );",
             )?;
-            version = Some("3".to_owned());
+            version = Some("4".to_owned());
         } else {
             connection.exec(
                 "CREATE TABLE IF NOT EXISTS state_events (
@@ -444,12 +472,41 @@ impl Storage {
                 Ok(()) => {}
                 Err(error) => return Err(error),
             }
+            version = Some("3".to_owned());
+        }
+        if version.as_deref() == Some("3") {
+            let migration = (|| {
+                connection.exec("ALTER TABLE jobs ADD COLUMN requested_node TEXT;")?;
+                for (id, payload) in connection.query_text_pairs(
+                    "SELECT CAST(id AS TEXT), payload_json FROM jobs WHERE state='PENDING' ORDER BY id",
+                )? {
+                    let id = id.parse::<i64>().map_err(|error| {
+                        SubmitError::Database(format!(
+                            "invalid job id during monitor-index migration: {error}"
+                        ))
+                    })?;
+                    let job = decode_job(&payload)?;
+                    connection.update_job_requested_node(
+                        id,
+                        job.spec.node.as_ref().map(|node| node.as_str()),
+                    )?;
+                }
+                connection.exec(
+                    "CREATE INDEX jobs_monitor_pending ON jobs(requested_node, queue) WHERE state='PENDING';
+                     UPDATE schema_meta SET value='4' WHERE key='schema_version';",
+                )
+            })();
+            match migration {
+                Ok(()) => {}
+                Err(error) => return Err(error),
+            }
         }
         connection.exec(
             "CREATE INDEX IF NOT EXISTS jobs_state_created ON jobs(state, created_unix_ms, id);
              CREATE INDEX IF NOT EXISTS jobs_state_id ON jobs(state, id DESC);
              CREATE INDEX IF NOT EXISTS jobs_queue_state ON jobs(queue, state);
-             CREATE INDEX IF NOT EXISTS jobs_queue_work ON jobs(queue, id) WHERE state IN ('PENDING','STARTING','RUNNING','CANCELLING') OR log_sync_pending=1;"
+             CREATE INDEX IF NOT EXISTS jobs_queue_work ON jobs(queue, id) WHERE state IN ('PENDING','STARTING','RUNNING','CANCELLING') OR log_sync_pending=1;
+             CREATE INDEX IF NOT EXISTS jobs_monitor_pending ON jobs(requested_node, queue) WHERE state='PENDING';"
         )?;
         connection.exec("CREATE UNIQUE INDEX IF NOT EXISTS active_node_occupation ON jobs(assigned_node) WHERE assigned_node IS NOT NULL AND state IN ('STARTING','RUNNING','CANCELLING');")?;
         connection.exec("COMMIT")?;
@@ -774,6 +831,10 @@ impl Storage {
         self.connection.query_queue_job_counts()
     }
 
+    pub fn monitor_job_counts(&self) -> Result<MonitorJobCounts, SubmitError> {
+        self.connection.query_monitor_job_counts()
+    }
+
     /// Keep the cluster-managed job log tree and its controller records below
     /// a byte limit. Only terminal jobs whose output synchronization finished
     /// are eligible for removal; user result files outside each managed job
@@ -865,28 +926,7 @@ impl Storage {
         namespace: Id128,
         jobs: &[JobRecord],
     ) -> Result<u64, SubmitError> {
-        let state_root = self.root.canonicalize()?;
-        let managed_root = shared_root.join("jobs").join(namespace.to_string());
-        let mut bytes = safe_tree_size(shared_root, &managed_root)?;
-        for job in jobs {
-            if job
-                .spec
-                .storage_namespace
-                .is_some_and(|value| value != namespace)
-            {
-                continue;
-            }
-            if job.spec.storage_namespace.is_none() {
-                let legacy = shared_root.join("jobs").join(job.id.to_string());
-                bytes = bytes.saturating_add(safe_tree_size(shared_root, &legacy)?);
-            }
-        }
-        bytes = bytes.saturating_add(safe_tree_size(&state_root, &state_root.join("snapshots"))?);
-        for suffix in ["", "-wal", "-shm"] {
-            let path = state_root.join(format!("controller.sqlite3{suffix}"));
-            bytes = bytes.saturating_add(file_size_if_present(&path)?);
-        }
-        Ok(bytes)
+        job_storage_bytes(&self.root, shared_root, namespace, jobs)
     }
 
     fn prune_unreferenced_snapshots(
@@ -1509,6 +1549,32 @@ impl Connection {
         Ok(counts)
     }
 
+    fn query_monitor_job_counts(&self) -> Result<MonitorJobCounts, SubmitError> {
+        Ok(MonitorJobCounts {
+            pending_by_queue: self.query_count_map(
+                "SELECT queue, CAST(COUNT(*) AS TEXT) FROM jobs WHERE state='PENDING' AND requested_node IS NULL GROUP BY queue",
+            )?,
+            pending_by_node: self.query_count_map(
+                "SELECT requested_node, CAST(COUNT(*) AS TEXT) FROM jobs WHERE state='PENDING' AND requested_node IS NOT NULL GROUP BY requested_node",
+            )?,
+            running_by_node: self.query_count_map(
+                "SELECT assigned_node, CAST(COUNT(*) AS TEXT) FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') AND assigned_node IS NOT NULL GROUP BY assigned_node",
+            )?,
+        })
+    }
+
+    fn query_count_map(&self, sql: &str) -> Result<HashMap<String, u32>, SubmitError> {
+        self.query_text_pairs(sql)?
+            .into_iter()
+            .map(|(key, value)| {
+                let count = value.parse::<u64>().map_err(|error| {
+                    SubmitError::Database(format!("invalid aggregate job count: {error}"))
+                })?;
+                Ok((key, count.min(u32::MAX as u64) as u32))
+            })
+            .collect()
+    }
+
     fn collect_texts(
         &self,
         statement: *mut sqlite3_stmt,
@@ -1588,23 +1654,42 @@ impl Connection {
         }
     }
 
+    fn update_job_requested_node(
+        &self,
+        id: i64,
+        requested_node: Option<&str>,
+    ) -> Result<(), SubmitError> {
+        let statement = self.prepare("UPDATE jobs SET requested_node=NULLIF(?1,'') WHERE id=?2")?;
+        bind_text(self.raw, statement, 1, requested_node.unwrap_or_default())?;
+        check_sqlite(self.raw, unsafe { sqlite3_bind_int64(statement, 2, id) })?;
+        let code = unsafe { sqlite3_step(statement) };
+        unsafe { sqlite3_finalize(statement) };
+        if code == SQLITE_DONE {
+            Ok(())
+        } else {
+            Err(SubmitError::Database(self.error_message()))
+        }
+    }
+
     fn update_job_record(&self, record: &JobRecord, payload: &str) -> Result<(), SubmitError> {
         let node = record.node.as_ref().map_or("", |node| node.as_str());
+        let requested_node = record.spec.node.as_ref().map_or("", |node| node.as_str());
         let statement = self.prepare(
-            "UPDATE jobs SET payload_json=?1, state=?2, cancel_requested=CASE WHEN ?2='CANCELLING' THEN 1 ELSE cancel_requested END, assigned_node=NULLIF(?3,''), queue=?4, snapshot_sync_pending=?5, log_sync_pending=?6 WHERE id=?7",
+            "UPDATE jobs SET payload_json=?1, state=?2, cancel_requested=CASE WHEN ?2='CANCELLING' THEN 1 ELSE cancel_requested END, assigned_node=NULLIF(?3,''), queue=?4, requested_node=NULLIF(?5,''), snapshot_sync_pending=?6, log_sync_pending=?7 WHERE id=?8",
         )?;
         bind_text(self.raw, statement, 1, payload)?;
         bind_text(self.raw, statement, 2, job_state_name(record.state))?;
         bind_text(self.raw, statement, 3, node)?;
         bind_text(self.raw, statement, 4, record.spec.queue.as_str())?;
+        bind_text(self.raw, statement, 5, requested_node)?;
         check_sqlite(self.raw, unsafe {
-            sqlite3_bind_int64(statement, 5, i64::from(record.snapshot_sync_pending))
+            sqlite3_bind_int64(statement, 6, i64::from(record.snapshot_sync_pending))
         })?;
         check_sqlite(self.raw, unsafe {
-            sqlite3_bind_int64(statement, 6, i64::from(record.log_sync_pending))
+            sqlite3_bind_int64(statement, 7, i64::from(record.log_sync_pending))
         })?;
         check_sqlite(self.raw, unsafe {
-            sqlite3_bind_int64(statement, 7, record.id as i64)
+            sqlite3_bind_int64(statement, 8, record.id as i64)
         })?;
         let code = unsafe { sqlite3_step(statement) };
         unsafe { sqlite3_finalize(statement) };
@@ -1701,6 +1786,37 @@ fn check_sqlite(database: *mut sqlite3, code: c_int) -> Result<(), SubmitError> 
                 .into_owned(),
         ))
     }
+}
+
+fn job_storage_bytes(
+    state_root: &Path,
+    shared_root: &Path,
+    namespace: Id128,
+    jobs: &[JobRecord],
+) -> Result<u64, SubmitError> {
+    let state_root = state_root.canonicalize()?;
+    let shared_root = shared_root.canonicalize()?;
+    let managed_root = shared_root.join("jobs").join(namespace.to_string());
+    let mut bytes = safe_tree_size(&shared_root, &managed_root)?;
+    for job in jobs {
+        if job
+            .spec
+            .storage_namespace
+            .is_some_and(|value| value != namespace)
+        {
+            continue;
+        }
+        if job.spec.storage_namespace.is_none() {
+            let legacy = shared_root.join("jobs").join(job.id.to_string());
+            bytes = bytes.saturating_add(safe_tree_size(&shared_root, &legacy)?);
+        }
+    }
+    bytes = bytes.saturating_add(safe_tree_size(&state_root, &state_root.join("snapshots"))?);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = state_root.join(format!("controller.sqlite3{suffix}"));
+        bytes = bytes.saturating_add(file_size_if_present(&path)?);
+    }
+    Ok(bytes)
 }
 
 fn file_size_if_present(path: &Path) -> Result<u64, SubmitError> {
@@ -1835,7 +1951,7 @@ mod read_only_tests {
 
     use macluster_protocol::identifiers::Id128;
 
-    use super::{Connection, ReadOnlyJobStore};
+    use super::{Connection, ReadOnlyJobStore, Storage};
 
     fn fresh_root() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-read-only-unit-{}", Id128::random()))
@@ -1921,6 +2037,43 @@ mod read_only_tests {
     }
 
     #[test]
+    fn read_only_job_storage_measurement_counts_managed_files_without_writing() {
+        let root = fresh_root();
+        let state_root = root.join("controller");
+        let shared_root = root.join("shared");
+        fs::create_dir_all(&shared_root).unwrap();
+        let storage = Storage::open(&state_root).unwrap();
+        drop(storage);
+
+        let namespace = Id128::parse("00000000-0000-4000-8000-000000000001").unwrap();
+        let database_before = fs::read(state_root.join("controller.sqlite3")).unwrap();
+        let store = ReadOnlyJobStore::open(&state_root).unwrap();
+        let before = store
+            .measure_job_storage_usage(&shared_root, namespace)
+            .unwrap();
+
+        let managed_dir = shared_root.join("jobs").join(namespace.to_string());
+        fs::create_dir_all(&managed_dir).unwrap();
+        fs::write(managed_dir.join("log.txt"), b"managed output bytes").unwrap();
+        let after = store
+            .measure_job_storage_usage(&shared_root, namespace)
+            .unwrap();
+
+        assert_eq!(after, before + b"managed output bytes".len() as u64);
+        assert_eq!(
+            fs::read(state_root.join("controller.sqlite3")).unwrap(),
+            database_before
+        );
+        assert_eq!(
+            fs::read(managed_dir.join("log.txt")).unwrap(),
+            b"managed output bytes"
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn exclusive_database_lock_fails_within_the_busy_timeout() {
         let root = fresh_root();
         fs::create_dir_all(&root).unwrap();
@@ -1981,12 +2134,25 @@ mod schema_migration_tests {
         let connection = Connection::open(&root.join("controller.sqlite3")).unwrap();
         connection
             .exec(
-                "DROP INDEX IF EXISTS jobs_queue_work;
+                "DROP INDEX IF EXISTS jobs_monitor_pending;
+                 DROP INDEX IF EXISTS jobs_queue_work;
                  DROP INDEX IF EXISTS jobs_queue_state;
+                 ALTER TABLE jobs DROP COLUMN requested_node;
                  ALTER TABLE jobs DROP COLUMN log_sync_pending;
                  ALTER TABLE jobs DROP COLUMN snapshot_sync_pending;
                  ALTER TABLE jobs DROP COLUMN queue;
                  UPDATE schema_meta SET value='2' WHERE key='schema_version';",
+            )
+            .unwrap();
+    }
+
+    fn set_schema_v3(root: &PathBuf) {
+        let connection = Connection::open(&root.join("controller.sqlite3")).unwrap();
+        connection
+            .exec(
+                "DROP INDEX IF EXISTS jobs_monitor_pending;
+                 ALTER TABLE jobs DROP COLUMN requested_node;
+                 UPDATE schema_meta SET value='3' WHERE key='schema_version';",
             )
             .unwrap();
     }
@@ -2024,6 +2190,32 @@ mod schema_migration_tests {
             1
         );
         drop(ReadOnlyJobStore::open(&root).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_migration_backfills_pinned_pending_node_index() {
+        let root = fresh_root();
+        let storage = Storage::open(&root).unwrap();
+        storage
+            .submit_once(RequestId(Id128::random()), interactive_spec("mini01"))
+            .unwrap();
+        drop(storage);
+        set_schema_v3(&root);
+
+        let migrated = Storage::open(&root).unwrap();
+        let counts = migrated.monitor_job_counts().unwrap();
+        assert_eq!(counts.pending_by_node.get("mini01-a"), Some(&1));
+        assert!(counts.pending_by_queue.is_empty());
+        let version = migrated
+            .connection
+            .query_text(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                None,
+            )
+            .unwrap();
+        assert_eq!(version.as_deref(), Some("4"));
+        drop(migrated);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2110,6 +2302,42 @@ mod schema_migration_tests {
             JobState::Completed
         );
         drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn monitor_counts_aggregate_queue_waiters_and_node_targets_without_decoding_jobs() {
+        let root = fresh_root();
+        let storage = Storage::open(&root).unwrap();
+        let mut pinned_a = interactive_spec("mini01");
+        pinned_a.node = Some(NodeId::new("mini01-a").unwrap());
+        storage
+            .submit_once(RequestId(Id128::random()), pinned_a)
+            .unwrap();
+
+        let mut unpinned = interactive_spec("mini01");
+        unpinned.node = None;
+        storage
+            .submit_once(RequestId(Id128::random()), unpinned)
+            .unwrap();
+
+        let mut pinned_b = interactive_spec("mini01");
+        pinned_b.node = Some(NodeId::new("mini01-b").unwrap());
+        let running = storage
+            .submit_once(RequestId(Id128::random()), pinned_b)
+            .unwrap();
+        storage
+            .reserve_job(running.id, NodeId::new("mini01-b").unwrap())
+            .unwrap();
+        storage.mark_running(running.id).unwrap();
+
+        let counts = storage.monitor_job_counts().unwrap();
+
+        assert_eq!(counts.pending_by_queue.get("mini01"), Some(&1));
+        assert_eq!(counts.pending_by_node.get("mini01-a"), Some(&1));
+        assert!(!counts.pending_by_node.contains_key("mini01-b"));
+        assert_eq!(counts.running_by_node.get("mini01-b"), Some(&1));
+        drop(storage);
         fs::remove_dir_all(root).unwrap();
     }
 

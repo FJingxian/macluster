@@ -23,7 +23,6 @@ use macluster_protocol::{
     },
     framing::{ChunkAssembler, MAX_SNAPSHOT_BYTES},
     identifiers::{Id128, NodeId},
-    types::JobState,
 };
 
 use crate::compatibility::{
@@ -726,7 +725,7 @@ impl ControlApi {
     }
 
     fn refresh_monitor_job_counts(&mut self) -> Result<(), ControlError> {
-        let jobs = self.storage.list_monitor_jobs().map_err(storage_error)?;
+        let job_counts = self.storage.monitor_job_counts().map_err(storage_error)?;
         let mut counts = self
             .config
             .nodes
@@ -734,30 +733,27 @@ impl ControlApi {
             .filter_map(|id| NodeId::new(id.clone()).ok())
             .map(|node_id| (node_id, (0_u32, 0_u32)))
             .collect::<std::collections::HashMap<_, _>>();
-        for job in jobs {
-            match job.state {
-                JobState::Starting | JobState::Running | JobState::Cancelling => {
-                    if let Some(target) = job.node.as_ref()
-                        && let Ok(node_id) = NodeId::new(target.to_string())
-                        && let Some((running, _)) = counts.get_mut(&node_id)
-                    {
-                        *running = running.saturating_add(1);
-                    }
+        for (queue, pending) in job_counts.pending_by_queue {
+            for target in self.config.queue_compute_nodes(&queue) {
+                if let Ok(node_id) = NodeId::new(target)
+                    && let Some((_, waiting)) = counts.get_mut(&node_id)
+                {
+                    *waiting = waiting.saturating_add(pending);
                 }
-                JobState::Pending => {
-                    let targets = job.spec.node.as_ref().map_or_else(
-                        || self.config.queue_compute_nodes(job.spec.queue.as_str()),
-                        |node| vec![node.to_string()],
-                    );
-                    for target in targets {
-                        if let Ok(node_id) = NodeId::new(target)
-                            && let Some((_, waiting)) = counts.get_mut(&node_id)
-                        {
-                            *waiting = waiting.saturating_add(1);
-                        }
-                    }
-                }
-                _ => {}
+            }
+        }
+        for (target, pending) in job_counts.pending_by_node {
+            if let Ok(node_id) = NodeId::new(target)
+                && let Some((_, waiting)) = counts.get_mut(&node_id)
+            {
+                *waiting = waiting.saturating_add(pending);
+            }
+        }
+        for (target, running) in job_counts.running_by_node {
+            if let Ok(node_id) = NodeId::new(target)
+                && let Some((count, _)) = counts.get_mut(&node_id)
+            {
+                *count = count.saturating_add(running);
             }
         }
         self.monitor.update_job_counts(counts);

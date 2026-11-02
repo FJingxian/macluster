@@ -245,7 +245,7 @@ fn metric_units_are_in_headers_and_table_values_are_compact() {
     state.selected_id = Some("mini01-a".into());
     state.expanded = true;
     let details = rendered_lines(160, 24, &state).join("\n");
-    assert!(details.contains("CPU% 100/800"), "details: {details:?}");
+    assert!(details.contains("100/800%"), "details: {details:?}");
     assert!(
         details.contains("MEM(GiB) 4.0/16.0"),
         "details: {details:?}"

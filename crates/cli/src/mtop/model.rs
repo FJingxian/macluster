@@ -200,6 +200,7 @@ pub struct ResourceValues {
     pub fresh: bool,
     pub cpu_percent: Option<f64>,
     pub cpu_max_percent: Option<f64>,
+    pub logical_cpu_percent: Option<Vec<f64>>,
     pub cpu_temp_celsius: Option<f64>,
     pub memory_used_bytes: Option<u64>,
     pub memory_total_bytes: Option<u64>,

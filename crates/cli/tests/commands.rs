@@ -2224,6 +2224,113 @@ fn unfinished_enrollment_is_not_listed_as_a_node_and_errors_remain_available() {
 }
 
 #[test]
+fn pending_enrollment_without_remote_side_effects_can_be_cancelled_after_config_changes() {
+    let (root, _shared, config) = fixture();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    let operations = serde_json::json!({
+        "add:operator@192.0.2.50:22": {
+            "id":"draft-one", "action":"add", "node_id":"draft-001",
+            "endpoint":"operator@192.0.2.50:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":null, "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":false,
+            "detail":"SSH preflight failed"
+        },
+        "add:operator@192.0.2.51:22": {
+            "id":"draft-two", "action":"add", "node_id":"draft-002",
+            "endpoint":"operator@192.0.2.51:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":"old-config", "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":false,
+            "detail":"SSH preflight failed"
+        },
+        "add:operator@192.0.2.52:22": {
+            "id":"draft-three", "action":"add", "node_id":"draft-003",
+            "endpoint":"operator@192.0.2.52:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":"stale-config", "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":true,
+            "detail":"NFS setup was interrupted"
+        }
+    });
+    fs::write(
+        state.join("node-admin.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,
+            "config_path":config.canonicalize().unwrap(),
+            "state_dir":state.canonicalize().unwrap(),
+            "reserved_node_ids":["draft-001", "draft-002", "draft-003"],
+            "machine_uuids":{},
+            "operations":operations
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-001"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Cancelled pending enrollment draft-001"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stale_pristine = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-002"])
+        .output()
+        .unwrap();
+    assert!(
+        stale_pristine.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_pristine.stderr)
+    );
+
+    let unsafe_cancel = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-003"])
+        .output()
+        .unwrap();
+    assert!(!unsafe_cancel.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsafe_cancel.stderr)
+            .contains("remote cleanup cannot be verified"),
+        "{}",
+        String::from_utf8_lossy(&unsafe_cancel.stderr)
+    );
+
+    let failed = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "--failed"])
+        .output()
+        .unwrap();
+    assert!(failed.status.success());
+    let failures = String::from_utf8_lossy(&failed.stdout);
+    assert!(failures.contains("draft-003"), "{failures}");
+    assert!(!failures.contains("draft-001"), "{failures}");
+    assert!(!failures.contains("draft-002"), "{failures}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn mnode_reports_online_when_agent_answers_but_share_health_fails() {
     let (root, shared, _config) = fixture();
     let identity = Command::new("/usr/sbin/ioreg")

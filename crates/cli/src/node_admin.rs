@@ -9719,11 +9719,20 @@ fn remove_node(
                     "SETUP_PENDING" | "CANDIDATE_INSTALLED" | "ADD_COMMITTING" => {
                         let current_digest = sha256_hex(config_source.as_bytes())
                             .map_err(|error| (1, error.to_string()))?;
-                        if operation.old_config_sha256.as_deref() != Some(current_digest.as_str()) {
+                        // A pristine draft is only a local reservation: enrollment records
+                        // client_setup_attempted before making any remote changes. It can
+                        // therefore be cancelled even if the cluster config has since
+                        // changed. Once remote state may exist, the original digest fences
+                        // cleanup so we do not remove resources using a different config.
+                        let remote_cleanup_required = pending_add_may_have_client_state(operation);
+                        if remote_cleanup_required
+                            && operation.old_config_sha256.as_deref()
+                                != Some(current_digest.as_str())
+                        {
                             return Err((
                                 1,
                                 format!(
-                                    "cluster config changed during enrollment of {node_id}; refusing to cancel it automatically"
+                                    "cluster config changed during enrollment of {node_id}; remote cleanup cannot be verified against the current config. Rerun the original add command to resume, or resolve the node-admin journal before cancelling"
                                 ),
                             ));
                         }
@@ -10581,7 +10590,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
         .count();
     if drafts > 0 {
         eprintln!(
-            "{drafts} enrollment attempt(s) did not complete; those nodes are not registered. Use `mnode --failed` for details and retry the original add command."
+            "{drafts} enrollment attempt(s) did not complete; those nodes are not registered. Use `mnode --failed` to find their IDs, rerun `mnode -a ...` to resume, or `mnode -rm NODE_ID` to cancel an attempt."
         );
     }
     print!("{}", format_node_list(&rows));

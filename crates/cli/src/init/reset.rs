@@ -1143,7 +1143,7 @@ impl ResetPlan {
                         }
                     }
                 }
-                "share" => {
+                "share" | "share-remove" => {
                     let (share_id, server_id, source_root, mount_root) =
                         parse_pending_share_endpoint(&operation.endpoint, &operation.node_id)?;
                     if server_id != operation.node_id {

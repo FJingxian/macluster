@@ -1887,7 +1887,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::Add(options) => add_node(&config_path, &state_dir, options),
         Action::Remove { target, connect } => {
             if let Some(share_id) = target.strip_prefix("share:") {
-                remove_pending_share(&config_path, &state_dir, share_id)
+                remove_share(&config_path, &state_dir, share_id)
             } else {
                 remove_node(&config_path, &state_dir, &target, connect.as_ref())
             }
@@ -3320,8 +3320,8 @@ REMOVE NODES
   `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node, verifies
   its machine UUID, and preserves the previous address for NFS export cleanup.
   The connection is saved for interrupted-removal retries. Host-key
-  verification stays enabled. `mnode -rm share:SHARE_ID` removes only exact
-  macluster-managed resources and can cancel incomplete share setup.
+  verification stays enabled. `mnode -rm share:SHARE_ID` removes a configured
+  named share or cancels incomplete setup. Source directories and files remain.
 
 CONTROLLER MAINTENANCE
   Node and share changes pause submissions. If the controller is running,
@@ -9054,6 +9054,22 @@ fn abort_pending_enrollment(
     Ok(true)
 }
 
+fn remove_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
+    let config_path = config_path.canonicalize().map_err(io_error)?;
+    let config = read_config(&config_path)?;
+    let journal_path = state_dir.join("node-admin.json");
+    let state = read_admin_state(&journal_path, &config_path, state_dir)?;
+    let removal_pending = state
+        .operations
+        .get(&format!("share-remove:{share_id}"))
+        .is_some_and(|operation| operation.action == "share-remove");
+    if config.shares.contains_key(share_id) || removal_pending {
+        remove_registered_share(&config_path, state_dir, share_id)
+    } else {
+        remove_pending_share(&config_path, state_dir, share_id)
+    }
+}
+
 fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
@@ -9303,6 +9319,568 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
         println!(
             "Cancelled pending named share {share_id}; exact managed NFS resources were removed."
         );
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShareRemovalRecovery {
+    Cleanup,
+    Sync,
+    Done,
+}
+
+fn share_removal_recovery(
+    operation: &NodeOperation,
+    current_digest: &str,
+) -> Result<ShareRemovalRecovery, String> {
+    let old_matches = operation.old_config_sha256.as_deref() == Some(current_digest);
+    let candidate_matches = operation.candidate_config_sha256.as_deref() == Some(current_digest);
+    match operation.phase.as_str() {
+        "REMOVED" => Ok(ShareRemovalRecovery::Done),
+        "REMOVAL_PENDING" if old_matches => Ok(ShareRemovalRecovery::Cleanup),
+        "REMOVAL_COMMITTING" if old_matches => Ok(ShareRemovalRecovery::Cleanup),
+        "REMOVAL_COMMITTING" | "SYNC_PENDING" if candidate_matches => {
+            Ok(ShareRemovalRecovery::Sync)
+        }
+        phase => Err(format!(
+            "share removal {} is in phase {phase}, but the active config does not match its recorded before/after state",
+            operation.id
+        )),
+    }
+}
+
+fn share_removal_in_progress<'a>(
+    state: &'a AdminState,
+    share_id: &str,
+) -> Option<&'a NodeOperation> {
+    state
+        .operations
+        .get(&format!("share-remove:{share_id}"))
+        .filter(|operation| {
+            operation.action == "share-remove"
+                && !matches!(operation.phase.as_str(), "REMOVED" | "ABORTED")
+        })
+}
+
+struct ShareRemovalClientPlan {
+    node_id: String,
+    node: NodeConfig,
+    mounts: Vec<NfsMount>,
+    aliases: Vec<NfsAlias>,
+}
+
+fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "named-share removal",
+        MaintenanceScope::Cluster,
+    )?;
+    if maintenance.recovered {
+        return Ok(());
+    }
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source_text = fs::read_to_string(&config_path).map_err(io_error)?;
+        let current_digest =
+            sha256_hex(source_text.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        let config = ClusterConfig::parse(&source_text).map_err(|error| (2, error.to_string()))?;
+        let journal_path = state_dir.join("node-admin.json");
+        let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        let operation_key = format!("share-remove:{share_id}");
+        let existing_operation = state.operations.get(&operation_key).cloned();
+        let resumed_removal = existing_operation.as_ref().is_some_and(|operation| {
+            operation.action == "share-remove" && operation.phase != "REMOVED"
+        });
+        if let Some(operation) = existing_operation.as_ref()
+            && operation.action != "share-remove"
+        {
+            return Err((
+                1,
+                format!(
+                    "node admin journal key {operation_key} belongs to action {}; refusing to overwrite it",
+                    operation.action
+                ),
+            ));
+        }
+
+        let configured_share = config.shares.get(share_id).cloned();
+        if let Some(share_operation) = state.operations.get(&format!("share:{share_id}"))
+            && share_operation.action == "share"
+            && !matches!(share_operation.phase.as_str(), "READY" | "ABORTED")
+        {
+            return Err((
+                1,
+                format!(
+                    "share {share_id} setup is still in phase {}; rerun its original mnode --add command before removal",
+                    share_operation.phase
+                ),
+            ));
+        }
+
+        let mut operation = match (configured_share.as_ref(), existing_operation) {
+            (Some(share), Some(operation))
+                if operation.phase != "REMOVED"
+                    && named_share_operation_matches(
+                        &operation,
+                        share_id,
+                        share.server.as_str(),
+                        &share.source_root,
+                        &share.mount_root,
+                        share.allow_existing_contents,
+                    )
+                    && operation.machine_uuid.as_deref() == Some(share.share_uuid.as_str()) =>
+            {
+                operation
+            }
+            (Some(_), Some(operation)) if operation.phase != "REMOVED" => {
+                return Err((
+                    1,
+                    format!(
+                        "share removal {} does not match the configured share {share_id}; inspect node-admin.json before retrying",
+                        operation.id
+                    ),
+                ));
+            }
+            (Some(share), _) => {
+                let candidate =
+                    remove_share_sections(&source_text, &BTreeSet::from([share_id.to_owned()]));
+                let candidate_config =
+                    ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+                if candidate_config.shares.contains_key(share_id) {
+                    return Err((1, format!("could not remove share {share_id} from config")));
+                }
+                NodeOperation {
+                    id: Id128::random().to_string(),
+                    action: "share-remove".into(),
+                    connection_endpoint: None,
+                    remote_config_path: None,
+                    node_id: share.server.as_str().to_owned(),
+                    endpoint: named_share_operation_endpoint(
+                        share_id,
+                        share.server.as_str(),
+                        &share.source_root,
+                        &share.mount_root,
+                        share.allow_existing_contents,
+                    ),
+                    machine_uuid: Some(share.share_uuid.clone()),
+                    phase: "REMOVAL_PENDING".into(),
+                    old_config_sha256: Some(current_digest.clone()),
+                    candidate_config_sha256: Some(
+                        sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?,
+                    ),
+                    managed_export: false,
+                    managed_shares: BTreeSet::new(),
+                    client_setup_attempted: Some(true),
+                    detail: Some("removing this named share's managed NFS resources".into()),
+                }
+            }
+            (None, Some(operation)) if operation.phase == "REMOVED" => {
+                println!("Named share {share_id} was already removed.");
+                return Ok(());
+            }
+            (None, Some(operation)) if operation.action == "share-remove" => operation,
+            (None, _) => {
+                return Err((2, format!("named share {share_id} is not configured")));
+            }
+        };
+
+        if operation.node_id.is_empty() {
+            return Err((1, format!("share {share_id} removal has no NFS server ID")));
+        }
+        let (recorded_share_id, server_id, source_root, mount_root, allow_existing_contents) =
+            parse_pending_named_share_endpoint(&operation.endpoint)?;
+        if recorded_share_id != share_id || operation.node_id != server_id {
+            return Err((
+                1,
+                format!(
+                    "share removal {} has an inconsistent endpoint",
+                    operation.id
+                ),
+            ));
+        }
+        let share_uuid = operation.machine_uuid.as_deref().ok_or_else(|| {
+            (
+                1,
+                format!("share removal {} has no recorded share UUID", operation.id),
+            )
+        })?;
+        Id128::parse(share_uuid)
+            .map_err(|error| (1, format!("share {share_id} has an invalid UUID: {error}")))?;
+        let share = match configured_share {
+            Some(share) => share,
+            None => ShareConfig {
+                server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
+                source_root: source_root.clone(),
+                mount_root: mount_root.clone(),
+                share_uuid: share_uuid.to_owned(),
+                allow_existing_contents,
+            },
+        };
+        if share.server.as_str() != server_id
+            || share.source_root != source_root
+            || share.mount_root != mount_root
+            || share.share_uuid != share_uuid
+        {
+            return Err((
+                1,
+                format!(
+                    "share removal {} no longer matches the active share",
+                    operation.id
+                ),
+            ));
+        }
+        let server = config.nodes.get(&server_id).ok_or_else(|| {
+            (
+                1,
+                format!("NFS server {server_id} for share {share_id} is missing"),
+            )
+        })?;
+        let recovery =
+            share_removal_recovery(&operation, &current_digest).map_err(|error| (1, error))?;
+        if recovery == ShareRemovalRecovery::Done {
+            println!("Named share {share_id} was already removed.");
+            return Ok(());
+        }
+
+        if recovery == ShareRemovalRecovery::Sync {
+            operation.phase = "SYNC_PENDING".into();
+            operation.detail = Some("share is removed locally; synchronizing peer configs".into());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            if let Err(error) =
+                sync_remote_configs(&config, &source_text, state_dir, &operation.id, None)
+            {
+                operation.detail = Some(error.clone());
+                state
+                    .operations
+                    .insert(operation_key.clone(), operation.clone());
+                save_admin_state(&journal_path, &state)?;
+                return Err((
+                    1,
+                    format!(
+                        "share {share_id} was removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm share:{share_id}` to resume."
+                    ),
+                ));
+            }
+            operation.phase = "REMOVED".into();
+            operation.detail = None;
+            state.operations.insert(operation_key, operation);
+            save_admin_state(&journal_path, &state)?;
+            println!("Removed named NFS share {share_id}; source files were preserved.");
+            return Ok(());
+        }
+
+        if let Some(old_digest) = operation.old_config_sha256.as_deref()
+            && old_digest != current_digest
+        {
+            return Err((
+                1,
+                format!(
+                    "cluster config changed during removal of share {share_id}; inspect node-admin.json before retrying"
+                ),
+            ));
+        }
+        if !config.shares.contains_key(share_id) {
+            return Err((
+                1,
+                format!(
+                    "share {share_id} is absent from config before the removal commit; inspect node-admin.json"
+                ),
+            ));
+        }
+        let replaced = replaced_child_shares(&config, &share);
+        if !replaced.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "cannot remove share {share_id} while nested share(s) {} depend on it",
+                    replaced.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+
+        if state_dir.join("controller.sqlite3").is_file()
+            && ReadOnlyJobStore::open(state_dir)
+                .and_then(|store| store.has_maintenance_work())
+                .map_err(|error| {
+                    (
+                        1,
+                        format!("cannot check active jobs and output sync: {error}"),
+                    )
+                })?
+        {
+            return Err((
+                1,
+                "cannot remove a named share while jobs or output synchronization are active"
+                    .into(),
+            ));
+        }
+        for (node_id, node) in &config.nodes {
+            verify_registered_node_identity(node_id, node, &state)?;
+            check_remote_idle(node, node_id, &config_path)?;
+        }
+
+        let existing_removal = resumed_removal;
+        if existing_removal {
+            check_managed_nfs_marker(
+                server,
+                &share.source_root.to_string_lossy(),
+                share_uuid,
+                &format!("verify source marker for share {share_id} removal"),
+            )
+            .map_err(|error| (1, error))?;
+        } else {
+            verify_named_share_mount(
+                server,
+                &server_id,
+                &server_id,
+                &server.host,
+                &share.source_root,
+                &share.mount_root,
+                share_uuid,
+            )?;
+        }
+        if share.source_root != share.mount_root {
+            check_managed_nfs_alias(
+                server,
+                &share.mount_root.to_string_lossy(),
+                &share.source_root.to_string_lossy(),
+                true,
+                &format!("verify server alias for share {share_id} removal"),
+            )
+            .map_err(|error| (1, error))?;
+        }
+
+        let expected_source = format!("{}:{}", server.host, share.source_root.display());
+        let mut clients = Vec::new();
+        for (node_id, node) in &config.nodes {
+            if node_id == &server_id {
+                continue;
+            }
+            let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
+                (
+                    1,
+                    format!(
+                        "cannot inspect NFS mounts on {node_id} before removing {share_id}: {error}"
+                    ),
+                )
+            })?;
+            if !mounts.status.success() {
+                return Err((
+                    1,
+                    format!(
+                        "cannot inspect NFS mounts on {node_id} before removing {share_id}: {}",
+                        command_error("mount inspection failed", &mounts)
+                    ),
+                ));
+            }
+            let mount_text = String::from_utf8_lossy(&mounts.stdout);
+            let mut client_mounts = Vec::new();
+            match named_share_mount_status(
+                &mount_text,
+                &expected_source,
+                &share.mount_root.to_string_lossy(),
+            ) {
+                NamedShareMountStatus::Expected => {
+                    verify_named_share_mount(
+                        node,
+                        node_id,
+                        &server_id,
+                        &server.host,
+                        &share.source_root,
+                        &share.mount_root,
+                        share_uuid,
+                    )?;
+                    client_mounts.push(NfsMount {
+                        source: expected_source.clone(),
+                        target: share.mount_root.to_string_lossy().into_owned(),
+                        share_uuid: share_uuid.to_owned(),
+                        alias: None,
+                        allow_existing_contents: false,
+                    });
+                }
+                NamedShareMountStatus::NotMounted => {}
+                NamedShareMountStatus::MountedElsewhere(other) => {
+                    return Err((
+                        1,
+                        format!(
+                            "mount point {} on {node_id} belongs to {other}; refusing to remove share {share_id}",
+                            share.mount_root.display()
+                        ),
+                    ));
+                }
+            }
+            let mut aliases = Vec::new();
+            if share.source_root != share.mount_root {
+                check_managed_nfs_alias(
+                    node,
+                    &share.source_root.to_string_lossy(),
+                    &share.mount_root.to_string_lossy(),
+                    true,
+                    &format!("verify client alias for share {share_id} removal on {node_id}"),
+                )
+                .map_err(|error| (1, error))?;
+                aliases.push(NfsAlias {
+                    path: share.source_root.to_string_lossy().into_owned(),
+                    target: share.mount_root.to_string_lossy().into_owned(),
+                });
+            }
+            clients.push(ShareRemovalClientPlan {
+                node_id: node_id.clone(),
+                node: node.clone(),
+                mounts: client_mounts,
+                aliases,
+            });
+        }
+
+        let export_requests = config
+            .nodes
+            .iter()
+            .filter(|(node_id, _)| node_id.as_str() != server_id)
+            .map(|(node_id, node)| NfsExportRequest {
+                root: share.source_root.to_string_lossy().into_owned(),
+                client_ip: node.host.to_string(),
+                share_uuid: share_uuid.to_owned(),
+                node_id: node_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        if !export_requests.is_empty() {
+            let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
+                (
+                    1,
+                    format!("cannot inspect NFS exports before removing share {share_id}: {error}"),
+                )
+            })?;
+            plan_remove_nfs_exports(&exports, &export_requests).map_err(|error| {
+                (
+                    1,
+                    format!("cannot safely remove NFS exports for share {share_id}: {error}"),
+                )
+            })?;
+        }
+
+        let candidate = remove_share_sections(&source_text, &BTreeSet::from([share_id.to_owned()]));
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let candidate_digest =
+            sha256_hex(candidate.as_bytes()).map_err(|error| (1, error.to_string()))?;
+        if operation.candidate_config_sha256.as_deref() != Some(candidate_digest.as_str()) {
+            operation.candidate_config_sha256 = Some(candidate_digest);
+        }
+        operation.old_config_sha256 = Some(current_digest.clone());
+        operation.phase = "REMOVAL_PENDING".into();
+        operation.detail = Some("removing exact NFS mounts, exports, aliases and marker".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+
+        for client in &clients {
+            if client.mounts.is_empty() && client.aliases.is_empty() {
+                continue;
+            }
+            unmount_managed_nfs(
+                &client.node,
+                &client.mounts,
+                &client.aliases,
+                false,
+                &format!(
+                    "remove exact NFS share {share_id} mount on {}",
+                    client.node_id
+                ),
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "cannot remove share {share_id} mount from {}: {error}",
+                        client.node_id
+                    ),
+                )
+            })?;
+        }
+
+        let mut still_authorized = Vec::new();
+        if !export_requests.is_empty() {
+            let statuses = remove_managed_nfs_exports(server, &export_requests, &operation.id)
+                .map_err(|error| {
+                    (
+                        1,
+                        format!("cannot remove managed NFS exports for share {share_id}: {error}"),
+                    )
+                })?;
+            for ((_, node), (_, authorized)) in config
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| node_id.as_str() != server_id)
+                .zip(statuses)
+            {
+                if authorized {
+                    still_authorized.push(node.host.to_string());
+                }
+            }
+        }
+        if share.source_root != share.mount_root {
+            remove_pending_share_alias(server, &share.mount_root, &share.source_root, share_id)?;
+        }
+        remove_pending_share_marker(server, &share.source_root, share_uuid, share_id)?;
+
+        operation.phase = "REMOVAL_COMMITTING".into();
+        operation.detail = Some("NFS resources are removed; committing share config change".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        backup_config(&config_path, &operation.id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+
+        operation.phase = "SYNC_PENDING".into();
+        operation.detail = Some("share is removed locally; synchronizing peer configs".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
+        if let Err(error) = sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation.id,
+            None,
+        ) {
+            operation.detail = Some(error.clone());
+            state
+                .operations
+                .insert(operation_key.clone(), operation.clone());
+            save_admin_state(&journal_path, &state)?;
+            return Err((
+                1,
+                format!(
+                    "share {share_id} was removed locally, but peer config sync is pending: {error}. Rerun `mnode -rm share:{share_id}` to resume."
+                ),
+            ));
+        }
+        operation.phase = "REMOVED".into();
+        operation.detail = None;
+        state.operations.insert(operation_key, operation);
+        save_admin_state(&journal_path, &state)?;
+        println!("Removed named NFS share {share_id}; source files were preserved.");
+        if !still_authorized.is_empty() {
+            println!(
+                "Warning: operator-managed NFS exports still authorize: {}.",
+                still_authorized.join(", ")
+            );
+        }
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
@@ -10977,6 +11555,15 @@ fn register_named_share(
         fs::create_dir_all(state_dir).map_err(io_error)?;
         let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
         let operation_key = format!("share:{share_id}");
+        if let Some(operation) = share_removal_in_progress(&state, share_id) {
+            return Err((
+                1,
+                format!(
+                    "share {share_id} removal is still in phase {}; rerun `mnode -rm share:{share_id}` before adding it again",
+                    operation.phase
+                ),
+            ));
+        }
         let endpoint_key = named_share_operation_endpoint(
             share_id,
             &server_id,
@@ -14878,6 +15465,87 @@ exec "$@"
     }
 
     #[test]
+    fn remove_nfs_exports_rejects_a_managed_marker_with_a_changed_line() {
+        let request = super::NfsExportRequest {
+            root: "/Users/Shared/one".into(),
+            client_ip: "192.0.2.10".into(),
+            share_uuid: "share-one".into(),
+            node_id: "worker-a".into(),
+        };
+        let original = concat!(
+            "# operator note\n",
+            "# macluster-managed share-one worker-a\n",
+            "/Users/Shared/other 192.0.2.10\n",
+        );
+
+        let error = plan_remove_nfs_exports(original, &[request]).unwrap_err();
+
+        assert!(error.contains("did not match"), "{error}");
+        assert!(original.contains("/Users/Shared/other 192.0.2.10"));
+    }
+
+    #[test]
+    fn share_removal_recovery_detects_committed_config_waiting_for_sync() {
+        let operation = NodeOperation {
+            id: "remove-share-test".into(),
+            action: "share-remove".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
+            node_id: "login-01".into(),
+            endpoint: "share:tools:login-01:/Users/login/tools:/Users/Shared/tools".into(),
+            machine_uuid: Some("00000000-0000-4000-8000-000000000002".into()),
+            phase: "REMOVAL_COMMITTING".into(),
+            old_config_sha256: Some("before".into()),
+            candidate_config_sha256: Some("after".into()),
+            managed_export: false,
+            managed_shares: BTreeSet::new(),
+            client_setup_attempted: Some(true),
+            detail: None,
+        };
+
+        assert_eq!(
+            super::share_removal_recovery(&operation, "after").unwrap(),
+            super::ShareRemovalRecovery::Sync
+        );
+    }
+
+    #[test]
+    fn pending_share_removal_blocks_a_concurrent_share_add() {
+        let operation = NodeOperation {
+            id: "remove-share-test".into(),
+            action: "share-remove".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
+            node_id: "login-01".into(),
+            endpoint: "share:tools:login-01:/Users/login/tools:/Users/Shared/tools".into(),
+            machine_uuid: Some("00000000-0000-4000-8000-000000000002".into()),
+            phase: "REMOVAL_PENDING".into(),
+            old_config_sha256: Some("before".into()),
+            candidate_config_sha256: Some("after".into()),
+            managed_export: false,
+            managed_shares: BTreeSet::new(),
+            client_setup_attempted: Some(true),
+            detail: None,
+        };
+        let mut state = AdminState {
+            version: 1,
+            config_path: "/tmp/config.toml".into(),
+            state_dir: "/tmp/state".into(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::new(),
+            operations: BTreeMap::from([("share-remove:tools".into(), operation.clone())]),
+        };
+
+        assert!(super::share_removal_in_progress(&state, "tools").is_some());
+        state
+            .operations
+            .get_mut("share-remove:tools")
+            .unwrap()
+            .phase = "REMOVED".into();
+        assert!(super::share_removal_in_progress(&state, "tools").is_none());
+    }
+
+    #[test]
     fn power_install_and_export_reload_share_one_admin_wrapper() {
         let update = super::nfs_exports_update_commands(
             "# macluster-managed share worker\n/Users/Shared/data 192.0.2.10\n",
@@ -17114,6 +17782,23 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn removing_one_share_section_preserves_other_shares_and_cluster_config() {
+        let source = concat!(
+            "[cluster]\nname = \"test\"\n",
+            "[shares.homebrew]\nserver = \"login\"\nsource_root = \"/opt/homebrew\"\n",
+            "[shares.mamba]\nserver = \"login\"\nsource_root = \"/Users/login/mamba\"\n",
+            "[queues.default]\nnodes = [\"node-001\"]\n",
+        );
+
+        let result = super::remove_share_sections(source, &BTreeSet::from(["homebrew".to_owned()]));
+
+        assert!(!result.contains("[shares.homebrew]"));
+        assert!(result.contains("[shares.mamba]"));
+        assert!(result.contains("[cluster]"));
+        assert!(result.contains("[queues.default]"));
+    }
+
+    #[test]
     fn pending_share_endpoint_parser_checks_share_server_and_paths() {
         let parsed = super::parse_pending_named_share_endpoint(
             "share:volumes_data:default-a:/Volumes/Data:/Volumes/Data",
@@ -17255,6 +17940,75 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             fs::read_to_string(source.join("keep.txt")).unwrap(),
             "shared data"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn registered_share_removal_preserves_source_data_and_removes_only_its_marker() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("homebrew");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("keep.txt"), "brew data").unwrap();
+        let config_path = share_registration_fixture(&root, &source, &source, true);
+        let machine_uuid = super::local_platform_uuid().unwrap();
+        let config_text = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("01234567-89ab-cdef-0123-456789abcdef", &machine_uuid);
+        fs::write(&config_path, &config_text).unwrap();
+        let config_path = config_path.canonicalize().unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+        let share_uuid = "00000000-0000-4000-8000-000000000002";
+        fs::write(source.join(".macluster-share-id"), share_uuid).unwrap();
+
+        let mut state =
+            super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
+                .unwrap();
+        state.machine_uuids.insert("storage".into(), machine_uuid);
+        let config_digest = sha256_hex(config_text.as_bytes()).unwrap();
+        state.operations.insert(
+            "share:tools".into(),
+            super::NodeOperation {
+                id: "ready-homebrew-share".into(),
+                action: "share".into(),
+                connection_endpoint: None,
+                remote_config_path: None,
+                node_id: "storage".into(),
+                endpoint: format!(
+                    "share:tools:storage:{}:{}",
+                    source.display(),
+                    source.display()
+                ),
+                machine_uuid: Some(share_uuid.into()),
+                phase: "READY".into(),
+                old_config_sha256: Some(config_digest.clone()),
+                candidate_config_sha256: Some(config_digest),
+                managed_export: false,
+                managed_shares: BTreeSet::new(),
+                client_setup_attempted: Some(true),
+                detail: None,
+            },
+        );
+        super::save_admin_state(&state_dir.join("node-admin.json"), &state).unwrap();
+
+        super::remove_share(&config_path, &state_dir, "tools").unwrap();
+
+        let remaining_config = fs::read_to_string(&config_path).unwrap();
+        let parsed = ClusterConfig::parse(&remaining_config).unwrap();
+        assert!(!parsed.shares.contains_key("tools"));
+        assert_eq!(
+            fs::read_to_string(source.join("keep.txt")).unwrap(),
+            "brew data"
+        );
+        assert!(!source.join(".macluster-share-id").exists());
+        let state =
+            super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
+                .unwrap();
+        assert_eq!(state.operations["share-remove:tools"].phase, "REMOVED");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     process::Command,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use macluster_core::config::{NodeConfig, Transport};
@@ -20,10 +20,13 @@ use crate::{
     transport::run_child_bounded,
 };
 
-const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
+const PROCESS_SAMPLE_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_WORKERS: usize = 2;
+#[cfg(test)]
 const PROCESS_MARKER: &str = "__MACLUSTER_PS_NAMES__";
+#[cfg(test)]
+const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
 
 struct ProcessTask {
     node_id: NodeId,
@@ -40,6 +43,12 @@ pub(super) struct ProcessSampler {
     sender: SyncSender<ProcessTask>,
     receiver: Receiver<ProcessResult>,
     in_flight: HashSet<NodeId>,
+    cpu_samples: HashMap<NodeId, ProcessCpuSample>,
+}
+
+struct ProcessCpuSample {
+    sampled_at: Instant,
+    process_times: BTreeMap<u32, f64>,
 }
 
 impl ProcessSampler {
@@ -78,6 +87,7 @@ impl ProcessSampler {
             sender,
             receiver,
             in_flight: HashSet::new(),
+            cpu_samples: HashMap::new(),
         }
     }
 
@@ -105,9 +115,30 @@ impl ProcessSampler {
         let mut completed = Vec::new();
         loop {
             match self.receiver.try_recv() {
-                Ok(result) => {
+                Ok(mut result) => {
                     self.in_flight.remove(&result.node_id);
-                    completed.push(result);
+                    let publish = match &mut result.result {
+                        Ok(rows) => {
+                            let ready = apply_instantaneous_cpu(
+                                &mut self.cpu_samples,
+                                &result.node_id,
+                                rows,
+                                result.completed_at,
+                            );
+                            rows.sort_by(|left, right| {
+                                right
+                                    .cpu_percent
+                                    .total_cmp(&left.cpu_percent)
+                                    .then_with(|| left.pid.cmp(&right.pid))
+                            });
+                            rows.truncate(MAX_MONITOR_PROCESS_ROWS);
+                            ready
+                        }
+                        Err(_) => true,
+                    };
+                    if publish {
+                        completed.push(result);
+                    }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -123,7 +154,7 @@ pub(super) fn sample_node(
 ) -> Result<Vec<ProcessRow>, String> {
     let command = if node.transport == Transport::Local {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", PROCESS_COMMAND]);
+        command.args(["-c", PROCESS_SAMPLE_COMMAND]);
         command
     } else {
         let mut command = Command::new("/usr/bin/ssh");
@@ -139,7 +170,7 @@ pub(super) fn sample_node(
         if let Ok(key) = ConnectionKey::for_node(pool.namespace(), node_id.as_str(), node) {
             let _ = pool.append_args(&key, &mut command);
         }
-        command.arg(&node.host).arg(PROCESS_COMMAND);
+        command.arg(&node.host).arg(PROCESS_SAMPLE_COMMAND);
         command
     };
     let output = run_child_bounded(command, None, PROCESS_TIMEOUT)
@@ -152,9 +183,132 @@ pub(super) fn sample_node(
             detail
         });
     }
-    parse_processes(&String::from_utf8_lossy(&output.stdout))
+    parse_ps_processes(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn apply_instantaneous_cpu(
+    samples: &mut HashMap<NodeId, ProcessCpuSample>,
+    node_id: &NodeId,
+    rows: &mut [ProcessRow],
+    sampled_at: Instant,
+) -> bool {
+    let process_times = rows
+        .iter()
+        .filter_map(|row| Some((row.pid, parse_cpu_time_seconds(&row.cpu_time)?)))
+        .collect::<BTreeMap<_, _>>();
+    let previous = samples.insert(
+        node_id.clone(),
+        ProcessCpuSample {
+            sampled_at,
+            process_times,
+        },
+    );
+    let Some(previous) = previous else {
+        return false;
+    };
+    let elapsed = sampled_at
+        .saturating_duration_since(previous.sampled_at)
+        .as_secs_f64();
+    if elapsed <= 0.0 || elapsed > 3.0 {
+        return false;
+    }
+    for row in rows {
+        row.cpu_percent = match (
+            parse_cpu_time_seconds(&row.cpu_time),
+            previous.process_times.get(&row.pid),
+        ) {
+            (Some(current), Some(previous)) if current >= *previous => {
+                (current - previous) * 100.0 / elapsed
+            }
+            _ => 0.0,
+        };
+    }
+    true
+}
+
+fn parse_cpu_time_seconds(value: &str) -> Option<f64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
+        None => (0.0, value),
+    };
+    let components = clock
+        .split(':')
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let seconds = match components.as_slice() {
+        [seconds] => *seconds,
+        [minutes, seconds] => minutes * 60.0 + seconds,
+        [hours, minutes, seconds] => hours * 3_600.0 + minutes * 60.0 + seconds,
+        _ => return None,
+    } + days * 86_400.0;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
+}
+
+fn format_process_time(value: &str) -> Option<String> {
+    let total_seconds = parse_cpu_time_seconds(value)?;
+    if total_seconds >= 3_600.0 {
+        let hours = (total_seconds / 3_600.0).floor() as u64;
+        let minutes = ((total_seconds % 3_600.0) / 60.0).floor() as u64;
+        let seconds = (total_seconds % 60.0).floor() as u64;
+        Some(format!("{hours:02}:{minutes:02}:{seconds:02}"))
+    } else {
+        let minutes = (total_seconds / 60.0).floor() as u64;
+        let seconds = total_seconds % 60.0;
+        Some(format!("{minutes:02}:{seconds:05.2}"))
+    }
+}
+
+fn format_process_memory_kib(memory_kib: u64) -> String {
+    const KIB_PER_MIB: u64 = 1024;
+    const KIB_PER_GIB: u64 = KIB_PER_MIB * 1024;
+    if memory_kib >= KIB_PER_GIB {
+        format!("{:.1}G", memory_kib as f64 / KIB_PER_GIB as f64)
+    } else if memory_kib >= 10 * KIB_PER_MIB {
+        format!("{}M", (memory_kib + KIB_PER_MIB / 2) / KIB_PER_MIB)
+    } else {
+        format!("{memory_kib}K")
+    }
+}
+
+fn parse_ps_processes(input: &str) -> Result<Vec<ProcessRow>, String> {
+    let mut rows = Vec::new();
+    for line in input.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5 {
+            continue;
+        }
+        let (Ok(pid), Ok(cpu_percent), Ok(memory_kib)) = (
+            fields[0].parse::<u32>(),
+            fields[1].parse::<f64>(),
+            fields[2].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if !cpu_percent.is_finite() || cpu_percent < 0.0 {
+            continue;
+        }
+        let mut command = fields[4..].join(" ");
+        if command.is_empty() {
+            continue;
+        }
+        truncate_utf8(&mut command, 512);
+        rows.push(ProcessRow {
+            pid,
+            cpu_percent,
+            memory_bytes: Some(memory_kib.saturating_mul(1024)),
+            memory: format_process_memory_kib(memory_kib),
+            cpu_time: format_process_time(fields[3]).unwrap_or_else(|| fields[3].to_owned()),
+            command,
+        });
+    }
+    if rows.is_empty() {
+        return Err("ps process sample returned no valid rows".into());
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
 fn parse_processes(input: &str) -> Result<Vec<ProcessRow>, String> {
     let (top_output, process_output) = input
         .split_once(PROCESS_MARKER)
@@ -204,6 +358,7 @@ fn parse_processes(input: &str) -> Result<Vec<ProcessRow>, String> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn parse_memory_bytes(memory: &str) -> Option<u64> {
     let value = memory.trim_end_matches('+');
     let (number, multiplier) = match value.chars().last()? {
@@ -229,11 +384,13 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
     value.truncate(boundary);
 }
 
+#[cfg(test)]
 fn is_top_header(line: &str) -> bool {
     let fields: Vec<_> = line.split_whitespace().collect();
     fields.starts_with(&["PID", "%CPU", "MEM", "TIME", "COMMAND"])
 }
 
+#[cfg(test)]
 fn parse_process_names(input: &str) -> BTreeMap<u32, String> {
     input
         .lines()

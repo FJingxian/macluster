@@ -13,12 +13,17 @@ use std::{
 
 use macluster_core::config::{NodeConfig, Transport};
 
-const PROCESS_TABLE_MARKER: &str = "__MACLUSTER_PS_NAMES__";
 const PREVIEW_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm= | /usr/bin/sort -k2,2nr | /usr/bin/head -n 32";
-const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
+const PROCESS_SAMPLE_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
 const MAX_PROCESS_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PROCESS_ROWS: usize = 32;
+
+#[cfg(test)]
+const PROCESS_TABLE_MARKER: &str = "__MACLUSTER_PS_NAMES__";
+#[cfg(test)]
+const PROCESS_COMMAND: &str = "top_output=$(/usr/bin/top -l 2 -n 32 -s 1 -stats pid,cpu,mem,time,command -o cpu) || exit $?; printf '%s\\n' \"$top_output\"; printf '\\n__MACLUSTER_PS_NAMES__\\n'; pids=$(printf '%s\\n' \"$top_output\" | /usr/bin/awk '/^[[:space:]]*PID[[:space:]]+%CPU[[:space:]]+MEM[[:space:]]+TIME[[:space:]]+COMMAND/ { table=1; count=0; next } table && $1 ~ /^[0-9]+$/ { pids[++count]=$1 } END { for (i=1; i<=count; i++) { if (i > 1) printf \",\"; printf \"%s\", pids[i] } }'); if [ -n \"$pids\" ]; then /bin/ps -p \"$pids\" -o pid=,ucomm=; fi";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ProcessInfo {
@@ -203,6 +208,12 @@ pub(super) struct ProcessSampler {
     in_flight: Option<String>,
     stop: Arc<AtomicBool>,
     preview_only: bool,
+    cpu_samples: BTreeMap<String, ProcessCpuSample>,
+}
+
+struct ProcessCpuSample {
+    sampled_at: Instant,
+    process_times: BTreeMap<u32, f64>,
 }
 
 impl ProcessSampler {
@@ -214,6 +225,7 @@ impl ProcessSampler {
             in_flight: None,
             stop: Arc::new(AtomicBool::new(false)),
             preview_only: false,
+            cpu_samples: BTreeMap::new(),
         }
     }
 
@@ -255,11 +267,31 @@ impl ProcessSampler {
         let mut completed = Vec::new();
         loop {
             match self.result_receiver.try_recv() {
-                Ok(result) => {
+                Ok(mut result) => {
                     if self.in_flight.as_deref() == Some(result.id.as_str()) {
                         self.in_flight = None;
                     }
-                    completed.push(result);
+                    let publish = if self.preview_only {
+                        true
+                    } else {
+                        match &mut result.result {
+                            Ok(rows) => {
+                                let ready = apply_instantaneous_cpu(
+                                    &mut self.cpu_samples,
+                                    &result.id,
+                                    rows,
+                                    result.received_at,
+                                );
+                                sort_processes(rows, ProcessSort::Cpu);
+                                rows.truncate(MAX_PROCESS_ROWS);
+                                ready
+                            }
+                            Err(_) => true,
+                        }
+                    };
+                    if publish {
+                        completed.push(result);
+                    }
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -275,7 +307,123 @@ impl Drop for ProcessSampler {
 }
 
 fn sample_target(target: &ProcessTarget, stop: &AtomicBool) -> Result<Vec<ProcessInfo>, String> {
-    parse_top_processes(&sample_output(target, stop, PROCESS_COMMAND)?)
+    parse_ps_processes(&sample_output(target, stop, PROCESS_SAMPLE_COMMAND)?)
+}
+
+fn apply_instantaneous_cpu(
+    samples: &mut BTreeMap<String, ProcessCpuSample>,
+    node_id: &str,
+    rows: &mut [ProcessInfo],
+    sampled_at: Instant,
+) -> bool {
+    let process_times = rows
+        .iter()
+        .filter_map(|row| Some((row.pid, parse_cpu_time_seconds(&row.cpu_time)?)))
+        .collect::<BTreeMap<_, _>>();
+    let previous = samples.insert(
+        node_id.to_owned(),
+        ProcessCpuSample {
+            sampled_at,
+            process_times,
+        },
+    );
+    let Some(previous) = previous else {
+        return false;
+    };
+    let elapsed = sampled_at
+        .saturating_duration_since(previous.sampled_at)
+        .as_secs_f64();
+    if elapsed <= 0.0 || elapsed > 3.0 {
+        return false;
+    }
+    for row in rows {
+        row.cpu_percent = match (
+            parse_cpu_time_seconds(&row.cpu_time),
+            previous.process_times.get(&row.pid),
+        ) {
+            (Some(current), Some(previous)) if current >= *previous => {
+                (current - previous) * 100.0 / elapsed
+            }
+            _ => 0.0,
+        };
+    }
+    true
+}
+
+fn parse_cpu_time_seconds(value: &str) -> Option<f64> {
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<f64>().ok()?, clock),
+        None => (0.0, value),
+    };
+    let components = clock
+        .split(':')
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let seconds = match components.as_slice() {
+        [seconds] => *seconds,
+        [minutes, seconds] => minutes * 60.0 + seconds,
+        [hours, minutes, seconds] => hours * 3_600.0 + minutes * 60.0 + seconds,
+        _ => return None,
+    } + days * 86_400.0;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
+}
+
+fn format_process_time(value: &str) -> Option<String> {
+    let total_seconds = parse_cpu_time_seconds(value)?;
+    if total_seconds >= 3_600.0 {
+        let hours = (total_seconds / 3_600.0).floor() as u64;
+        let minutes = ((total_seconds % 3_600.0) / 60.0).floor() as u64;
+        let seconds = (total_seconds % 60.0).floor() as u64;
+        Some(format!("{hours:02}:{minutes:02}:{seconds:02}"))
+    } else {
+        let minutes = (total_seconds / 60.0).floor() as u64;
+        let seconds = total_seconds % 60.0;
+        Some(format!("{minutes:02}:{seconds:05.2}"))
+    }
+}
+
+fn format_process_memory_kib(memory_kib: u64) -> String {
+    const KIB_PER_MIB: u64 = 1024;
+    const KIB_PER_GIB: u64 = KIB_PER_MIB * 1024;
+    if memory_kib >= KIB_PER_GIB {
+        format!("{:.1}G", memory_kib as f64 / KIB_PER_GIB as f64)
+    } else if memory_kib >= 10 * KIB_PER_MIB {
+        format!("{}M", (memory_kib + KIB_PER_MIB / 2) / KIB_PER_MIB)
+    } else {
+        format!("{memory_kib}K")
+    }
+}
+
+fn parse_ps_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
+    let mut rows = Vec::new();
+    for line in input.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 5 {
+            continue;
+        }
+        let (Ok(pid), Ok(cpu_percent), Ok(memory_kib)) = (
+            fields[0].parse::<u32>(),
+            fields[1].parse::<f64>(),
+            fields[2].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        if !cpu_percent.is_finite() || cpu_percent < 0.0 {
+            continue;
+        }
+        rows.push(ProcessInfo {
+            pid,
+            cpu_percent,
+            memory: format_process_memory_kib(memory_kib),
+            cpu_time: format_process_time(fields[3]).unwrap_or_else(|| fields[3].to_owned()),
+            command: fields[4..].join(" "),
+        });
+    }
+    if rows.is_empty() {
+        return Err("ps process sample returned no valid rows".into());
+    }
+    Ok(rows)
 }
 
 fn sample_preview_target(
@@ -475,8 +623,8 @@ fn parse_preview_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
         rows.push(ProcessInfo {
             pid,
             cpu_percent,
-            memory: format!("{rss}K"),
-            cpu_time: fields[3].into(),
+            memory: format_process_memory_kib(rss),
+            cpu_time: format_process_time(fields[3]).unwrap_or_else(|| fields[3].into()),
             command: fields[4..].join(" "),
         });
     }
@@ -488,6 +636,7 @@ fn parse_preview_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn parse_top_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
     let (top_output, process_output) = input
         .split_once(PROCESS_TABLE_MARKER)
@@ -534,11 +683,13 @@ fn parse_top_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn is_top_header(line: &str) -> bool {
     let fields: Vec<_> = line.split_whitespace().collect();
     fields.starts_with(&["PID", "%CPU", "MEM", "TIME", "COMMAND"])
 }
 
+#[cfg(test)]
 fn parse_process_names(input: &str) -> BTreeMap<u32, String> {
     input
         .lines()

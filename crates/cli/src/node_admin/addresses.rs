@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::unix::fs::DirBuilderExt,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -1105,11 +1105,47 @@ pub(crate) fn address_migration_has_active_jobs(state_dir: &Path) -> AppResult<b
 pub(crate) struct AddressWatcher {
     stop: Arc<AtomicBool>,
     pending: Arc<AtomicBool>,
+    errors: AddressErrorReporter,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct AddressErrorReporter(Arc<Mutex<Option<String>>>);
+
+impl AddressErrorReporter {
+    pub(crate) fn should_report(&self, error: &str) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if last.as_deref() == Some(error) {
+            return false;
+        }
+        *last = Some(error.to_owned());
+        true
+    }
+
+    pub(crate) fn remember(&self, error: &str) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(error.to_owned());
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+fn record_address_discovery_error(
+    pending: &AtomicBool,
+    reporter: &AddressErrorReporter,
+    error: &str,
+) -> bool {
+    pending.store(true, Ordering::SeqCst);
+    reporter.should_report(error)
 }
 
 impl AddressWatcher {
     pub(crate) fn pending_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.pending)
+    }
+
+    pub(crate) fn error_reporter(&self) -> AddressErrorReporter {
+        self.errors.clone()
     }
 }
 
@@ -1126,9 +1162,11 @@ pub(crate) fn watch_node_addresses(
     let watcher = AddressWatcher {
         stop: Arc::new(AtomicBool::new(false)),
         pending: Arc::new(AtomicBool::new(address_migration_pending(&state_dir))),
+        errors: AddressErrorReporter::default(),
     };
     let stop = Arc::clone(&watcher.stop);
     let pending = Arc::clone(&watcher.pending);
+    let errors = watcher.errors.clone();
     thread::Builder::new()
         .name("macluster-node-addresses".into())
         .spawn(move || {
@@ -1140,9 +1178,16 @@ pub(crate) fn watch_node_addresses(
                     thread::sleep(Duration::from_secs(1));
                 }
                 match prepare_node_address_migration(&config_path, &state_dir) {
-                    Ok(found) => pending.store(found, Ordering::SeqCst),
+                    Ok(found) => {
+                        pending.store(found, Ordering::SeqCst);
+                        if !found {
+                            errors.clear();
+                        }
+                    }
                     Err((_, error)) => {
-                        eprintln!("macluster: automatic node address discovery: {error}")
+                        if record_address_discovery_error(&pending, &errors, &error) {
+                            eprintln!("macluster: automatic node address discovery: {error}");
+                        }
                     }
                 }
             }
@@ -1349,6 +1394,30 @@ fn check_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_error_reporter_suppresses_repeats_until_the_state_changes() {
+        let reporter = AddressErrorReporter::default();
+        let pending = AtomicBool::new(false);
+        assert!(record_address_discovery_error(
+            &pending,
+            &reporter,
+            "no unambiguous interface"
+        ));
+        assert!(pending.load(Ordering::SeqCst));
+        assert!(!record_address_discovery_error(
+            &pending,
+            &reporter,
+            "no unambiguous interface"
+        ));
+        assert!(record_address_discovery_error(
+            &pending,
+            &reporter,
+            "another discovery failure"
+        ));
+        reporter.clear();
+        assert!(reporter.should_report("no unambiguous interface"));
+    }
 
     #[test]
     fn verified_connection_cache_keeps_recent_origins_for_long_running_clients() {

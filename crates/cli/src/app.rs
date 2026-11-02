@@ -128,6 +128,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         return Err((2, "msub -Is requires terminal stdin and stdout".into()));
     }
     let mut address_migration_deferred = false;
+    let mut address_migration_deferred_error = None;
     let local_read_query = is_read_only_query(&command, &args);
     let refresh_node_addresses = !local_read_query
         && is_macluster_executable()
@@ -159,6 +160,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                     "Node address discovery needs attention: {error}. Continuing with `{command}`; automatic Agent updates are deferred."
                 );
                 address_migration_deferred = true;
+                address_migration_deferred_error = Some(error);
                 false
             }
             Err(error) => return Err(error),
@@ -192,6 +194,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 Ok(stopped) => stopped,
                 Err((_, error)) if can_defer => {
                     address_migration_deferred = true;
+                    address_migration_deferred_error = Some(error.clone());
                     eprintln!(
                         "Node address/NFS migration could not finish yet: {error}. Continuing with `{command}`; migration progress is preserved."
                     );
@@ -224,7 +227,13 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
         "top" => top(global, &args, address_migration_deferred),
-        "controller" => controller(global, &args, false),
+        "controller" => controller(
+            global,
+            &args,
+            false,
+            address_migration_deferred,
+            address_migration_deferred_error,
+        ),
         "init" => {
             let config_path = resolved_config_path(global.config.as_deref());
             let state_dir = state_root(global.state_dir.as_deref())?;
@@ -383,6 +392,7 @@ fn defer_update_without_terminal(
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "kill" | "top")
+        || controller_web_monitor_requested(command, args)
         || command == "fans"
             && args
                 .iter()
@@ -391,6 +401,12 @@ fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
             && args
                 .first()
                 .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
+}
+
+fn controller_web_monitor_requested(command: &str, args: &[String]) -> bool {
+    command == "controller"
+        && args.first().is_some_and(|arg| arg == "run")
+        && args.iter().any(|arg| arg == "--web")
 }
 
 fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
@@ -4874,7 +4890,13 @@ fn run_tui_with_updates(
     }
 }
 
-fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
+fn controller(
+    global: GlobalOptions,
+    args: &[String],
+    service_child: bool,
+    address_migration_deferred: bool,
+    address_migration_deferred_error: Option<String>,
+) -> AppResult<()> {
     let requested_help = if args.is_empty() {
         Some(HelpMode::Short)
     } else {
@@ -5155,15 +5177,19 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             );
             let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir)
                 .map_err(|error| (1, error))?;
-            service.set_dispatch_enabled(
-                !sync_pending && !crate::node_admin::address_migration_pending(&state_dir),
-            );
+            let address_migration = address_migration_deferred
+                || crate::node_admin::address_migration_pending(&state_dir);
+            service.set_dispatch_enabled(!sync_pending && !address_migration);
             if sync_pending {
                 eprintln!(
                     "macluster: peer config synchronization is pending; controller will reconcile status and cancellations but will not dispatch new jobs"
                 );
             }
-            let address_migration = crate::node_admin::address_migration_pending(&state_dir);
+            if address_migration_deferred {
+                eprintln!(
+                    "Browser monitoring will start, but new job dispatch is paused until the login node address can be verified."
+                );
+            }
             let maintenance_pending =
                 macluster_core::maintenance::maintenance_barrier_path(&config_file).exists();
             let lifecycle = if sync_pending || address_migration {
@@ -5255,6 +5281,19 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                     state_dir.clone(),
                 )?;
                 let pending = watcher.pending_flag();
+                let address_errors = watcher.error_reporter();
+                if let Some(error) = address_migration_deferred_error.as_deref() {
+                    // The command preflight already showed this error. Reuse
+                    // the same reporter so the background retries do not
+                    // immediately print the identical warning again.
+                    address_errors.remember(error);
+                }
+                if address_migration_deferred {
+                    // Keep dispatch paused and ask the existing background
+                    // watcher to retry discovery until the login interface can
+                    // be identified safely.
+                    pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let requested = std::sync::Arc::clone(&pending);
                 let mut maintenance_lock = Some(maintenance_lock);
                 let _signal_guard = ControllerSignalGuard::install()?;
@@ -5290,12 +5329,17 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                                 Ok(_) => {
                                     let next = load_config(global.config.as_deref()).map_err(|error| io::Error::other(error.to_string()))?;
                                     service.apply_idle_address_config(next)?;
-                                    service.set_dispatch_enabled(!crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?);
+                                    let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?;
+                                    let address_pending = crate::node_admin::address_migration_pending(&state_dir);
+                                    service.set_dispatch_enabled(!sync_pending && !address_pending);
                                     pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    address_errors.clear();
                                     Ok(true)
                                 }
                                 Err((_, error)) => {
-                                    eprintln!("macluster: address migration needs attention: {error}. If administrator authorization is required, run a foreground macluster command to resume it.");
+                                    if address_errors.should_report(&error) {
+                                        eprintln!("macluster: address migration needs attention: {error}. If administrator authorization is required, run a foreground macluster command to resume it.");
+                                    }
                                     Ok(false)
                                 }
                             }
@@ -6223,7 +6267,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
             }
-            controller(global, &["run".into()], true)
+            controller(global, &["run".into()], true, false, None)
         }
         Some("claim-agent") => {
             let node_id = option_value(args, "--node")?

@@ -26,9 +26,9 @@
     </header>
 
     <nav class="main-nav" aria-label="Main navigation">
-      <button class="nav-item active" data-page="overview">Overview <span id="nav-node-count" class="nav-count">—</span></button>
-      <button class="nav-item" data-page="jobs">Jobs</button>
-      <button class="nav-item" data-page="queues">Queues</button>
+      <button class="nav-item active" data-page="overview"><span class="nav-icon" data-icon="overview" aria-hidden="true"></span><span>Overview</span><span id="nav-node-count" class="nav-count">—</span></button>
+      <button class="nav-item" data-page="jobs"><span class="nav-icon" data-icon="jobs" aria-hidden="true"></span><span>Jobs</span></button>
+      <button class="nav-item" data-page="queues"><span class="nav-icon" data-icon="queues" aria-hidden="true"></span><span>Queues</span></button>
       <span class="nav-spacer"></span>
       <span id="connection-state" class="connection-state">Starting local monitor</span>
     </nav>
@@ -38,14 +38,14 @@
       <section id="page-overview" class="page active" aria-labelledby="overview-title">
         <div class="page-heading">
           <div><p class="eyebrow">LIVE CLUSTER</p><h1 id="overview-title">Overview</h1></div>
-          <div class="heading-actions"><button id="refresh-button" class="button button-secondary">Refresh</button><span id="sample-age" class="muted small">Waiting for first sample</span></div>
+          <div class="heading-actions"><button id="refresh-button" class="button button-secondary"><span class="button-icon" data-icon="refresh" aria-hidden="true"></span>Refresh</button><span id="sample-age" class="muted small">Waiting for first sample</span></div>
         </div>
         <div class="summary-grid">
-          <article class="summary-card"><span class="summary-label">NODES ONLINE</span><strong id="kpi-nodes" class="summary-value">—</strong><span id="kpi-nodes-note" class="summary-note">of — configured</span></article>
-          <article class="summary-card"><span class="summary-label">RUNNING</span><strong id="kpi-running" class="summary-value">—</strong><span class="summary-note">jobs currently executing</span></article>
-          <article class="summary-card"><span class="summary-label">WAITING</span><strong id="kpi-waiting" class="summary-value">—</strong><span class="summary-note">unique queued jobs</span></article>
-          <article class="summary-card"><span class="summary-label">CPU CAPACITY</span><div id="cluster-cpu-ring" class="resource-ring cpu"><strong id="kpi-cpu">—</strong></div><span id="kpi-cpu-note" class="summary-note">across available nodes</span></article>
-          <article class="summary-card"><span class="summary-label">MEMORY</span><div id="cluster-memory-ring" class="resource-ring memory"><strong id="kpi-memory">—</strong></div><span class="summary-note">of shared cluster memory</span></article>
+          <article class="summary-card"><div class="summary-heading"><span class="summary-icon icon-nodes" data-icon="nodes" aria-hidden="true"></span><span class="summary-label">NODES ONLINE</span></div><strong id="kpi-nodes" class="summary-value">—</strong><span id="kpi-nodes-note" class="summary-note">of — configured</span></article>
+          <article class="summary-card"><div class="summary-heading"><span class="summary-icon icon-running" data-icon="running" aria-hidden="true"></span><span class="summary-label">RUNNING</span></div><strong id="kpi-running" class="summary-value">—</strong><span class="summary-note">jobs currently executing</span></article>
+          <article class="summary-card"><div class="summary-heading"><span class="summary-icon icon-waiting" data-icon="waiting" aria-hidden="true"></span><span class="summary-label">WAITING</span></div><strong id="kpi-waiting" class="summary-value">—</strong><span class="summary-note">unique queued jobs</span></article>
+          <article class="summary-card"><div class="summary-heading"><span class="summary-icon icon-cpu" data-icon="cpu" aria-hidden="true"></span><span class="summary-label">CPU CAPACITY</span></div><div id="cluster-cpu-ring" class="resource-ring cpu"><strong id="kpi-cpu">—</strong></div><span id="kpi-cpu-note" class="summary-note">across available nodes</span></article>
+          <article class="summary-card"><div class="summary-heading"><span class="summary-icon icon-memory" data-icon="memory" aria-hidden="true"></span><span class="summary-label">MEMORY</span></div><div id="cluster-memory-ring" class="resource-ring memory"><strong id="kpi-memory">—</strong></div><span class="summary-note">of shared cluster memory</span></article>
         </div>
 
         <section class="panel node-panel" aria-label="Cluster nodes">

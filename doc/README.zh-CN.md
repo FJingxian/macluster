@@ -63,7 +63,7 @@ macluster controller start
 macluster controller stop
 ```
 
-`controller run` 用于前台排查。仅需启动服务时不要重新执行 `init`：已有配置时，它会询问是否重置集群。
+`controller run` 用于前台排查。仅需启动服务时不要执行 `macluster --init`：已有配置时，它会询问是否重置集群。
 
 ## 提交任务
 
@@ -165,8 +165,8 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 | `macluster fans --auto [--node ID]` | 按 40–80°C 线性调速 |
 | `macluster fans --power [--node ID]` | 按 40–80°C 对数曲线调速 |
 | `macluster fans --reset [--node ID]` | 恢复系统风扇控制 |
-| `macluster init` | 确认重置，归档旧状态，然后重新配置 |
-| `macluster init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
+| `macluster --init` | 确认重置，归档旧状态，然后重新配置 |
+| `macluster --init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
 
 重置清理托管的 NFS 挂载/导出，并保留共享数据文件；请阅读确认提示。风扇控制使用 AppleSMC 私有接口，支持情况取决于机型，不支持的机器维持系统控制。
 
@@ -177,7 +177,7 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 需要独立存储 Mac 时：
 
 ```sh
-macluster init --name home --queue default \
+macluster --init --name home --queue default \
   --primary-nfs 'storage@198.51.100.10:22:/Volumes/Data/macluster' \
   --shared-root /Users/Shared/macluster
 ```

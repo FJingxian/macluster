@@ -142,7 +142,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         options.force = false;
         true
     } else if options.force {
-        return Err((2, "--force requires an existing cluster or an interrupted reset; run `macluster init` for first-time setup".into()));
+        return Err((2, "--force requires an existing cluster or an interrupted reset; run `macluster --init` for first-time setup".into()));
     } else {
         false
     };
@@ -159,7 +159,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
             return Err((
                 1,
                 format!(
-                    "controller state directory {} is not empty but no active config exists; restore its matching archived config before rerunning `macluster init`",
+                    "controller state directory {} is not empty but no active config exists; restore its matching archived config before rerunning `macluster --init`",
                     state_dir.display()
                 ),
             ));
@@ -271,7 +271,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     } else {
         return Err((
             2,
-            "cluster initialization requires terminal confirmation; run `macluster init` from an interactive Terminal".into(),
+            "cluster initialization requires terminal confirmation; run `macluster --init` from an interactive Terminal".into(),
         ));
     }
 
@@ -409,7 +409,7 @@ fn write_remote_init_journal(
         return Err((
             1,
             format!(
-                "remote initialization recovery record {} already exists; resume it with `macluster init`",
+                "remote initialization recovery record {} already exists; resume it with `macluster --init`",
                 path.display()
             ),
         ));
@@ -628,7 +628,7 @@ fn finish_remote_init(
         (
             1,
             format!(
-                "cluster config is committed, but remote storage config sync failed: {error}. Rerun `macluster init` to resume; keep the controller stopped until it completes."
+                "cluster config is committed, but remote storage config sync failed: {error}. Rerun `macluster --init` to resume; keep the controller stopped until it completes."
             ),
         )
     })?;
@@ -1515,7 +1515,7 @@ fn prepare_local_primary_inner(
             return Err((
                 1,
                 format!(
-                    "primary storage marker {} already exists; run `macluster init` with its matching cluster config to verify and reset the managed share",
+                    "primary storage marker {} already exists; run `macluster --init` with its matching cluster config to verify and reset the managed share",
                     marker.display()
                 ),
             ));
@@ -1885,7 +1885,7 @@ fn print_help(full: bool) {
 fn init_help(full: bool) -> &'static str {
     if !full {
         return r#"Usage
-  macluster init [OPTIONS]
+  macluster --init [OPTIONS]
 
 Creates a cluster with this Mac as login and storage. The compute queue starts
 empty; add Macs with `mnode -a USER@IPv4[:PORT]`.
@@ -1897,7 +1897,7 @@ An existing cluster starts the reset confirmation flow. Use --help for details."
     }
 
     r#"Usage
-  macluster init [--force] [OPTIONS]
+  macluster --init [--force] [OPTIONS]
 
 OPTIONS
   --name NAME              Set the cluster name.
@@ -1923,10 +1923,10 @@ RESET
   continues with cluster setup. Shared data files are preserved. `--force`
   discards pending snapshot/log synchronization for finished jobs; their
   unsynchronized output may be unavailable. Active jobs still block reset.
-  Use `macluster init` again to resume interrupted cleanup.
+  Use `macluster --init` again to resume interrupted cleanup.
 
 EXAMPLE
-  macluster init --name home-macluster"#
+  macluster --init --name home-macluster"#
 }
 
 fn validate_name(name: &str) -> AppResult<()> {

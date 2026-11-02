@@ -406,7 +406,7 @@ fn init_refuses_to_overwrite_an_existing_config_without_reset() {
             config.display().to_string(),
             "--state-dir".into(),
             state.display().to_string(),
-            "init".into(),
+            "--init".into(),
             "--name".into(),
             "replacement".into(),
         ],
@@ -420,13 +420,13 @@ fn init_refuses_to_overwrite_an_existing_config_without_reset() {
 #[test]
 fn init_help_is_available_without_a_cluster_config() {
     let output = macluster_command()
-        .args(["init", "--help"])
+        .args(["--init", "--help"])
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("macluster init"));
+    assert!(stdout.contains("macluster --init"));
     assert!(stdout.contains("--primary-nfs"));
     assert!(!stdout.contains("--reset"));
     assert!(stdout.contains("--force"));
@@ -484,7 +484,7 @@ fn init_in_pty_with_args(
     args: &[String],
     input: &[u8],
 ) -> (std::process::ExitStatus, String) {
-    command_in_pty_with_args(config, state, "init", args, input)
+    command_in_pty_with_args(config, state, "--init", args, input)
 }
 
 fn command_in_pty_with_args(
@@ -1001,7 +1001,7 @@ fn noninteractive_init_requires_explicit_terminal_confirmation() {
         .arg("--state-dir")
         .arg(root.join("state"))
         .args([
-            "init",
+            "--init",
             "--name",
             "no-tty",
             "--queue",
@@ -1044,7 +1044,7 @@ fn init_force_requires_an_existing_cluster_or_recovery_record() {
         .arg(&config)
         .arg("--state-dir")
         .arg(&state)
-        .args(["init", "--force"])
+        .args(["--init", "--force"])
         .output()
         .unwrap();
     assert!(!output.status.success());

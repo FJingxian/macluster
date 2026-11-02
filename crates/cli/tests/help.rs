@@ -22,7 +22,7 @@ fn short_help_for_long_commands_is_a_quick_reference() {
     for (args, maximum_words) in [
         (&["msub", "-h"][..], 100),
         (&["mnode", "-h"][..], 120),
-        (&["init", "-h"][..], 60),
+        (&["--init", "-h"][..], 60),
         (&["mjob", "-h"][..], 50),
         (&["mqueue", "-h"][..], 60),
         (&["mtop", "-h"][..], 60),
@@ -57,7 +57,7 @@ fn long_help_keeps_operational_details_for_reference() {
     assert!(node.contains("host fingerprint"));
     assert!(node.contains("host-key verification"));
 
-    let init = help(&["init", "--help"]);
+    let init = help(&["--init", "--help"]);
     assert!(init.contains("Shared data files are preserved"));
     assert!(init.contains("--force"));
 
@@ -67,15 +67,19 @@ fn long_help_keeps_operational_details_for_reference() {
 }
 
 #[test]
-fn main_help_is_a_command_index_with_examples() {
+fn main_help_is_a_compact_module_index() {
     let output = help(&["--help"]);
-    for section in ["COMMANDS", "GLOBAL OPTIONS", "EXAMPLES"] {
+    for section in ["Usage", "Modes", "Options", "Modules"] {
         assert!(output.contains(section), "missing {section}: {output}");
     }
     for command in ["msub", "mjob", "mqueue", "mnode", "mtop", "mfans"] {
         assert!(output.contains(command), "missing {command}: {output}");
     }
     assert!(output.contains("queue (mqueue)"), "{output}");
+    assert!(
+        output.contains("macluster <MODULE> [-h|--help]"),
+        "{output}"
+    );
     assert!(output.contains("macluster --init"), "{output}");
     assert!(
         output.contains("macluster --web [127.0.0.1[:PORT]]"),

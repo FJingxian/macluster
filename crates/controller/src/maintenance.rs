@@ -32,13 +32,13 @@ pub fn validate_scope_config_change(
 ) -> Result<(), String> {
     if old.share_uuid != next.share_uuid {
         return Err(
-            "controller storage namespace cannot change in-place; use `macluster init` to create a new cluster"
+            "controller storage namespace cannot change in-place; use `macluster --init` to create a new cluster"
                 .into(),
         );
     }
     if old.login_node != next.login_node {
         return Err(
-            "login-node ownership cannot change in-place; use `macluster init` to configure the new login node"
+            "login-node ownership cannot change in-place; use `macluster --init` to configure the new login node"
                 .into(),
         );
     }

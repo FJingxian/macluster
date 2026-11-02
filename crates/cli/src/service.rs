@@ -66,7 +66,7 @@ pub enum ServiceLifecycleError {
         "controller service is manually stopped; run `macluster controller start` to enable it"
     )]
     ManuallyStopped,
-    #[error("controller service is resetting; finish `macluster init` before starting it")]
+    #[error("controller service is resetting; finish `macluster --init` before starting it")]
     Resetting,
     #[error(
         "controller is running in the foreground; stop it with Ctrl-C before using the LaunchAgent command"

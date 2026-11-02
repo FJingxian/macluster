@@ -106,6 +106,11 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             args.truncate(command_index);
             args.extend(controller_args);
             command = Some("controller".into());
+        } else if command_arg == "init" {
+            return Err((
+                2,
+                "`init` is an option, not a command; use `macluster --init`".into(),
+            ));
         } else {
             command = alias_to_command(&command_arg).map(str::to_owned);
             if command.is_some() {
@@ -912,7 +917,6 @@ fn alias_to_command(name: &str) -> Option<&'static str> {
         "kill" | "mkill" => "kill",
         "top" | "mtop" => "top",
         "controller" => "controller",
-        "init" => "init",
         "agent" => "agent",
         "internal" => "internal",
         "node" | "mnode" => "node",
@@ -5439,7 +5443,7 @@ fn online_controller(
         ServiceIntent::Resetting => {
             return Err((
                 1,
-                "cluster reset is in progress; finish `macluster init` before this operation"
+                "cluster reset is in progress; finish `macluster --init` before this operation"
                     .into(),
             ));
         }
@@ -9285,39 +9289,29 @@ fn print_help() {
 macOS cluster task manager
 
 Usage
-  macluster [GLOBAL OPTIONS] COMMAND [OPTIONS]
-  macluster --init [OPTIONS]
-  macluster --web [127.0.0.1[:PORT]] [--no-open]
-  msub|mjob|mqueue|mkill|mtop|mnode|mfans [OPTIONS]
+  macluster [OPTIONS] <MODULE> [ARGS...]
+  macluster <MODULE> [-h|--help]
 
-COMMANDS
-  init (--init)   Create or reset a cluster.
-  submit (msub)   Submit a task or open an interactive session.
-  job (mjob)      List jobs, read logs, or watch task resources.
-  queue (mqueue)  Show queue membership and job counts.
-  kill (mkill)    Cancel one or more jobs.
-  top (mtop)      View node resources in a live display.
-  node (mnode)    Add, list, and remove nodes or shared paths.
-  fans (mfans)    Inspect or set node fan policies.
+Modes
+  macluster --init [OPTIONS]              Create or reset a cluster.
+  macluster --web [IP[:PORT]] [OPTIONS]   Open the read-only web monitor.
 
-WEB MONITOR
-  --web starts the read-only monitor through the background service.
-  It listens on 127.0.0.1 only.
+Options
+  -h, --help           Show this help message.
+  -V, --version        Show version and protocol information.
+  --config PATH        Use a cluster config file.
+  --state-dir PATH     Use a service state directory.
 
-GLOBAL OPTIONS
-  --config PATH      Use a cluster config file.
-  --state-dir PATH   Use a service state directory.
-  -V, --version      Print the version.
+Modules
+  submit (msub)        Submit a task or open an interactive session.
+  job (mjob)           List jobs, read logs, or watch task resources.
+  queue (mqueue)       Show queue membership and job counts.
+  kill (mkill)         Cancel one or more jobs.
+  top (mtop)           View node resources in a live display.
+  node (mnode)         Add, list, and remove nodes or shared paths.
+  fans (mfans)         Inspect or set node fan policies.
 
-EXAMPLES
-  macluster --init
-  macluster --web
-  macluster --web 127.0.0.1
-  macluster --web 127.0.0.1:8080
-  msub -q default python analysis.py
-  mtop
-
-Run `macluster COMMAND --help` for command details."#
+Run `macluster <MODULE> --help` for module details."#
     );
 }
 

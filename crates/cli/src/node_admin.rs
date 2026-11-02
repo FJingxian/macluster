@@ -9116,7 +9116,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             return Err((
                 1,
                 format!(
-                    "share operation {} is in phase {}; rerun its original mnode add command or use `macluster init` to reset the cluster",
+                    "share operation {} is in phase {}; rerun its original mnode add command or use `macluster --init` to reset the cluster",
                     operation.id, operation.phase
                 ),
             ));
@@ -9166,7 +9166,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             return Err((
                 1,
                 format!(
-                    "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster init` to reset safely",
+                    "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster --init` to reset safely",
                     replaced.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             ));
@@ -9981,7 +9981,7 @@ fn verify_registered_node_identity(
         (
             1,
             format!(
-                "cannot cancel pending share: no recorded machine UUID is available for node {node_id}; restore its recorded identity or run `macluster init` to reset safely"
+                "cannot cancel pending share: no recorded machine UUID is available for node {node_id}; restore its recorded identity or run `macluster --init` to reset safely"
             ),
         )
     })?;
@@ -11068,7 +11068,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
         return Err((
             1,
             format!(
-                "cluster is not initialized; config {} is missing. Run `macluster init` to configure a new cluster",
+                "cluster is not initialized; config {} is missing. Run `macluster --init` to configure a new cluster",
                 config_path.display()
             ),
         ));
@@ -18273,7 +18273,7 @@ remote_binary = "/usr/local/bin/macluster"
         let error = result.expect_err("listing requires an active cluster config");
         let _ = fs::remove_dir_all(&root);
 
-        assert!(error.1.contains("macluster init"), "{error:?}");
+        assert!(error.1.contains("macluster --init"), "{error:?}");
     }
 
     #[test]

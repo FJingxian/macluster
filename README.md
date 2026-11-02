@@ -61,7 +61,7 @@ macluster controller start
 macluster controller stop
 ```
 
-`controller run` runs in the foreground for troubleshooting. Do not initialize again just to start the controller: when a configuration exists, `init` offers to reset it.
+`controller run` runs in the foreground for troubleshooting. Do not run `macluster --init` just to start the controller: when a configuration exists, it offers to reset it.
 
 ## Run jobs
 
@@ -163,8 +163,8 @@ The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an 
 | `macluster fans --auto [--node ID]` | Linear 40–80°C temperature curve |
 | `macluster fans --power [--node ID]` | Logarithmic 40–80°C temperature curve |
 | `macluster fans --reset [--node ID]` | Restore macOS fan control |
-| `macluster init` | Confirm reset, archive old state, and configure a new cluster |
-| `macluster init --force` | Allow dropping pending output sync for finished jobs; active jobs still block reset |
+| `macluster --init` | Confirm reset, archive old state, and configure a new cluster |
+| `macluster --init --force` | Allow dropping pending output sync for finished jobs; active jobs still block reset |
 
 Reset cleans managed NFS mounts/exports and preserves shared data files. Read its confirmation carefully. Fan control uses a private AppleSMC interface and depends on the Mac model; unsupported nodes remain under system control.
 
@@ -175,7 +175,7 @@ Agent updates trigger automatically for known build mismatches. Privileged servi
 For a separate storage Mac:
 
 ```sh
-macluster init --name home --queue default \
+macluster --init --name home --queue default \
   --primary-nfs 'storage@198.51.100.10:22:/Volumes/Data/macluster' \
   --shared-root /Users/Shared/macluster
 ```

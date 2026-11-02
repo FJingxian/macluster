@@ -132,7 +132,7 @@ pub(crate) fn ensure_no_reset_in_progress(config_path: &Path, state_dir: &Path) 
                 return Err((
                     1,
                     format!(
-                        "reset is complete, but its recovery journal {} cannot be removed: {error}; rerun `macluster init` to finish cleanup",
+                        "reset is complete, but its recovery journal {} cannot be removed: {error}; rerun `macluster --init` to finish cleanup",
                         path.display()
                     ),
                 ));
@@ -143,7 +143,7 @@ pub(crate) fn ensure_no_reset_in_progress(config_path: &Path, state_dir: &Path) 
     Err((
         1,
         format!(
-            "cluster reset {} is in phase {}; resume it with `macluster init` before submitting or starting the controller",
+            "cluster reset {} is in phase {}; resume it with `macluster --init` before submitting or starting the controller",
             journal.id, journal.phase
         ),
     ))
@@ -157,7 +157,7 @@ pub(crate) fn run(
     if unsafe { libc::geteuid() } == 0 {
         return Err((
             1,
-            "run `macluster init` as the normal login account, not root; cluster config is per-user".into(),
+            "run `macluster --init` as the normal login account, not root; cluster config is per-user".into(),
         ));
     }
     let config_path = if config_path.exists() {
@@ -250,13 +250,13 @@ pub(crate) fn run(
             cancel_temporary_drain(&path);
         }
         let retry = if journal.discard_terminal_sync {
-            "`macluster init --force`"
+            "`macluster --init --force`"
         } else {
-            "`macluster init`"
+            "`macluster --init`"
         };
         let recovery_hint = match (temporary_barrier_removed, journal.discard_terminal_sync) {
             (true, true) => format!("The old config is unchanged and the temporary reset barrier was removed. Cancel the listed nonterminal jobs with `mkill`, restart the updated controller, then retry {retry}."),
-            (true, false) => "The old config is unchanged and the temporary reset barrier was removed. Use `mkill` for jobs you do not want to run, restart the controller to finish reconciliation/log sync, then retry `macluster init`.".into(),
+            (true, false) => "The old config is unchanged and the temporary reset barrier was removed. Use `mkill` for jobs you do not want to run, restart the controller to finish reconciliation/log sync, then retry `macluster --init`.".into(),
             (false, _) => format!("The reset barrier remains active; resolve the listed nonterminal blockers and rerun {retry}."),
         };
         return Err((
@@ -421,7 +421,7 @@ fn cancel_temporary_drain(path: &Path) {
     if let Err(error) = fs::remove_file(path) {
         if error.kind() != io::ErrorKind::NotFound {
             eprintln!(
-                "macluster: could not remove temporary reset barrier {}: {error}; rerun `macluster init` to recover",
+                "macluster: could not remove temporary reset barrier {}: {error}; rerun `macluster --init` to recover",
                 path.display()
             );
         }
@@ -553,7 +553,7 @@ fn validate_resume_options(saved: &InitOptions, supplied: &InitOptions) -> AppRe
     if conflicts {
         return Err((
             2,
-            "a reset is already in progress with different target options; rerun `macluster init` without changing them".into(),
+            "a reset is already in progress with different target options; rerun `macluster --init` without changing them".into(),
         ));
     }
     Ok(())
@@ -1836,7 +1836,7 @@ fn wait_for_exclusive_lock(config_path: &Path, state_dir: &Path) -> AppResult<Ma
                 if started.elapsed() >= Duration::from_secs(300) {
                     return Err((
                         1,
-                        "the config lock stayed busy for five minutes and no verified controller process was found to stop. The reset barrier remains active; finish the other cluster command, then rerun `macluster init`.".into(),
+                        "the config lock stayed busy for five minutes and no verified controller process was found to stop. The reset barrier remains active; finish the other cluster command, then rerun `macluster --init`.".into(),
                     ));
                 }
                 thread::sleep(Duration::from_millis(250));
@@ -4256,7 +4256,7 @@ mod tests {
 
         let error = ensure_no_reset_in_progress(&config, &state_dir).unwrap_err();
         assert!(error.1.contains("phase CLEANING"));
-        assert!(error.1.contains("macluster init"));
+        assert!(error.1.contains("macluster --init"));
         fs::remove_dir_all(root).unwrap();
     }
 

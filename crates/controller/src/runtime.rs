@@ -162,6 +162,7 @@ enum WorkerResult {
 
 struct ProbeResult {
     fence_error: Option<String>,
+    endpoint_reachable: Option<bool>,
     status: Option<Result<ResponseBody, ProbeError>>,
     health: Option<Result<ResponseBody, String>>,
 }
@@ -189,6 +190,7 @@ struct NodeHealthCache {
     ready: bool,
     interactive_pty: bool,
     namespaced_jobs: bool,
+    logical_cpus: Option<u32>,
     sampled_at: Instant,
     retry_at: Instant,
 }
@@ -202,6 +204,7 @@ struct NodeRuntime {
     next_probe_at: Instant,
     probe_after_inflight_for_job: Option<u64>,
     probe_failures: u8,
+    unreachable_since_unix_ms: Option<u64>,
     last_probe_error: Option<String>,
     next_control_at: Instant,
     control_failures: u8,
@@ -219,6 +222,7 @@ impl NodeRuntime {
             next_probe_at: now,
             probe_after_inflight_for_job: None,
             probe_failures: 0,
+            unreachable_since_unix_ms: None,
             last_probe_error: None,
             next_control_at: now,
             control_failures: 0,
@@ -254,6 +258,41 @@ fn probe_delay(configured_interval: Duration, occupied: bool) -> Duration {
         configured_interval
     } else {
         IDLE_NODE_PROBE_INTERVAL
+    }
+}
+
+fn node_probe_retry_delay() -> Duration {
+    // A TCP-only preflight avoids starting SSH while the node is absent, so a
+    // fixed five-second retry keeps reconnect latency low without repeated
+    // SSH process launches or exponential delays.
+    Duration::from_secs(5)
+}
+
+fn persist_node_liveness<T: NodeTransport>(
+    service: &ControllerService<T>,
+    node_id: &str,
+    reachable: bool,
+    observed_unix_ms: u64,
+) {
+    let Some(node) = service.config.nodes.get(node_id) else {
+        return;
+    };
+    let observation = crate::liveness::NodeObservation {
+        node_id: node_id.to_owned(),
+        identity_key: node
+            .machine_uuid
+            .as_deref()
+            .unwrap_or(node.host.as_str())
+            .to_ascii_lowercase(),
+        reachable,
+    };
+    if let Err(error) = crate::liveness::observe_many(
+        service.storage.root(),
+        &service.config.share_uuid,
+        &[observation],
+        observed_unix_ms,
+    ) {
+        eprintln!("macluster: could not persist node liveness for {node_id}: {error}");
     }
 }
 
@@ -324,6 +363,14 @@ impl RuntimeState {
         let configured_nodes = service.config.nodes.len().max(1);
         let probe_workers = PROBE_WORKERS.min(configured_nodes);
         let control_workers = CONTROL_WORKERS.min(configured_nodes);
+        let persisted_liveness =
+            match crate::liveness::read(service.storage.root(), &service.config.share_uuid) {
+                Ok(records) => records,
+                Err(error) => {
+                    eprintln!("macluster: could not read node liveness state: {error}");
+                    Default::default()
+                }
+            };
         Ok(Self {
             digest: service.config.execution_digest().unwrap_or_default(),
             previous_digest: None,
@@ -331,8 +378,21 @@ impl RuntimeState {
             nodes: service
                 .config
                 .nodes
-                .keys()
-                .map(|id| (id.clone(), NodeRuntime::new(now)))
+                .iter()
+                .map(|(id, config)| {
+                    let mut runtime = NodeRuntime::new(now);
+                    if let Some(record) = persisted_liveness.get(id)
+                        && record.identity_key.eq_ignore_ascii_case(
+                            config
+                                .machine_uuid
+                                .as_deref()
+                                .unwrap_or(config.host.as_str()),
+                        )
+                    {
+                        runtime.unreachable_since_unix_ms = record.unreachable_since_unix_ms;
+                    }
+                    (id.clone(), runtime)
+                })
                 .collect(),
             node_probe_pool: WorkerPool::new(
                 probe_workers,
@@ -754,9 +814,21 @@ impl RuntimeState {
             runtime.fenced = false;
             runtime.status = None;
             runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-            runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+            runtime.next_probe_at = received_at + node_probe_retry_delay();
+            if probe.endpoint_reachable == Some(true) {
+                if runtime.unreachable_since_unix_ms.take().is_some() {
+                    persist_node_liveness(service, node_id, true, super::now_ms());
+                }
+            } else if runtime.unreachable_since_unix_ms.is_none() {
+                let observed_unix_ms = super::now_ms();
+                runtime.unreachable_since_unix_ms = Some(observed_unix_ms);
+                persist_node_liveness(service, node_id, false, observed_unix_ms);
+            }
             service.idle_since.remove(node_id);
             return Ok(());
+        }
+        if runtime.unreachable_since_unix_ms.take().is_some() {
+            persist_node_liveness(service, node_id, true, super::now_ms());
         }
         runtime.fenced = true;
         service.fenced_nodes.insert(node_id.to_owned());
@@ -813,19 +885,19 @@ impl RuntimeState {
                 runtime.last_probe_error = Some(error.chars().take(256).collect());
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at = received_at + node_probe_retry_delay();
                 service.idle_since.remove(node_id);
             }
             None => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at = received_at + node_probe_retry_delay();
                 service.idle_since.remove(node_id);
             }
             Some(Ok(_)) => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at = received_at + node_probe_retry_delay();
                 service.idle_since.remove(node_id);
             }
         }
@@ -860,6 +932,7 @@ impl RuntimeState {
                     namespaced_jobs: health.features.iter().any(|feature| {
                         feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE
                     }),
+                    logical_cpus: health.logical_cpus,
                     interactive_pty: health
                         .features
                         .iter()
@@ -878,6 +951,7 @@ impl RuntimeState {
                 ready: false,
                 interactive_pty: false,
                 namespaced_jobs: false,
+                logical_cpus: None,
                 sampled_at: tag.started_at,
                 retry_at: received_at + NODE_HEALTH_RETRY,
             },
@@ -1019,6 +1093,7 @@ impl RuntimeState {
                 continue;
             }
             let already_fenced = runtime.fenced && service.fenced_nodes.contains(id);
+            let check_endpoint_first = runtime.probe_failures > 0;
             let generation = runtime.generation;
             let node_id = NodeId::new(id.clone()).expect("validated node ID");
             let expected_execution = service.storage.node_execution_to_reconcile(&node_id)?;
@@ -1039,7 +1114,14 @@ impl RuntimeState {
             );
             let worker_tag = tag.clone();
             if self.node_probe_pool.try_spawn(move || {
-                let fence_error = if already_fenced {
+                let mut endpoint_reachable = if check_endpoint_first {
+                    transport.endpoint_reachable(&node_config, Duration::from_millis(350))
+                } else {
+                    None
+                };
+                let fence_error = if endpoint_reachable == Some(false) {
+                    Some("registered SSH endpoint is not reachable".into())
+                } else if already_fenced {
                     None
                 } else {
                     match transport.call(
@@ -1054,6 +1136,10 @@ impl RuntimeState {
                         Err(error) => Some(error.to_string()),
                     }
                 };
+                if fence_error.is_some() && endpoint_reachable.is_none() {
+                    endpoint_reachable =
+                        transport.endpoint_reachable(&node_config, Duration::from_millis(350));
+                }
                 let (status, health) =
                     if fence_error.is_none() && worker_tag.kind == WorkKind::Health {
                         (
@@ -1112,6 +1198,7 @@ impl RuntimeState {
                     received_at: Instant::now(),
                     result: WorkerResult::Probe(ProbeResult {
                         fence_error,
+                        endpoint_reachable,
                         status,
                         health,
                     }),
@@ -1548,6 +1635,7 @@ impl RuntimeState {
                 };
                 NodeEligibility {
                     id: NodeId::new(id.clone()).expect("validated node ID"),
+                    logical_cpus: health.and_then(|health| health.logical_cpus),
                     idle_since_unix_ms,
                     online,
                     storage_ready: self.share_ready(now) && node_storage_ready,
@@ -2182,8 +2270,9 @@ mod tests {
         IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL,
         NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState,
         WakeForwarder, WorkKind, WorkTag, WorkerCompletion, WorkerPool, WorkerResult,
-        maintenance_drain_complete, node_result_is_current, now_ms, pending_queue_heads,
-        probe_delay, reset_drain_complete, retry_delay, run_forever, should_measure_job_storage,
+        maintenance_drain_complete, node_probe_retry_delay, node_result_is_current, now_ms,
+        pending_queue_heads, probe_delay, reset_drain_complete, retry_delay, run_forever,
+        should_measure_job_storage,
     };
     use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
@@ -2481,6 +2570,7 @@ mod tests {
                     macluster_protocol::types::NodeHealth {
                         machine_uuid: String::new(),
                         execution_uid: 0,
+                        logical_cpus: None,
                         execution_digest: String::new(),
                         primary_share_ready: true,
                         shares: Default::default(),
@@ -2527,6 +2617,7 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
                     execution_uid: 501,
+                    logical_cpus: None,
                     execution_digest: self.execution_digest.clone(),
                     primary_share_ready: true,
                     shares: Default::default(),
@@ -2580,6 +2671,7 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: String::new(),
                     execution_uid: 0,
+                    logical_cpus: None,
                     execution_digest: String::new(),
                     primary_share_ready: true,
                     shares: BTreeMap::new(),
@@ -2711,6 +2803,7 @@ scheduler = "fifo"
             ready: true,
             interactive_pty: true,
             namespaced_jobs: true,
+            logical_cpus: None,
             sampled_at: now,
             retry_at: now + NODE_HEALTH_TTL,
         });
@@ -2919,6 +3012,7 @@ scheduler = "fifo"
                     ready: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
+                    logical_cpus: None,
                     sampled_at: now,
                     retry_at: now,
                 });
@@ -3084,6 +3178,7 @@ scheduler = "fifo"
                     ready: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
+                    logical_cpus: None,
                     sampled_at: now,
                     retry_at: now,
                 });
@@ -3184,6 +3279,7 @@ scheduler = "fifo"
                 ready: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
+                logical_cpus: None,
                 sampled_at: now,
                 retry_at: now + NODE_HEALTH_TTL,
             });
@@ -3208,6 +3304,7 @@ scheduler = "fifo"
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(20), Duration::from_secs(30));
+        assert_eq!(node_probe_retry_delay(), Duration::from_secs(5));
     }
 
     fn reset_test_job(state: JobState, snapshot_sync_pending: bool) -> JobRecord {
@@ -3738,6 +3835,7 @@ scheduler = "fifo"
             ready: false,
             interactive_pty: false,
             namespaced_jobs: false,
+            logical_cpus: None,
             sampled_at,
             retry_at,
         });

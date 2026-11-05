@@ -4,6 +4,7 @@ pub mod compatibility;
 mod control;
 pub mod events;
 mod ipc;
+pub mod liveness;
 pub mod maintenance;
 pub mod monitor;
 mod runtime;
@@ -265,6 +266,7 @@ impl<T: NodeTransport> ControllerService<T> {
                         self.idle_since.remove(id);
                         availability.push(NodeEligibility {
                             id: node_id,
+                            logical_cpus: None,
                             idle_since_unix_ms: 0,
                             online: false,
                             storage_ready: false,
@@ -312,6 +314,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     .iter()
                     .any(|feature| feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE)
             });
+            let logical_cpus = health.as_ref().and_then(|health| health.logical_cpus);
             let node_storage_ready =
                 if !requires_health {
                     true
@@ -329,6 +332,7 @@ impl<T: NodeTransport> ControllerService<T> {
                 let idle_since = *self.idle_since.entry(id.clone()).or_insert(now);
                 availability.push(NodeEligibility {
                     id: node_id,
+                    logical_cpus,
                     idle_since_unix_ms: idle_since,
                     online,
                     storage_ready: storage_ready && node_storage_ready,
@@ -341,6 +345,7 @@ impl<T: NodeTransport> ControllerService<T> {
                 self.idle_since.remove(id);
                 availability.push(NodeEligibility {
                     id: node_id,
+                    logical_cpus,
                     idle_since_unix_ms: 0,
                     online,
                     storage_ready,

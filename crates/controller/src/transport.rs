@@ -2,6 +2,7 @@
 
 use std::{
     io::{self, Cursor, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -51,6 +52,32 @@ pub trait NodeTransport: Send + Sync + 'static {
         node: &NodeConfig,
         operation: Operation,
     ) -> Result<ResponseBody, TransportError>;
+
+    /// A cheap reachability hint for retrying a known-offline SSH node. The
+    /// controller uses it to avoid spawning SSH while the endpoint is down.
+    fn endpoint_reachable(&self, _node: &NodeConfig, _timeout: Duration) -> Option<bool> {
+        None
+    }
+}
+
+fn endpoint_probe_error(error: &io::Error) -> Option<bool> {
+    let code = error.raw_os_error()?;
+    if matches!(
+        code,
+        libc::ECONNREFUSED
+            | libc::ETIMEDOUT
+            | libc::ECONNRESET
+            | libc::ECONNABORTED
+            | libc::EHOSTUNREACH
+            | libc::ENETUNREACH
+            | libc::EHOSTDOWN
+    ) {
+        Some(false)
+    } else {
+        // Errors such as macOS's local-network privacy denial are
+        // inconclusive; let strict SSH report its own result.
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -251,6 +278,22 @@ fn interactive_attach_exit_code(
 }
 
 impl NodeTransport for ClusterTransport {
+    fn endpoint_reachable(&self, node: &NodeConfig, timeout: Duration) -> Option<bool> {
+        match node.transport {
+            Transport::Local => Some(true),
+            Transport::Ssh => {
+                let address = node.host.parse::<Ipv4Addr>().ok()?;
+                match TcpStream::connect_timeout(
+                    &SocketAddr::from((address, node.ssh_port.unwrap_or(22))),
+                    timeout,
+                ) {
+                    Ok(_) => Some(true),
+                    Err(error) => endpoint_probe_error(&error),
+                }
+            }
+        }
+    }
+
     fn call(
         &self,
         node_id: &NodeId,
@@ -647,6 +690,22 @@ mod tests {
             machine_uuid: Some("00000000-0000-4000-8000-000000000003".into()),
             execution_uid: Some(501),
         }
+    }
+
+    #[test]
+    fn endpoint_preflight_treats_local_network_permission_errors_as_unknown() {
+        assert_eq!(
+            endpoint_probe_error(&io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+            Some(false)
+        );
+        assert_eq!(
+            endpoint_probe_error(&io::Error::from_raw_os_error(libc::EPERM)),
+            None
+        );
+        assert_eq!(
+            endpoint_probe_error(&io::Error::from_raw_os_error(libc::EACCES)),
+            None
+        );
     }
 
     #[test]

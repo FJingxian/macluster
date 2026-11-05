@@ -511,6 +511,10 @@ mod metric_snapshot_tests {
 pub struct NodeHealth {
     pub machine_uuid: String,
     pub execution_uid: u32,
+    /// Number of logical processors reported by the node's Agent.
+    /// Optional so older Agents remain compatible during rolling updates.
+    #[serde(default)]
+    pub logical_cpus: Option<u32>,
     pub execution_digest: String,
     pub primary_share_ready: bool,
     pub shares: BTreeMap<String, bool>,
@@ -729,8 +733,9 @@ mod interactive_job_compatibility_tests {
         });
 
         let decoded: NodeHealth = serde_json::from_value(legacy).unwrap();
-        let encoded = serde_json::to_value(decoded).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
 
+        assert_eq!(decoded.logical_cpus, None);
         assert_eq!(encoded["features"], json!([]));
     }
 }

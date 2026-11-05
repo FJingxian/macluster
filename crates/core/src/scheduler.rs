@@ -10,6 +10,7 @@ use crate::config::QueueConfig;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeEligibility {
     pub id: NodeId,
+    pub logical_cpus: Option<u32>,
     pub idle_since_unix_ms: u64,
     pub online: bool,
     pub storage_ready: bool,
@@ -62,8 +63,10 @@ pub fn next_dispatch(
         .collect();
     eligible.sort_by(|left, right| {
         right
-            .idle_since_unix_ms
-            .cmp(&left.idle_since_unix_ms)
+            .logical_cpus
+            .unwrap_or_default()
+            .cmp(&left.logical_cpus.unwrap_or_default())
+            .then_with(|| right.idle_since_unix_ms.cmp(&left.idle_since_unix_ms))
             .then_with(|| left.id.cmp(&right.id))
     });
     eligible.first().map(|node| Dispatch {

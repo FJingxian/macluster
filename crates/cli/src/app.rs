@@ -283,6 +283,12 @@ fn controller_is_running(global: &GlobalOptions, state_dir: &Path) -> bool {
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    // Monitoring is read-only and must remain available while an Agent update
+    // is pending or a compute node is unreachable. mtop reports the mismatch
+    // inside its UI instead of starting cluster-wide maintenance first.
+    if command == "top" {
+        return false;
+    }
     // Network discovery only probes the configured login subnet. It must not
     // trigger address migration or an Agent refresh before the read-only scan.
     if is_node_network_scan(command, args) {
@@ -310,6 +316,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
         return false;
     }
     if command == "node" && args.first().is_some_and(|arg| arg == "--failed") {
+        return false;
+    }
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+    {
         return false;
     }
     let help_requested = if command == "submit" {
@@ -4846,6 +4859,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                 Ok(action)
             },
             |action| match action {
+                #[cfg(test)]
                 crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
                     preflight_agent_update_with_compatibility(
                         "top",
@@ -4854,6 +4868,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                         Some(compatibility),
                     )
                 }
+                #[cfg(test)]
                 crate::mtop::MtopPostAction::RecoverMaintenance => {
                     preflight_agent_update("top", args, &global)
                 }
@@ -4940,6 +4955,7 @@ fn run_tui_with_updates(
     loop {
         let action = match view()? {
             None | Some(crate::mtop::MtopPostAction::UpdateDeferred) => return Ok(()),
+            #[cfg(test)]
             Some(crate::mtop::MtopPostAction::CheckBuilds(ref compatibility))
                 if !compatibility.requires_update() =>
             {
@@ -5717,6 +5733,39 @@ fn sample_cluster(
     state_dir: &Path,
     config_path: &Path,
 ) -> ClusterMetricView {
+    let selected_nodes = selected_queue.map(|queue| config.queue_compute_nodes(queue.as_str()));
+    let is_selected = |id: &str| {
+        selected_nodes
+            .as_ref()
+            .is_none_or(|members| members.iter().any(|member| member == id))
+    };
+    let unreachable_nodes = macluster_controller::liveness::read(state_dir, &config.share_uuid)
+        .ok()
+        .into_iter()
+        .flat_map(|records| records.into_iter())
+        .filter_map(|(id, record)| {
+            let node = config.nodes.get(&id)?;
+            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            (record.identity_key.eq_ignore_ascii_case(identity_key)
+                && (record.consecutive_failures > 0 || record.unreachable_since_unix_ms.is_some())
+                && !config.is_login_node(&id))
+            .then_some(id)
+        })
+        .filter(|id| is_selected(id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let sample_config = if unreachable_nodes.is_empty() {
+        None
+    } else {
+        let mut filtered = config.clone();
+        filtered
+            .nodes
+            .retain(|id, _| !unreachable_nodes.contains(id));
+        for queue in filtered.queues.values_mut() {
+            queue.nodes.retain(|id| !unreachable_nodes.contains(id));
+        }
+        Some(filtered)
+    };
+    let sample_config = sample_config.as_ref().unwrap_or(config);
     let local_uuid = local_machine_uuid().ok();
     let login_compute_node_id = config
         .nodes
@@ -5736,34 +5785,28 @@ fn sample_cluster(
             is_local && selected && !config.is_login_node(id)
         })
         .map(|(id, _)| id.clone());
-    let (login, samples) = cached_monitor_samples(config, config_path, state_dir, selected_queue)
-        .unwrap_or_else(|| {
-            crate::mtop::sample_one_shot(config, selected_queue.map(QueueName::as_str))
+    let (login, samples) =
+        cached_monitor_samples(sample_config, config_path, state_dir, selected_queue)
+            .unwrap_or_else(|| {
+                crate::mtop::sample_one_shot(sample_config, selected_queue.map(QueueName::as_str))
+            });
+    let mut rows = Vec::new();
+    let mut missing_nodes = unreachable_nodes.len();
+    for (id, node, result) in samples {
+        let Ok(mut metrics) = result else {
+            missing_nodes = missing_nodes.saturating_add(1);
+            continue;
+        };
+        explain_legacy_power_agent(&mut metrics);
+        rows.push(NodeMetricRow {
+            id,
+            host: node.host,
+            reachable: true,
+            metrics: Some(metrics),
+            error: None,
         });
-    let mut rows: Vec<NodeMetricRow> = samples
-        .into_iter()
-        .map(|(id, node, result)| match result {
-            Ok(mut metrics) => {
-                explain_legacy_power_agent(&mut metrics);
-                NodeMetricRow {
-                    id,
-                    host: node.host,
-                    reachable: true,
-                    metrics: Some(metrics),
-                    error: None,
-                }
-            }
-            Err(error) => NodeMetricRow {
-                id,
-                host: node.host,
-                reachable: false,
-                metrics: None,
-                error: Some(error),
-            },
-        })
-        .collect();
+    }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
-    let missing_nodes = rows.iter().filter(|row| !row.reachable).count();
     let pool_total = aggregate_metrics(&rows);
     ClusterMetricView {
         sampled_unix_ms: now_unix_ms(),
@@ -5990,10 +6033,10 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
     } else {
         println!("MACLUSTER NODE MONITOR");
     }
+    let total_compute_nodes = view.nodes.len().saturating_add(view.missing_nodes);
     println!(
         "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
-        view.missing_nodes,
-        view.nodes.len()
+        view.missing_nodes, total_compute_nodes
     );
 
     let mut rows = Vec::with_capacity(view.nodes.len() + 2);
@@ -7159,15 +7202,7 @@ mod tests {
                 "{command} {args:?} must bypass build preflight"
             );
         }
-        for command in [
-            "submit",
-            "job",
-            "queue",
-            "kill",
-            "top",
-            "node",
-            "controller",
-        ] {
+        for command in ["submit", "job", "queue", "kill", "node", "controller"] {
             assert!(
                 should_preflight_agent_update(command, &[]),
                 "{command} must run build preflight"
@@ -7195,6 +7230,16 @@ mod tests {
                 "controller",
                 &[lifecycle_command.into()]
             ));
+        }
+    }
+
+    #[test]
+    fn node_listing_does_not_preflight_agents() {
+        for flag in ["-l", "--list"] {
+            assert!(
+                !should_preflight_agent_update("node", &[flag.into()]),
+                "mnode {flag} must report current reachability without starting Agent maintenance"
+            );
         }
     }
 
@@ -9197,6 +9242,7 @@ mod tests {
                         stale,
                         sample_error: None,
                         request_latency_ms: None,
+                        consecutive_failures: 0,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,
@@ -9211,6 +9257,7 @@ mod tests {
                         stale,
                         sample_error: None,
                         request_latency_ms: None,
+                        consecutive_failures: 0,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,

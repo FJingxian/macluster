@@ -114,6 +114,8 @@ pub enum MetricView {
 pub struct NodeMetricCache {
     last_success: Option<(MetricSnapshot, Instant)>,
     last_error: Option<String>,
+    last_error_at: Option<Instant>,
+    consecutive_failures: u8,
 }
 
 impl NodeMetricCache {
@@ -152,14 +154,40 @@ impl NodeMetricCache {
         }
         self.last_success = Some((snapshot, received_at));
         self.last_error = None;
+        self.last_error_at = None;
+        self.consecutive_failures = 0;
     }
 
     pub fn apply_error(&mut self, reason: String) {
         self.last_error = Some(reason);
+        self.last_error_at.get_or_insert_with(Instant::now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub fn set_consecutive_failures(&mut self, failures: u8) {
+        self.consecutive_failures = failures;
+    }
+
+    pub fn has_fresh_sample(&self, now: Instant) -> bool {
+        self.consecutive_failures == 0
+            && self.last_success.as_ref().is_some_and(|(_, sampled_at)| {
+                now.saturating_duration_since(*sampled_at) < METRICS_STALE_AFTER
+            })
+    }
+
+    #[cfg(test)]
+    pub fn failed_for(&self, now: Instant) -> Option<Duration> {
+        self.last_error.as_ref()?;
+        let since = self
+            .last_success
+            .as_ref()
+            .map(|(_, sampled_at)| *sampled_at)
+            .or(self.last_error_at)?;
+        Some(now.saturating_duration_since(since))
     }
 
     pub fn view_at(&self, now: Instant) -> MetricView {

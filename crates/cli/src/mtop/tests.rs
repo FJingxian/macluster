@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use super::model::{
-    ConfiguredNode, CpuHistory, LoginIdentity, MetricView, NodeMetricCache, NodeRole,
-    ResourceValues, SortDirection, SortKey, SortRow, aggregate_cpu, aggregate_disk,
+    ConfiguredNode, CpuHistory, DisplayNodeIdentity, LoginIdentity, MetricView, NodeMetricCache,
+    NodeRole, ResourceValues, SortDirection, SortKey, SortRow, aggregate_cpu, aggregate_disk,
     aggregate_memory, aggregate_network, aggregate_power, display_node_identities, sort_rows,
 };
-use super::{apply_monitor_row, job_targets_node};
+use super::{apply_monitor_row, job_targets_node, update_visible_nodes};
 use macluster_metrics::unavailable;
 use macluster_protocol::types::{JobRecord, MetricSnapshot};
 use macluster_protocol::{control::NodeMonitorRow, identifiers::NodeId};
@@ -86,6 +86,7 @@ fn controller_monitor_request_latency_reaches_node_details() {
         metrics: metric(Some(50.0), Some(800.0), None),
         age_ms: Some(0),
         request_latency_ms: Some(87),
+        consecutive_failures: 0,
         stale: false,
         sample_error: None,
         running_tasks: 0,
@@ -292,6 +293,110 @@ fn failed_request_keeps_last_sample_and_marks_it_stale_by_age() {
         }
         other => panic!("expected stale retained sample, got {other:?}"),
     }
+}
+
+#[test]
+fn mtop_shows_compute_nodes_only_after_a_fresh_successful_sample() {
+    let sampled_at = Instant::now();
+    let identities = vec![
+        DisplayNodeIdentity {
+            id: "@login".into(),
+            host: "127.0.0.1".into(),
+            role: NodeRole::Login,
+            queues: Vec::new(),
+            compute_member: false,
+        },
+        DisplayNodeIdentity {
+            id: "worker-a".into(),
+            host: "192.0.2.2".into(),
+            role: NodeRole::Compute,
+            queues: vec!["q".into()],
+            compute_member: true,
+        },
+        DisplayNodeIdentity {
+            id: "worker-b".into(),
+            host: "192.0.2.3".into(),
+            role: NodeRole::Compute,
+            queues: vec!["q".into()],
+            compute_member: true,
+        },
+        DisplayNodeIdentity {
+            id: "worker-c".into(),
+            host: "192.0.2.4".into(),
+            role: NodeRole::Compute,
+            queues: vec!["q".into()],
+            compute_member: true,
+        },
+    ];
+    let mut login_cache = NodeMetricCache::default();
+    login_cache.apply_success(metric(Some(15.0), Some(800.0), None), sampled_at);
+    login_cache.apply_error("login sample failed".into());
+    let mut worker_cache = NodeMetricCache::default();
+    worker_cache.apply_success(metric(Some(20.0), Some(800.0), None), sampled_at);
+    worker_cache.apply_error("SSH timeout".into());
+    worker_cache.apply_error("SSH timeout".into());
+    let mut healthy_cache = NodeMetricCache::default();
+    healthy_cache.apply_success(metric(Some(25.0), Some(800.0), None), sampled_at);
+    let mut initial_failure_cache = NodeMetricCache::default();
+    initial_failure_cache.apply_error("initial SSH timeout".into());
+    let initial_failure_at = Instant::now();
+    let mut caches = BTreeMap::from([
+        ("@login".into(), login_cache),
+        ("worker-a".into(), worker_cache),
+        ("worker-b".into(), healthy_cache),
+        ("worker-c".into(), initial_failure_cache),
+    ]);
+    let mut state = super::ui::AppState::empty("all queues");
+
+    update_visible_nodes(
+        &mut state,
+        &identities,
+        &caches,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        initial_failure_at + Duration::from_millis(1),
+    );
+    assert_eq!(
+        state.nodes.len(),
+        2,
+        "hide failed and unverified compute nodes while retaining the login node"
+    );
+
+    caches
+        .get_mut("worker-a")
+        .unwrap()
+        .apply_error("SSH timeout".into());
+    let expired_at = initial_failure_at + Duration::from_millis(2);
+    update_visible_nodes(
+        &mut state,
+        &identities,
+        &caches,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        expired_at,
+    );
+    assert_eq!(
+        state
+            .nodes
+            .iter()
+            .map(|node| node.identity.id.as_str())
+            .collect::<Vec<_>>(),
+        ["@login", "worker-b"]
+    );
+
+    caches
+        .get_mut("worker-a")
+        .unwrap()
+        .apply_success(metric(Some(35.0), Some(800.0), None), expired_at);
+    update_visible_nodes(
+        &mut state,
+        &identities,
+        &caches,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        expired_at,
+    );
+    assert_eq!(state.nodes.len(), 3, "show the node again after recovery");
 }
 
 #[test]

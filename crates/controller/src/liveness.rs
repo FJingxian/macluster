@@ -1,7 +1,7 @@
 //! Small durable liveness hints shared by the controller and `mnode -l`.
 //!
-//! Only transitions to/from unreachable are written, so the periodic node
-//! monitor does not produce a steady stream of filesystem writes.
+//! Only health refreshes and liveness transitions are written, so the
+//! periodic node monitor does not produce a steady stream of filesystem writes.
 
 use std::{
     collections::BTreeMap,
@@ -12,10 +12,14 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use macluster_protocol::types::NodeHealth;
 use serde::{Deserialize, Serialize};
 
 const STATE_FILE: &str = "node-liveness.json";
 const LOCK_FILE: &str = "node-liveness.lock";
+pub const OFFLINE_AFTER_FAILURES: u8 = 3;
+const MIN_FAILURE_PROBE_INTERVAL_MS: u64 = 3_000;
+const LAST_SEEN_PERSIST_INTERVAL_MS: u64 = 60_000;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,6 +28,23 @@ pub struct NodeLiveness {
     pub unreachable_since_unix_ms: Option<u64>,
     #[serde(default)]
     pub last_transition_unix_ms: u64,
+    #[serde(default)]
+    pub consecutive_failures: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_probe_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reachable_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<NodeHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_sampled_unix_ms: Option<u64>,
+}
+
+impl NodeLiveness {
+    pub fn is_confirmed_offline(&self) -> bool {
+        self.consecutive_failures >= OFFLINE_AFTER_FAILURES
+            && self.unreachable_since_unix_ms.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,14 +60,31 @@ struct LivenessFile {
     nodes: BTreeMap<String, NodeLiveness>,
 }
 
-/// Read the persisted offline timestamps for one cluster namespace.
+/// Read persisted node liveness and the latest Agent health snapshot.
 pub fn read(state_dir: &Path, cluster_uuid: &str) -> io::Result<BTreeMap<String, NodeLiveness>> {
-    with_locked_file(state_dir, cluster_uuid, |state, _| Ok(state.nodes.clone()))
+    with_locked_file(state_dir, cluster_uuid, |state, changed| {
+        // Older versions began the reconnect grace period after one failed
+        // probe. Treat that persisted state as one miss so an upgrade does
+        // not immediately hide nodes before the new three-miss threshold.
+        for record in state.nodes.values_mut() {
+            if record.unreachable_since_unix_ms.is_some() && record.consecutive_failures == 0 {
+                record.unreachable_since_unix_ms = None;
+                record.consecutive_failures = 1;
+                record.last_failed_probe_unix_ms = Some(record.last_transition_unix_ms);
+                *changed = true;
+            }
+            if record.last_reachable_unix_ms.is_none() && record.unreachable_since_unix_ms.is_none()
+            {
+                record.last_reachable_unix_ms = Some(record.last_transition_unix_ms);
+                *changed = true;
+            }
+        }
+        Ok(state.nodes.clone())
+    })
 }
 
 /// Record node observations in one locked update and return their current
-/// transition records. Healthy records are small tombstones that prevent a
-/// stale concurrent offline observation from restarting the grace period.
+/// state. A node is confirmed offline only after three consecutive misses.
 pub fn observe_many(
     state_dir: &Path,
     cluster_uuid: &str,
@@ -72,29 +110,85 @@ pub fn observe_many(
                 result.insert(observation.node_id.clone(), old.expect("checked above"));
                 continue;
             }
-            let record = if observation.reachable {
-                NodeLiveness {
-                    identity_key: observation.identity_key.clone(),
-                    unreachable_since_unix_ms: None,
-                    last_transition_unix_ms: old.as_ref().map_or(observed_unix_ms, |record| {
-                        if record.unreachable_since_unix_ms.is_some() {
+            let previous = old.as_ref();
+            if !observation.reachable
+                && previous
+                    .and_then(|record| record.last_failed_probe_unix_ms)
+                    .is_some_and(|last| {
+                        observed_unix_ms.saturating_sub(last) < MIN_FAILURE_PROBE_INTERVAL_MS
+                    })
+            {
+                result.insert(observation.node_id.clone(), old.expect("checked above"));
+                continue;
+            }
+            let (
+                consecutive_failures,
+                unreachable_since_unix_ms,
+                last_transition_unix_ms,
+                last_reachable_unix_ms,
+                last_failed_probe_unix_ms,
+            ) = if observation.reachable {
+                (
+                    0,
+                    None,
+                    previous.map_or(observed_unix_ms, |record| {
+                        if record.consecutive_failures > 0
+                            || record.unreachable_since_unix_ms.is_some()
+                        {
                             observed_unix_ms
                         } else {
                             record.last_transition_unix_ms
                         }
                     }),
-                }
-            } else if old
-                .as_ref()
-                .is_some_and(|record| record.unreachable_since_unix_ms.is_some())
-            {
-                old.as_ref().expect("checked above").clone()
+                    Some(previous.map_or(observed_unix_ms, |record| {
+                        record
+                            .last_reachable_unix_ms
+                            .map_or(observed_unix_ms, |last_seen| {
+                                if observed_unix_ms.saturating_sub(last_seen)
+                                    >= LAST_SEEN_PERSIST_INTERVAL_MS
+                                {
+                                    observed_unix_ms
+                                } else {
+                                    last_seen
+                                }
+                            })
+                    })),
+                    None,
+                )
             } else {
-                NodeLiveness {
-                    identity_key: observation.identity_key.clone(),
-                    unreachable_since_unix_ms: Some(observed_unix_ms),
-                    last_transition_unix_ms: observed_unix_ms,
-                }
+                let failures = previous.map_or(1, |record| {
+                    record
+                        .consecutive_failures
+                        .saturating_add(1)
+                        .min(OFFLINE_AFTER_FAILURES)
+                });
+                let offline_since = previous
+                    .and_then(|record| record.unreachable_since_unix_ms)
+                    .or_else(|| (failures >= OFFLINE_AFTER_FAILURES).then_some(observed_unix_ms));
+                let crossed_offline_threshold = previous.is_none_or(|record| {
+                    record.unreachable_since_unix_ms.is_none() && offline_since.is_some()
+                });
+                (
+                    failures,
+                    offline_since,
+                    if crossed_offline_threshold {
+                        observed_unix_ms
+                    } else {
+                        previous.map_or(observed_unix_ms, |record| record.last_transition_unix_ms)
+                    },
+                    previous.and_then(|record| record.last_reachable_unix_ms),
+                    Some(observed_unix_ms),
+                )
+            };
+            let record = NodeLiveness {
+                identity_key: observation.identity_key.clone(),
+                unreachable_since_unix_ms,
+                last_transition_unix_ms,
+                consecutive_failures,
+                last_failed_probe_unix_ms,
+                last_reachable_unix_ms,
+                health: previous.and_then(|record| record.health.clone()),
+                health_sampled_unix_ms: previous.and_then(|record| record.health_sampled_unix_ms),
             };
             if old.as_ref() != Some(&record) {
                 state
@@ -105,6 +199,61 @@ pub fn observe_many(
             result.insert(observation.node_id.clone(), record);
         }
         Ok(result)
+    })
+}
+
+/// Save the most recent authenticated Agent health response for fast local
+/// status commands. It also confirms that the node has returned after an
+/// outage; execution safety still comes from fresh Status probes.
+pub fn update_health(
+    state_dir: &Path,
+    cluster_uuid: &str,
+    node_id: &str,
+    identity_key: &str,
+    health: NodeHealth,
+    sampled_unix_ms: u64,
+) -> io::Result<()> {
+    with_locked_file(state_dir, cluster_uuid, |state, changed| {
+        let previous = state.nodes.get(node_id).cloned();
+        let same_machine = previous
+            .as_ref()
+            .is_some_and(|record| same_identity(Some(&record.identity_key), Some(identity_key)));
+        let mut record = if same_machine {
+            previous.expect("checked above")
+        } else {
+            NodeLiveness {
+                identity_key: identity_key.to_owned(),
+                unreachable_since_unix_ms: None,
+                last_transition_unix_ms: sampled_unix_ms,
+                consecutive_failures: 0,
+                last_failed_probe_unix_ms: None,
+                last_reachable_unix_ms: Some(sampled_unix_ms),
+                health: None,
+                health_sampled_unix_ms: None,
+            }
+        };
+        if record
+            .health_sampled_unix_ms
+            .is_some_and(|previous_ms| sampled_unix_ms < previous_ms)
+        {
+            return Ok(());
+        }
+        let recovered =
+            record.unreachable_since_unix_ms.is_some() || record.consecutive_failures > 0;
+        record.unreachable_since_unix_ms = None;
+        record.consecutive_failures = 0;
+        record.last_failed_probe_unix_ms = None;
+        if recovered {
+            record.last_transition_unix_ms = sampled_unix_ms;
+        }
+        record.health = Some(health);
+        record.health_sampled_unix_ms = Some(sampled_unix_ms);
+        record.last_reachable_unix_ms = Some(sampled_unix_ms);
+        if state.nodes.get(node_id) != Some(&record) {
+            state.nodes.insert(node_id.to_owned(), record);
+            *changed = true;
+        }
+        Ok(())
     })
 }
 
@@ -215,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_grace_survives_repeated_probes_and_clears_on_recovery() {
+    fn liveness_requires_three_failed_probes_and_clears_on_recovery() {
         let root = temp_dir();
         let online = NodeObservation {
             node_id: "compute-001".into(),
@@ -228,22 +377,33 @@ mod tests {
         };
 
         observe_many(&root, "cluster-1", &[online], 100).unwrap();
-        let first = observe_many(&root, "cluster-1", &[offline.clone()], 200).unwrap();
-        assert_eq!(first["compute-001"].unreachable_since_unix_ms, Some(200));
-        let repeated = observe_many(&root, "cluster-1", &[offline.clone()], 300).unwrap();
-        assert_eq!(repeated["compute-001"].unreachable_since_unix_ms, Some(200));
+        let first = observe_many(&root, "cluster-1", &[offline.clone()], 3_100).unwrap();
+        assert_eq!(first["compute-001"].consecutive_failures, 1);
+        assert_eq!(first["compute-001"].unreachable_since_unix_ms, None);
+        let repeated = observe_many(&root, "cluster-1", &[offline.clone()], 6_100).unwrap();
+        assert_eq!(repeated["compute-001"].consecutive_failures, 2);
+        assert_eq!(repeated["compute-001"].unreachable_since_unix_ms, None);
+        let confirmed = observe_many(&root, "cluster-1", &[offline.clone()], 9_100).unwrap();
+        assert_eq!(confirmed["compute-001"].consecutive_failures, 3);
         assert_eq!(
-            read(&root, "cluster-1").unwrap()["compute-001"].unreachable_since_unix_ms,
-            Some(200)
+            confirmed["compute-001"].unreachable_since_unix_ms,
+            Some(9_100)
+        );
+        let repeated_offline =
+            observe_many(&root, "cluster-1", &[offline.clone()], 12_100).unwrap();
+        assert_eq!(
+            repeated_offline["compute-001"].unreachable_since_unix_ms,
+            Some(9_100)
         );
 
         let recovered = NodeObservation {
             reachable: true,
             ..offline.clone()
         };
-        let online_record = observe_many(&root, "cluster-1", &[recovered.clone()], 400).unwrap();
+        let online_record = observe_many(&root, "cluster-1", &[recovered.clone()], 15_100).unwrap();
         assert_eq!(online_record["compute-001"].unreachable_since_unix_ms, None);
-        let stale = observe_many(&root, "cluster-1", &[offline], 350).unwrap();
+        assert_eq!(online_record["compute-001"].consecutive_failures, 0);
+        let stale = observe_many(&root, "cluster-1", &[offline], 14_100).unwrap();
         assert_eq!(stale["compute-001"].unreachable_since_unix_ms, None);
         let _ = fs::remove_dir_all(root);
     }

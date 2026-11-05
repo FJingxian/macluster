@@ -82,7 +82,11 @@ impl ControlApi {
             config.clone(),
             hello.namespace.clone(),
         );
-        let monitor = MonitorHub::new(config.clone(), hello.namespace.clone());
+        let monitor = MonitorHub::new_with_liveness(
+            config.clone(),
+            hello.namespace.clone(),
+            storage.root().to_path_buf(),
+        );
         let task_resources = resource_hub(config_path.clone(), &hello);
         Self {
             config,
@@ -197,7 +201,11 @@ impl ControlApi {
             self.config.clone(),
             self.hello.namespace.clone(),
         );
-        self.monitor = MonitorHub::new(self.config.clone(), self.hello.namespace.clone());
+        self.monitor = MonitorHub::new_with_liveness(
+            self.config.clone(),
+            self.hello.namespace.clone(),
+            self.storage.root().to_path_buf(),
+        );
         self.last_monitor_job_counts_at = None;
         self.task_resources = resource_hub(self.config_path.clone(), &self.hello);
         Ok(())

@@ -261,11 +261,19 @@ fn probe_delay(configured_interval: Duration, occupied: bool) -> Duration {
     }
 }
 
+#[cfg(test)]
 fn node_probe_retry_delay() -> Duration {
-    // A TCP-only preflight avoids starting SSH while the node is absent, so a
-    // fixed five-second retry keeps reconnect latency low without repeated
-    // SSH process launches or exponential delays.
     Duration::from_secs(5)
+}
+
+fn node_probe_retry_delay_for_failures(failures: u8) -> Duration {
+    // Retry quickly while confirming a disconnect, then reduce network noise
+    // for a node that has remained absent across the full failure threshold.
+    if failures < crate::liveness::OFFLINE_AFTER_FAILURES {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(30)
+    }
 }
 
 fn persist_node_liveness<T: NodeTransport>(
@@ -273,9 +281,9 @@ fn persist_node_liveness<T: NodeTransport>(
     node_id: &str,
     reachable: bool,
     observed_unix_ms: u64,
-) {
+) -> Option<crate::liveness::NodeLiveness> {
     let Some(node) = service.config.nodes.get(node_id) else {
-        return;
+        return None;
     };
     let observation = crate::liveness::NodeObservation {
         node_id: node_id.to_owned(),
@@ -286,13 +294,43 @@ fn persist_node_liveness<T: NodeTransport>(
             .to_ascii_lowercase(),
         reachable,
     };
-    if let Err(error) = crate::liveness::observe_many(
+    match crate::liveness::observe_many(
         service.storage.root(),
         &service.config.share_uuid,
         &[observation],
         observed_unix_ms,
     ) {
-        eprintln!("macluster: could not persist node liveness for {node_id}: {error}");
+        Ok(records) => records.get(node_id).cloned(),
+        Err(error) => {
+            eprintln!("macluster: could not persist node liveness for {node_id}: {error}");
+            None
+        }
+    }
+}
+
+fn persist_node_health<T: NodeTransport>(
+    service: &ControllerService<T>,
+    node_id: &str,
+    health: macluster_protocol::types::NodeHealth,
+    sampled_unix_ms: u64,
+) {
+    let Some(node) = service.config.nodes.get(node_id) else {
+        return;
+    };
+    let identity_key = node
+        .machine_uuid
+        .as_deref()
+        .unwrap_or(node.host.as_str())
+        .to_ascii_lowercase();
+    if let Err(error) = crate::liveness::update_health(
+        service.storage.root(),
+        &service.config.share_uuid,
+        node_id,
+        &identity_key,
+        health,
+        sampled_unix_ms,
+    ) {
+        eprintln!("macluster: could not persist node health for {node_id}: {error}");
     }
 }
 
@@ -390,6 +428,7 @@ impl RuntimeState {
                         )
                     {
                         runtime.unreachable_since_unix_ms = record.unreachable_since_unix_ms;
+                        runtime.probe_failures = record.consecutive_failures;
                     }
                     (id.clone(), runtime)
                 })
@@ -814,22 +853,24 @@ impl RuntimeState {
             runtime.fenced = false;
             runtime.status = None;
             runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-            runtime.next_probe_at = received_at + node_probe_retry_delay();
             if probe.endpoint_reachable == Some(true) {
-                if runtime.unreachable_since_unix_ms.take().is_some() {
-                    persist_node_liveness(service, node_id, true, super::now_ms());
-                }
-            } else if runtime.unreachable_since_unix_ms.is_none() {
-                let observed_unix_ms = super::now_ms();
-                runtime.unreachable_since_unix_ms = Some(observed_unix_ms);
-                persist_node_liveness(service, node_id, false, observed_unix_ms);
+                let record = persist_node_liveness(service, node_id, true, super::now_ms());
+                runtime.unreachable_since_unix_ms =
+                    record.and_then(|record| record.unreachable_since_unix_ms);
+                runtime.probe_failures = 0;
+            } else {
+                let record = persist_node_liveness(service, node_id, false, super::now_ms());
+                runtime.unreachable_since_unix_ms =
+                    record.and_then(|record| record.unreachable_since_unix_ms);
             }
+            runtime.next_probe_at =
+                received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
             service.idle_since.remove(node_id);
             return Ok(());
         }
-        if runtime.unreachable_since_unix_ms.take().is_some() {
-            persist_node_liveness(service, node_id, true, super::now_ms());
-        }
+        let record = persist_node_liveness(service, node_id, true, super::now_ms());
+        runtime.unreachable_since_unix_ms =
+            record.and_then(|record| record.unreachable_since_unix_ms);
         runtime.fenced = true;
         service.fenced_nodes.insert(node_id.to_owned());
 
@@ -885,19 +926,22 @@ impl RuntimeState {
                 runtime.last_probe_error = Some(error.chars().take(256).collect());
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + node_probe_retry_delay();
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
             None => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + node_probe_retry_delay();
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
             Some(Ok(_)) => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + node_probe_retry_delay();
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
         }
@@ -913,9 +957,19 @@ impl RuntimeState {
         received_at: Instant,
         health_result: Option<Result<ResponseBody, String>>,
     ) {
+        if let Some(Ok(ResponseBody::Health(health))) = health_result.as_ref() {
+            persist_node_health(service, node_id, health.clone(), super::now_ms());
+        }
         let Some(runtime) = self.nodes.get_mut(node_id) else {
             return;
         };
+        if matches!(health_result.as_ref(), Some(Ok(ResponseBody::Health(_)))) {
+            // A successful authenticated health response proves the Agent has
+            // returned even if its execution-status probe has not completed.
+            runtime.unreachable_since_unix_ms = None;
+            runtime.probe_failures = 0;
+            runtime.next_probe_at = received_at;
+        }
         runtime.health = Some(match health_result {
             Some(Ok(ResponseBody::Health(health))) => {
                 let expected_digest = service.config.execution_digest().unwrap_or_default();

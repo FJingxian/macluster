@@ -222,10 +222,15 @@
     const query = $("#node-search").value.trim().toLowerCase();
     const queue = $("#queue-filter").value;
     return [...state.nodes.values()].filter(node => {
+      const row = state.rows.get(node.id);
+      if (!hasFreshNodeSample(row)) return false;
       const matchesText = !query || node.id.toLowerCase().includes(query);
       const matchesQueue = !queue || node.queues.includes(queue);
       return matchesText && matchesQueue;
     }).sort((a, b) => compareNodes(a, b, state.sort.key, state.sort.descending));
+  }
+  function hasFreshNodeSample(row) {
+    return Boolean(row && row.age_ms != null && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
   }
   function compareNodes(a, b, key, descending) {
     const left = state.rows.get(a.id), right = state.rows.get(b.id);
@@ -255,8 +260,9 @@
     $("#node-empty").classList.toggle("hidden", nodes.length > 0);
     $("#node-count-label").textContent = `${nodes.length} ${nodes.length === 1 ? "node" : "nodes"}`;
     $("#nav-node-count").textContent = nodes.length;
-    const allRows = [...state.rows.values()].filter(row => state.nodes.has(row.node_id));
-    const fresh = allRows.filter(row => !row.stale && !row.sample_error);
+    const visibleIds = new Set(nodes.map(node => node.id));
+    const allRows = [...state.rows.values()].filter(row => visibleIds.has(row.node_id));
+    const fresh = allRows.filter(hasFreshNodeSample);
     text($("#kpi-nodes"), fresh.length);
     text($("#kpi-nodes-note"), `of ${state.nodes.size} configured`);
     const active = state.activeJobs.filter(job => ["RUNNING", "STARTING", "CANCELLING"].includes(job.state));
@@ -439,7 +445,10 @@
         state.lastUpdated = Date.now();
         text($("#last-updated"), new Date(state.lastUpdated).toLocaleTimeString());
         renderOverview();
-        if (state.selectedNode) renderNodeDetail();
+        if (state.selectedNode) {
+          if (!hasFreshNodeSample(state.rows.get(state.selectedNode))) closeNode();
+          else renderNodeDetail();
+        }
       }
       if (update.jobs) { state.activeJobs = update.jobs.jobs; renderOverview(); }
       if (update.queues) { state.queues = update.queues; renderQueueFilter(); renderQueues(); renderOverview(); }

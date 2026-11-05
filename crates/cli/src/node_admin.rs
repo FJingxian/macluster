@@ -3314,8 +3314,9 @@ EXAMPLES
   mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
   mnode -rm default-001
 
-`mnode -l` briefly keeps unreachable compute nodes as RECONNECTING, then hides
-them after 60 seconds. Use `mnode -l --all` to include those nodes.
+`mnode -l` lists compute nodes only after recent successful reachability checks.
+Unverified, reconnecting, and offline nodes stay hidden until they respond;
+use `mnode -l --all` to inspect their states.
 
 ADD NODES
   Setup is verified before a node is listed. Failed attempts stay outside the
@@ -11181,51 +11182,52 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
             .unwrap_or(0);
         for mapping in mappings {
             output.push_str(&format!(
-                "    {:<name_width$}  {:<7}  {:<7}  {} → {}\n",
-                mapping.name, mapping.state, mapping.kind, mapping.source_node, mapping.target,
+                "    {:<name_width$}  {:<7}  {} → {}\n",
+                mapping.name, mapping.kind, mapping.source_node, mapping.target,
             ));
         }
     }
     output
 }
 
-const MAX_NODE_LIST_PROBES: usize = 16;
-const NODE_RECONNECT_GRACE_MS: u64 = 60_000;
+const MAX_NODE_LIST_PROBES: usize = 64;
+#[cfg(test)]
+const NODE_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+const NODE_LIST_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
+
+const NODE_LIST_HEALTH_CACHE_TTL_MS: u64 = 120_000;
+const NODE_LIST_LIVENESS_CACHE_TTL_MS: u64 = 90_000;
 
 fn node_list_probe_worker_count(node_count: usize) -> usize {
     node_count.min(MAX_NODE_LIST_PROBES)
 }
 
-fn node_list_state(
-    bridge_online: bool,
+fn cached_node_list_state(
     login_node: bool,
+    known_online: bool,
+    consecutive_failures: u8,
+    confirmed_offline: bool,
     digest_matches: bool,
     shares_ready: bool,
-    unreachable_since_unix_ms: Option<u64>,
-    now_unix_ms: u64,
     show_all: bool,
 ) -> Option<&'static str> {
-    if !bridge_online && !login_node {
-        let offline_since = unreachable_since_unix_ms.unwrap_or(now_unix_ms);
-        let grace_elapsed = now_unix_ms.saturating_sub(offline_since) >= NODE_RECONNECT_GRACE_MS;
-        if grace_elapsed && !show_all {
-            return None;
-        }
-        return Some(if show_all && grace_elapsed {
-            "OFFLINE"
-        } else {
-            "RECONNECTING"
-        });
+    if !login_node && confirmed_offline {
+        return show_all.then_some("OFFLINE");
     }
-    Some(if digest_matches && shares_ready && bridge_online {
+    if !login_node && consecutive_failures > 0 {
+        return show_all.then_some("RECONNECTING");
+    }
+    if !login_node && !known_online {
+        return show_all.then_some("UNKNOWN");
+    }
+    Some(if digest_matches && shares_ready {
         "READY"
-    } else if bridge_online {
-        "ONLINE"
     } else {
-        "OFFLINE"
+        "ONLINE"
     })
 }
 
+#[cfg(test)]
 fn ssh_endpoint_is_reachable(transport: &ClusterTransport, node: &NodeConfig) -> bool {
     node.transport == Transport::Ssh
         && transport
@@ -11233,6 +11235,7 @@ fn ssh_endpoint_is_reachable(transport: &ClusterTransport, node: &NodeConfig) ->
             .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn probe_node_list(
     config_path: &Path,
     namespace: &str,
@@ -11244,19 +11247,26 @@ fn probe_node_list(
     };
     let mut transport =
         ClusterTransport::new_with_namespace(config_path.to_path_buf(), namespace.to_owned());
-    if transport.endpoint_reachable(node, Duration::from_millis(300)) == Some(false) {
+    let endpoint_reachable = transport.endpoint_reachable(node, Duration::from_millis(300));
+    if endpoint_reachable == Some(false) {
         return (None, false);
     }
     // Health walks configured share paths. A local disk or NFS mount can
-    // block that walk, so bound it and use the storage-independent Ping as a
-    // fallback before declaring an otherwise reachable node offline.
-    transport.timeout = Duration::from_secs(4);
+    // block that walk, so keep the RPC bounded; Ping is only needed when the
+    // endpoint preflight could not establish SSH reachability.
+    transport.timeout = NODE_LIST_RPC_TIMEOUT;
     match transport.call(&node_id, node, Operation::Health) {
         Ok(ResponseBody::Health(health)) => (Some(health), true),
         // An Agent rejection also proves the authenticated bridge answered.
         Ok(_) | Err(macluster_controller::transport::TransportError::Remote(_)) => (None, true),
         Err(macluster_controller::transport::TransportError::Timeout) => {
-            transport.timeout = Duration::from_secs(4);
+            // An open SSH endpoint already answers the reachability question.
+            // Do not make a second Agent round trip when the health operation
+            // is stalled on a mounted filesystem.
+            if node.transport == Transport::Ssh && endpoint_reachable == Some(true) {
+                return (None, true);
+            }
+            transport.timeout = NODE_LIST_RPC_TIMEOUT;
             match transport.call(&node_id, node, Operation::Ping) {
                 Ok(_) | Err(macluster_controller::transport::TransportError::Remote(_)) => {
                     (None, true)
@@ -11292,65 +11302,16 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
     let journal_path = state_dir.join("node-admin.json");
     let state = read_admin_state(&journal_path, &canonical, state_dir)?;
     let liveness_now_ms = validation_now_ms();
-    let tasks = Mutex::new(VecDeque::from_iter(config.nodes.iter()));
-    let observations = std::thread::scope(|scope| {
-        let handles = (0..node_list_probe_worker_count(config.nodes.len()))
-            .map(|_| {
-                let tasks = &tasks;
-                let namespace = &config.share_uuid;
-                scope.spawn(move || {
-                    let mut results = Vec::new();
-                    loop {
-                        let Some((id, node)) =
-                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
-                        else {
-                            break;
-                        };
-                        results.push((
-                            id.clone(),
-                            probe_node_list(config_path, namespace, id, node),
-                        ));
-                    }
-                    results
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().unwrap_or_default())
-            .collect::<BTreeMap<_, _>>()
-    });
-    let mut observations = observations;
-    let liveness_observations = config
-        .nodes
-        .iter()
-        .map(|(id, node)| {
-            let bridge_online = observations
-                .get(id)
-                .is_some_and(|(_, bridge_online)| *bridge_online);
-            macluster_controller::liveness::NodeObservation {
-                node_id: id.clone(),
-                identity_key: node
-                    .machine_uuid
-                    .as_deref()
-                    .unwrap_or(node.host.as_str())
-                    .to_ascii_lowercase(),
-                reachable: bridge_online,
-            }
-        })
-        .collect::<Vec<_>>();
-    let liveness = match macluster_controller::liveness::observe_many(
-        state_dir,
-        &config.share_uuid,
-        &liveness_observations,
-        liveness_now_ms,
-    ) {
+    // Use the compact health journal for READY/ONLINE detail, and refresh
+    // reachability with bounded TCP endpoint checks below.
+    let liveness = match macluster_controller::liveness::read(state_dir, &config.share_uuid) {
         Ok(records) => records,
         Err(error) => {
-            eprintln!("macluster: could not update node reconnect grace state: {error}");
+            eprintln!("macluster: could not read cached node state: {error}");
             BTreeMap::new()
         }
     };
+    let liveness = refresh_node_liveness_for_list(&canonical, state_dir, &config, liveness);
     let mut rows = Vec::new();
     let mut hidden_unreachable = 0usize;
     for (id, node) in &config.nodes {
@@ -11363,7 +11324,23 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let (health, bridge_online) = observations.remove(id).unwrap_or_default();
+        let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+        let cached = liveness
+            .get(id)
+            .filter(|record| record.identity_key.eq_ignore_ascii_case(identity_key));
+        let confirmed_offline = cached.is_some_and(|record| record.is_confirmed_offline());
+        let cached_health = cached
+            .filter(|record| {
+                !confirmed_offline
+                    && record
+                        .health_sampled_unix_ms
+                        .is_some_and(|sampled| sampled >= record.last_transition_unix_ms)
+                    && record.health_sampled_unix_ms.is_some_and(|sampled| {
+                        liveness_now_ms.saturating_sub(sampled) <= NODE_LIST_HEALTH_CACHE_TTL_MS
+                    })
+            })
+            .and_then(|record| record.health.as_ref());
+        let health = cached_health.cloned();
         let digest_matches = verified_node_health(&config, id, health.as_ref()).is_some();
         let all_shares_ready = health.as_ref().is_some_and(|health| {
             health.primary_share_ready
@@ -11373,16 +11350,20 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                     .all(|share_id| health.shares.get(share_id).copied().unwrap_or(false))
         });
         let login_node = config.is_login_node(id);
-        let unreachable_since = liveness
-            .get(id)
-            .and_then(|record| record.unreachable_since_unix_ms);
-        let Some(state_name) = node_list_state(
-            bridge_online,
+        let known_online = login_node
+            || cached.is_some_and(|record| {
+                record.unreachable_since_unix_ms.is_none()
+                    && record.last_reachable_unix_ms.is_some_and(|sampled| {
+                        liveness_now_ms.saturating_sub(sampled) <= NODE_LIST_LIVENESS_CACHE_TTL_MS
+                    })
+            });
+        let Some(state_name) = cached_node_list_state(
             login_node,
+            known_online,
+            cached.map_or(0, |record| record.consecutive_failures),
+            confirmed_offline,
             digest_matches,
             all_shares_ready,
-            unreachable_since,
-            liveness_now_ms,
             show_all,
         ) else {
             hidden_unreachable += 1;
@@ -11422,11 +11403,97 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
     }
     if hidden_unreachable > 0 {
         eprintln!(
-            "{hidden_unreachable} unreachable compute node(s) hidden after the 60-second reconnect grace; use `mnode -l --all` to show them"
+            "{hidden_unreachable} unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
         );
     }
     print!("{}", format_node_list(&rows));
     Ok(())
+}
+
+fn refresh_node_liveness_for_list(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+    cached: BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+) -> BTreeMap<String, macluster_controller::liveness::NodeLiveness> {
+    if config.nodes.is_empty() {
+        return cached;
+    }
+
+    // A list command needs a current answer even while the controller is
+    // running. Probe only the SSH TCP endpoints, in parallel and with a short
+    // timeout; do not perform SSH authentication or an Agent health walk.
+    let transport =
+        ClusterTransport::new_with_namespace(config_path.to_path_buf(), config.share_uuid.clone());
+    let tasks = Mutex::new(VecDeque::from_iter(
+        config
+            .nodes
+            .iter()
+            .filter(|(id, _)| !config.is_login_node(id))
+            .map(|(id, node)| (id.clone(), node.clone())),
+    ));
+    let worker_count = node_list_probe_worker_count(
+        config
+            .nodes
+            .keys()
+            .filter(|id| !config.is_login_node(id))
+            .count(),
+    );
+    let observations = std::thread::scope(|scope| {
+        let handles = (0..worker_count)
+            .map(|_| {
+                let tasks = &tasks;
+                let transport = transport.clone();
+                scope.spawn(move || {
+                    let mut observations = Vec::new();
+                    loop {
+                        let Some((node_id, node)) =
+                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                        else {
+                            break;
+                        };
+                        let reachable = if node.transport == Transport::Local {
+                            Some(true)
+                        } else {
+                            transport.endpoint_reachable(&node, NODE_LIST_ENDPOINT_TIMEOUT)
+                        };
+                        let Some(reachable) = reachable else {
+                            continue;
+                        };
+                        observations.push(macluster_controller::liveness::NodeObservation {
+                            node_id,
+                            identity_key: node
+                                .machine_uuid
+                                .as_deref()
+                                .unwrap_or(node.host.as_str())
+                                .to_ascii_lowercase(),
+                            reachable,
+                        });
+                    }
+                    observations
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    if observations.is_empty() {
+        return cached;
+    }
+    match macluster_controller::liveness::observe_many(
+        state_dir,
+        &config.share_uuid,
+        &observations,
+        validation_now_ms(),
+    ) {
+        Ok(refreshed) => refreshed,
+        Err(error) => {
+            eprintln!("macluster: could not refresh cached node reachability: {error}");
+            cached
+        }
+    }
 }
 
 fn list_failed_operations(config_path: &Path, state_dir: &Path) -> AppResult<()> {
@@ -15191,11 +15258,11 @@ mod tests {
         ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds,
         acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
         acquire_node_maintenance_with_confirmation_using, admin_shell_command,
-        agent_update_recovery_pending, candidate_admin_script, classify_configured_agents,
-        cleanup_node_from_endpoint, client_mount_admin_request, client_mount_batch_script,
-        client_mount_status_awk_script, client_nfs_cleanup_batch_script, client_nfs_cleanup_plan,
-        client_share_alias_script, config_path_candidate, controller_command_matches,
-        dispatch_sync_pending, ensure_controller_recovery_clean,
+        agent_update_recovery_pending, cached_node_list_state, candidate_admin_script,
+        classify_configured_agents, cleanup_node_from_endpoint, client_mount_admin_request,
+        client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
+        client_nfs_cleanup_plan, client_share_alias_script, config_path_candidate,
+        controller_command_matches, dispatch_sync_pending, ensure_controller_recovery_clean,
         ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
         inspect_configured_agent_build, list_nodes, local_config_candidate,
         maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
@@ -15203,8 +15270,8 @@ mod tests {
         named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
         nfs_exports_read_command, nfs_exports_update_baseline_read_command,
         nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
-        node_admin_recovery_pending, node_list_state, node_nfs_mappings, normalize_binary_path,
-        parse_action, parse_agent_build_probe, parse_nfs_exports_update_baseline,
+        node_admin_recovery_pending, node_nfs_mappings, normalize_binary_path, parse_action,
+        parse_agent_build_probe, parse_nfs_exports_update_baseline,
         pending_add_may_have_client_state, pending_add_operation_for_endpoint,
         pending_combined_ssh_add, pending_local_share_retry_node,
         pending_managed_export_cleanup_plan, plan_ensure_nfs_exports, plan_remove_nfs_exports,
@@ -18546,31 +18613,72 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
+    fn node_listing_bounds_health_and_ping_when_the_agent_stalls() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("macluster");
+        fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut node = parse_build_test_config().nodes["login"].clone();
+        node.transport = Transport::Local;
+        node.remote_binary = binary.to_string_lossy().into_owned();
+
+        let started = std::time::Instant::now();
+        let (health, online) =
+            super::probe_node_list(&root.join("config.toml"), "test", "login", &node);
+
+        assert!(health.is_none());
+        assert!(!online);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "stalled node listing probe took {:?}",
+            started.elapsed()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn node_list_probe_fanout_handles_large_clusters_without_unbounded_workers() {
         assert_eq!(super::node_list_probe_worker_count(0), 0);
         assert_eq!(super::node_list_probe_worker_count(1), 1);
         assert_eq!(super::node_list_probe_worker_count(4), 4);
-        assert_eq!(super::node_list_probe_worker_count(17), 16);
-        assert_eq!(super::node_list_probe_worker_count(100), 16);
+        assert_eq!(super::node_list_probe_worker_count(17), 17);
+        assert_eq!(super::node_list_probe_worker_count(100), 64);
     }
 
     #[test]
-    fn node_list_hides_only_after_grace_and_keeps_login_visible() {
+    fn node_list_hides_unverified_and_reconnecting_compute_nodes_by_default() {
         assert_eq!(
-            node_list_state(false, false, false, false, Some(10_000), 69_999, false),
-            Some("RECONNECTING")
-        );
-        assert_eq!(
-            node_list_state(false, false, false, false, Some(10_000), 70_000, false),
+            cached_node_list_state(false, false, 1, false, false, false, false),
             None
         );
         assert_eq!(
-            node_list_state(false, false, false, false, Some(10_000), 70_000, true),
+            cached_node_list_state(false, false, 2, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            cached_node_list_state(false, false, 1, false, false, false, true),
+            Some("RECONNECTING")
+        );
+        assert_eq!(
+            cached_node_list_state(false, false, 0, false, false, false, false),
+            None
+        );
+        assert_eq!(
+            cached_node_list_state(false, false, 0, false, false, false, true),
+            Some("UNKNOWN")
+        );
+        assert_eq!(
+            cached_node_list_state(false, false, 3, true, false, false, false),
+            None
+        );
+        assert_eq!(
+            cached_node_list_state(false, false, 3, true, false, false, true),
             Some("OFFLINE")
         );
         assert_eq!(
-            node_list_state(false, true, false, false, Some(10_000), 70_000, false),
-            Some("OFFLINE")
+            cached_node_list_state(true, true, 3, true, false, false, false),
+            Some("ONLINE")
         );
     }
 
@@ -18622,7 +18730,7 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(mappings_heading < first_mapping, "{output}");
         assert_eq!(
             output
-                .matches("primary  READY    MOUNT    login-01 → /Users/Shared/macluster")
+                .matches("primary  MOUNT    login-01 → /Users/Shared/macluster")
                 .count(),
             1,
             "{output}"

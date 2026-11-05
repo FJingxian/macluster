@@ -13,7 +13,7 @@ const INVENTORY_FILE: &str = "node-addresses.json";
 const MIGRATION_FILE: &str = "node-address-migration.json";
 const PROPOSAL_FILE: &str = "node-address-proposal.json";
 const CHECK_INTERVAL_MS: u64 = 30_000;
-const SUBNET_SCAN_INTERVAL_MS: u64 = 5 * 60_000;
+const SUBNET_SCAN_INTERVAL_MS: u64 = 30_000;
 pub(super) const MAINTENANCE_OPERATION: &str = "node address and NFS migration";
 
 fn full_subnet_scan_due(last_scan_ms: u64, now_ms: u64, force: bool) -> bool {
@@ -21,15 +21,15 @@ fn full_subnet_scan_due(last_scan_ms: u64, now_ms: u64, force: bool) -> bool {
 }
 
 #[derive(Clone, Debug)]
-struct InterfaceAddress {
-    interface: String,
-    address: Ipv4Addr,
-    mask: u32,
-    mac: Option<String>,
+pub(super) struct InterfaceAddress {
+    pub(super) interface: String,
+    pub(super) address: Ipv4Addr,
+    pub(super) mask: u32,
+    pub(super) mac: Option<String>,
 }
 
 impl InterfaceAddress {
-    fn contains(&self, address: Ipv4Addr) -> bool {
+    pub(super) fn contains(&self, address: Ipv4Addr) -> bool {
         u32::from(self.address) & self.mask == u32::from(address) & self.mask
     }
 }
@@ -73,7 +73,13 @@ fn normalize_mac(value: &str) -> Option<String> {
             u8::from_str_radix(part, 16).ok()
         })
         .collect::<Option<Vec<_>>>()?;
-    if bytes.len() != 6 || bytes[0] & 1 != 0 || bytes.iter().all(|byte| *byte == 0) {
+    if bytes.len() != 6
+        || bytes[0] & 1 != 0
+        || bytes.iter().all(|byte| *byte == 0)
+        // macOS may redact hardware addresses for unapproved subprocesses
+        // with this placeholder. Never use it as a real node identity.
+        || bytes == [0x02, 0, 0, 0, 0, 0]
+    {
         return None;
     }
     Some(
@@ -258,7 +264,7 @@ fn remove_stale_proposal(path: &Path) -> AppResult<()> {
     }
 }
 
-fn neighbors() -> Vec<(Ipv4Addr, String)> {
+pub(super) fn neighbors() -> Vec<(Ipv4Addr, String)> {
     Command::new("/usr/sbin/arp")
         .arg("-an")
         .output()
@@ -268,7 +274,7 @@ fn neighbors() -> Vec<(Ipv4Addr, String)> {
         .unwrap_or_default()
 }
 
-fn local_interfaces() -> AppResult<Vec<InterfaceAddress>> {
+pub(super) fn local_interfaces() -> AppResult<Vec<InterfaceAddress>> {
     let output = Command::new("/sbin/ifconfig")
         .arg("-a")
         .output()
@@ -477,7 +483,7 @@ fn subnet_candidates(
         .filter(|(address, found)| allowed(*address) && mac == Some(found.as_str()))
         .map(|(address, _)| *address)
         .collect::<BTreeSet<_>>();
-    if preferred.is_empty() {
+    if preferred.is_empty() && mac.is_none() {
         preferred.extend(
             neighbors
                 .iter()
@@ -545,23 +551,50 @@ fn scan_candidates(
     Ok(matches.pop())
 }
 
+fn sweep_registered_subnet(candidates: &[Ipv4Addr], port: u16) -> bool {
+    if candidates.is_empty() {
+        return false;
+    }
+    let next = AtomicUsize::new(0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    thread::scope(|scope| {
+        let handles = (0..16.min(candidates.len()))
+            .map(|_| {
+                let next = &next;
+                scope.spawn(move || {
+                    while Instant::now() < deadline {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(address) = candidates.get(index).copied() else {
+                            break;
+                        };
+                        let _ = tcp_available(address, port);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+    next.load(Ordering::Relaxed) >= candidates.len()
+}
+
 fn discover_remote(
     node: &NodeConfig,
     record: Option<&AddressRecord>,
     interfaces: &[InterfaceAddress],
+    arp: &[(Ipv4Addr, String)],
     force: bool,
-    allow_full_subnet_scan: bool,
-) -> AppResult<(Option<(NodeConfig, AddressRecord)>, bool)> {
+) -> AppResult<Option<(NodeConfig, AddressRecord)>> {
     let Ok(old_address) = node.host.parse::<Ipv4Addr>() else {
-        return Ok((None, false));
+        return Ok(None);
     };
     let Some(interface) = matching_interface(old_address, interfaces, None) else {
-        return Ok((None, false));
+        return Ok(None);
     };
     let pinned = ensure_host_key_pin(node)?;
     let local = interfaces.iter().any(|entry| entry.address == old_address);
     let reachable = !local && tcp_available(old_address, node.ssh_port.unwrap_or(22));
-    let arp = neighbors();
     let mac_matches = record
         .and_then(|record| record.mac.as_deref())
         .is_some_and(|mac| {
@@ -573,34 +606,36 @@ fn discover_remote(
             && mac_matches
             && let Some(record) = record
         {
-            return Ok((Some((node.clone(), record.clone())), false));
+            return Ok(Some((node.clone(), record.clone())));
         }
         if let Ok(record) = verified_record(node, old_address) {
-            return Ok((Some((node.clone(), record)), false));
+            return Ok(Some((node.clone(), record)));
         }
     }
     // A MAC address narrows the search. Only a trusted host key and matching
     // machine UUID authorize a replacement address; never trust ssh-keyscan.
     if !pinned {
-        return Ok((None, false));
+        return Ok(None);
     }
-    eprintln!(
-        "Searching {} for the registered node formerly at {} (MAC + trusted SSH key + machine UUID)",
-        interface.interface, node.host
-    );
-    let (preferred, rest) = subnet_candidates(
+    if force {
+        eprintln!(
+            "Searching {} for the registered node formerly at {} (MAC + trusted SSH key + machine UUID)",
+            interface.interface, node.host
+        );
+    }
+    let (mut preferred, _) = subnet_candidates(
         interface,
         interfaces,
         &arp,
         record.and_then(|entry| entry.mac.as_deref()),
     );
-    if let Some(found) = scan_candidates(node, &preferred)? {
-        return Ok((Some(found), false));
+    // A node can return through a different interface (for example, wired to
+    // Wi-Fi). In that case its old MAC no longer matches, so use live
+    // neighbors only as candidates and still require the pinned key and UUID.
+    if preferred.is_empty() && record.and_then(|entry| entry.mac.as_deref()).is_some() {
+        preferred = subnet_candidates(interface, interfaces, &arp, None).0;
     }
-    if !allow_full_subnet_scan {
-        return Ok((None, false));
-    }
-    Ok((scan_candidates(node, &rest)?, true))
+    scan_candidates(node, &preferred)
 }
 
 fn address_candidate(
@@ -1309,8 +1344,60 @@ fn check_addresses(
     } else if !local_current {
         return Err((1, "login address changed but no unambiguous interface remains in the registered subnet; select the intended cluster interface explicitly".into()));
     }
-    let mut unreachable = Vec::new();
+    let mut discovery_neighbors = neighbors();
     let mut scanned_full_subnet = false;
+    if allow_full_subnet_scan {
+        let mut sweep_targets = BTreeMap::<(u32, u32, u16), InterfaceAddress>::new();
+        for (node_id, node) in &config.nodes {
+            if node.transport != Transport::Ssh {
+                continue;
+            }
+            let Some(address) = node.host.parse::<Ipv4Addr>().ok() else {
+                continue;
+            };
+            if interfaces
+                .iter()
+                .any(|interface| interface.address == address)
+            {
+                continue;
+            }
+            let known = inventory.nodes.get(node_id).filter(|record| {
+                node.machine_uuid
+                    .as_deref()
+                    .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&record.machine_uuid))
+            });
+            let interface = matching_interface(
+                address,
+                &interfaces,
+                known.and_then(|record| record.mac.as_deref()),
+            );
+            let Some(interface) = interface else {
+                continue;
+            };
+            let port = node.ssh_port.unwrap_or(22);
+            let endpoint_up = tcp_available(address, port);
+            let known_mac = known.and_then(|record| record.mac.as_deref());
+            let mac_still_at_registered_ip = known_mac.is_some_and(|mac| {
+                discovery_neighbors
+                    .iter()
+                    .any(|(neighbor, found)| *neighbor == address && found == mac)
+            });
+            if force || !endpoint_up || (known_mac.is_some() && !mac_still_at_registered_ip) {
+                let subnet = u32::from(interface.address) & interface.mask;
+                sweep_targets.insert((subnet, interface.mask, port), interface.clone());
+            }
+        }
+        let mut all_sweeps_completed = !sweep_targets.is_empty();
+        for ((_, _, port), interface) in &sweep_targets {
+            let (_, candidates) = subnet_candidates(interface, &interfaces, &[], None);
+            all_sweeps_completed &= sweep_registered_subnet(&candidates, *port);
+        }
+        scanned_full_subnet = all_sweeps_completed;
+        if !sweep_targets.is_empty() {
+            discovery_neighbors = neighbors();
+        }
+    }
+    let mut unreachable = Vec::new();
     for (node_id, node) in &config.nodes {
         if node.transport != Transport::Ssh {
             continue;
@@ -1320,9 +1407,7 @@ fn check_addresses(
                 .as_deref()
                 .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&record.machine_uuid))
         });
-        let (discovered, scanned) =
-            discover_remote(node, known, &interfaces, force, allow_full_subnet_scan)?;
-        scanned_full_subnet |= scanned;
+        let discovered = discover_remote(node, known, &interfaces, &discovery_neighbors, force)?;
         match discovered {
             Some((connection, record)) => {
                 if let Some((pin, _)) = node.ssh_host_key_pin()
@@ -1619,6 +1704,7 @@ mod tests {
             Some("36:52:b2:04:bb:80")
         );
         assert!(normalize_mac("ff:ff:ff:ff:ff:ff").is_none());
+        assert!(normalize_mac("02:00:00:00:00:00").is_none());
         let entries = parse_neighbors(
             "? (192.168.2.3) at 36:52:b2:4:bb:80 on bridge0 ifscope [bridge]\n? (192.168.2.4) at (incomplete) on bridge0\n",
         );

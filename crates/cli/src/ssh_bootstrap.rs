@@ -1,6 +1,7 @@
 use std::{
     env, fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -21,6 +22,19 @@ enum SshFailureKind {
 struct SshIdentity {
     private_key: PathBuf,
     public_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostKeyDecision {
+    Accept,
+    Reject,
+    Invalid,
+}
+
+struct ScannedHostKey {
+    known_hosts_line: String,
+    fingerprint: String,
+    key_type: String,
 }
 
 fn classify_ssh_error(error: &str) -> SshFailureKind {
@@ -312,6 +326,371 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn host_key_decision(input: &str, fingerprint: &str) -> HostKeyDecision {
+    let input = input.trim();
+    match input.to_ascii_lowercase().as_str() {
+        "y" | "yes" => HostKeyDecision::Accept,
+        "" | "n" | "no" => HostKeyDecision::Reject,
+        _ if input == fingerprint => HostKeyDecision::Accept,
+        _ => HostKeyDecision::Invalid,
+    }
+}
+
+fn offending_host_key_file(error: &str) -> Option<PathBuf> {
+    error.lines().find_map(|line| {
+        let line = line.trim();
+        if !line.to_ascii_lowercase().starts_with("offending ") {
+            return None;
+        }
+        let (_, location) = line.split_once(" in ")?;
+        let (path, line_number) = location.rsplit_once(':')?;
+        line_number.parse::<u64>().ok()?;
+        Some(PathBuf::from(path))
+    })
+}
+
+fn known_host_lookup(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+fn validate_known_hosts_file(path: &Path, home: &Path) -> Result<(), String> {
+    let ssh_dir = home.join(".ssh");
+    let ssh_metadata = fs::symlink_metadata(&ssh_dir).map_err(|error| {
+        format!(
+            "cannot inspect SSH directory {}: {error}",
+            ssh_dir.display()
+        )
+    })?;
+    if !ssh_metadata.is_dir()
+        || ssh_metadata.file_type().is_symlink()
+        || ssh_metadata.uid() != unsafe { libc::geteuid() }
+        || ssh_metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "refusing to edit SSH trust: {} is not a private directory owned by the current account",
+            ssh_dir.display()
+        ));
+    }
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect offending SSH trust file {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "refusing to edit unsafe SSH trust file {}",
+            path.display()
+        ));
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some("known_hosts")
+        || path.parent().and_then(|parent| parent.canonicalize().ok())
+            != ssh_dir.canonicalize().ok()
+    {
+        return Err(format!(
+            "the changed key is recorded outside the default user known_hosts file: {}; no file was changed",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn fingerprint_for_host_key(known_hosts_line: &str) -> Result<String, String> {
+    let path = env::temp_dir().join(format!(
+        "macluster-host-key-{}-{}",
+        std::process::id(),
+        macluster_protocol::identifiers::Id128::random()
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|error| format!("could not create temporary host-key file: {error}"))?;
+        writeln!(file, "{known_hosts_line}")
+            .map_err(|error| format!("could not write temporary host-key file: {error}"))?;
+        drop(file);
+
+        let output = Command::new("/usr/bin/ssh-keygen")
+            .args(["-lf"])
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("could not calculate SSH host fingerprint: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not calculate SSH host fingerprint: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let fingerprint = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .nth(1)
+            .filter(|value| value.starts_with("SHA256:"))
+            .ok_or_else(|| "ssh-keygen returned an invalid host fingerprint".to_owned())?
+            .to_owned();
+        Ok(fingerprint)
+    })();
+    let _ = fs::remove_file(path);
+    result
+}
+
+fn parse_host_key_scan_output(
+    output: &str,
+    host: &str,
+    port: u16,
+) -> Result<ScannedHostKey, String> {
+    let lookup = known_host_lookup(host, port);
+    let scan_port_alias = format!("[{host}]:{port}");
+    let mut candidates = Vec::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 3 || (fields[0] != lookup && fields[0] != scan_port_alias) {
+            continue;
+        }
+        let priority = match fields[1] {
+            "ssh-ed25519" => 0,
+            "ecdsa-sha2-nistp256" => 1,
+            "ecdsa-sha2-nistp384" => 2,
+            "ecdsa-sha2-nistp521" => 3,
+            "ssh-rsa" => 4,
+            _ => continue,
+        };
+        let key_type = fields[1].to_owned();
+        let known_hosts_line = format!("{lookup} {} {}", fields[1], fields[2]);
+        candidates.push((priority, known_hosts_line, key_type));
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    let (_, known_hosts_line, key_type) = candidates.into_iter().next().ok_or_else(|| {
+        format!(
+            "could not scan an SSH host key for {lookup}; check that the node is reachable and offers an Ed25519, ECDSA, or RSA host key"
+        )
+    })?;
+    let fingerprint = fingerprint_for_host_key(&known_hosts_line)?;
+    Ok(ScannedHostKey {
+        known_hosts_line,
+        fingerprint,
+        key_type,
+    })
+}
+
+fn scan_host_key(node: &NodeConfig) -> Result<ScannedHostKey, String> {
+    let port = node.ssh_port.unwrap_or(22);
+    let output = Command::new("/usr/bin/ssh-keyscan")
+        .args(["-T", "5", "-p"])
+        .arg(port.to_string())
+        .args(["-t", "ed25519,ecdsa,rsa"])
+        .arg(&node.host)
+        .output()
+        .map_err(|error| format!("could not start ssh-keyscan for {}: {error}", node.host))?;
+    parse_host_key_scan_output(&String::from_utf8_lossy(&output.stdout), &node.host, port).map_err(
+        |error| {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if detail.is_empty() {
+                error
+            } else {
+                format!("{error}: {detail}")
+            }
+        },
+    )
+}
+
+fn prompt_for_host_key(node: &NodeConfig, key: &ScannedHostKey) -> Result<bool, String> {
+    let account = node.ssh_user.as_deref().unwrap_or("current account");
+    eprintln!(
+        "SSH host fingerprint for {account}@{} ({}): {}",
+        node.host, key.key_type, key.fingerprint
+    );
+    eprintln!(
+        "Compare it with the fingerprint shown on the Mac itself or obtained through another trusted channel before accepting."
+    );
+    loop {
+        eprint!("Trust this fingerprint? [y/N] (or paste the full fingerprint): ");
+        io::stderr()
+            .flush()
+            .map_err(|error| format!("could not display host-key confirmation: {error}"))?;
+        let mut response = String::new();
+        let count = io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| format!("could not read host-key confirmation: {error}"))?;
+        if count == 0 {
+            return Ok(false);
+        }
+        match host_key_decision(&response, &key.fingerprint) {
+            HostKeyDecision::Accept => return Ok(true),
+            HostKeyDecision::Reject => return Ok(false),
+            HostKeyDecision::Invalid => {
+                eprintln!("Enter y, n, or the exact SHA256 fingerprint shown above.");
+            }
+        }
+    }
+}
+
+fn ensure_default_known_hosts_file(home: &Path) -> Result<PathBuf, String> {
+    let ssh_dir = home.join(".ssh");
+    ensure_directory(&ssh_dir, 0o700, false)?;
+    let path = ssh_dir.join("known_hosts");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => validate_known_hosts_file(&path, home)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not create SSH trust file {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            validate_known_hosts_file(&path, home)?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect SSH trust file {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    Ok(path)
+}
+
+fn known_host_entry_exists(path: &Path, lookup: &str) -> Result<bool, String> {
+    let output = Command::new("/usr/bin/ssh-keygen")
+        .args(["-F", lookup, "-f"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not inspect SSH known_hosts: {error}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "could not inspect SSH known_hosts: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+fn append_known_host_entry(path: &Path, entry: &str, home: &Path) -> Result<(), String> {
+    validate_known_hosts_file(path, home)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("could not open SSH trust file {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect SSH trust file: {error}"))?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+        || !metadata.is_file()
+    {
+        return Err(format!(
+            "refusing to modify unsafe SSH trust file {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > 0 {
+        file.seek(SeekFrom::End(-1))
+            .map_err(|error| format!("could not inspect the end of SSH trust file: {error}"))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)
+            .map_err(|error| format!("could not inspect the end of SSH trust file: {error}"))?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")
+                .map_err(|error| format!("could not update SSH trust file: {error}"))?;
+        }
+    }
+    writeln!(file, "{entry}")
+        .map_err(|error| format!("could not update SSH trust file: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("could not save SSH trust file: {error}"))
+}
+
+fn remove_known_host_entry(path: &Path, lookup: &str, home: &Path) -> Result<(), String> {
+    validate_known_hosts_file(path, home)?;
+    let found = Command::new("/usr/bin/ssh-keygen")
+        .args(["-F", lookup, "-f"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not inspect SSH known_hosts: {error}"))?;
+    if !found.status.success() {
+        return Err(format!(
+            "could not find the exact {lookup} entry in {}; no file was changed",
+            path.display()
+        ));
+    }
+    let removed = Command::new("/usr/bin/ssh-keygen")
+        .args(["-R", lookup, "-f"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("could not remove the stale SSH host key: {error}"))?;
+    if !removed.status.success() {
+        return Err(format!(
+            "could not remove the exact {lookup} entry from {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&removed.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn recover_changed_host_key(node: &NodeConfig, error: &str) -> Result<(), String> {
+    if unsafe { libc::isatty(0) } != 1 {
+        return Err(format!(
+            "SSH host key for {} changed. Run mnode from an interactive Terminal to verify the replacement fingerprint; no known_hosts entry was changed",
+            node.host
+        ));
+    }
+    let path = offending_host_key_file(error).ok_or_else(|| {
+        format!(
+            "SSH host key for {} changed, but OpenSSH did not identify a removable offending entry; inspect known_hosts manually",
+            node.host
+        )
+    })?;
+    let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        "cannot locate the login account's HOME for SSH host-key recovery".to_owned()
+    })?;
+    validate_known_hosts_file(&path, &home)?;
+    let key = scan_host_key(node)?;
+    if !prompt_for_host_key(node, &key)? {
+        return Err(format!(
+            "replacement SSH host key for {} was not accepted; known_hosts was left unchanged",
+            node.host
+        ));
+    }
+    let lookup = known_host_lookup(&node.host, node.ssh_port.unwrap_or(22));
+    remove_known_host_entry(&path, &lookup, &home)?;
+    append_known_host_entry(&path, &key.known_hosts_line, &home)?;
+    eprintln!(
+        "Replaced only the stale {lookup} entry in {}. The exact scanned key is now pinned; the next SSH connection will reject any different key.",
+        path.display()
+    );
+    Ok(())
+}
+
 pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result<(), String> {
     match probe_key_auth(node) {
         Ok(()) => return Ok(()),
@@ -334,10 +713,26 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
                 }
             }
             SshFailureKind::ChangedHostKey => {
-                return Err(format!(
-                    "SSH host key for {} changed; inspect known_hosts before retrying",
-                    node.host
-                ));
+                recover_changed_host_key(node, &error)?;
+                match probe_key_auth(node) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => match classify_ssh_error(&error) {
+                        SshFailureKind::Authentication => {}
+                        SshFailureKind::UnknownHostKey => {
+                            return Err(format!(
+                                "replacement SSH host key for {} was not accepted; rerun mnode and verify its fingerprint",
+                                node.host
+                            ));
+                        }
+                        SshFailureKind::ChangedHostKey => {
+                            return Err(format!(
+                                "SSH host key for {} changed again while being verified; stop and inspect the host identity",
+                                node.host
+                            ));
+                        }
+                        SshFailureKind::Other => return Err(error),
+                    },
+                }
             }
             SshFailureKind::Other => return Err(error),
         },
@@ -406,21 +801,31 @@ fn probe_key_auth(node: &NodeConfig) -> Result<(), String> {
 }
 
 fn run_host_key_confirmation(node: &NodeConfig) -> Result<(), String> {
+    if unsafe { libc::isatty(0) } != 1 {
+        return Err("SSH host-key confirmation requires an interactive Terminal".into());
+    }
+    let home = env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        "cannot locate the login account's HOME for SSH host-key confirmation".to_owned()
+    })?;
+    let key = scan_host_key(node)?;
+    if !prompt_for_host_key(node, &key)? {
+        return Err(format!(
+            "SSH host key for {} was not accepted; no known_hosts entry was changed",
+            node.host
+        ));
+    }
+    let path = ensure_default_known_hosts_file(&home)?;
+    let lookup = known_host_lookup(&node.host, node.ssh_port.unwrap_or(22));
+    if known_host_entry_exists(&path, &lookup)? {
+        return Err(format!(
+            "SSH trust entry for {lookup} already exists in {}; OpenSSH reported it as unknown, so no entry was changed",
+            path.display()
+        ));
+    }
+    append_known_host_entry(&path, &key.known_hosts_line, &home)?;
     eprintln!(
-        "Verify the SSH host fingerprint shown by OpenSSH for {} before accepting it.",
-        node.host
+        "Pinned the confirmed SSH host key for {lookup}; the next connection will verify that exact key."
     );
-    let _ = run_interactive_ssh(
-        node,
-        &[
-            "StrictHostKeyChecking=ask",
-            "PreferredAuthentications=publickey",
-            "PubkeyAuthentication=no",
-            "PasswordAuthentication=no",
-            "KbdInteractiveAuthentication=no",
-        ],
-        "/usr/bin/true",
-    )?;
     Ok(())
 }
 
@@ -459,10 +864,18 @@ fn run_interactive_ssh(
 #[cfg(test)]
 mod tests {
     use super::{
-        SshFailureKind, classify_ssh_error, ensure_local_keypair, existing_ssh_identity_file,
-        install_public_key_script, ssh_identity_path,
+        HostKeyDecision, SshFailureKind, append_known_host_entry, classify_ssh_error,
+        ensure_local_keypair, existing_ssh_identity_file, host_key_decision,
+        install_public_key_script, known_host_lookup, offending_host_key_file,
+        parse_host_key_scan_output, remove_known_host_entry, ssh_identity_path,
+        validate_known_hosts_file,
     };
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     fn temp_root(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -652,5 +1065,133 @@ mod tests {
             classify_ssh_error("Connection timed out"),
             SshFailureKind::Other
         );
+    }
+
+    #[test]
+    fn changed_host_key_error_extracts_the_offending_file_path() {
+        let error = "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nOffending ED25519 key in /Users/operator/.ssh with spaces/known_hosts:36\nHost key verification failed.";
+        assert_eq!(
+            offending_host_key_file(error).as_deref(),
+            Some(Path::new("/Users/operator/.ssh with spaces/known_hosts"))
+        );
+        assert_eq!(
+            offending_host_key_file("Host key verification failed."),
+            None
+        );
+    }
+
+    #[test]
+    fn host_key_lookup_formats_nondefault_ports() {
+        assert_eq!(known_host_lookup("192.0.2.3", 22), "192.0.2.3");
+        assert_eq!(known_host_lookup("192.0.2.3", 2222), "[192.0.2.3]:2222");
+    }
+
+    #[test]
+    fn host_key_confirmation_accepts_y_or_exact_fingerprint_and_defaults_to_no() {
+        let fingerprint = "SHA256:AbCdEf0123456789";
+        assert_eq!(host_key_decision("y", fingerprint), HostKeyDecision::Accept);
+        assert_eq!(
+            host_key_decision(" YES ", fingerprint),
+            HostKeyDecision::Accept
+        );
+        assert_eq!(
+            host_key_decision(fingerprint, fingerprint),
+            HostKeyDecision::Accept
+        );
+        assert_eq!(host_key_decision("n", fingerprint), HostKeyDecision::Reject);
+        assert_eq!(host_key_decision("", fingerprint), HostKeyDecision::Reject);
+        assert_eq!(
+            host_key_decision("SHA256:abcdef0123456789", fingerprint),
+            HostKeyDecision::Invalid
+        );
+    }
+
+    #[test]
+    fn stale_host_key_removal_is_exact_and_preserves_a_backup() {
+        let root = temp_root("replace-known-host");
+        let home = root.join("home");
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let key = ensure_local_keypair(&root.join("key-home"), "known-host-test").unwrap();
+        let path = ssh_dir.join("known_hosts");
+        let contents = format!(
+            "192.0.2.3 {}\n192.0.2.4 {}\n",
+            key.public_key, key.public_key
+        );
+        fs::write(&path, &contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        validate_known_hosts_file(&path, &home).unwrap();
+        remove_known_host_entry(&path, "192.0.2.3", &home).unwrap();
+
+        let remaining = fs::read_to_string(&path).unwrap();
+        assert!(!remaining.contains("192.0.2.3"));
+        assert!(remaining.contains("192.0.2.4"));
+        let backup = PathBuf::from(format!("{}.old", path.display()));
+        assert_eq!(fs::read_to_string(backup).unwrap(), contents);
+        assert!(validate_known_hosts_file(&root.join("foreign/known_hosts"), &home).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scanned_host_key_prefers_ed25519_and_displays_its_fingerprint() {
+        let root = temp_root("scan-host-key");
+        let identity = ensure_local_keypair(&root.join("key-home"), "known-host-test").unwrap();
+        let key = identity.public_key.split_whitespace().collect::<Vec<_>>();
+        let output = format!(
+            "# scan banner\n192.0.2.3 ecdsa-sha2-nistp256 aaaa\n192.0.2.3 {} {}\n",
+            key[0], key[1]
+        );
+
+        let scanned = parse_host_key_scan_output(&output, "192.0.2.3", 22).unwrap();
+
+        assert_eq!(scanned.key_type, "ssh-ed25519");
+        assert_eq!(
+            scanned.known_hosts_line,
+            format!("192.0.2.3 {} {}", key[0], key[1])
+        );
+        assert!(scanned.fingerprint.starts_with("SHA256:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scanned_host_key_normalizes_nondefault_port_and_hostkey_fingerprint_input() {
+        let root = temp_root("scan-host-key-port");
+        let identity = ensure_local_keypair(&root.join("key-home"), "known-host-test").unwrap();
+        let output = format!("[192.0.2.3]:2222 {}\n", identity.public_key);
+
+        let scanned = parse_host_key_scan_output(&output, "192.0.2.3", 2222).unwrap();
+
+        assert!(
+            scanned
+                .known_hosts_line
+                .starts_with("[192.0.2.3]:2222 ssh-ed25519 ")
+        );
+        assert_eq!(
+            host_key_decision(&scanned.fingerprint, &scanned.fingerprint),
+            HostKeyDecision::Accept
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn appending_a_confirmed_host_key_preserves_existing_file_contents() {
+        let root = temp_root("append-known-host");
+        let home = root.join("home");
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = ssh_dir.join("known_hosts");
+        fs::write(&path, "192.0.2.1 ssh-ed25519 AAAAold").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        append_known_host_entry(&path, "192.0.2.3 ssh-ed25519 AAAAnew", &home).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "192.0.2.1 ssh-ed25519 AAAAold\n192.0.2.3 ssh-ed25519 AAAAnew\n"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

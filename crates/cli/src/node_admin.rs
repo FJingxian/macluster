@@ -2,6 +2,7 @@
 
 mod addresses;
 mod primary_reuse;
+mod scan;
 
 pub(crate) use addresses::{
     address_migration_has_active_jobs, address_migration_pending, prepare_node_address_migration,
@@ -1765,7 +1766,10 @@ struct AddOptions {
 #[derive(Debug)]
 enum Action {
     Add(AddOptions),
-    List,
+    List {
+        all: bool,
+    },
+    Scan,
     Failures,
     Remove {
         target: String,
@@ -1882,7 +1886,11 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     }
     let action = parse_action(args)?;
     match action {
-        Action::List => list_nodes(&config_path, &state_dir),
+        Action::List { all } => list_nodes(&config_path, &state_dir, all),
+        Action::Scan => {
+            let config = read_config(&config_path)?;
+            scan::scan_nodes(&config)
+        }
         Action::Failures => list_failed_operations(&config_path, &state_dir),
         Action::Add(options) => add_node(&config_path, &state_dir, options),
         Action::Remove { target, connect } => {
@@ -3055,10 +3063,17 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         return Ok(Action::Failures);
     }
     if key == "-l" || key == "--list" {
-        if args.len() != 1 {
-            return Err((2, "mnode --list does not accept a value".into()));
+        let all = args.get(1).is_some_and(|value| value == "--all");
+        if args.len() != (if all { 2 } else { 1 }) || inline.is_some() {
+            return Err((2, "use `mnode -l [--all]`".into()));
         }
-        return Ok(Action::List);
+        return Ok(Action::List { all });
+    }
+    if key == "--scan" {
+        if inline.is_some() || args.len() != 1 {
+            return Err((2, "mnode --scan does not accept arguments".into()));
+        }
+        return Ok(Action::Scan);
     }
     match key {
         "-a" | "--add" => {
@@ -3252,7 +3267,8 @@ fn node_help(full: bool) -> &'static str {
         return r#"Usage
   mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
   mnode -a local[:SOURCE_PATH] [OPTIONS]
-  mnode -l|--list
+  mnode -l|--list [--all]
+  mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
   mnode -rm share:SHARE_ID
@@ -3267,6 +3283,9 @@ OPTIONS
 EXAMPLES
   mnode -a user@192.0.2.10
   mnode -a local
+  mnode --scan
+
+Use `mnode -l --all` to include unreachable compute nodes.
 
 Use --help for share, SSH, and removal details."#;
     }
@@ -3274,7 +3293,8 @@ Use --help for share, SSH, and removal details."#;
     r#"Usage
   mnode -a|--add USER@IPv4[:PORT][:SOURCE_PATH] [OPTIONS]
   mnode -a local[:SOURCE_PATH] [OPTIONS]
-  mnode -l|--list
+  mnode -l|--list [--all]
+  mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
   mnode -rm share:SHARE_ID
@@ -3293,6 +3313,9 @@ EXAMPLES
   mnode -a local
   mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
   mnode -rm default-001
+
+`mnode -l` briefly keeps unreachable compute nodes as RECONNECTING, then hides
+them after 60 seconds. Use `mnode -l --all` to include those nodes.
 
 ADD NODES
   Setup is verified before a node is listed. Failed attempts stay outside the
@@ -3322,6 +3345,15 @@ REMOVE NODES
   The connection is saved for interrupted-removal retries. Host-key
   verification stays enabled. `mnode -rm share:SHARE_ID` removes a configured
   named share or cancels incomplete setup. Source directories and files remain.
+
+SCAN NETWORK
+  `mnode --scan` searches only the subnet attached to the configured login
+  address. It reports IP, MAC when known, service availability, registered
+  node ID, and a best-effort OS guess. Generic SSH banners may not identify
+  macOS or Linux. Reachability checks do not verify login credentials.
+  The interface link rate is shown when macOS reports it; this is not a
+  throughput benchmark. Scanning is read-only; it does not enroll nodes or
+  change SSH trust. Add a result separately with `mnode -a USER@IP`.
 
 CONTROLLER MAINTENANCE
   Node and share changes pause submissions. If the controller is running,
@@ -8335,26 +8367,151 @@ pub(crate) fn forget_cluster_update_trust(
             cluster_id: cluster_id.to_owned(),
         },
     };
-    match request_nfs_admin_service(node, &request)? {
-        Some(()) => Ok(()),
-        None => {
+    match request_nfs_admin_service(node, &request) {
+        Err(error) if is_foreign_cluster_updater_trust_error(&error) => {
+            eprintln!(
+                "Preserving updater trust on {} because it belongs to another cluster; this operation will only remove trust owned by the current cluster.",
+                node.host
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+        Ok(Some(())) => Ok(()),
+        Ok(None) => {
             let trust_dir = "/Library/PrivilegedHelperTools/org.macluster.update";
+            let cluster_id_path = format!("{trust_dir}/cluster-id");
             let script = format!(
-                "if [ -e {path} ] || [ -L {path} ]; then exit 0; else exit 1; fi",
-                path = shell_quote(trust_dir)
+                "if [ -L {trust_dir} ]; then exit 2; fi\nif [ ! -e {trust_dir} ]; then exit 1; fi\nif [ ! -d {trust_dir} ] || [ -L {cluster_id_path} ] || [ ! -f {cluster_id_path} ]; then exit 2; fi\n/bin/cat {cluster_id_path}\n",
+                trust_dir = shell_quote(trust_dir),
+                cluster_id_path = shell_quote(&cluster_id_path),
             );
             let output = ssh_output(node, &script, None).map_err(|(_, error)| error)?;
-            if output.status.code() == Some(1) {
-                Ok(())
-            } else if output.status.success() {
-                Err("the node still has pinned cluster updater trust, but its privileged service cannot remove it; refresh the helper and retry".into())
-            } else {
-                Err(command_error(
+            match output.status.code() {
+                Some(1) => Ok(()),
+                Some(0) => {
+                    let installed_cluster_id = String::from_utf8_lossy(&output.stdout);
+                    let installed_cluster_id = installed_cluster_id.trim();
+                    if Id128::parse(installed_cluster_id)
+                        .is_ok_and(|parsed| parsed.to_string() == installed_cluster_id)
+                        && installed_cluster_id != cluster_id
+                    {
+                        eprintln!(
+                            "Preserving updater trust on {} because it belongs to another cluster; this operation will only remove trust owned by the current cluster.",
+                            node.host
+                        );
+                        Ok(())
+                    } else {
+                        Err("the node still has updater trust for this cluster, but its privileged service cannot remove it; refresh the helper and retry".into())
+                    }
+                }
+                _ => Err(command_error(
                     "cannot inspect pinned cluster updater trust",
                     &output,
-                ))
+                )),
             }
         }
+    }
+}
+
+fn is_foreign_cluster_updater_trust_error(error: &str) -> bool {
+    error.trim() == "refusing to forget updater trust for a different cluster"
+}
+
+fn foreign_updater_trust_to_remove(
+    installed_cluster_id: &str,
+    requested_cluster_id: &str,
+) -> Result<Option<String>, String> {
+    for (label, cluster_id) in [
+        ("installed", installed_cluster_id),
+        ("requested", requested_cluster_id),
+    ] {
+        let parsed = Id128::parse(cluster_id)
+            .map_err(|_| format!("{label} cluster updater identity is invalid"))?;
+        if parsed.to_string() != cluster_id {
+            return Err(format!(
+                "{label} cluster updater identity must be canonical"
+            ));
+        }
+    }
+    Ok((installed_cluster_id != requested_cluster_id).then(|| installed_cluster_id.to_owned()))
+}
+
+fn read_pinned_updater_cluster_id(node: &NodeConfig) -> Result<Option<String>, String> {
+    let trust_dir = "/Library/PrivilegedHelperTools/org.macluster.update";
+    let cluster_id_path = format!("{trust_dir}/cluster-id");
+    let script = format!(
+        "if [ -L {trust_dir} ] || [ -L {cluster_id_path} ]; then echo 'pinned updater trust path is a symlink' >&2; exit 2; fi\nif [ ! -e {trust_dir} ]; then exit 1; fi\nif [ ! -d {trust_dir} ] || [ ! -f {cluster_id_path} ]; then echo 'pinned updater trust is incomplete' >&2; exit 2; fi\n/bin/cat {cluster_id_path}\n",
+        trust_dir = shell_quote(trust_dir),
+        cluster_id_path = shell_quote(&cluster_id_path),
+    );
+    let output = ssh_output(node, &script, None).map_err(|(_, error)| error)?;
+    match output.status.code() {
+        Some(1) => Ok(None),
+        Some(0) => {
+            let cluster_id = String::from_utf8_lossy(&output.stdout);
+            let cluster_id = cluster_id.trim();
+            let parsed = Id128::parse(cluster_id)
+                .map_err(|_| "pinned updater cluster identity is invalid".to_owned())?;
+            if parsed.to_string() != cluster_id {
+                return Err("pinned updater cluster identity is not canonical".into());
+            }
+            Ok(Some(cluster_id.to_owned()))
+        }
+        _ => Err(command_error(
+            "cannot inspect pinned updater trust",
+            &output,
+        )),
+    }
+}
+
+/// A fresh mnode --add explicitly transfers an idle machine into this cluster.
+/// Remove only the previously pinned updater identity through the privileged
+/// service; its implementation verifies the exact old cluster ID, serializes
+/// against helper updates, and deletes only managed trust files. Existing
+/// per-cluster configs and job data are left untouched.
+fn retire_foreign_updater_trust_for_enrollment(
+    node: &NodeConfig,
+    requested_cluster_id: &str,
+) -> Result<(), String> {
+    let Some(installed_cluster_id) = read_pinned_updater_cluster_id(node)? else {
+        return Ok(());
+    };
+    let Some(cluster_id_to_remove) =
+        foreign_updater_trust_to_remove(&installed_cluster_id, requested_cluster_id)?
+    else {
+        return Ok(());
+    };
+
+    eprintln!(
+        "Transferring {} from a previous cluster: retiring only its old privileged updater trust; saved cluster configs and job data are preserved.",
+        node.host
+    );
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::ForgetClusterUpdater {
+            cluster_id: cluster_id_to_remove.clone(),
+        },
+    };
+    match request_nfs_admin_service(node, &request)? {
+        Some(()) => {}
+        None => {
+            return Err(format!(
+                "cannot transfer {} from its previous cluster because its privileged updater service is unavailable; refresh that service before retrying node enrollment",
+                node.host
+            ));
+        }
+    }
+
+    match read_pinned_updater_cluster_id(node)?.as_deref() {
+        None => Ok(()),
+        Some(installed) if installed == requested_cluster_id => Ok(()),
+        Some(installed) if installed == cluster_id_to_remove => Err(format!(
+            "previous updater trust remains pinned on {}; retry node enrollment to resume its cleanup",
+            node.host
+        )),
+        Some(_) => Err(format!(
+            "updater trust changed concurrently on {}; inspect the node before retrying enrollment",
+            node.host
+        )),
     }
 }
 
@@ -8539,14 +8696,8 @@ pub(crate) fn update_nfs_exports(
                 )
             })
         }
-        Err(error)
-            if node.transport == Transport::Local
-                && nfs_exports_permission_denied(&error)
-                && !io::stdin().is_terminal() =>
-        {
-            Err(format!(
-                "{error}; macOS denied the background service access to /etc/exports. Rerun this mnode command from Terminal to authorize the same transaction with sudo."
-            ))
+        Err(error) if nfs_exports_permission_denied(&error) => {
+            Err(nfs_exports_permission_failure_guidance(node, &error).unwrap_or(error))
         }
         Err(error) => Err(error),
     }
@@ -8557,6 +8708,22 @@ fn nfs_exports_permission_denied(error: &str) -> bool {
     normalized.contains("/etc/exports")
         && (normalized.contains("operation not permitted")
             || normalized.contains("interrupted system call"))
+}
+
+fn nfs_exports_permission_failure_guidance(node: &NodeConfig, error: &str) -> Option<String> {
+    if !nfs_exports_permission_denied(error) {
+        return None;
+    }
+    let action = match node.transport {
+        Transport::Local => "macOS denied the background NFS service access to /etc/exports. In System Settings > Privacy & Security > Full Disk Access, authorize the Terminal app used for this command, quit and reopen Terminal, then rerun the same mnode command.".to_owned(),
+        Transport::Ssh => format!(
+            "macOS denied the NFS export write on remote NFS server {}. Its TCC log identifies /Library/PrivilegedHelperTools/org.macluster.power as the responsible process. On that Mac, grant this exact executable Full Disk Access in System Settings > Privacy & Security > Full Disk Access (or use an equivalent MDM privacy policy), then rerun the same mnode command. Full Disk Access for /sbin/nfsd is a separate permission for nfsd to read/check exports; it does not authorize this write. SSH or sudo authorization alone cannot grant this macOS privacy permission.",
+            node.host
+        ),
+    };
+    Some(format!(
+        "{error}; {action} The NFS transaction files were preserved for retry."
+    ))
 }
 
 fn should_fallback_nfs_exports_to_terminal(
@@ -11023,9 +11190,47 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
 }
 
 const MAX_NODE_LIST_PROBES: usize = 16;
+const NODE_RECONNECT_GRACE_MS: u64 = 60_000;
 
 fn node_list_probe_worker_count(node_count: usize) -> usize {
     node_count.min(MAX_NODE_LIST_PROBES)
+}
+
+fn node_list_state(
+    bridge_online: bool,
+    login_node: bool,
+    digest_matches: bool,
+    shares_ready: bool,
+    unreachable_since_unix_ms: Option<u64>,
+    now_unix_ms: u64,
+    show_all: bool,
+) -> Option<&'static str> {
+    if !bridge_online && !login_node {
+        let offline_since = unreachable_since_unix_ms.unwrap_or(now_unix_ms);
+        let grace_elapsed = now_unix_ms.saturating_sub(offline_since) >= NODE_RECONNECT_GRACE_MS;
+        if grace_elapsed && !show_all {
+            return None;
+        }
+        return Some(if show_all && grace_elapsed {
+            "OFFLINE"
+        } else {
+            "RECONNECTING"
+        });
+    }
+    Some(if digest_matches && shares_ready && bridge_online {
+        "READY"
+    } else if bridge_online {
+        "ONLINE"
+    } else {
+        "OFFLINE"
+    })
+}
+
+fn ssh_endpoint_is_reachable(transport: &ClusterTransport, node: &NodeConfig) -> bool {
+    node.transport == Transport::Ssh
+        && transport
+            .endpoint_reachable(node, Duration::from_millis(300))
+            .unwrap_or(false)
 }
 
 fn probe_node_list(
@@ -11039,6 +11244,9 @@ fn probe_node_list(
     };
     let mut transport =
         ClusterTransport::new_with_namespace(config_path.to_path_buf(), namespace.to_owned());
+    if transport.endpoint_reachable(node, Duration::from_millis(300)) == Some(false) {
+        return (None, false);
+    }
     // Health walks configured share paths. A local disk or NFS mount can
     // block that walk, so bound it and use the storage-independent Ping as a
     // fallback before declaring an otherwise reachable node offline.
@@ -11055,15 +11263,15 @@ fn probe_node_list(
                 }
                 // A malformed Agent response still proves that the bridge answered.
                 Err(macluster_controller::transport::TransportError::Protocol(_)) => (None, true),
-                Err(_) => (None, false),
+                Err(_) => (None, ssh_endpoint_is_reachable(&transport, node)),
             }
         }
         Err(macluster_controller::transport::TransportError::Protocol(_)) => (None, true),
-        Err(_) => (None, false),
+        Err(_) => (None, ssh_endpoint_is_reachable(&transport, node)),
     }
 }
 
-fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
+fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult<()> {
     if !config_path.is_file() {
         return Err((
             1,
@@ -11083,6 +11291,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
     let canonical = config_path.canonicalize().map_err(io_error)?;
     let journal_path = state_dir.join("node-admin.json");
     let state = read_admin_state(&journal_path, &canonical, state_dir)?;
+    let liveness_now_ms = validation_now_ms();
     let tasks = Mutex::new(VecDeque::from_iter(config.nodes.iter()));
     let observations = std::thread::scope(|scope| {
         let handles = (0..node_list_probe_worker_count(config.nodes.len()))
@@ -11112,7 +11321,38 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
             .collect::<BTreeMap<_, _>>()
     });
     let mut observations = observations;
+    let liveness_observations = config
+        .nodes
+        .iter()
+        .map(|(id, node)| {
+            let bridge_online = observations
+                .get(id)
+                .is_some_and(|(_, bridge_online)| *bridge_online);
+            macluster_controller::liveness::NodeObservation {
+                node_id: id.clone(),
+                identity_key: node
+                    .machine_uuid
+                    .as_deref()
+                    .unwrap_or(node.host.as_str())
+                    .to_ascii_lowercase(),
+                reachable: bridge_online,
+            }
+        })
+        .collect::<Vec<_>>();
+    let liveness = match macluster_controller::liveness::observe_many(
+        state_dir,
+        &config.share_uuid,
+        &liveness_observations,
+        liveness_now_ms,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("macluster: could not update node reconnect grace state: {error}");
+            BTreeMap::new()
+        }
+    };
     let mut rows = Vec::new();
+    let mut hidden_unreachable = 0usize;
     for (id, node) in &config.nodes {
         let queue_names = config
             .queues
@@ -11132,12 +11372,21 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
                     .keys()
                     .all(|share_id| health.shares.get(share_id).copied().unwrap_or(false))
         });
-        let state_name = if digest_matches && all_shares_ready && bridge_online {
-            "READY"
-        } else if bridge_online {
-            "ONLINE"
-        } else {
-            "OFFLINE"
+        let login_node = config.is_login_node(id);
+        let unreachable_since = liveness
+            .get(id)
+            .and_then(|record| record.unreachable_since_unix_ms);
+        let Some(state_name) = node_list_state(
+            bridge_online,
+            login_node,
+            digest_matches,
+            all_shares_ready,
+            unreachable_since,
+            liveness_now_ms,
+            show_all,
+        ) else {
+            hidden_unreachable += 1;
+            continue;
         };
         let user = if node.transport == Transport::Local {
             "local"
@@ -11169,6 +11418,11 @@ fn list_nodes(config_path: &Path, state_dir: &Path) -> AppResult<()> {
     if drafts > 0 {
         eprintln!(
             "{drafts} enrollment attempt(s) did not complete; those nodes are not registered. Use `mnode --failed` to find their IDs, rerun `mnode -a ...` to resume, or `mnode -rm NODE_ID` to cancel an attempt."
+        );
+    }
+    if hidden_unreachable > 0 {
+        eprintln!(
+            "{hidden_unreachable} unreachable compute node(s) hidden after the 60-second reconnect grace; use `mnode -l --all` to show them"
         );
     }
     print!("{}", format_node_list(&rows));
@@ -13680,6 +13934,10 @@ fn add_local_node(
                 Some(&update_trust),
             )
         };
+        if !defer_queue_for_share {
+            retire_foreign_updater_trust_for_enrollment(&local_node, &update_trust.cluster_id)
+                .map_err(|error| (1, error))?;
+        }
         let power_setup = if defer_queue_for_share {
             None
         } else {
@@ -14615,6 +14873,8 @@ fn add_ssh_node(
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
 
+        retire_foreign_updater_trust_for_enrollment(&node_config, &update_trust.cluster_id)
+            .map_err(|error| (1, error))?;
         let existing_power_setups = prepare_power_helpers_for_nodes(
             &config,
             &operation.id,
@@ -14943,8 +15203,8 @@ mod tests {
         named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
         nfs_exports_read_command, nfs_exports_update_baseline_read_command,
         nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
-        node_admin_recovery_pending, node_nfs_mappings, normalize_binary_path, parse_action,
-        parse_agent_build_probe, parse_nfs_exports_update_baseline,
+        node_admin_recovery_pending, node_list_state, node_nfs_mappings, normalize_binary_path,
+        parse_action, parse_agent_build_probe, parse_nfs_exports_update_baseline,
         pending_add_may_have_client_state, pending_add_operation_for_endpoint,
         pending_combined_ssh_add, pending_local_share_retry_node,
         pending_managed_export_cleanup_plan, plan_ensure_nfs_exports, plan_remove_nfs_exports,
@@ -16763,6 +17023,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let mut health = NodeHealth {
             machine_uuid: config.nodes["login"].machine_uuid.clone().unwrap(),
             execution_uid: 501,
+            logical_cpus: None,
             execution_digest: config.execution_digest().unwrap(),
             primary_share_ready: true,
             shares: BTreeMap::from([("JanusX".into(), false)]),
@@ -17573,6 +17834,34 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn scan_action_accepts_no_extra_arguments() {
+        let args = ["--scan"].map(str::to_owned);
+        assert!(
+            parse_action(&args).is_ok(),
+            "mnode --scan must be a recognized action"
+        );
+
+        let args = ["--scan", "192.0.2.0/24"].map(str::to_owned);
+        let error = parse_action(&args).expect_err("scan does not accept a subnet override");
+        assert_eq!(error.0, 2);
+    }
+
+    #[test]
+    fn list_action_accepts_all_for_unreachable_nodes() {
+        let args = ["-l", "--all"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::List { all: true })
+        ));
+
+        let args = ["--list"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::List { all: false })
+        ));
+    }
+
+    #[test]
     fn removal_accepts_an_explicit_connection_for_a_moved_node() {
         let args = ["-rm", "default-a", "--connect", "operator@192.0.2.10"].map(str::to_owned);
         assert!(
@@ -18219,6 +18508,7 @@ remote_binary = "/usr/local/bin/macluster"
         let health = NodeHealth {
             machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
             execution_uid: 501,
+            logical_cpus: None,
             execution_digest: "test-digest".into(),
             primary_share_ready: true,
             shares: BTreeMap::new(),
@@ -18265,11 +18555,31 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
+    fn node_list_hides_only_after_grace_and_keeps_login_visible() {
+        assert_eq!(
+            node_list_state(false, false, false, false, Some(10_000), 69_999, false),
+            Some("RECONNECTING")
+        );
+        assert_eq!(
+            node_list_state(false, false, false, false, Some(10_000), 70_000, false),
+            None
+        );
+        assert_eq!(
+            node_list_state(false, false, false, false, Some(10_000), 70_000, true),
+            Some("OFFLINE")
+        );
+        assert_eq!(
+            node_list_state(false, true, false, false, Some(10_000), 70_000, false),
+            Some("OFFLINE")
+        );
+    }
+
+    #[test]
     fn listing_nodes_without_active_config_tells_user_to_initialize() {
         let root =
             std::env::temp_dir().join(format!("macluster-uninitialized-{}", Id128::random()));
         fs::create_dir_all(&root).expect("create test root");
-        let result = list_nodes(&root.join("config.toml"), &root.join("controller"));
+        let result = list_nodes(&root.join("config.toml"), &root.join("controller"), false);
         let error = result.expect_err("listing requires an active cluster config");
         let _ = fs::remove_dir_all(&root);
 
@@ -18735,6 +19045,51 @@ ssh_port = 22
             "/etc/exports: Operation not permitted",
             true,
         ));
+    }
+
+    #[test]
+    fn remote_nfs_exports_permission_error_explains_the_per_node_privacy_gate() {
+        let mut remote = local_share_test_node();
+        remote.host = "192.0.2.3".into();
+        remote.transport = Transport::Ssh;
+
+        let guidance = super::nfs_exports_permission_failure_guidance(
+            &remote,
+            "NFS admin command failed: /bin/sh: line 34: /etc/exports: Operation not permitted",
+        )
+        .unwrap();
+
+        assert!(guidance.contains("192.0.2.3"));
+        assert!(guidance.contains("Full Disk Access"));
+        assert!(guidance.contains("org.macluster.power"));
+        assert!(guidance.contains("rerun the same mnode command"));
+        assert!(guidance.contains("transaction files were preserved"));
+    }
+
+    #[test]
+    fn updater_trust_from_another_cluster_is_classified_as_preservable() {
+        assert!(super::is_foreign_cluster_updater_trust_error(
+            "refusing to forget updater trust for a different cluster"
+        ));
+        assert!(!super::is_foreign_cluster_updater_trust_error(
+            "pinned updater trust is corrupt"
+        ));
+    }
+
+    #[test]
+    fn enrollment_retires_only_a_canonical_foreign_updater_pin() {
+        let current = "00000000-0000-4000-8000-000000000001";
+        let foreign = "00000000-0000-4000-8000-000000000002";
+        assert_eq!(
+            super::foreign_updater_trust_to_remove(foreign, current).unwrap(),
+            Some(foreign.to_owned())
+        );
+        assert_eq!(
+            super::foreign_updater_trust_to_remove(current, current).unwrap(),
+            None
+        );
+        assert!(super::foreign_updater_trust_to_remove("not-a-cluster", current).is_err());
+        assert!(super::foreign_updater_trust_to_remove(foreign, "not-a-cluster").is_err());
     }
 
     #[test]

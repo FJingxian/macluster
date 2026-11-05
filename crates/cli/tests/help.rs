@@ -54,6 +54,8 @@ fn long_help_keeps_operational_details_for_reference() {
     assert!(submit.contains("RSS snapshot"), "{submit}");
 
     let node = help(&["mnode", "--help"]);
+    assert!(node.contains("mnode --scan"), "{node}");
+    assert!(node.contains("searches only the subnet attached"), "{node}");
     assert!(node.contains("host fingerprint"));
     assert!(node.contains("host-key verification"));
 
@@ -81,10 +83,7 @@ fn main_help_is_a_compact_module_index() {
         "{output}"
     );
     assert!(output.contains("macluster --init"), "{output}");
-    assert!(
-        output.contains("macluster --web [127.0.0.1[:PORT]]"),
-        "{output}"
-    );
+    assert!(output.contains("macluster --web [IP[:PORT]]"), "{output}");
     assert!(!output.contains("macluster controller"), "{output}");
 }
 

@@ -283,6 +283,11 @@ fn controller_is_running(global: &GlobalOptions, state_dir: &Path) -> bool {
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    // Network discovery only probes the configured login subnet. It must not
+    // trigger address migration or an Agent refresh before the read-only scan.
+    if is_node_network_scan(command, args) {
+        return false;
+    }
     // Init owns reset/recovery and stages any artifacts needed by a new cluster.
     // Updating the old cluster first can block the very operation repairing it.
     if command == "init" {
@@ -317,7 +322,7 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 }
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
-    if matches!(command, "internal" | "agent" | "init") {
+    if matches!(command, "internal" | "agent" | "init") || is_node_network_scan(command, args) {
         return false;
     }
     if command == "fans"
@@ -3639,6 +3644,7 @@ fn validate_shared_output_path(
 
 fn is_read_only_query(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "top")
+        || is_node_network_scan(command, args)
         || command == "controller" && args.first().is_some_and(|arg| arg == "status")
         || command == "node"
             && args
@@ -3648,6 +3654,10 @@ fn is_read_only_query(command: &str, args: &[String]) -> bool {
             && args
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
+}
+
+fn is_node_network_scan(command: &str, args: &[String]) -> bool {
+    command == "node" && args.first().is_some_and(|arg| arg == "--scan")
 }
 
 fn job_listing_uses_local_store(args: &[String]) -> bool {
@@ -7139,6 +7149,7 @@ mod tests {
             ("agent", vec!["--stdio".into()]),
             ("top", vec!["--help".into()]),
             ("node", vec!["-h".into()]),
+            ("node", vec!["--scan".into()]),
             ("init", vec!["--help".into()]),
             ("init", vec![]),
             ("init", vec!["--force".into()]),
@@ -7172,6 +7183,9 @@ mod tests {
             &["python".into(), "-h".into()]
         ));
         assert!(!super::should_refresh_node_addresses("init", &[]));
+        let scan_args = ["--scan".into()];
+        assert!(!super::should_refresh_node_addresses("node", &scan_args));
+        assert!(super::is_read_only_query("node", &scan_args));
         for lifecycle_command in ["start", "stop", "restart", "status"] {
             assert!(!should_preflight_agent_update(
                 "controller",

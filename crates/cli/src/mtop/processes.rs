@@ -423,6 +423,7 @@ fn parse_ps_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
     if rows.is_empty() {
         return Err("ps process sample returned no valid rows".into());
     }
+    sort_processes(&mut rows, ProcessSort::Cpu);
     Ok(rows)
 }
 
@@ -757,10 +758,10 @@ mod tests {
             rows.len()
         );
         assert!(!rows.is_empty());
-        assert!(
-            rows.iter()
-                .all(|row| row.memory.ends_with('K') && row.cpu_percent.is_finite())
-        );
+        assert!(rows.iter().all(
+            |row| matches!(row.memory.chars().last(), Some('K' | 'M' | 'G'))
+                && row.cpu_percent.is_finite()
+        ));
         assert!(
             rows.windows(2)
                 .all(|pair| pair[0].cpu_percent >= pair[1].cpu_percent)

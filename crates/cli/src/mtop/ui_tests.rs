@@ -90,6 +90,40 @@ fn renderer_handles_wide_medium_compact_and_small_terminals() {
 }
 
 #[test]
+fn expanded_resource_panel_fits_a_100_column_terminal() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.cpu_percent = Some(125.0);
+    snapshot.cpu_max_percent = Some(800.0);
+    snapshot.logical_cpu_percent = Some(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]);
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-a".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-a".into(),
+            host: "192.0.2.11".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: Vec::new(),
+        cpu_history: Vec::new(),
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let screen = rendered_lines(100, 24, &state).join("\n");
+    assert!(screen.contains("RESOURCES"), "details: {screen:?}");
+    assert!(screen.contains("TOP"), "details: {screen:?}");
+    assert!(screen.contains("CPU0"), "details: {screen:?}");
+}
+
+#[test]
 fn node_columns_expand_in_priority_order_as_width_allows() {
     let mut state = AppState::empty("mini01");
     state.nodes.push(super::ui::UiNode {

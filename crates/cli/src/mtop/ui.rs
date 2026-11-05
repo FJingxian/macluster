@@ -25,8 +25,8 @@ const POWER_STALE_AFTER: Duration = Duration::from_secs(15);
 const POWER_CACHE_TTL: Duration =
     Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS);
 const DETAIL_BASE_ROWS: u16 = 5;
-const DETAIL_WIDE_MIN_WIDTH: u16 = 132;
-const DETAIL_WIDE_MIN_HEIGHT: u16 = 10;
+const DETAIL_SPLIT_MIN_WIDTH: u16 = 100;
+const DETAIL_SPLIT_MIN_HEIGHT: u16 = 10;
 const DETAIL_MIN_PROCESS_ROWS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1070,10 +1070,11 @@ fn render_expanded_detail(
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(" Details · c CPU ↓ · m Memory ↓ · Esc to close ");
     let inner = block.inner(area);
-    let wide_layout = area.width >= DETAIL_WIDE_MIN_WIDTH && area.height >= DETAIL_WIDE_MIN_HEIGHT;
+    let split_layout =
+        area.width >= DETAIL_SPLIT_MIN_WIDTH && area.height >= DETAIL_SPLIT_MIN_HEIGHT;
     let header = detail_header_line(node, &selected_age, request_latency, &queues, no_color);
-    if wide_layout {
-        render_wide_expanded_detail(
+    if split_layout {
+        render_split_expanded_detail(
             frame,
             area,
             header,
@@ -1229,7 +1230,7 @@ fn render_process_table(
     frame.render_widget(table, area);
 }
 
-fn render_wide_expanded_detail(
+fn render_split_expanded_detail(
     frame: &mut Frame<'_>,
     area: Rect,
     header: Line<'_>,
@@ -1281,10 +1282,10 @@ fn render_wide_expanded_detail(
         process_pane[0],
     );
     render_process_table(frame, process_pane[1], &node.processes, process_sort);
-    render_wide_resource_panel(frame, panes[2], resources, &node.metrics, no_color);
+    render_resource_panel(frame, panes[2], resources, &node.metrics, no_color);
 }
 
-fn render_wide_resource_panel(
+fn render_resource_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     resources: &ResourceValues,

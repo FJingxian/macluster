@@ -39,6 +39,13 @@ pub struct NodeLiveness {
     pub health: Option<NodeHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_sampled_unix_ms: Option<u64>,
+    /// Whether the Agent itself answered recently. Host reachability is
+    /// tracked separately so a pingable, overloaded node is not mistaken for
+    /// a physically disconnected machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_responding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_sampled_unix_ms: Option<u64>,
 }
 
 impl NodeLiveness {
@@ -64,7 +71,11 @@ impl NodeLiveness {
 pub struct NodeObservation {
     pub node_id: String,
     pub identity_key: String,
-    pub reachable: bool,
+    /// Host/network reachability. `None` means the probe was inconclusive and
+    /// must not advance the offline counter.
+    pub reachable: Option<bool>,
+    /// Agent responsiveness is independent from host reachability.
+    pub agent_responding: Option<bool>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -88,12 +99,17 @@ pub fn read(state_dir: &Path, cluster_uuid: &str) -> io::Result<BTreeMap<String,
             if record.unreachable_since_unix_ms.is_some()
                 && record.consecutive_failures < OFFLINE_AFTER_FAILURES
             {
+                if record.last_reachable_unix_ms.is_none() {
+                    record.last_reachable_unix_ms = Some(record.last_transition_unix_ms);
+                }
                 record.unreachable_since_unix_ms = None;
                 record.consecutive_failures = record.consecutive_failures.max(1);
                 record.last_failed_probe_unix_ms = Some(record.last_transition_unix_ms);
                 *changed = true;
             }
-            if record.last_reachable_unix_ms.is_none() && record.unreachable_since_unix_ms.is_none()
+            if record.last_reachable_unix_ms.is_none()
+                && record.unreachable_since_unix_ms.is_none()
+                && record.last_failed_probe_unix_ms.is_none()
             {
                 record.last_reachable_unix_ms = Some(record.last_transition_unix_ms);
                 *changed = true;
@@ -131,7 +147,7 @@ pub fn observe_many(
                 continue;
             }
             let previous = old.as_ref();
-            if !observation.reachable
+            if observation.reachable == Some(false)
                 && previous
                     .and_then(|record| record.last_failed_probe_unix_ms)
                     .is_some_and(|last| {
@@ -147,7 +163,7 @@ pub fn observe_many(
                 last_transition_unix_ms,
                 last_reachable_unix_ms,
                 last_failed_probe_unix_ms,
-            ) = if observation.reachable {
+            ) = if observation.reachable == Some(true) {
                 (
                     0,
                     None,
@@ -175,7 +191,7 @@ pub fn observe_many(
                     })),
                     None,
                 )
-            } else {
+            } else if observation.reachable == Some(false) {
                 let failures = previous.map_or(1, |record| {
                     record
                         .consecutive_failures
@@ -199,6 +215,25 @@ pub fn observe_many(
                     previous.and_then(|record| record.last_reachable_unix_ms),
                     Some(observed_unix_ms),
                 )
+            } else {
+                // An unknown network result (for example, local-network
+                // privacy denial) must not count as a failed heartbeat.
+                (
+                    previous.map_or(0, |record| record.consecutive_failures),
+                    previous.and_then(|record| record.unreachable_since_unix_ms),
+                    previous.map_or(observed_unix_ms, |record| record.last_transition_unix_ms),
+                    previous.and_then(|record| record.last_reachable_unix_ms),
+                    previous.and_then(|record| record.last_failed_probe_unix_ms),
+                )
+            };
+            if previous.is_none() && observation.reachable.is_none() {
+                continue;
+            }
+            let (agent_responding, agent_sampled_unix_ms) = match observation.agent_responding {
+                Some(responding) => (Some(responding), Some(observed_unix_ms)),
+                None => previous.map_or((None, None), |record| {
+                    (record.agent_responding, record.agent_sampled_unix_ms)
+                }),
             };
             let record = NodeLiveness {
                 identity_key: observation.identity_key.clone(),
@@ -209,6 +244,8 @@ pub fn observe_many(
                 last_reachable_unix_ms,
                 health: previous.and_then(|record| record.health.clone()),
                 health_sampled_unix_ms: previous.and_then(|record| record.health_sampled_unix_ms),
+                agent_responding,
+                agent_sampled_unix_ms,
             };
             if old.as_ref() != Some(&record) {
                 state
@@ -250,6 +287,8 @@ pub fn update_health(
                 last_reachable_unix_ms: Some(sampled_unix_ms),
                 health: None,
                 health_sampled_unix_ms: None,
+                agent_responding: None,
+                agent_sampled_unix_ms: None,
             }
         };
         if record
@@ -268,6 +307,8 @@ pub fn update_health(
         }
         record.health = Some(health);
         record.health_sampled_unix_ms = Some(sampled_unix_ms);
+        record.agent_responding = Some(true);
+        record.agent_sampled_unix_ms = Some(sampled_unix_ms);
         record.last_reachable_unix_ms = Some(sampled_unix_ms);
         if state.nodes.get(node_id) != Some(&record) {
             state.nodes.insert(node_id.to_owned(), record);
@@ -401,10 +442,12 @@ mod tests {
         let online = NodeObservation {
             node_id: "compute-001".into(),
             identity_key: "machine-uuid-1".into(),
-            reachable: true,
+            reachable: Some(true),
+            agent_responding: Some(true),
         };
         let offline = NodeObservation {
-            reachable: false,
+            reachable: Some(false),
+            agent_responding: Some(false),
             ..online.clone()
         };
 
@@ -429,7 +472,8 @@ mod tests {
         );
 
         let recovered = NodeObservation {
-            reachable: true,
+            reachable: Some(true),
+            agent_responding: Some(true),
             ..offline.clone()
         };
         let online_record = observe_many(&root, "cluster-1", &[recovered.clone()], 15_100).unwrap();
@@ -446,7 +490,8 @@ mod tests {
         let offline = NodeObservation {
             node_id: "compute-001".into(),
             identity_key: "machine-uuid-1".into(),
-            reachable: false,
+            reachable: Some(false),
+            agent_responding: Some(false),
         };
         observe_many(&root, "cluster-1", &[offline], 100).unwrap();
         assert!(read(&root, "cluster-2").unwrap().is_empty());

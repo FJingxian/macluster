@@ -89,6 +89,7 @@ fn controller_monitor_request_latency_reaches_node_details() {
         consecutive_failures: 0,
         stale: false,
         confirmed_offline: false,
+        agent_responding: None,
         sample_error: None,
         running_tasks: 0,
         waiting_tasks: 0,

@@ -11436,6 +11436,7 @@ const MAX_NODE_LIST_PROBES: usize = 64;
 #[cfg(test)]
 const NODE_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_LIST_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
+const NODE_LIST_HOST_TIMEOUT: Duration = Duration::from_millis(400);
 
 const NODE_LIST_HEALTH_CACHE_TTL_MS: u64 = 120_000;
 const NODE_LIST_LIVENESS_CACHE_TTL_MS: u64 = macluster_controller::liveness::RECENTLY_ONLINE_TTL_MS;
@@ -11449,6 +11450,7 @@ fn cached_node_list_state(
     known_online: bool,
     consecutive_failures: u8,
     confirmed_offline: bool,
+    agent_responding: Option<bool>,
     digest_matches: bool,
     shares_ready: bool,
     show_all: bool,
@@ -11461,6 +11463,9 @@ fn cached_node_list_state(
     }
     if !login_node && consecutive_failures > 0 {
         return Some("RECONNECTING");
+    }
+    if !login_node && agent_responding == Some(false) {
+        return Some("DEGRADED");
     }
     Some(if digest_matches && shares_ready {
         "READY"
@@ -11571,6 +11576,13 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             .get(id)
             .filter(|record| record.identity_key.eq_ignore_ascii_case(identity_key));
         let confirmed_offline = cached.is_some_and(|record| record.is_confirmed_offline());
+        let agent_responding = cached
+            .filter(|record| {
+                record.agent_sampled_unix_ms.is_some_and(|sampled| {
+                    liveness_now_ms.saturating_sub(sampled) <= NODE_LIST_LIVENESS_CACHE_TTL_MS
+                })
+            })
+            .and_then(|record| record.agent_responding);
         let cached_health = cached
             .filter(|record| {
                 !confirmed_offline
@@ -11604,6 +11616,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             known_online,
             cached.map_or(0, |record| record.consecutive_failures),
             confirmed_offline,
+            agent_responding,
             digest_matches,
             all_shares_ready,
             show_all,
@@ -11663,8 +11676,10 @@ fn refresh_node_liveness_for_list(
     }
 
     // A list command needs a current answer even while the controller is
-    // running. Probe only the SSH TCP endpoints, in parallel and with a short
-    // timeout; do not perform SSH authentication or an Agent health walk.
+    // running. Probe SSH TCP endpoints, then use a short ICMP fallback when
+    // the port is unavailable. This distinguishes an overloaded sshd from a
+    // host that actually left the network without doing SSH authentication or
+    // an Agent health walk.
     let transport =
         ClusterTransport::new_with_namespace(config_path.to_path_buf(), config.share_uuid.clone());
     let tasks = Mutex::new(VecDeque::from_iter(
@@ -11694,14 +11709,22 @@ fn refresh_node_liveness_for_list(
                         else {
                             break;
                         };
-                        let reachable = if node.transport == Transport::Local {
+                        let endpoint_reachable = if node.transport == Transport::Local {
                             Some(true)
                         } else {
                             transport.endpoint_reachable(&node, NODE_LIST_ENDPOINT_TIMEOUT)
                         };
-                        let Some(reachable) = reachable else {
-                            continue;
+                        let reachable = match endpoint_reachable {
+                            Some(true) => Some(true),
+                            Some(false) | None if node.transport == Transport::Ssh => {
+                                transport.host_reachable(&node, NODE_LIST_HOST_TIMEOUT)
+                            }
+                            None => None,
+                            Some(false) => Some(false),
                         };
+                        let agent_responding = (endpoint_reachable == Some(false)
+                            && reachable == Some(true))
+                        .then_some(false);
                         observations.push(macluster_controller::liveness::NodeObservation {
                             node_id,
                             identity_key: node
@@ -11710,6 +11733,7 @@ fn refresh_node_liveness_for_list(
                                 .unwrap_or(node.host.as_str())
                                 .to_ascii_lowercase(),
                             reachable,
+                            agent_responding,
                         });
                     }
                     observations
@@ -18893,35 +18917,35 @@ remote_binary = "/usr/local/bin/macluster"
     #[test]
     fn node_list_keeps_reconnecting_nodes_until_confirmed_offline() {
         assert_eq!(
-            cached_node_list_state(false, true, 1, false, false, false, false),
+            cached_node_list_state(false, true, 1, false, None, false, false, false),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, true, 2, false, false, false, false),
+            cached_node_list_state(false, true, 2, false, None, false, false, false),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, true, 1, false, false, false, true),
+            cached_node_list_state(false, true, 1, false, None, false, false, true),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 0, false, false, false, false),
+            cached_node_list_state(false, false, 0, false, None, false, false, false),
             None
         );
         assert_eq!(
-            cached_node_list_state(false, false, 0, false, false, false, true),
+            cached_node_list_state(false, false, 0, false, None, false, false, true),
             Some("UNKNOWN")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 3, true, false, false, false),
+            cached_node_list_state(false, false, 3, true, None, false, false, false),
             None
         );
         assert_eq!(
-            cached_node_list_state(false, false, 3, true, false, false, true),
+            cached_node_list_state(false, false, 3, true, None, false, false, true),
             Some("OFFLINE")
         );
         assert_eq!(
-            cached_node_list_state(true, true, 3, true, false, false, false),
+            cached_node_list_state(true, true, 3, true, None, false, false, false),
             Some("ONLINE")
         );
     }

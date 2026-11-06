@@ -350,8 +350,9 @@
   }
   function updateNodeRow(card, node, row) {
     const m = row?.metrics || {};
-    const online = Boolean(row && !row.confirmed_offline && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
-    const reconnecting = Boolean(row && !row.confirmed_offline && (row.consecutive_failures || 0) > 0);
+    const agentUnresponsive = Boolean(row && !row.confirmed_offline && row.agent_responding === false);
+    const online = Boolean(row && !agentUnresponsive && !row.confirmed_offline && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
+    const reconnecting = Boolean(row && !row.confirmed_offline && ((row.consecutive_failures || 0) > 0 || agentUnresponsive));
     card.classList.toggle("is-stale", !online);
     if (!card.querySelector(".node-card-heading")) {
       const head = element("div", "node-card-heading"), identity = element("div", "node-identity");
@@ -372,7 +373,7 @@
     }
     const status = card.querySelector(".node-health");
     status.className = `node-health ${online ? "online" : reconnecting ? "reconnecting" : "offline"}`;
-    status.textContent = online ? `Online · ${sampleAge(row?.age_ms || 0)}` : reconnecting ? `Reconnecting · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
+    status.textContent = agentUnresponsive ? `Host reachable · Agent reconnecting · ${sampleAge(row?.age_ms || 0)}` : online ? `Online · ${sampleAge(row?.age_ms || 0)}` : reconnecting ? `Reconnecting · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
     const gauges = card.querySelector(".node-gauges");
     const gaugeValues = [
       ["cpu", "CPU", m.cpu_percent, m.cpu_max_percent, m.cpu_percent == null ? "No reading" : `${num(m.cpu_percent)} / ${num(m.cpu_max_percent)} CPU%`],

@@ -58,6 +58,12 @@ pub trait NodeTransport: Send + Sync + 'static {
     fn endpoint_reachable(&self, _node: &NodeConfig, _timeout: Duration) -> Option<bool> {
         None
     }
+
+    /// Host-level reachability, independent from whether the SSH/Agent
+    /// endpoint is responding. Implementations can use ICMP as a fallback.
+    fn host_reachable(&self, node: &NodeConfig, timeout: Duration) -> Option<bool> {
+        self.endpoint_reachable(node, timeout)
+    }
 }
 
 fn endpoint_probe_error(error: &io::Error) -> Option<bool> {
@@ -294,6 +300,13 @@ impl NodeTransport for ClusterTransport {
         }
     }
 
+    fn host_reachable(&self, node: &NodeConfig, timeout: Duration) -> Option<bool> {
+        match node.transport {
+            Transport::Local => Some(true),
+            Transport::Ssh => ping_host(node, timeout),
+        }
+    }
+
     fn call(
         &self,
         node_id: &NodeId,
@@ -336,6 +349,57 @@ impl NodeTransport for ClusterTransport {
             ));
         }
         response.result.map_err(TransportError::Remote)
+    }
+}
+
+fn ping_host(node: &NodeConfig, timeout: Duration) -> Option<bool> {
+    let address = node.host.parse::<Ipv4Addr>().ok()?;
+    // macOS `ping -W` is in milliseconds. Keep the fallback short: it is only
+    // used after SSH fails, and it prevents CPU pressure or a slow sshd from
+    // being mistaken for a disconnected cable.
+    let wait_ms = timeout.as_millis().clamp(100, 1_000).to_string();
+    let address = address.to_string();
+    let mut command = Command::new("/sbin/ping");
+    command
+        .arg("-n")
+        .arg("-c")
+        .arg("1")
+        .arg("-q")
+        .arg("-W")
+        .arg(wait_ms)
+        .arg(address)
+        .stdin(Stdio::null());
+    match run_child_bounded(
+        command,
+        None,
+        timeout.saturating_add(Duration::from_millis(250)),
+    ) {
+        Ok(output) => {
+            let diagnostic = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            let summary = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            // Only an explicit ICMP reply timeout or packet-loss summary is
+            // evidence that this host did not answer. Permission, route,
+            // interface and other local ping errors are inconclusive; treating
+            // every nonzero exit as host-down can hide a live node after a
+            // macOS privacy or network-policy denial.
+            let packet_timeout = diagnostic.contains("request timeout for icmp_seq")
+                || diagnostic.contains("100.0% packet loss")
+                || summary.contains("100.0% packet loss")
+                || summary.contains("0 packets received");
+            if packet_timeout {
+                Some(false)
+            } else if diagnostic.contains("bytes from")
+                || (summary.contains("packets received") && !summary.contains("0 packets received"))
+            {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        // A hung ping process does not prove the remote host is offline.
+        // Keep this inconclusive so it cannot advance the offline counter.
+        Err(TransportError::Timeout) => None,
+        Err(_) => None,
     }
 }
 

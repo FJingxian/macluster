@@ -94,6 +94,7 @@ pub struct MonitorHub {
     liveness_state_dir: Option<PathBuf>,
     last_liveness_refresh: Option<Instant>,
     unreachable_nodes: BTreeSet<NodeId>,
+    agent_responding: BTreeMap<NodeId, bool>,
     job_counts: HashMap<NodeId, (u32, u32)>,
     sequence: u64,
     metric_cursor: usize,
@@ -191,6 +192,7 @@ impl MonitorHub {
             liveness_state_dir: None,
             last_liveness_refresh: None,
             unreachable_nodes: BTreeSet::new(),
+            agent_responding: BTreeMap::new(),
             job_counts: HashMap::new(),
             sequence: 1,
             metric_cursor: 0,
@@ -303,7 +305,7 @@ impl MonitorHub {
 
     fn row(&self, node_id: NodeId, now: Instant) -> NodeMonitorRow {
         let metrics = self.metric_cache.get(&node_id);
-        let (mut snapshot, age, stale, sample_error) = match metrics {
+        let (mut snapshot, age, stale, mut sample_error) = match metrics {
             Some(cache) => match (&cache.snapshot, cache.sampled_at) {
                 (Some(snapshot), Some(sampled_at)) => {
                     let age = now.saturating_duration_since(sampled_at);
@@ -362,12 +364,19 @@ impl MonitorHub {
         let (running_tasks, waiting_tasks) =
             self.job_counts.get(&node_id).copied().unwrap_or_default();
         let confirmed_offline = self.unreachable_nodes.contains(&node_id);
+        let agent_responding = self.agent_responding.get(&node_id).copied();
+        if agent_responding == Some(false) {
+            sample_error.get_or_insert_with(|| {
+                "host is reachable, but the macluster Agent is not responding".into()
+            });
+        }
         NodeMonitorRow {
             node_id,
             metrics: snapshot,
             age_ms: age,
             stale,
             confirmed_offline,
+            agent_responding,
             sample_error,
             request_latency_ms: metrics.and_then(|cache| cache.request_latency_ms),
             consecutive_failures: metrics.map_or(0, |cache| cache.consecutive_failures),
@@ -570,8 +579,30 @@ impl MonitorHub {
                 .then_some(node_id)
             })
             .collect::<BTreeSet<_>>();
+        let now_ms = now_unix_ms();
+        let agent_responding = self
+            .config
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let node_id = NodeId::new(id.clone()).ok()?;
+                let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+                let record = records.get(id)?;
+                if !record.was_recently_reachable(expected_identity, now_ms)
+                    || record.consecutive_failures > 0
+                    || record.agent_sampled_unix_ms.is_none_or(|sampled| {
+                        now_ms.saturating_sub(sampled) > crate::liveness::RECENTLY_ONLINE_TTL_MS
+                    })
+                {
+                    return None;
+                }
+                record
+                    .agent_responding
+                    .map(|responding| (node_id, responding))
+            })
+            .collect::<BTreeMap<_, _>>();
 
-        if unreachable == self.unreachable_nodes {
+        if unreachable == self.unreachable_nodes && agent_responding == self.agent_responding {
             return;
         }
         for node_id in unreachable.difference(&self.unreachable_nodes) {
@@ -607,6 +638,7 @@ impl MonitorHub {
             }
         }
         self.unreachable_nodes = unreachable;
+        self.agent_responding = agent_responding;
         self.sequence = self.sequence.saturating_add(1);
     }
 }

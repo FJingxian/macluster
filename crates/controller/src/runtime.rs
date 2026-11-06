@@ -162,15 +162,22 @@ enum WorkerResult {
 
 struct ProbeResult {
     fence_error: Option<String>,
-    endpoint_reachable: Option<bool>,
+    host_reachable: Option<bool>,
+    agent_responding: bool,
     status: Option<Result<ResponseBody, ProbeError>>,
     health: Option<Result<ResponseBody, String>>,
 }
 
 enum ProbeError {
     NotFound,
-    Failed(String),
-    MissingExecution { job_id: u64, detail: String },
+    Failed {
+        detail: String,
+        agent_responded: bool,
+    },
+    MissingExecution {
+        job_id: u64,
+        detail: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,7 +288,8 @@ fn node_probe_retry_delay_for_failures(failures: u8) -> Duration {
 fn persist_node_liveness<T: NodeTransport>(
     service: &ControllerService<T>,
     node_id: &str,
-    reachable: bool,
+    reachable: Option<bool>,
+    agent_responding: Option<bool>,
     observed_unix_ms: u64,
 ) -> Option<crate::liveness::NodeLiveness> {
     let Some(node) = service.config.nodes.get(node_id) else {
@@ -295,6 +303,7 @@ fn persist_node_liveness<T: NodeTransport>(
             .unwrap_or(node.host.as_str())
             .to_ascii_lowercase(),
         reachable,
+        agent_responding,
     };
     match crate::liveness::observe_many(
         service.storage.root(),
@@ -307,6 +316,18 @@ fn persist_node_liveness<T: NodeTransport>(
             eprintln!("macluster: could not persist node liveness for {node_id}: {error}");
             None
         }
+    }
+}
+
+fn observed_agent_status(agent_responding: bool, host_reachable: Option<bool>) -> Option<bool> {
+    if agent_responding {
+        Some(true)
+    } else if host_reachable == Some(true) {
+        Some(false)
+    } else {
+        // A failed Agent/SSH probe cannot distinguish a quiet host from a
+        // host that is unreachable. Keep this separate from host liveness.
+        None
     }
 }
 
@@ -779,6 +800,8 @@ impl RuntimeState {
                                     &tag,
                                     completion.received_at,
                                     probe.health,
+                                    probe.host_reachable,
+                                    probe.agent_responding,
                                 ),
                                 _ => {}
                             }
@@ -855,22 +878,30 @@ impl RuntimeState {
             runtime.fenced = false;
             runtime.status = None;
             runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-            if probe.endpoint_reachable == Some(true) {
-                let record = persist_node_liveness(service, node_id, true, super::now_ms());
-                runtime.unreachable_since_unix_ms =
-                    record.and_then(|record| record.unreachable_since_unix_ms);
+            let record = persist_node_liveness(
+                service,
+                node_id,
+                probe.host_reachable,
+                observed_agent_status(probe.agent_responding, probe.host_reachable),
+                super::now_ms(),
+            );
+            runtime.unreachable_since_unix_ms =
+                record.and_then(|record| record.unreachable_since_unix_ms);
+            if probe.agent_responding {
                 runtime.probe_failures = 0;
-            } else {
-                let record = persist_node_liveness(service, node_id, false, super::now_ms());
-                runtime.unreachable_since_unix_ms =
-                    record.and_then(|record| record.unreachable_since_unix_ms);
             }
             runtime.next_probe_at =
                 received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
             service.idle_since.remove(node_id);
             return Ok(());
         }
-        let record = persist_node_liveness(service, node_id, true, super::now_ms());
+        let record = persist_node_liveness(
+            service,
+            node_id,
+            probe.host_reachable,
+            observed_agent_status(probe.agent_responding, probe.host_reachable),
+            super::now_ms(),
+        );
         runtime.unreachable_since_unix_ms =
             record.and_then(|record| record.unreachable_since_unix_ms);
         runtime.fenced = true;
@@ -911,7 +942,7 @@ impl RuntimeState {
                     .entry(node_id.to_owned())
                     .or_insert_with(now_ms);
             }
-            Some(Err(ProbeError::MissingExecution { job_id, detail })) => {
+            Some(Err(ProbeError::MissingExecution { job_id, detail, .. })) => {
                 let id = NodeId::new(node_id.to_owned()).expect("validated node ID");
                 service.missing_execution(&id, job_id, &detail)?;
                 runtime.status = Some(NodeStatusCache {
@@ -924,8 +955,8 @@ impl RuntimeState {
                 runtime.next_probe_at = received_at + probe_delay(probe_interval, true);
                 service.idle_since.remove(node_id);
             }
-            Some(Err(ProbeError::Failed(error))) => {
-                runtime.last_probe_error = Some(error.chars().take(256).collect());
+            Some(Err(ProbeError::Failed { detail, .. })) => {
+                runtime.last_probe_error = Some(detail.chars().take(256).collect());
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
                 runtime.next_probe_at =
@@ -958,7 +989,16 @@ impl RuntimeState {
         tag: &WorkTag,
         received_at: Instant,
         health_result: Option<Result<ResponseBody, String>>,
+        host_reachable: Option<bool>,
+        agent_responding: bool,
     ) {
+        persist_node_liveness(
+            service,
+            node_id,
+            host_reachable,
+            observed_agent_status(agent_responding, host_reachable),
+            super::now_ms(),
+        );
         if let Some(Ok(ResponseBody::Health(health))) = health_result.as_ref() {
             persist_node_health(service, node_id, health.clone(), super::now_ms());
         }
@@ -1177,10 +1217,22 @@ impl RuntimeState {
                 } else {
                     None
                 };
-                let fence_error = if endpoint_reachable == Some(false) {
-                    Some("registered SSH endpoint is not reachable".into())
+                let mut host_reachable = match endpoint_reachable {
+                    Some(true) => Some(true),
+                    Some(false) => {
+                        transport.host_reachable(&node_config, Duration::from_millis(750))
+                    }
+                    None => None,
+                };
+                let confirmed_host_down =
+                    endpoint_reachable == Some(false) && host_reachable == Some(false);
+                let (fence_error, fence_agent_responding) = if confirmed_host_down {
+                    (
+                        Some("registered SSH endpoint is not reachable".into()),
+                        false,
+                    )
                 } else if already_fenced {
-                    None
+                    (None, false)
                 } else {
                     match transport.call(
                         &node_id,
@@ -1189,25 +1241,32 @@ impl RuntimeState {
                             controller: worker_tag.epoch,
                         },
                     ) {
-                        Ok(ResponseBody::Ack) => None,
-                        Ok(_) => Some("fence returned an unexpected response".into()),
-                        Err(error) => Some(error.to_string()),
+                        Ok(ResponseBody::Ack) => (None, true),
+                        Ok(_) => (Some("fence returned an unexpected response".into()), true),
+                        Err(TransportError::Remote(error)) => (Some(error.to_string()), true),
+                        Err(error) => (Some(error.to_string()), false),
                     }
                 };
                 if fence_error.is_some() && endpoint_reachable.is_none() {
                     endpoint_reachable =
                         transport.endpoint_reachable(&node_config, Duration::from_millis(350));
+                    host_reachable = match endpoint_reachable {
+                        Some(true) => Some(true),
+                        Some(false) => {
+                            transport.host_reachable(&node_config, Duration::from_millis(750))
+                        }
+                        None => None,
+                    };
                 }
-                let (status, health) =
+                let (status, health, health_agent_responding) =
                     if fence_error.is_none() && worker_tag.kind == WorkKind::Health {
-                        (
-                            None,
-                            Some(
-                                transport
-                                    .call(&node_id, &node_config, Operation::Health)
-                                    .map_err(|error| error.to_string()),
-                            ),
-                        )
+                        match transport.call(&node_id, &node_config, Operation::Health) {
+                            Ok(response) => (None, Some(Ok(response)), true),
+                            Err(TransportError::Remote(error)) => {
+                                (None, Some(Err(error.to_string())), true)
+                            }
+                            Err(error) => (None, Some(Err(error.to_string())), false),
+                        }
                     } else if fence_error.is_none() {
                         let status = Some(
                             match transport.call(&node_id, &node_config, Operation::Status) {
@@ -1243,20 +1302,56 @@ impl RuntimeState {
                                         None => Err(ProbeError::NotFound),
                                     }
                                 }
-                                Err(error) => Err(ProbeError::Failed(error.to_string())),
+                                Err(TransportError::Remote(error)) => Err(ProbeError::Failed {
+                                    detail: error.to_string(),
+                                    agent_responded: true,
+                                }),
+                                Err(error) => Err(ProbeError::Failed {
+                                    detail: error.to_string(),
+                                    agent_responded: false,
+                                }),
                                 Ok(response) => Ok(response),
                             },
                         );
-                        (status, None)
+                        (status, None, false)
                     } else {
-                        (None, None)
+                        (None, None, false)
                     };
+                let status_responded = status.as_ref().is_some_and(|status| {
+                    matches!(
+                        status,
+                        Ok(_)
+                            | Err(ProbeError::NotFound)
+                            | Err(ProbeError::MissingExecution { .. })
+                            | Err(ProbeError::Failed {
+                                agent_responded: true,
+                                ..
+                            })
+                    )
+                });
+                let health_responded = health_agent_responding;
+                let agent_responding =
+                    fence_agent_responding || status_responded || health_responded;
+                if agent_responding {
+                    host_reachable = Some(true);
+                } else if endpoint_reachable.is_none() {
+                    endpoint_reachable =
+                        transport.endpoint_reachable(&node_config, Duration::from_millis(350));
+                    host_reachable = match endpoint_reachable {
+                        Some(true) => Some(true),
+                        Some(false) => {
+                            transport.host_reachable(&node_config, Duration::from_millis(750))
+                        }
+                        None => None,
+                    };
+                }
                 WorkerCompletion {
                     tag: worker_tag,
                     received_at: Instant::now(),
                     result: WorkerResult::Probe(ProbeResult {
                         fence_error,
-                        endpoint_reachable,
+                        host_reachable,
+                        agent_responding,
                         status,
                         health,
                     }),

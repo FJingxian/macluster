@@ -284,6 +284,11 @@ pub struct NodeMonitorRow {
     /// True only after the controller's three-probe offline threshold is met.
     #[serde(default)]
     pub confirmed_offline: bool,
+    /// Recent Agent responsiveness, separate from host-level ping liveness.
+    /// `Some(false)` means the host is reachable but its Agent has not
+    /// answered; such a node is visible but is not dispatch-eligible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_responding: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

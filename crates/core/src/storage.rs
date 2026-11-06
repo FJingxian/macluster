@@ -1190,6 +1190,39 @@ impl Storage {
         })
     }
 
+    /// Replace a provisional NODE_LOST result when the same verified Agent
+    /// execution later reports its durable terminal result. This is needed
+    /// for transient boot-identity mismatches; it cannot alter other terminal
+    /// states or accept a second NODE_LOST result.
+    pub fn reconcile_node_lost_job(
+        &self,
+        job_id: u64,
+        state: JobState,
+        exit_code: Option<i32>,
+        reason: Option<String>,
+    ) -> Result<JobRecord, SubmitError> {
+        if !state.is_terminal() || state == JobState::NodeLost {
+            return Err(SubmitError::InvalidTransition(
+                job_id,
+                "NODE_LOST".into(),
+                job_state_name(state).into(),
+            ));
+        }
+        self.transaction(|| {
+            let mut record = self.get_job(job_id)?.ok_or(SubmitError::NotFound(job_id))?;
+            if record.state != JobState::NodeLost {
+                return Ok(record);
+            }
+            let finished = now_unix_ms();
+            record.state = state;
+            record.finished_unix_ms = Some(finished);
+            record.exit_code = exit_code;
+            record.end_reason = reason;
+            self.persist_record(&record, Some(finished))?;
+            Ok(record)
+        })
+    }
+
     pub fn set_log_sync_pending(
         &self,
         job_id: u64,

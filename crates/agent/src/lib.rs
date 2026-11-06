@@ -833,10 +833,7 @@ fn status(state_dir: &Path) -> Result<ExecutionStatus, ProtocolError> {
         };
         if record.terminal() {
             None
-        } else if record.boot_id != current_boot
-            && record.boot_id != "unknown"
-            && current_boot != "unknown"
-        {
+        } else if boot_id_changed(&record.boot_id, &current_boot) {
             mark_lost_execution(
                 record,
                 "node rebooted while task was active; the task process no longer exists",
@@ -1694,6 +1691,29 @@ fn boot_id() -> String {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn boot_id_changed(previous: &str, current: &str) -> bool {
+    if previous == "unknown" || current == "unknown" {
+        return false;
+    }
+    match (boot_time_seconds(previous), boot_time_seconds(current)) {
+        (Some(previous), Some(current)) => previous != current,
+        // Preserve compatibility with older/platform-specific identifiers
+        // that do not use the macOS kern.boottime representation.
+        _ => previous != current,
+    }
+}
+
+fn boot_time_seconds(value: &str) -> Option<u64> {
+    let value = value.split_once("sec = ")?.1;
+    let seconds = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!seconds.is_empty())
+        .then(|| seconds.parse().ok())
+        .flatten()
 }
 
 pub fn default_state_dir() -> PathBuf {

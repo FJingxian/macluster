@@ -504,6 +504,17 @@ impl<T: NodeTransport> ControllerService<T> {
                     status.exit_code,
                     status.end_reason.clone(),
                 )?;
+            } else if job.state == JobState::NodeLost && terminal != JobState::NodeLost {
+                // NODE_LOST can be recorded provisionally if an Agent's boot
+                // identity changes during a task. A later status from the
+                // same node and start token is authoritative and can restore
+                // the real terminal outcome.
+                self.storage.reconcile_node_lost_job(
+                    job.id,
+                    terminal,
+                    status.exit_code,
+                    status.end_reason.clone(),
+                )?;
             }
             if job.log_sync_pending != status.log_sync_pending {
                 self.storage

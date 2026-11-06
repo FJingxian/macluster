@@ -18,6 +18,10 @@ pub const VERBOSE_TASK_LOG_ROOT_ENV: &str = "MCLUSTER_INTERNAL_VERBOSE_LOG_ROOT"
 pub const VERBOSE_TASK_LOG_FILES: &[&str] = &["monitor.log", "resources.jsonl", "summary.json"];
 /// Internal JobSpec value used to scope a node-local Cargo target cache.
 pub const ACTIVE_ENV_PREFIX_ENV: &str = "MCLUSTER_INTERNAL_ACTIVE_ENV_PREFIX";
+/// Internal JobSpec value naming a shared Cargo home used to seed the node-local cache.
+pub const CARGO_HOME_SEED_ENV: &str = "MCLUSTER_INTERNAL_CARGO_HOME_SEED";
+/// Internal JobSpec marker enabling bounded cleanup of node-local build caches.
+pub const BUILD_CACHE_MAINTENANCE_ENV: &str = "MCLUSTER_INTERNAL_BUILD_CACHE_MAINTENANCE";
 pub const NAMESPACED_JOBS_FEATURE: &str = "agent.namespaced-jobs.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

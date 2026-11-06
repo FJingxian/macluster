@@ -20,7 +20,7 @@ where
 }
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, FileTimes, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
@@ -30,15 +30,16 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_protocol::{
     framing::sha256_hex,
     identifiers::{Id128, StartToken},
     types::{
-        ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase,
-        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_FILES,
+        ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, CARGO_HOME_SEED_ENV,
+        EXPLICIT_TASK_PATH_ENV, JobState, RuntimePhase, VERBOSE_TASK_LOG_ENV,
+        VERBOSE_TASK_LOG_FILES,
     },
 };
 
@@ -46,6 +47,9 @@ use crate::{AgentError, AgentRecord, active_record, local_script_path, write_act
 
 const BASE_TASK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 const LOCAL_JOB_LOG_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+const MANAGED_CACHE_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MANAGED_CACHE_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const MANAGED_CACHE_KINDS: &[&str] = &["cargo-target", "cargo-home", "ccache", "sccache"];
 const LOCAL_JOB_LOG_PAYLOADS: &[&str] = &[
     "script.sh",
     "stdout.log",
@@ -438,6 +442,16 @@ fn configure_task_environment(
         Some(adapted)
     };
     let record = adapted_record.as_ref().unwrap_or(record);
+    if record
+        .spec
+        .env
+        .get(BUILD_CACHE_MAINTENANCE_ENV)
+        .is_some_and(|value| value == "1")
+        && let Some(namespace) = managed_cache_namespace(record)
+        && let Err(error) = prune_managed_caches(&managed_cache_paths(record), &namespace)
+    {
+        eprintln!("macluster-agent: could not prune old build caches: {error}");
+    }
     let cargo_target = cargo_target_directory(record)?;
     let ccache = compiler_cache_directory(record, "CCACHE_DIR", "ccache")?;
     let sccache = compiler_cache_directory(record, "SCCACHE_DIR", "sccache")?;
@@ -446,6 +460,21 @@ fn configure_task_environment(
     }
     if cargo_home_is_managed(record) {
         ensure_private_cache(&cargo_home, "cargo-home")?;
+        if let Some(seed_path) = record.spec.env.get(CARGO_HOME_SEED_ENV) {
+            let refresh = record
+                .spec
+                .env
+                .get("CARGO_NET_OFFLINE")
+                .is_some_and(|value| {
+                    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1")
+                });
+            if let Err(error) = seed_cargo_home_cache(Path::new(seed_path), &cargo_home, refresh) {
+                eprintln!(
+                    "macluster-agent: could not seed the node-local Cargo cache from {}: {error}; Cargo will use the local cache and may download missing packages",
+                    seed_path
+                );
+            }
+        }
     }
     if compiler_cache_is_managed(record, "CCACHE_DIR") {
         ensure_private_cache(&ccache, "ccache")?;
@@ -716,6 +745,547 @@ fn ensure_private_cache(path: &Path, cache_kind: &str) -> Result<(), AgentError>
         }
     }
     Ok(())
+}
+
+fn seed_cargo_home_cache(source: &Path, destination: &Path, refresh: bool) -> io::Result<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if !source_metadata.is_dir() || source_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shared Cargo cache is not a real directory",
+        ));
+    }
+    ensure_real_cache_directory(destination)?;
+    sync_cargo_home_files(source, destination)?;
+    let source_identity = source.canonicalize()?.to_string_lossy().into_owned();
+    let marker = destination.join(".macluster-seed-v1");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            if !refresh && fs::read_to_string(&marker).is_ok_and(|saved| saved == source_identity) {
+                return Ok(());
+            }
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Cargo cache seed marker is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    // These are immutable download/index stores from Cargo's perspective.
+    // Avoid copying registry/src (it is reconstructible from registry/cache),
+    // lock files, Git checkouts, and executable shims. Git object databases
+    // are enough for Cargo to recreate a checkout. The small global Cargo
+    // config and credentials files are synchronized separately with private
+    // permissions so mirrors and authenticated registries keep working.
+    for relative in ["registry/index", "registry/cache", "git/db"] {
+        let from = source.join(relative);
+        match fs::symlink_metadata(&from) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                copy_cache_tree(&from, &destination.join(relative))?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    write_private_file_atomic(&marker, source_identity.as_bytes())
+}
+
+fn copy_cache_tree(source: &Path, destination: &Path) -> io::Result<()> {
+    ensure_real_cache_directory(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            copy_cache_tree(&from, &to)?;
+        } else if metadata.is_file() && !entry.file_name().to_string_lossy().ends_with(".lock") {
+            let should_copy = match fs::symlink_metadata(&to) {
+                Ok(existing) => {
+                    if existing.file_type().is_symlink() || !existing.is_file() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "refusing to follow a non-file Cargo cache destination {}",
+                                to.display()
+                            ),
+                        ));
+                    }
+                    existing.len() != metadata.len()
+                        || existing.modified().ok() != metadata.modified().ok()
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error),
+            };
+            if should_copy {
+                copy_cache_file_atomic(&from, &to, metadata)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_real_cache_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to follow a non-directory Cargo cache path {}",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(path)?;
+                    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "refusing to follow a non-directory Cargo cache path {}",
+                                path.display()
+                            ),
+                        ))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn sync_cargo_home_files(source: &Path, destination: &Path) -> io::Result<()> {
+    const CARGO_HOME_FILES: &[&str] = &["config.toml", "config", "credentials.toml"];
+    const MAX_CARGO_HOME_FILE_BYTES: u64 = 1024 * 1024;
+
+    for name in CARGO_HOME_FILES {
+        let from = source.join(name);
+        let to = destination.join(name);
+        match resolve_regular_cargo_file(&from)? {
+            Some((from, metadata)) => {
+                if metadata.len() > MAX_CARGO_HOME_FILE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("shared Cargo {name} exceeds the 1 MiB safety limit"),
+                    ));
+                }
+                let mut input = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&from)?;
+                let mut contents = Vec::with_capacity(metadata.len() as usize);
+                Read::by_ref(&mut input)
+                    .take(MAX_CARGO_HOME_FILE_BYTES + 1)
+                    .read_to_end(&mut contents)?;
+                let after_read = input.metadata()?;
+                if contents.len() as u64 > MAX_CARGO_HOME_FILE_BYTES
+                    || contents.len() as u64 != metadata.len()
+                    || after_read.len() != metadata.len()
+                    || after_read.modified().ok() != metadata.modified().ok()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("shared Cargo {name} changed while it was being copied"),
+                    ));
+                }
+                match fs::symlink_metadata(&to) {
+                    Ok(destination_metadata)
+                        if destination_metadata.is_file()
+                            && !destination_metadata.file_type().is_symlink()
+                            && read_regular_file_no_follow(&to).ok().as_deref()
+                                == Some(contents.as_slice()) => {}
+                    Ok(destination_metadata)
+                        if destination_metadata.file_type().is_symlink()
+                            || !destination_metadata.is_file() =>
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "refusing to follow a non-file Cargo configuration destination {}",
+                                to.display()
+                            ),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        write_private_file_atomic(&to, &contents)?;
+                    }
+                    Ok(_) => write_private_file_atomic(&to, &contents)?,
+                    Err(error) => return Err(error),
+                }
+            }
+            None => match fs::symlink_metadata(&to) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    fs::remove_file(to)?;
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to remove a non-file Cargo configuration destination {}",
+                            to.display()
+                        ),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            },
+        }
+    }
+    Ok(())
+}
+
+fn resolve_regular_cargo_file(path: &Path) -> io::Result<Option<(PathBuf, fs::Metadata)>> {
+    let resolved = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        },
+        Ok(metadata) if metadata.is_file() => path.to_path_buf(),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("shared Cargo file {} is not a regular file", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = fs::symlink_metadata(&resolved)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "shared Cargo file {} is not a regular file",
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(Some((resolved, metadata)))
+}
+
+fn write_private_file_atomic(destination: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    ensure_real_cache_directory(parent)?;
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to replace a non-file destination {}",
+                    destination.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let temporary = parent.join(format!(".macluster-copy-{}.tmp", Id128::random()));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    let write_result = (|| {
+        output.write_all(contents)?;
+        output.sync_all()?;
+        fs::rename(&temporary, destination)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn read_regular_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a regular file",
+        ));
+    }
+    if metadata.len() > MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds the Cargo config size limit",
+        ));
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+fn copy_cache_file_atomic(
+    source: &Path,
+    destination: &Path,
+    before: fs::Metadata,
+) -> io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cargo cache file has no parent",
+        )
+    })?;
+    ensure_real_cache_directory(parent)?;
+    let temporary = parent.join(format!(".macluster-cache-{}.tmp", Id128::random()));
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    let result = (|| {
+        io::copy(&mut input, &mut output)?;
+        let after = input.metadata()?;
+        if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shared Cargo cache entry changed while it was being copied",
+            ));
+        }
+        if let Ok(modified) = after.modified() {
+            output.set_times(FileTimes::new().set_modified(modified))?;
+        }
+        output.sync_all()?;
+        fs::rename(&temporary, destination)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn managed_cache_paths(record: &AgentRecord) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut add = |kind: &str, include_project: bool| {
+        if let Ok(path) = managed_cache_directory(record, kind, include_project) {
+            paths.push(path);
+        }
+    };
+    if cargo_target_is_managed(record) {
+        add("cargo-target", true);
+    }
+    if cargo_home_is_managed(record) {
+        add("cargo-home", false);
+    }
+    if compiler_cache_is_managed(record, "CCACHE_DIR") {
+        add("ccache", false);
+    }
+    if compiler_cache_is_managed(record, "SCCACHE_DIR") {
+        add("sccache", false);
+    }
+    paths
+}
+
+fn managed_cache_namespace(record: &AgentRecord) -> Option<String> {
+    record
+        .spec
+        .storage_namespace
+        .map(|namespace| namespace.to_string())
+        .or_else(|| record.share_uuid.clone())
+}
+
+fn prune_managed_caches(protected_paths: &[PathBuf], namespace: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if namespace.is_empty()
+        || !namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid managed cache namespace",
+        ));
+    }
+    let namespace_hash =
+        sha256_hex(namespace.as_bytes()).map_err(|error| io::Error::other(error.to_string()))?;
+    let temp_root = std::env::temp_dir().canonicalize()?;
+    let root = temp_root.join("macluster");
+    ensure_real_cache_directory(&root)?;
+    let root_metadata = fs::symlink_metadata(&root)?;
+    if root_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed cache root is not private to this account",
+        ));
+    }
+
+    let lock_path = root.join(format!(".cache-gc-{namespace_hash}.lock"));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let lock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(error);
+    }
+
+    let last_run = root.join(format!(".cache-gc-{namespace_hash}.v1"));
+    if let Ok(metadata) = fs::symlink_metadata(&last_run) {
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|elapsed| elapsed < MANAGED_CACHE_GC_INTERVAL)
+        {
+            return Ok(());
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut total = 0_u64;
+    for kind in MANAGED_CACHE_KINDS {
+        let kind_root = root.join(kind);
+        if !is_real_directory(&kind_root)? {
+            continue;
+        }
+        let namespace_root = kind_root.join(namespace);
+        if !is_real_directory(&namespace_root)? {
+            continue;
+        }
+        for entry in fs::read_dir(&namespace_root)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            let name = entry.file_name();
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || !name.to_str().is_some_and(|name| is_cache_digest(name))
+            {
+                continue;
+            }
+            let (bytes, modified) = cache_tree_size_and_mtime(&entry.path())?;
+            total = total.saturating_add(bytes);
+            entries.push((
+                entry.path(),
+                kind_root.clone(),
+                namespace_root.clone(),
+                bytes,
+                modified,
+            ));
+        }
+    }
+    if total > MANAGED_CACHE_LIMIT_BYTES {
+        entries.sort_by_key(|(_, _, _, _, modified)| *modified);
+        for (path, kind_root, namespace_root, bytes, _) in entries {
+            if total <= MANAGED_CACHE_LIMIT_BYTES {
+                break;
+            }
+            if protected_paths.iter().any(|protected| protected == &path) {
+                continue;
+            }
+            // Recheck the leaf immediately before deletion. The tree is local,
+            // but this prevents following a link if another process replaced
+            // a cache directory after the scan.
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if is_real_directory(&root)?
+                && is_real_directory(&kind_root)?
+                && is_real_directory(&namespace_root)?
+                && metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+            {
+                fs::remove_dir_all(&path)?;
+                total = total.saturating_sub(bytes);
+            }
+        }
+        if total > MANAGED_CACHE_LIMIT_BYTES {
+            eprintln!(
+                "macluster-agent: managed build caches still use {:.1} GiB because the active task cache was preserved",
+                total as f64 / (1024.0_f64.powi(3))
+            );
+        }
+    }
+
+    write_private_file_atomic(&last_run, now_unix_seconds().to_string().as_bytes())
+}
+
+fn is_real_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_cache_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cache_tree_size_and_mtime(path: &Path) -> io::Result<(u64, SystemTime)> {
+    let metadata = fs::symlink_metadata(path)?;
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    if metadata.file_type().is_symlink() {
+        return Ok((0, modified));
+    }
+    if metadata.is_dir() {
+        let mut bytes = 0_u64;
+        let mut latest = modified;
+        for entry in fs::read_dir(path)? {
+            let (entry_bytes, entry_modified) = cache_tree_size_and_mtime(&entry?.path())?;
+            bytes = bytes.saturating_add(entry_bytes);
+            latest = latest.max(entry_modified);
+        }
+        Ok((bytes, latest))
+    } else if metadata.is_file() {
+        Ok((metadata.len(), modified))
+    } else {
+        Ok((0, modified))
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn task_path(record: &AgentRecord) -> String {

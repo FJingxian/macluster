@@ -26,9 +26,10 @@ use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
-        ACTIVE_ENV_PREFIX_ENV, EXPLICIT_TASK_PATH_ENV, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord,
-        JobSpec, JobState, METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION,
-        SnapshotRef, VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
+        ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, CARGO_HOME_SEED_ENV,
+        EXPLICIT_TASK_PATH_ENV, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSpec, JobState,
+        METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION, SnapshotRef,
+        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1924,6 +1925,14 @@ fn build_submission(
         validate_active_environment,
         allow_unused_build_metadata,
     )?;
+    if task_script_uses_build_cache(&script, merged.interactive, &task_env) {
+        task_env.insert(BUILD_CACHE_MAINTENANCE_ENV.into(), "1".into());
+    } else {
+        task_env.remove(BUILD_CACHE_MAINTENANCE_ENV);
+    }
+    if !task_script_uses_cargo_cache(&script, merged.interactive, &task_env) {
+        task_env.remove(CARGO_HOME_SEED_ENV);
+    }
     if merged.verbose {
         task_env.insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
         task_env.insert(
@@ -2008,6 +2017,60 @@ fn is_command_available(command: &str, overrides: &BTreeMap<String, String>) -> 
                 !prefix.is_empty() && Path::new(prefix).join("bin").join(command).is_file()
             })
         })
+}
+
+fn task_script_uses_cargo_cache(
+    script: &[u8],
+    interactive: bool,
+    task_env: &BTreeMap<String, String>,
+) -> bool {
+    if interactive && script.iter().all(u8::is_ascii_whitespace) {
+        return true;
+    }
+    if task_env
+        .get("CARGO_NET_OFFLINE")
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"))
+    {
+        return true;
+    }
+    let script = String::from_utf8_lossy(script).to_ascii_lowercase();
+    [
+        "cargo",
+        "rustc",
+        "maturin",
+        "pip install",
+        "pip wheel",
+        "uv pip",
+    ]
+    .iter()
+    .any(|marker| script.contains(marker))
+}
+
+fn task_script_uses_build_cache(
+    script: &[u8],
+    interactive: bool,
+    task_env: &BTreeMap<String, String>,
+) -> bool {
+    if task_script_uses_cargo_cache(script, interactive, task_env) {
+        return true;
+    }
+    let script = String::from_utf8_lossy(script).to_ascii_lowercase();
+    [
+        "cc ",
+        "c++ ",
+        "gcc",
+        "clang",
+        "cmake",
+        "make ",
+        "ninja",
+        "meson",
+        "setup.py build",
+        "pip install",
+        "pip wheel",
+        "uv pip",
+    ]
+    .iter()
+    .any(|marker| script.contains(marker))
 }
 
 fn inherited_task_environment() -> BTreeMap<String, String> {
@@ -2115,21 +2178,35 @@ fn prepare_task_environment_with_policy(
         .map(|prefix| validate_active_environment(config, prefix))
         .transpose()?;
 
-    let cargo_offline = task_env
-        .get("CARGO_NET_OFFLINE")
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"));
-    if cargo_offline
-        && !explicit_env_keys.iter().any(|key| key == "CARGO_HOME")
-        && task_env
+    // A configured login-node Cargo share is the only safe way to reuse its
+    // registry cache from compute nodes. Select it for ordinary online builds
+    // too; previously this happened only in offline mode, so normal msub
+    // builds silently started with an empty per-node Cargo registry.
+    if !explicit_env_keys.iter().any(|key| key == "CARGO_HOME") {
+        let inherited_cargo_home = task_env
             .get("CARGO_HOME")
-            .is_none_or(|value| value.is_empty())
-        && let Some(home) = env::var_os("HOME").map(PathBuf::from)
-        && let Some(cargo_home) = configured_shared_cargo_home(config, &home)
-    {
-        task_env.insert(
-            "CARGO_HOME".into(),
-            cargo_home.to_string_lossy().into_owned(),
-        );
+            .filter(|value| !value.is_empty())
+            .map(Path::new);
+        let inherited_shared = inherited_cargo_home
+            .filter(|path| path.is_absolute())
+            .and_then(|path| remap_shared_path(config, path));
+        let configured_shared = if inherited_shared.is_none() {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .and_then(|home| configured_shared_cargo_home(config, &home))
+                .and_then(|path| remap_shared_path(config, &path))
+        } else {
+            None
+        };
+        if let Some(compute_path) = inherited_shared.or(configured_shared) {
+            // Keep Cargo's writable cache node-local. The Agent seeds it once
+            // from the login node's shared registry/Git download cache.
+            task_env.remove("CARGO_HOME");
+            task_env.insert(
+                CARGO_HOME_SEED_ENV.into(),
+                compute_path.to_string_lossy().into_owned(),
+            );
+        }
     }
 
     if let Some(prefix) = selected_prefix.as_deref()

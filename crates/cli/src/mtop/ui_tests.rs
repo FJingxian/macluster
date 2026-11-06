@@ -6,8 +6,8 @@ use super::{
     model::{DisplayNodeIdentity, MetricView, NodeRole, SortKey, aggregate_power},
     processes::{ProcessInfo, ProcessView},
     ui::{
-        AppState, InputAction, LayoutMode, handle_key, job_label, layout_mode, power_text, render,
-        resources,
+        AppState, InputAction, LayoutMode, UiNode, handle_key, job_label, layout_mode, power_text,
+        render, resources,
     },
 };
 
@@ -87,6 +87,57 @@ fn renderer_handles_wide_medium_compact_and_small_terminals() {
         terminal.draw(|frame| render(frame, &state)).unwrap();
         assert_eq!(layout_mode(Rect::new(0, 0, width, height)), expected);
     }
+}
+
+#[test]
+fn disconnected_selected_node_remains_in_details_and_is_labeled_offline() {
+    let identity = |id: &str, role| DisplayNodeIdentity {
+        id: id.into(),
+        host: format!("{id}.local"),
+        role,
+        queues: vec!["default".into()],
+        compute_member: true,
+    };
+    let node = |id: &str, role| UiNode {
+        identity: identity(id, role),
+        metrics: MetricView::Unavailable {
+            reason: "SSH timeout".into(),
+        },
+        jobs: Vec::new(),
+        cpu_history: Vec::new(),
+        last_error: Some("SSH timeout".into()),
+        processes: ProcessView::Loading,
+    };
+    let mut state = AppState::empty("default");
+    state.nodes = vec![node("@login", NodeRole::Login)];
+    state.selected_id = Some("default-001".into());
+    state.selected_detail = Some(node("default-001", NodeRole::Compute));
+
+    assert!(state.selected_is_offline());
+    assert_eq!(
+        state
+            .selected()
+            .map(|selected| selected.identity.id.as_str()),
+        Some("default-001")
+    );
+    let compact = rendered_lines(120, 24, &state).join("\n");
+    assert!(compact.contains("default-001"), "details: {compact}");
+    assert!(
+        compact.contains("OFFLINE · reconnecting"),
+        "details: {compact}"
+    );
+
+    state.expanded = true;
+    let expanded = rendered_lines(160, 40, &state).join("\n");
+    assert!(expanded.contains("default-001"), "details: {expanded}");
+    assert!(
+        expanded.contains("OFFLINE · reconnecting"),
+        "details: {expanded}"
+    );
+
+    state.select_delta(1);
+    assert_eq!(state.selected_id.as_deref(), Some("@login"));
+    assert!(!state.selected_is_offline());
 }
 
 #[test]

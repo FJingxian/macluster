@@ -537,7 +537,7 @@ pub fn run_interactive(
                 dirty = true;
             }
 
-            if state.expanded {
+            if state.expanded && !state.selected_is_offline() {
                 if let Some(id) = state.selected_id.as_deref() {
                     if !preview_attempted.contains(id)
                         && process_caches
@@ -620,7 +620,9 @@ pub fn run_interactive(
                     }
                 }
             } else if state.expanded {
-                if let Some(selected_id) = state.selected_id.as_deref() {
+                if state.selected_is_offline() {
+                    process_selection = None;
+                } else if let Some(selected_id) = state.selected_id.as_deref() {
                     if process_selection.as_deref() != Some(selected_id) {
                         process_selection = Some(selected_id.to_owned());
                         next_process_sample = now;
@@ -866,16 +868,8 @@ fn update_visible_nodes(
     now: Instant,
 ) {
     let old_selection = state.selected_id.clone();
-    state.nodes = identities
+    let all_nodes = identities
         .iter()
-        .filter(|identity| {
-            if identity.role != NodeRole::Compute {
-                return true;
-            }
-            caches
-                .get(&identity.id)
-                .is_some_and(|cache| cache.should_display(now))
-        })
         .map(|identity| {
             let cache = caches.get(&identity.id);
             let metrics = cache.map_or(MetricView::Loading, |cache| cache.view_at(now));
@@ -916,9 +910,42 @@ fn update_visible_nodes(
                 processes,
             }
         })
+        .collect::<Vec<_>>();
+    let selected_is_configured = old_selection
+        .as_ref()
+        .is_some_and(|id| identities.iter().any(|identity| &identity.id == id));
+    let selected_is_visible = old_selection.as_ref().is_some_and(|id| {
+        identities
+            .iter()
+            .find(|identity| &identity.id == id)
+            .is_some_and(|identity| {
+                identity.role != NodeRole::Compute
+                    || caches
+                        .get(&identity.id)
+                        .is_some_and(|cache| cache.should_display(now))
+            })
+    });
+    state.selected_detail = if selected_is_configured && !selected_is_visible {
+        old_selection.as_ref().and_then(|id| {
+            all_nodes
+                .iter()
+                .find(|node| &node.identity.id == id)
+                .cloned()
+        })
+    } else {
+        None
+    };
+    state.nodes = all_nodes
+        .into_iter()
+        .filter(|node| {
+            node.identity.role != NodeRole::Compute
+                || caches
+                    .get(&node.identity.id)
+                    .is_some_and(|cache| cache.should_display(now))
+        })
         .collect();
     state.selected_id = old_selection
-        .filter(|id| state.nodes.iter().any(|node| &node.identity.id == id))
+        .filter(|_| selected_is_configured)
         .or_else(|| state.nodes.first().map(|node| node.identity.id.clone()));
     state.sort_nodes();
 }

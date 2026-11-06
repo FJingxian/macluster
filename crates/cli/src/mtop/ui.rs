@@ -65,6 +65,7 @@ pub struct AppState {
     pub nodes: Vec<UiNode>,
     pub jobs: Vec<JobRecord>,
     pub selected_id: Option<String>,
+    pub(super) selected_detail: Option<UiNode>,
     pub sort_key: SortKey,
     pub sort_direction: SortDirection,
     pub process_sort: ProcessSort,
@@ -86,6 +87,7 @@ impl AppState {
             nodes: Vec::new(),
             jobs: Vec::new(),
             selected_id: None,
+            selected_detail: None,
             sort_key: SortKey::Id,
             sort_direction: SortDirection::Ascending,
             process_sort: ProcessSort::Cpu,
@@ -104,24 +106,30 @@ impl AppState {
     pub fn select_delta(&mut self, delta: isize) {
         if self.nodes.is_empty() {
             self.selected_id = None;
+            self.selected_detail = None;
             return;
         }
-        let index = self
+        let selected_index = self
             .selected_id
             .as_ref()
-            .and_then(|id| self.nodes.iter().position(|node| &node.identity.id == id))
-            .unwrap_or(0);
+            .and_then(|id| self.nodes.iter().position(|node| &node.identity.id == id));
         let count = self.nodes.len() as isize;
-        let next = (index as isize + delta).clamp(0, count - 1) as usize;
+        let next = selected_index.map_or_else(
+            || if delta < 0 { count - 1 } else { 0 },
+            |index| (index as isize + delta).clamp(0, count - 1),
+        ) as usize;
         self.selected_id = Some(self.nodes[next].identity.id.clone());
+        self.selected_detail = None;
     }
 
     pub fn select_first(&mut self) {
         self.selected_id = self.nodes.first().map(|node| node.identity.id.clone());
+        self.selected_detail = None;
     }
 
     pub fn select_last(&mut self) {
         self.selected_id = self.nodes.last().map(|node| node.identity.id.clone());
+        self.selected_detail = None;
     }
 
     pub fn sort(&mut self, key: SortKey) {
@@ -163,7 +171,24 @@ impl AppState {
 
     pub fn selected(&self) -> Option<&UiNode> {
         let id = self.selected_id.as_ref()?;
-        self.nodes.iter().find(|node| &node.identity.id == id)
+        self.nodes
+            .iter()
+            .find(|node| &node.identity.id == id)
+            .or_else(|| {
+                self.selected_detail
+                    .as_ref()
+                    .filter(|node| &node.identity.id == id)
+            })
+    }
+
+    pub fn selected_is_offline(&self) -> bool {
+        let Some(id) = self.selected_id.as_ref() else {
+            return false;
+        };
+        self.selected_detail
+            .as_ref()
+            .is_some_and(|node| &node.identity.id == id)
+            && !self.nodes.iter().any(|node| &node.identity.id == id)
     }
 }
 
@@ -919,6 +944,7 @@ fn render_detail(
             tasks,
             state.process_sort,
             state.no_color,
+            state.selected_is_offline(),
             &request_latency,
         );
         return;
@@ -963,8 +989,13 @@ fn render_detail(
                 },
             ),
             Span::raw(format!(
-                " · {} · sample age {selected_age} · request {request_latency}",
-                node.identity.host
+                " · {}{} · sample age {selected_age} · request {request_latency}",
+                node.identity.host,
+                if state.selected_is_offline() {
+                    " · OFFLINE · reconnecting"
+                } else {
+                    ""
+                }
             )),
         ]),
         Line::from(format!(
@@ -1054,6 +1085,7 @@ fn render_expanded_detail(
     tasks: TaskCounts,
     process_sort: ProcessSort,
     no_color: bool,
+    selected_offline: bool,
     request_latency: &str,
 ) {
     let selected_age = match &node.metrics {
@@ -1072,7 +1104,14 @@ fn render_expanded_detail(
     let inner = block.inner(area);
     let split_layout =
         area.width >= DETAIL_SPLIT_MIN_WIDTH && area.height >= DETAIL_SPLIT_MIN_HEIGHT;
-    let header = detail_header_line(node, &selected_age, request_latency, &queues, no_color);
+    let header = detail_header_line(
+        node,
+        &selected_age,
+        request_latency,
+        &queues,
+        no_color,
+        selected_offline,
+    );
     if split_layout {
         render_split_expanded_detail(
             frame,
@@ -1166,6 +1205,7 @@ fn detail_header_line<'a>(
     request_latency: &str,
     queues: &str,
     no_color: bool,
+    selected_offline: bool,
 ) -> Line<'a> {
     let display_id = if node.identity.role == NodeRole::Login {
         "login"
@@ -1182,8 +1222,13 @@ fn detail_header_line<'a>(
             },
         ),
         Span::raw(format!(
-            " · {} · sample age {selected_age} · request {request_latency} · queues {queues}",
-            node.identity.host
+            " · {}{} · sample age {selected_age} · request {request_latency} · queues {queues}",
+            node.identity.host,
+            if selected_offline {
+                " · OFFLINE · reconnecting"
+            } else {
+                ""
+            }
         )),
     ])
 }

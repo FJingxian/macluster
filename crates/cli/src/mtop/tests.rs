@@ -368,6 +368,7 @@ fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
             .iter()
             .any(|node| node.identity.id == "worker-a")
     );
+    state.selected_id = Some("worker-a".into());
 
     caches
         .get_mut("worker-a")
@@ -410,6 +411,17 @@ fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
             .collect::<Vec<_>>(),
         ["@login", "worker-b"]
     );
+    assert_eq!(
+        state.selected_id.as_deref(),
+        Some("worker-a"),
+        "hiding a disconnected node must not move the details selection"
+    );
+    assert_eq!(
+        state.selected().map(|node| node.identity.id.as_str()),
+        Some("worker-a"),
+        "the offline node's details should remain available"
+    );
+    assert!(state.selected_is_offline());
 
     caches
         .get_mut("worker-a")
@@ -424,6 +436,8 @@ fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
         expired_at,
     );
     assert_eq!(state.nodes.len(), 3, "show the node again after recovery");
+    assert_eq!(state.selected_id.as_deref(), Some("worker-a"));
+    assert!(!state.selected_is_offline());
 }
 
 #[test]

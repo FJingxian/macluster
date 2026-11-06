@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
+    widgets::{Block, Cell, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -25,6 +25,8 @@ const POWER_STALE_AFTER: Duration = Duration::from_secs(15);
 const POWER_CACHE_TTL: Duration =
     Duration::from_millis(macluster_protocol::types::POWER_SAMPLE_CACHE_TTL_MS);
 const DETAIL_BASE_ROWS: u16 = 5;
+const DETAIL_SPLIT_MIN_WIDTH: u16 = 100;
+const DETAIL_SPLIT_MIN_HEIGHT: u16 = 10;
 const DETAIL_MIN_PROCESS_ROWS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +251,7 @@ pub(super) fn resources(view: &MetricView) -> ResourceValues {
         fresh: is_fresh,
         cpu_percent: snapshot.cpu_percent,
         cpu_max_percent: snapshot.cpu_max_percent,
+        logical_cpu_percent: snapshot.logical_cpu_percent.clone(),
         cpu_temp_celsius: snapshot.cpu_temp_celsius,
         memory_used_bytes: snapshot.memory_used_bytes,
         memory_total_bytes: snapshot.memory_total_bytes,
@@ -1058,11 +1061,6 @@ fn render_expanded_detail(
         _ => "N/A".into(),
     };
     let resources = resources(&node.metrics);
-    let display_id = if node.identity.role == NodeRole::Login {
-        "login"
-    } else {
-        &node.identity.id
-    };
     let queues = if node.identity.queues.is_empty() {
         "none".to_owned()
     } else {
@@ -1072,12 +1070,29 @@ fn render_expanded_detail(
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(" Details · c CPU ↓ · m Memory ↓ · Esc to close ");
     let inner = block.inner(area);
+    let split_layout =
+        area.width >= DETAIL_SPLIT_MIN_WIDTH && area.height >= DETAIL_SPLIT_MIN_HEIGHT;
+    let header = detail_header_line(node, &selected_age, request_latency, &queues, no_color);
+    if split_layout {
+        render_split_expanded_detail(
+            frame,
+            area,
+            header,
+            node,
+            tasks,
+            process_sort,
+            no_color,
+            &resources,
+        );
+        return;
+    }
+    frame.render_widget(block, area);
+
     let (system_disk, external_disks) = disk_capacities(&node.metrics);
     let external_disk_line = (inner.height > DETAIL_BASE_ROWS + DETAIL_MIN_PROCESS_ROWS)
         .then(|| external_disk_capacity_line(external_disks, inner.width as usize))
         .flatten();
     let external_disk_rows = usize::from(external_disk_line.is_some());
-    frame.render_widget(block, area);
     let mut constraints =
         vec![Constraint::Length(1); DETAIL_BASE_ROWS as usize + external_disk_rows];
     constraints.push(Constraint::Min(1));
@@ -1085,23 +1100,7 @@ fn render_expanded_detail(
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                display_id,
-                if no_color {
-                    Style::default()
-                } else {
-                    link_style(&node.metrics)
-                },
-            ),
-            Span::raw(format!(
-                " · {} · sample age {selected_age} · request {request_latency} · queues {queues}",
-                node.identity.host
-            )),
-        ])),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(header), chunks[0]);
     frame.render_widget(
         Paragraph::new(format!(
             "CPU% {}   MEM(GiB) {}   GPU% {}   TEMP {}",
@@ -1141,6 +1140,8 @@ fn render_expanded_detail(
     if let Some(line) = external_disk_line {
         frame.render_widget(Paragraph::new(line), chunks[4]);
     }
+    let jobs_index = DETAIL_BASE_ROWS as usize - 1 + external_disk_rows;
+    let processes_index = DETAIL_BASE_ROWS as usize + external_disk_rows;
     frame.render_widget(
         Paragraph::new(format!(
             "Jobs {} · RUN/WAIT {}/{} · {}",
@@ -1149,17 +1150,58 @@ fn render_expanded_detail(
             tasks.waiting,
             process_status(&node.processes, process_sort)
         )),
-        chunks[4 + external_disk_rows],
+        chunks[jobs_index],
     );
-
-    let preview_cpu = matches!(
+    render_process_table(
+        frame,
+        chunks[processes_index],
         &node.processes,
+        process_sort,
+    );
+}
+
+fn detail_header_line<'a>(
+    node: &'a UiNode,
+    selected_age: &str,
+    request_latency: &str,
+    queues: &str,
+    no_color: bool,
+) -> Line<'a> {
+    let display_id = if node.identity.role == NodeRole::Login {
+        "login"
+    } else {
+        &node.identity.id
+    };
+    Line::from(vec![
+        Span::styled(
+            display_id,
+            if no_color {
+                Style::default()
+            } else {
+                link_style(&node.metrics)
+            },
+        ),
+        Span::raw(format!(
+            " · {} · sample age {selected_age} · request {request_latency} · queues {queues}",
+            node.identity.host
+        )),
+    ])
+}
+
+fn render_process_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    processes: &ProcessView,
+    process_sort: ProcessSort,
+) {
+    let preview_cpu = matches!(
+        processes,
         ProcessView::Available {
             warning: Some(warning),
             ..
         } if warning.starts_with("Preview: ps average CPU%")
     );
-    let mut rows = match &node.processes {
+    let mut rows = match processes {
         ProcessView::Available { rows, .. } => rows.clone(),
         ProcessView::Loading | ProcessView::Unavailable { .. } => Vec::new(),
     };
@@ -1185,7 +1227,373 @@ fn render_expanded_detail(
         ])
         .style(Style::default().add_modifier(Modifier::BOLD)),
     );
-    frame.render_widget(table, chunks[5 + external_disk_rows]);
+    frame.render_widget(table, area);
+}
+
+fn render_split_expanded_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    header: Line<'_>,
+    node: &UiNode,
+    tasks: TaskCounts,
+    process_sort: ProcessSort,
+    no_color: bool,
+    resources: &ResourceValues,
+) {
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().add_modifier(Modifier::BOLD)),
+        body[0],
+    );
+
+    let pane_width = body[1].width.saturating_sub(1);
+    let process_width = (((pane_width as u32 * 35) / 100) as u16)
+        .clamp(70, 90)
+        .min(pane_width.saturating_sub(50));
+    let resource_width = pane_width.saturating_sub(process_width);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(process_width),
+            Constraint::Length(1),
+            Constraint::Length(resource_width),
+        ])
+        .split(body[1]);
+    let process_block = Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(" TOP · c CPU ↓ · m Memory ↓ ");
+    let process_inner = process_block.inner(panes[0]);
+    frame.render_widget(process_block, panes[0]);
+    let process_pane = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(process_inner);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Jobs {} · RUN/WAIT {}/{} · {}",
+            job_label(&node.jobs),
+            tasks.running,
+            tasks.waiting,
+            process_status(&node.processes, process_sort)
+        )),
+        process_pane[0],
+    );
+    render_process_table(frame, process_pane[1], &node.processes, process_sort);
+    render_resource_panel(frame, panes[2], resources, &node.metrics, no_color);
+}
+
+fn render_resource_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    resources: &ResourceValues,
+    metrics: &MetricView,
+    no_color: bool,
+) {
+    let block = Block::bordered()
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(" RESOURCES ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (system_disk, external_disks) = disk_capacities(metrics);
+    let logical_cpus = resources
+        .logical_cpu_percent
+        .as_ref()
+        .filter(|values| !values.is_empty())
+        .map(Vec::len)
+        .or_else(|| {
+            resources
+                .cpu_max_percent
+                .filter(|maximum| maximum.is_finite() && *maximum > 0.0)
+                .map(|maximum| (maximum / 100.0).round().clamp(1.0, 256.0) as usize)
+        })
+        .unwrap_or(0);
+    let columns = if logical_cpus == 0 {
+        1
+    } else {
+        ((inner.width / 15).clamp(1, 4) as usize).min(logical_cpus)
+    };
+    let core_rows = logical_cpus.max(1).div_ceil(columns);
+    let core_section_rows = 1 + core_rows as u16;
+    let always_visible_rows = core_section_rows + 1 + 2;
+    let extra_rows = inner.height.saturating_sub(always_visible_rows);
+    let show_disk_io = extra_rows >= 1;
+    let show_network = extra_rows >= 2;
+    let show_system_disk = extra_rows >= 3;
+    let external_disk_line = (extra_rows >= 4)
+        .then(|| external_disk_capacity_line(external_disks, inner.width as usize))
+        .flatten();
+
+    let mut constraints = vec![Constraint::Length(1); core_section_rows as usize];
+    constraints.push(Constraint::Length(1)); // memory
+    constraints.extend([Constraint::Length(1), Constraint::Length(1)]); // sensors
+    if show_disk_io {
+        constraints.push(Constraint::Length(1));
+    }
+    if show_network {
+        constraints.push(Constraint::Length(1));
+    }
+    if show_system_disk {
+        constraints.push(Constraint::Length(1));
+    }
+    if external_disk_line.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+    let mut row = 0;
+
+    let cpu_total = match (resources.cpu_percent, resources.cpu_max_percent) {
+        (Some(value), Some(maximum))
+            if value.is_finite() && maximum.is_finite() && maximum > 0.0 =>
+        {
+            format!("{value:.0}/{maximum:.0}%")
+        }
+        _ => "N/A".into(),
+    };
+    let cpu_header = if logical_cpus > 0 {
+        format!("CPU {cpu_total} · {logical_cpus} logical processors")
+    } else {
+        format!("CPU {cpu_total} · logical processor data unavailable")
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            cpu_header,
+            resource_label_style(Color::Cyan, no_color),
+        )),
+        rows[row],
+    );
+    row += 1;
+    if logical_cpus == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "per-processor data unavailable",
+                resource_label_style(Color::DarkGray, no_color),
+            )),
+            rows[row],
+        );
+        row += 1;
+    } else {
+        for core_row in 0..core_rows {
+            let first_core = core_row * columns;
+            let end_core = (first_core + columns).min(logical_cpus);
+            let cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![Constraint::Ratio(1, columns as u32); columns])
+                .split(rows[row]);
+            for core in first_core..end_core {
+                render_logical_cpu(
+                    frame,
+                    cells[core - first_core],
+                    core,
+                    resources
+                        .logical_cpu_percent
+                        .as_ref()
+                        .and_then(|values| values.get(core))
+                        .copied(),
+                    logical_cpus,
+                    no_color,
+                );
+            }
+            row += 1;
+        }
+    }
+
+    let memory_ratio = resource_ratio(
+        resources.memory_used_bytes.map(|used| used as f64),
+        resources.memory_total_bytes.map(|total| total as f64),
+    )
+    .unwrap_or(0.0);
+    let memory_label = match (resources.memory_used_bytes, resources.memory_total_bytes) {
+        (Some(_), Some(total)) if total > 0 => {
+            format!(
+                "MEM(GiB) {} · {:.0}%",
+                memory_text(resources),
+                memory_ratio * 100.0
+            )
+        }
+        _ => "MEM(GiB) N/A".into(),
+    };
+    frame.render_widget(
+        Gauge::default()
+            .ratio(memory_ratio)
+            .label(memory_label)
+            .use_unicode(true)
+            .gauge_style(resource_gauge_style(Color::Green, no_color)),
+        rows[row],
+    );
+    row += 1;
+
+    let sensor_pairs = [
+        [
+            ("GPU%", gpu_cell(resources), Color::Magenta),
+            (
+                "TEMP",
+                cpu_temperature_text(resources.cpu_temp_celsius),
+                Color::Red,
+            ),
+        ],
+        [
+            ("POWER", power_text(metrics), Color::Yellow),
+            (
+                "FAN",
+                fan_speed_detail_text(metrics, resources.fan_speed_rpm),
+                Color::Cyan,
+            ),
+        ],
+    ];
+    for pair in sensor_pairs {
+        let cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(rows[row]);
+        for ((label, value, color), cell) in pair.into_iter().zip(cells.iter()) {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(label, resource_label_style(color, no_color)),
+                    Span::raw(format!(" {value}")),
+                ])),
+                *cell,
+            );
+        }
+        row += 1;
+    }
+
+    if show_disk_io {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("DISK(R/W)", resource_label_style(Color::Blue, no_color)),
+                Span::raw(format!(
+                    " {}",
+                    pair_rate(
+                        resources.disk_read_bytes_per_sec,
+                        resources.disk_write_bytes_per_sec,
+                    )
+                )),
+            ])),
+            rows[row],
+        );
+        row += 1;
+    }
+    if show_network {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "NET(down/up)",
+                    resource_label_style(Color::LightBlue, no_color),
+                ),
+                Span::raw(format!(
+                    " {}",
+                    pair_rate(
+                        resources.network_rx_bytes_per_sec,
+                        resources.network_tx_bytes_per_sec,
+                    )
+                )),
+            ])),
+            rows[row],
+        );
+        row += 1;
+    }
+
+    if show_system_disk {
+        let (disk_ratio, disk_label) = system_disk.map_or_else(
+            || (0.0, "SYS DISK N/A".into()),
+            |disk| {
+                let ratio =
+                    resource_ratio(Some(disk.used_bytes as f64), Some(disk.total_bytes as f64))
+                        .unwrap_or(0.0);
+                (ratio, disk_capacity_line("SYS DISK", disk))
+            },
+        );
+        frame.render_widget(
+            Gauge::default()
+                .ratio(disk_ratio)
+                .label(disk_label)
+                .use_unicode(true)
+                .gauge_style(resource_gauge_style(Color::Blue, no_color)),
+            rows[row],
+        );
+        row += 1;
+    }
+    if let Some(line) = external_disk_line {
+        frame.render_widget(Paragraph::new(line), rows[row]);
+    }
+}
+
+fn render_logical_cpu(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    index: usize,
+    value: Option<f64>,
+    processor_count: usize,
+    no_color: bool,
+) {
+    let digits = processor_count.saturating_sub(1).to_string().len().max(1);
+    let prefix_width = 3 + digits + 1;
+    let bar_width = (area.width as usize).saturating_sub(prefix_width + 5);
+    let value = value.filter(|value| value.is_finite() && (0.0..=100.0).contains(value));
+    let prefix = format!("CPU{index:>digits$} ");
+    let mut spans = vec![Span::styled(
+        prefix,
+        resource_label_style(Color::DarkGray, no_color),
+    )];
+    if let Some(value) = value {
+        let filled = ((value / 100.0) * bar_width as f64).round() as usize;
+        let color = if value >= 85.0 {
+            Color::Red
+        } else if value >= 60.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        let bar_style = resource_label_style(color, no_color);
+        spans.push(Span::styled("█".repeat(filled.min(bar_width)), bar_style));
+        spans.push(Span::styled(
+            "░".repeat(bar_width.saturating_sub(filled)),
+            resource_label_style(Color::DarkGray, no_color),
+        ));
+        spans.push(Span::styled(
+            format!(" {value:>3.0}%"),
+            resource_label_style(color, no_color),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "·".repeat(bar_width),
+            resource_label_style(Color::DarkGray, no_color),
+        ));
+        spans.push(Span::styled(
+            "  N/A",
+            resource_label_style(Color::DarkGray, no_color),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn resource_label_style(color: Color, no_color: bool) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    }
+}
+
+fn resource_gauge_style(color: Color, no_color: bool) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(color).bg(Color::DarkGray)
+    }
+}
+
+fn resource_ratio(value: Option<f64>, maximum: Option<f64>) -> Option<f64> {
+    let (value, maximum) = (value?, maximum?);
+    (value.is_finite() && maximum.is_finite() && maximum > 0.0)
+        .then(|| (value / maximum).clamp(0.0, 1.0))
 }
 
 fn disk_capacities(view: &MetricView) -> (Option<&DiskCapacity>, &[DiskCapacity]) {

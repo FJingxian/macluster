@@ -320,7 +320,7 @@ fn online_job_lookup_and_queue_summary_reflect_durable_submissions() {
     };
     assert_eq!(queues.len(), 1);
     assert_eq!(queues[0].name, "cpu");
-    assert_eq!(queues[0].nodes, vec!["compute"]);
+    assert!(queues[0].nodes.is_empty(), "unprobed nodes are not online");
     assert_eq!(queues[0].pending, 1);
 }
 

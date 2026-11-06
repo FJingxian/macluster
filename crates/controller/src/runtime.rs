@@ -1,7 +1,7 @@
 //! Bounded asynchronous reconciliation used by the long-running controller.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex,
@@ -15,7 +15,7 @@ use macluster_core::{
     config::Transport,
     maintenance::ResetBarrierPolicy,
     scheduler::{NodeEligibility, next_dispatch},
-    storage::{Storage, SubmitError},
+    storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
 use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
@@ -40,6 +40,7 @@ const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
 const WORK_QUEUE_FACTOR: usize = 1;
 const NODE_STATUS_TTL: Duration = Duration::from_secs(6);
+const IDLE_NODE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const NODE_HEALTH_TTL: Duration = Duration::from_secs(60);
 const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
@@ -130,6 +131,7 @@ enum WorkKind {
     Cancel,
     ShareHealth,
     PublishSnapshot,
+    StorageUsage,
 }
 
 #[derive(Clone, Debug)]
@@ -155,10 +157,12 @@ enum WorkerResult {
     Control(Result<ResponseBody, String>),
     ShareHealth(bool),
     PublishSnapshot(Result<(), String>),
+    StorageUsage(Result<u64, String>),
 }
 
 struct ProbeResult {
     fence_error: Option<String>,
+    endpoint_reachable: Option<bool>,
     status: Option<Result<ResponseBody, ProbeError>>,
     health: Option<Result<ResponseBody, String>>,
 }
@@ -184,8 +188,10 @@ struct NodeStatusCache {
 struct NodeHealthCache {
     valid: bool,
     ready: bool,
+    agent_current: bool,
     interactive_pty: bool,
     namespaced_jobs: bool,
+    logical_cpus: Option<u32>,
     sampled_at: Instant,
     retry_at: Instant,
 }
@@ -199,6 +205,7 @@ struct NodeRuntime {
     next_probe_at: Instant,
     probe_after_inflight_for_job: Option<u64>,
     probe_failures: u8,
+    unreachable_since_unix_ms: Option<u64>,
     last_probe_error: Option<String>,
     next_control_at: Instant,
     control_failures: u8,
@@ -216,6 +223,7 @@ impl NodeRuntime {
             next_probe_at: now,
             probe_after_inflight_for_job: None,
             probe_failures: 0,
+            unreachable_since_unix_ms: None,
             last_probe_error: None,
             next_control_at: now,
             control_failures: 0,
@@ -246,6 +254,110 @@ impl NodeRuntime {
     }
 }
 
+fn probe_delay(configured_interval: Duration, occupied: bool) -> Duration {
+    if occupied {
+        configured_interval
+    } else {
+        IDLE_NODE_PROBE_INTERVAL
+    }
+}
+
+#[cfg(test)]
+fn node_probe_retry_delay() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn node_probe_retry_delay_for_failures(failures: u8) -> Duration {
+    // Retry quickly while confirming a disconnect. Keep a bounded 10-second
+    // recovery cadence after the node is hidden so cable/Wi-Fi rejoin is
+    // reflected promptly; the probe pool caps aggregate work for large pools.
+    if failures < crate::liveness::OFFLINE_AFTER_FAILURES {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+fn persist_node_liveness<T: NodeTransport>(
+    service: &ControllerService<T>,
+    node_id: &str,
+    reachable: bool,
+    observed_unix_ms: u64,
+) -> Option<crate::liveness::NodeLiveness> {
+    let Some(node) = service.config.nodes.get(node_id) else {
+        return None;
+    };
+    let observation = crate::liveness::NodeObservation {
+        node_id: node_id.to_owned(),
+        identity_key: node
+            .machine_uuid
+            .as_deref()
+            .unwrap_or(node.host.as_str())
+            .to_ascii_lowercase(),
+        reachable,
+    };
+    match crate::liveness::observe_many(
+        service.storage.root(),
+        &service.config.share_uuid,
+        &[observation],
+        observed_unix_ms,
+    ) {
+        Ok(records) => records.get(node_id).cloned(),
+        Err(error) => {
+            eprintln!("macluster: could not persist node liveness for {node_id}: {error}");
+            None
+        }
+    }
+}
+
+fn persist_node_health<T: NodeTransport>(
+    service: &ControllerService<T>,
+    node_id: &str,
+    health: macluster_protocol::types::NodeHealth,
+    sampled_unix_ms: u64,
+) {
+    let Some(node) = service.config.nodes.get(node_id) else {
+        return;
+    };
+    let identity_key = node
+        .machine_uuid
+        .as_deref()
+        .unwrap_or(node.host.as_str())
+        .to_ascii_lowercase();
+    if let Err(error) = crate::liveness::update_health(
+        service.storage.root(),
+        &service.config.share_uuid,
+        node_id,
+        &identity_key,
+        health,
+        sampled_unix_ms,
+    ) {
+        eprintln!("macluster: could not persist node health for {node_id}: {error}");
+    }
+}
+
+fn pending_queue_heads(jobs: &[JobRecord]) -> HashMap<String, usize> {
+    let mut heads = HashMap::new();
+    for (index, job) in jobs
+        .iter()
+        .enumerate()
+        .filter(|(_, job)| job.state == JobState::Pending)
+    {
+        let queue = job.spec.queue.to_string();
+        match heads.entry(queue) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(index);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if job.id < jobs[*entry.get()].id {
+                    entry.insert(index);
+                }
+            }
+        }
+    }
+    heads
+}
+
 struct SnapshotRetry {
     attempts: u8,
     retry_at: Instant,
@@ -260,6 +372,8 @@ struct RuntimeState {
     control_pool: WorkerPool<WorkerCompletion>,
     share_pool: WorkerPool<WorkerCompletion>,
     snapshot_pool: WorkerPool<WorkerCompletion>,
+    storage_usage_pool: WorkerPool<WorkerCompletion>,
+    storage_usage_result: Option<Result<u64, String>>,
     share_in_flight: Option<u64>,
     share_ready: Option<(bool, Instant)>,
     next_share_probe: Instant,
@@ -289,6 +403,14 @@ impl RuntimeState {
         let configured_nodes = service.config.nodes.len().max(1);
         let probe_workers = PROBE_WORKERS.min(configured_nodes);
         let control_workers = CONTROL_WORKERS.min(configured_nodes);
+        let persisted_liveness =
+            match crate::liveness::read(service.storage.root(), &service.config.share_uuid) {
+                Ok(records) => records,
+                Err(error) => {
+                    eprintln!("macluster: could not read node liveness state: {error}");
+                    Default::default()
+                }
+            };
         Ok(Self {
             digest: service.config.execution_digest().unwrap_or_default(),
             previous_digest: None,
@@ -296,8 +418,22 @@ impl RuntimeState {
             nodes: service
                 .config
                 .nodes
-                .keys()
-                .map(|id| (id.clone(), NodeRuntime::new(now)))
+                .iter()
+                .map(|(id, config)| {
+                    let mut runtime = NodeRuntime::new(now);
+                    if let Some(record) = persisted_liveness.get(id)
+                        && record.identity_key.eq_ignore_ascii_case(
+                            config
+                                .machine_uuid
+                                .as_deref()
+                                .unwrap_or(config.host.as_str()),
+                        )
+                    {
+                        runtime.unreachable_since_unix_ms = record.unreachable_since_unix_ms;
+                        runtime.probe_failures = record.consecutive_failures;
+                    }
+                    (id.clone(), runtime)
+                })
                 .collect(),
             node_probe_pool: WorkerPool::new(
                 probe_workers,
@@ -317,8 +453,10 @@ impl RuntimeState {
             snapshot_pool: WorkerPool::new(
                 SNAPSHOT_WORKERS,
                 SNAPSHOT_WORKERS * WORK_QUEUE_FACTOR,
-                signal,
+                signal.clone(),
             )?,
+            storage_usage_pool: WorkerPool::new(1, 1, signal)?,
+            storage_usage_result: None,
             share_in_flight: None,
             share_ready: None,
             next_share_probe: now,
@@ -514,6 +652,7 @@ impl RuntimeState {
             .chain(self.control_pool.poll())
             .chain(self.share_pool.poll())
             .chain(self.snapshot_pool.poll())
+            .chain(self.storage_usage_pool.poll())
             .collect::<Vec<_>>();
         for completion in completions {
             self.handle_completion(service, completion)?;
@@ -580,6 +719,14 @@ impl RuntimeState {
                         );
                     }
                     _ => {}
+                }
+            }
+            WorkKind::StorageUsage => {
+                if !identity_current {
+                    return Ok(());
+                }
+                if let WorkerResult::StorageUsage(result) = completion.result {
+                    self.storage_usage_result = Some(result);
                 }
             }
             WorkKind::Probe | WorkKind::Health | WorkKind::Start | WorkKind::Cancel => {
@@ -708,10 +855,24 @@ impl RuntimeState {
             runtime.fenced = false;
             runtime.status = None;
             runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-            runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+            if probe.endpoint_reachable == Some(true) {
+                let record = persist_node_liveness(service, node_id, true, super::now_ms());
+                runtime.unreachable_since_unix_ms =
+                    record.and_then(|record| record.unreachable_since_unix_ms);
+                runtime.probe_failures = 0;
+            } else {
+                let record = persist_node_liveness(service, node_id, false, super::now_ms());
+                runtime.unreachable_since_unix_ms =
+                    record.and_then(|record| record.unreachable_since_unix_ms);
+            }
+            runtime.next_probe_at =
+                received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
             service.idle_since.remove(node_id);
             return Ok(());
         }
+        let record = persist_node_liveness(service, node_id, true, super::now_ms());
+        runtime.unreachable_since_unix_ms =
+            record.and_then(|record| record.unreachable_since_unix_ms);
         runtime.fenced = true;
         service.fenced_nodes.insert(node_id.to_owned());
 
@@ -726,7 +887,7 @@ impl RuntimeState {
                 });
                 runtime.probe_failures = 0;
                 runtime.last_probe_error = None;
-                runtime.next_probe_at = received_at + probe_interval;
+                runtime.next_probe_at = received_at + probe_delay(probe_interval, occupied);
                 if online && !occupied {
                     service
                         .idle_since
@@ -744,7 +905,7 @@ impl RuntimeState {
                 });
                 runtime.probe_failures = 0;
                 runtime.last_probe_error = None;
-                runtime.next_probe_at = received_at + probe_interval;
+                runtime.next_probe_at = received_at + probe_delay(probe_interval, false);
                 service
                     .idle_since
                     .entry(node_id.to_owned())
@@ -760,26 +921,29 @@ impl RuntimeState {
                 });
                 runtime.probe_failures = 0;
                 runtime.last_probe_error = None;
-                runtime.next_probe_at = received_at + probe_interval;
+                runtime.next_probe_at = received_at + probe_delay(probe_interval, true);
                 service.idle_since.remove(node_id);
             }
             Some(Err(ProbeError::Failed(error))) => {
                 runtime.last_probe_error = Some(error.chars().take(256).collect());
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
             None => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
             Some(Ok(_)) => {
                 runtime.status = None;
                 runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-                runtime.next_probe_at = received_at + retry_delay(runtime.probe_failures);
+                runtime.next_probe_at =
+                    received_at + node_probe_retry_delay_for_failures(runtime.probe_failures);
                 service.idle_since.remove(node_id);
             }
         }
@@ -795,9 +959,19 @@ impl RuntimeState {
         received_at: Instant,
         health_result: Option<Result<ResponseBody, String>>,
     ) {
+        if let Some(Ok(ResponseBody::Health(health))) = health_result.as_ref() {
+            persist_node_health(service, node_id, health.clone(), super::now_ms());
+        }
         let Some(runtime) = self.nodes.get_mut(node_id) else {
             return;
         };
+        if matches!(health_result.as_ref(), Some(Ok(ResponseBody::Health(_)))) {
+            // A successful authenticated health response proves the Agent has
+            // returned even if its execution-status probe has not completed.
+            runtime.unreachable_since_unix_ms = None;
+            runtime.probe_failures = 0;
+            runtime.next_probe_at = received_at;
+        }
         runtime.health = Some(match health_result {
             Some(Ok(ResponseBody::Health(health))) => {
                 let expected_digest = service.config.execution_digest().unwrap_or_default();
@@ -811,9 +985,11 @@ impl RuntimeState {
                 NodeHealthCache {
                     valid: true,
                     ready,
+                    agent_current: health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID),
                     namespaced_jobs: health.features.iter().any(|feature| {
                         feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE
                     }),
+                    logical_cpus: health.logical_cpus,
                     interactive_pty: health
                         .features
                         .iter()
@@ -830,8 +1006,10 @@ impl RuntimeState {
             _ => NodeHealthCache {
                 valid: false,
                 ready: false,
+                agent_current: false,
                 interactive_pty: false,
                 namespaced_jobs: false,
+                logical_cpus: None,
                 sampled_at: tag.started_at,
                 retry_at: received_at + NODE_HEALTH_RETRY,
             },
@@ -855,6 +1033,85 @@ impl RuntimeState {
             }
         }) {
             self.share_in_flight = Some(operation_id);
+        }
+    }
+
+    fn schedule_job_storage_measurement<T: NodeTransport>(
+        &mut self,
+        service: &ControllerService<T>,
+    ) -> bool {
+        if self.storage_usage_pool.pending > 0 {
+            return false;
+        }
+        let state_root = service.storage.root().to_path_buf();
+        let shared_root = service.config.shared_root.clone();
+        let share_uuid = service.config.share_uuid.clone();
+        let operation_id = self.operation_id();
+        let tag = self.tag(service, None, 0, operation_id, WorkKind::StorageUsage, None);
+        let worker_tag = tag.clone();
+        self.storage_usage_pool.try_spawn(move || {
+            let result = Id128::parse(&share_uuid)
+                .map_err(|error| error.to_string())
+                .and_then(|namespace| {
+                    ReadOnlyJobStore::open(&state_root)
+                        .and_then(|store| store.measure_job_storage_usage(&shared_root, namespace))
+                        .map_err(|error| error.to_string())
+                });
+            WorkerCompletion {
+                tag: worker_tag,
+                received_at: Instant::now(),
+                result: WorkerResult::StorageUsage(result),
+            }
+        })
+    }
+
+    fn take_job_storage_measurement(&mut self) -> Option<Result<u64, String>> {
+        self.storage_usage_result.take()
+    }
+
+    fn accelerate_pending_queue_probes<T: NodeTransport>(
+        &mut self,
+        service: &ControllerService<T>,
+        jobs: &[JobRecord],
+        now: Instant,
+    ) {
+        let mut pending_targets = HashMap::<String, Option<HashSet<String>>>::new();
+        for job in jobs.iter().filter(|job| job.state == JobState::Pending) {
+            let targets = pending_targets
+                .entry(job.spec.queue.to_string())
+                .or_insert_with(|| Some(HashSet::new()));
+            match (&mut *targets, job.spec.node.as_ref()) {
+                (Some(targets), Some(node_id)) => {
+                    targets.insert(node_id.to_string());
+                }
+                (Some(_), None) => *targets = None,
+                (None, _) => {}
+            }
+        }
+        for (queue_name, targets) in pending_targets {
+            let Some(queue) = service.config.queue_for_dispatch(&queue_name) else {
+                continue;
+            };
+            for node_id in queue.nodes {
+                if targets
+                    .as_ref()
+                    .is_some_and(|targets| !targets.contains(&node_id))
+                {
+                    continue;
+                }
+                let Some(runtime) = self.nodes.get_mut(&node_id) else {
+                    continue;
+                };
+                if runtime.probe_failures > 0
+                    || runtime.status_fresh(now)
+                    || runtime.in_flight.is_some()
+                    || runtime.pending_start.is_some()
+                    || service.node_is_maintenance_scoped(&node_id)
+                {
+                    continue;
+                }
+                runtime.next_probe_at = now;
+            }
         }
     }
 
@@ -894,6 +1151,7 @@ impl RuntimeState {
                 continue;
             }
             let already_fenced = runtime.fenced && service.fenced_nodes.contains(id);
+            let check_endpoint_first = runtime.probe_failures > 0;
             let generation = runtime.generation;
             let node_id = NodeId::new(id.clone()).expect("validated node ID");
             let expected_execution = service.storage.node_execution_to_reconcile(&node_id)?;
@@ -914,7 +1172,14 @@ impl RuntimeState {
             );
             let worker_tag = tag.clone();
             if self.node_probe_pool.try_spawn(move || {
-                let fence_error = if already_fenced {
+                let mut endpoint_reachable = if check_endpoint_first {
+                    transport.endpoint_reachable(&node_config, Duration::from_millis(350))
+                } else {
+                    None
+                };
+                let fence_error = if endpoint_reachable == Some(false) {
+                    Some("registered SSH endpoint is not reachable".into())
+                } else if already_fenced {
                     None
                 } else {
                     match transport.call(
@@ -929,6 +1194,10 @@ impl RuntimeState {
                         Err(error) => Some(error.to_string()),
                     }
                 };
+                if fence_error.is_some() && endpoint_reachable.is_none() {
+                    endpoint_reachable =
+                        transport.endpoint_reachable(&node_config, Duration::from_millis(350));
+                }
                 let (status, health) =
                     if fence_error.is_none() && worker_tag.kind == WorkKind::Health {
                         (
@@ -987,6 +1256,7 @@ impl RuntimeState {
                     received_at: Instant::now(),
                     result: WorkerResult::Probe(ProbeResult {
                         fence_error,
+                        endpoint_reachable,
                         status,
                         health,
                     }),
@@ -1212,15 +1482,14 @@ impl RuntimeState {
         if !self.share_ready(Instant::now()) || queues.is_empty() {
             return;
         }
+        let pending_heads = pending_queue_heads(jobs);
         let cursor = self.queue_cursor % queues.len();
         for offset in 0..queues.len() {
             let queue = &queues[(cursor + offset) % queues.len()];
-            let Some(head) = jobs
-                .iter()
-                .filter(|job| job.state == JobState::Pending && job.spec.queue.as_str() == queue)
-                .min_by_key(|job| job.id)
-                .filter(|job| job.snapshot_sync_pending)
-            else {
+            let Some(&head_index) = pending_heads.get(queue) else {
+                continue;
+            };
+            let Some(head) = jobs.get(head_index).filter(|job| job.snapshot_sync_pending) else {
                 continue;
             };
             if self.snapshot_in_flight.contains_key(&head.id)
@@ -1273,6 +1542,7 @@ impl RuntimeState {
         }
         let now = Instant::now();
         let mut availability = self.availability(service, now);
+        let mut pending_heads = pending_queue_heads(&jobs);
         let cursor = self.queue_cursor % queues.len();
         for offset in 0..queues.len() {
             let queue_name = &queues[(cursor + offset) % queues.len()];
@@ -1281,12 +1551,10 @@ impl RuntimeState {
             };
             let queue = macluster_protocol::identifiers::QueueName::new(queue_name.clone())
                 .expect("validated config queue ID");
-            let head = jobs
-                .iter()
-                .filter(|job| job.state == JobState::Pending && job.spec.queue == queue)
-                .min_by_key(|job| job.id)
-                .cloned();
-            let Some(head) = head else {
+            let Some(head_index) = pending_heads.get(queue_name).copied() else {
+                continue;
+            };
+            let Some(mut head) = jobs.get(head_index).cloned() else {
                 continue;
             };
             if head.snapshot_sync_pending {
@@ -1302,6 +1570,10 @@ impl RuntimeState {
                     "job is pinned to login node '{}', which is excluded from compute jobs; cancel it with mkill and resubmit on a compute node",
                     pinned
                 ))
+            } else if let Some(reason) =
+                crate::agent_build_waiting_reason(&head, &queue_config, &availability)
+            {
+                Some(reason)
             } else if let Some(reason) =
                 crate::namespace_waiting_reason(&head, &queue_config, &availability)
             {
@@ -1328,10 +1600,14 @@ impl RuntimeState {
             let updated = service
                 .storage
                 .set_waiting_reason(head.id, waiting_reason)?;
-            if let Some(job) = jobs.iter_mut().find(|job| job.id == head.id) {
-                *job = updated;
-            }
-            let Some(dispatch) = next_dispatch(&queue, &queue_config, &jobs, &availability) else {
+            jobs[head_index] = updated.clone();
+            head = updated;
+            let Some(dispatch) = next_dispatch(
+                &queue,
+                &queue_config,
+                std::slice::from_ref(&head),
+                &availability,
+            ) else {
                 continue;
             };
             let reserved = match service
@@ -1350,13 +1626,12 @@ impl RuntimeState {
                 }
                 Err(SubmitError::InvalidTransition(_, _, _)) => {
                     jobs = service.storage.list_reconcile_jobs()?;
+                    pending_heads = pending_queue_heads(&jobs);
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
-            if let Some(job) = jobs.iter_mut().find(|job| job.id == reserved.id) {
-                *job = reserved.clone();
-            }
+            jobs[head_index] = reserved.clone();
             if let Some(node) = availability
                 .iter_mut()
                 .find(|node| node.id == dispatch.node_id)
@@ -1422,8 +1697,11 @@ impl RuntimeState {
                 };
                 NodeEligibility {
                     id: NodeId::new(id.clone()).expect("validated node ID"),
+                    logical_cpus: health.and_then(|health| health.logical_cpus),
                     idle_since_unix_ms,
                     online,
+                    agent_current: health_fresh
+                        && health.is_some_and(|health| health.agent_current),
                     storage_ready: self.share_ready(now) && node_storage_ready,
                     drain_requested: service.node_is_maintenance_scoped(id),
                     occupied: busy,
@@ -1555,6 +1833,18 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
         runtime.poll_workers(service)?;
+        if let Some(measurement) = runtime.take_job_storage_measurement()
+            && reset_policy.is_none()
+            && !maintenance_active
+        {
+            match measurement {
+                Ok(bytes) if bytes > JOB_STORAGE_LIMIT_BYTES => enforce_job_storage_limit(service),
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("macluster: could not measure managed job storage usage: {error}")
+                }
+            }
+        }
         if let Some((_, api)) = control.as_mut() {
             let scope = api.maintenance_scope();
             service.set_maintenance_scope(scope.clone());
@@ -1722,36 +2012,21 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
             }
         }
         let now = Instant::now();
-        if reset_policy.is_none() && !maintenance_active && now >= next_job_storage_sweep {
-            next_job_storage_sweep = now + JOB_STORAGE_SWEEP_INTERVAL;
-            match Id128::parse(&service.config.share_uuid) {
-                Ok(namespace) => match service.storage.enforce_job_storage_limit(
-                    &service.config.shared_root,
-                    namespace,
-                    JOB_STORAGE_LIMIT_BYTES,
-                ) {
-                    Ok(report) => {
-                        if !report.pruned_job_ids.is_empty() {
-                            eprintln!(
-                                "macluster: removed {} oldest terminal job log record(s); managed job storage is now {:.2} GiB",
-                                report.pruned_job_ids.len(),
-                                report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
-                            );
-                        }
-                        if report.over_limit_bytes > 0 {
-                            eprintln!(
-                                "macluster: managed job storage remains {:.2} GiB, above the 1 GiB limit; active, unsynchronized, or otherwise non-prunable data is retained",
-                                report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("macluster: could not enforce the 1 GiB job log limit: {error}")
-                    }
-                },
-                Err(error) => eprintln!(
-                    "macluster: could not enforce the 1 GiB job log limit because the storage namespace is invalid: {error}"
-                ),
+        if now >= next_job_storage_sweep {
+            let shared_storage_ready = runtime.share_ready(now);
+            if should_measure_job_storage(
+                reset_policy.is_some(),
+                maintenance_active,
+                shared_storage_ready,
+                now,
+                next_job_storage_sweep,
+            ) {
+                next_job_storage_sweep = now + JOB_STORAGE_SWEEP_INTERVAL;
+                let _ = runtime.schedule_job_storage_measurement(service);
+            } else if reset_policy.is_none() && !maintenance_active && !shared_storage_ready {
+                // A missing or disconnected shared root is expected during
+                // setup and recovery. Recheck after share health can retry.
+                next_job_storage_sweep = now + SHARE_HEALTH_RETRY;
             }
         }
         let address_maintenance = reset_policy.is_none() && !maintenance_active && requested();
@@ -1789,6 +2064,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
             runtime.schedule_snapshots(service, &jobs, &queue_names);
         }
         if !address_maintenance {
+            runtime.accelerate_pending_queue_probes(service, &jobs, Instant::now());
             runtime.dispatch(service, jobs, &queue_names)?;
         }
         runtime.schedule_probes(service)?;
@@ -1980,6 +2256,40 @@ fn maintenance_drain_complete(jobs: &[JobRecord]) -> bool {
     })
 }
 
+fn enforce_job_storage_limit<T: NodeTransport>(service: &ControllerService<T>) {
+    let namespace = match Id128::parse(&service.config.share_uuid) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            eprintln!(
+                "macluster: could not enforce the 1 GiB job log limit because the storage namespace is invalid: {error}"
+            );
+            return;
+        }
+    };
+    match service.storage.enforce_job_storage_limit(
+        &service.config.shared_root,
+        namespace,
+        JOB_STORAGE_LIMIT_BYTES,
+    ) {
+        Ok(report) => {
+            if !report.pruned_job_ids.is_empty() {
+                eprintln!(
+                    "macluster: removed {} oldest terminal job log record(s); managed job storage is now {:.2} GiB",
+                    report.pruned_job_ids.len(),
+                    report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+            if report.over_limit_bytes > 0 {
+                eprintln!(
+                    "macluster: managed job storage remains {:.2} GiB, above the 1 GiB limit; active, unsynchronized, or otherwise non-prunable data is retained",
+                    report.bytes_after as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+        }
+        Err(error) => eprintln!("macluster: could not enforce the 1 GiB job log limit: {error}"),
+    }
+}
+
 fn retry_delay(failures: u8) -> Duration {
     let seconds = 1_u64
         .checked_shl(u32::from(failures.saturating_sub(1).min(5)))
@@ -2008,13 +2318,25 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn should_measure_job_storage(
+    reset_pending: bool,
+    maintenance_active: bool,
+    shared_storage_ready: bool,
+    now: Instant,
+    next_sweep: Instant,
+) -> bool {
+    !reset_pending && !maintenance_active && shared_storage_ready && now >= next_sweep
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL, NodeHealthCache, NodeRuntime,
-        NodeStatusCache, RuntimeState, WakeForwarder, WorkKind, WorkTag, WorkerCompletion,
-        WorkerPool, WorkerResult, maintenance_drain_complete, node_result_is_current, now_ms,
-        reset_drain_complete, retry_delay, run_forever,
+        IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL,
+        NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState,
+        WakeForwarder, WorkKind, WorkTag, WorkerCompletion, WorkerPool, WorkerResult,
+        maintenance_drain_complete, node_probe_retry_delay, node_result_is_current, now_ms,
+        pending_queue_heads, probe_delay, reset_drain_complete, retry_delay, run_forever,
+        should_measure_job_storage,
     };
     use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
@@ -2027,6 +2349,154 @@ mod tests {
     use std::time::{Duration, Instant};
 
     struct IsolatedNodeTransport;
+
+    #[test]
+    fn job_storage_scan_requires_fresh_shared_storage_health() {
+        let now = Instant::now();
+        assert!(!should_measure_job_storage(false, false, false, now, now));
+        assert!(!should_measure_job_storage(true, false, true, now, now));
+        assert!(!should_measure_job_storage(false, true, true, now, now));
+        assert!(should_measure_job_storage(false, false, true, now, now));
+        assert!(!should_measure_job_storage(
+            false,
+            false,
+            true,
+            now,
+            now + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn idle_node_probes_are_slower_while_busy_nodes_keep_the_configured_interval() {
+        let interval = Duration::from_secs(2);
+        assert_eq!(probe_delay(interval, true), interval);
+        assert_eq!(probe_delay(interval, false), IDLE_NODE_PROBE_INTERVAL);
+        assert_eq!(IDLE_NODE_PROBE_INTERVAL, Duration::from_secs(5));
+        assert_eq!(NODE_STATUS_TTL, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn pending_queue_heads_keep_the_oldest_fifo_job_per_queue() {
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-pending-heads-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let first = submit_dispatch_test_job(&storage, &shared_root, None);
+        let second = submit_dispatch_test_job(&storage, &shared_root, None);
+
+        let ordered_jobs = [second, first.clone()];
+        let heads = pending_queue_heads(&ordered_jobs);
+        assert_eq!(ordered_jobs[heads["mini01"]].id, first.id);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_jobs_expedite_only_stale_queue_nodes_without_overriding_backoff() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-pending-probe-expedite-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let job = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let stale_at = now - Duration::from_secs(30);
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: stale_at,
+        });
+        worker.next_probe_at = now + Duration::from_secs(60);
+
+        runtime.accelerate_pending_queue_probes(&service, std::slice::from_ref(&job), now);
+
+        assert_eq!(runtime.nodes["worker"].next_probe_at, now);
+        assert_ne!(runtime.nodes["login"].next_probe_at, now);
+
+        let retry_at = now + Duration::from_secs(30);
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.probe_failures = 1;
+        worker.next_probe_at = retry_at;
+        runtime.accelerate_pending_queue_probes(&service, &[job], now);
+        assert_eq!(runtime.nodes["worker"].next_probe_at, retry_at);
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn periodic_job_storage_measurement_is_single_flight_and_read_only() {
+        use crate::ControllerService;
+        use macluster_core::storage::{ReadOnlyJobStore, Storage};
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-runtime-storage-measure-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let namespace = Id128::parse(&config.share_uuid).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let managed = shared_root.join("jobs").join(namespace.to_string());
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(managed.join("marker.log"), b"read only sample").unwrap();
+        let database_before = fs::read(service.storage.root().join("controller.sqlite3")).unwrap();
+        let expected = ReadOnlyJobStore::open(service.storage.root())
+            .unwrap()
+            .measure_job_storage_usage(&shared_root, namespace)
+            .unwrap();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+
+        assert!(runtime.schedule_job_storage_measurement(&service));
+        assert!(!runtime.schedule_job_storage_measurement(&service));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let measured = loop {
+            runtime.poll_workers(&mut service).unwrap();
+            if let Some(result) = runtime.take_job_storage_measurement() {
+                break result.unwrap();
+            }
+            assert!(Instant::now() < deadline, "storage scan did not complete");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        assert_eq!(measured, expected);
+        assert_eq!(
+            fs::read(service.storage.root().join("controller.sqlite3")).unwrap(),
+            database_before
+        );
+        assert_eq!(
+            fs::read(managed.join("marker.log")).unwrap(),
+            b"read only sample"
+        );
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     struct ReceiptTransport(bool);
     impl crate::transport::NodeTransport for ReceiptTransport {
@@ -2164,6 +2634,8 @@ mod tests {
                     macluster_protocol::types::NodeHealth {
                         machine_uuid: String::new(),
                         execution_uid: 0,
+                        build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+                        logical_cpus: None,
                         execution_digest: String::new(),
                         primary_share_ready: true,
                         shares: Default::default(),
@@ -2210,6 +2682,8 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
                     execution_uid: 501,
+                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+                    logical_cpus: None,
                     execution_digest: self.execution_digest.clone(),
                     primary_share_ready: true,
                     shares: Default::default(),
@@ -2263,6 +2737,8 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: String::new(),
                     execution_uid: 0,
+                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+                    logical_cpus: None,
                     execution_digest: String::new(),
                     primary_share_ready: true,
                     shares: BTreeMap::new(),
@@ -2392,8 +2868,10 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            agent_current: true,
             interactive_pty: true,
             namespaced_jobs: true,
+            logical_cpus: None,
             sampled_at: now,
             retry_at: now + NODE_HEALTH_TTL,
         });
@@ -2588,7 +3066,7 @@ scheduler = "fifo"
         let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
         let now = Instant::now();
         runtime.share_ready = Some((true, now));
-        for (id, node) in &service.config.nodes {
+        for id in service.config.nodes.keys() {
             let state = runtime.nodes.get_mut(id).unwrap();
             state.fenced = true;
             state.status = Some(NodeStatusCache {
@@ -2596,16 +3074,16 @@ scheduler = "fifo"
                 occupied: false,
                 sampled_at: now,
             });
-            if node.transport == macluster_core::config::Transport::Local {
-                state.health = Some(NodeHealthCache {
-                    valid: true,
-                    ready: true,
-                    interactive_pty: true,
-                    namespaced_jobs: true,
-                    sampled_at: now,
-                    retry_at: now,
-                });
-            }
+            state.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                agent_current: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                logical_cpus: None,
+                sampled_at: now,
+                retry_at: now,
+            });
         }
         let jobs = service.storage.list_reconcile_jobs().unwrap();
 
@@ -2765,8 +3243,10 @@ scheduler = "fifo"
                 state.health = Some(NodeHealthCache {
                     valid: true,
                     ready: true,
+                    agent_current: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
+                    logical_cpus: None,
                     sampled_at: now,
                     retry_at: now,
                 });
@@ -2865,8 +3345,10 @@ scheduler = "fifo"
             node.health = Some(NodeHealthCache {
                 valid: true,
                 ready: true,
+                agent_current: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
+                logical_cpus: None,
                 sampled_at: now,
                 retry_at: now + NODE_HEALTH_TTL,
             });
@@ -2891,6 +3373,7 @@ scheduler = "fifo"
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(20), Duration::from_secs(30));
+        assert_eq!(node_probe_retry_delay(), Duration::from_secs(5));
     }
 
     fn reset_test_job(state: JobState, snapshot_sync_pending: bool) -> JobRecord {
@@ -3071,6 +3554,16 @@ scheduler = "fifo"
                 online: true,
                 occupied: false,
                 sampled_at: now,
+            });
+            node.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                agent_current: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                logical_cpus: None,
+                sampled_at: now,
+                retry_at: now,
             });
         }
         service.set_maintenance_scope(Some(MaintenanceScope::Nodes(vec![
@@ -3419,8 +3912,10 @@ scheduler = "fifo"
         node.health = Some(NodeHealthCache {
             valid: true,
             ready: false,
+            agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
+            logical_cpus: None,
             sampled_at,
             retry_at,
         });

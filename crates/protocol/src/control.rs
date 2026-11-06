@@ -281,10 +281,15 @@ pub struct NodeMonitorRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
     pub stale: bool,
+    /// True only after the controller's three-probe offline threshold is met.
+    #[serde(default)]
+    pub confirmed_offline: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub consecutive_failures: u8,
     pub running_tasks: u32,
     pub waiting_tasks: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

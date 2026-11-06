@@ -47,8 +47,10 @@ fn nodes() -> Vec<NodeEligibility> {
     vec![
         NodeEligibility {
             id: NodeId::new("mini01-a").unwrap(),
+            logical_cpus: None,
             idle_since_unix_ms: 10,
             online: true,
+            agent_current: true,
             storage_ready: true,
             drain_requested: false,
             occupied: false,
@@ -57,8 +59,10 @@ fn nodes() -> Vec<NodeEligibility> {
         },
         NodeEligibility {
             id: NodeId::new("mini01-b").unwrap(),
+            logical_cpus: None,
             idle_since_unix_ms: 20,
             online: true,
+            agent_current: true,
             storage_ready: true,
             drain_requested: false,
             occupied: false,
@@ -119,6 +123,43 @@ fn scheduler_chooses_longest_idle_eligible_node_and_respects_exclusivity() {
     availability[1].occupied = true;
     let dispatch = next_dispatch(&queue, &queue_config(), &jobs, &availability).unwrap();
     assert_eq!(dispatch.job_id, 1);
+    assert_eq!(dispatch.node_id.as_str(), "mini01-a");
+}
+
+#[test]
+fn scheduler_prefers_more_logical_cpus_before_idle_duration() {
+    let queue = QueueName::new("mini01").unwrap();
+    let jobs = [job(1, "mini01", None, JobState::Pending)];
+    let mut availability = nodes();
+    // The smaller node became idle more recently, so core count must win
+    // before the existing idle-duration tie-break.
+    availability[0].idle_since_unix_ms = 30;
+    availability[1].idle_since_unix_ms = 20;
+    availability[0].logical_cpus = Some(8);
+    availability[1].logical_cpus = Some(16);
+
+    let dispatch = next_dispatch(&queue, &queue_config(), &jobs, &availability).unwrap();
+
+    assert_eq!(dispatch.node_id.as_str(), "mini01-b");
+}
+
+#[test]
+fn scheduler_keeps_node_id_order_for_equal_core_and_idle_values() {
+    let queue = QueueName::new("mini01").unwrap();
+    let mut availability = nodes();
+    for node in &mut availability {
+        node.logical_cpus = Some(8);
+        node.idle_since_unix_ms = 10;
+    }
+
+    let dispatch = next_dispatch(
+        &queue,
+        &queue_config(),
+        &[job(1, "mini01", None, JobState::Pending)],
+        &availability,
+    )
+    .unwrap();
+
     assert_eq!(dispatch.node_id.as_str(), "mini01-a");
 }
 

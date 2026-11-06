@@ -114,6 +114,7 @@ pub(crate) fn install_script(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_script(
     binary: &str,
     binary_digest: &str,

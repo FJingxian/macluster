@@ -49,7 +49,9 @@ const ONE_SHOT_DEADLINE: Duration = Duration::from_secs(10);
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) enum MtopPostAction {
+    #[cfg(test)]
     CheckBuilds(crate::node_admin::AgentBuildCompatibility),
+    #[cfg(test)]
     RecoverMaintenance,
     SetupLocalPower,
     UpdateDeferred,
@@ -58,7 +60,7 @@ pub(crate) enum MtopPostAction {
 enum StartupValidation {
     AddressMigration,
     NodeMaintenancePending,
-    Builds(crate::node_admin::AgentBuildCompatibility),
+    Builds,
     RecoverMaintenance,
     SetupLocalPower,
     UpdateDeferred,
@@ -297,6 +299,27 @@ pub fn run_interactive(
     let mut next_process_sample = Instant::now();
     let jobs = JobPoller::spawn(state_dir.clone());
     let mut caches: BTreeMap<String, NodeMetricCache> = BTreeMap::new();
+    if let Ok(liveness) = macluster_controller::liveness::read(&state_dir, &config.share_uuid) {
+        for identity in identities
+            .iter()
+            .filter(|identity| identity.role == NodeRole::Compute)
+        {
+            let Some(node) = config.nodes.get(&identity.id) else {
+                continue;
+            };
+            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            let cached_offline = liveness.get(&identity.id).filter(|record| {
+                record.identity_key.eq_ignore_ascii_case(identity_key)
+                    && record.is_confirmed_offline()
+            });
+            if cached_offline.is_some() {
+                caches
+                    .entry(identity.id.clone())
+                    .or_default()
+                    .set_confirmed_offline(true);
+            }
+        }
+    }
     let mut histories: BTreeMap<String, CpuHistory> = BTreeMap::new();
     let mut auto_round: Option<VecDeque<String>> = Some(target_ids.iter().cloned().collect());
     let mut initial_auto_round = true;
@@ -358,7 +381,7 @@ pub fn run_interactive(
                     }
                     StartupPreparation::Continue => {}
                 }
-                Ok(StartupValidation::Builds(compatibility))
+                Ok(StartupValidation::Builds)
             })();
             let _ = validation_tx.send(result);
         })
@@ -391,11 +414,9 @@ pub fn run_interactive(
                     }
                     Ok(Ok(StartupValidation::RecoverMaintenance)) => {
                         validation_finished = true;
-                        state.status_message = Some(
-                            "Agent maintenance recovery required; leaving mtop to resume it".into(),
+                        status_message = Some(
+                            "Agent maintenance recovery is pending; monitoring continues and the update can be resumed after nodes are reachable and idle".into(),
                         );
-                        post_action = Some(MtopPostAction::RecoverMaintenance);
-                        break;
                     }
                     Ok(Ok(StartupValidation::UpdateDeferred)) => {
                         validation_finished = true;
@@ -404,12 +425,12 @@ pub fn run_interactive(
                         );
                         post_action = Some(MtopPostAction::UpdateDeferred);
                     }
-                    Ok(Ok(StartupValidation::Builds(compatibility))) => {
+                    Ok(Ok(StartupValidation::Builds)) => {
                         validation_finished = true;
-                        if compatibility.requires_update() {
-                            post_action = Some(MtopPostAction::CheckBuilds(compatibility));
-                            break;
-                        }
+                        // Agent compatibility is checked in the background,
+                        // but monitoring must not turn a version notice into a
+                        // yellow footer banner while the user is inspecting a
+                        // node. Update-capable commands handle any mismatch.
                     }
                     Ok(Err(error)) => {
                         validation_finished = true;
@@ -809,6 +830,8 @@ fn apply_monitor_row(
     } else {
         metric_cache.apply_error("waiting for first monitor sample".into());
     }
+    metric_cache.set_consecutive_failures(row.consecutive_failures);
+    metric_cache.set_controller_liveness(row.confirmed_offline, received_at);
 
     let process_cache = processes.entry(display_id.to_owned()).or_default();
     if let Some(rows) = &row.processes {
@@ -845,6 +868,14 @@ fn update_visible_nodes(
     let old_selection = state.selected_id.clone();
     state.nodes = identities
         .iter()
+        .filter(|identity| {
+            if identity.role != NodeRole::Compute {
+                return true;
+            }
+            caches
+                .get(&identity.id)
+                .is_some_and(|cache| cache.should_display(now))
+        })
         .map(|identity| {
             let cache = caches.get(&identity.id);
             let metrics = cache.map_or(MetricView::Loading, |cache| cache.view_at(now));

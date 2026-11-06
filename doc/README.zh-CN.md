@@ -63,7 +63,7 @@ macluster controller start
 macluster controller stop
 ```
 
-`controller run` 用于前台排查。仅需启动服务时不要重新执行 `init`：已有配置时，它会询问是否重置集群。
+`controller run` 用于前台排查。仅需启动服务时不要执行 `macluster --init`：已有配置时，它会询问是否重置集群。
 
 ## 提交任务
 
@@ -142,14 +142,15 @@ macluster submit -Is pip install -e .
 ```sh
 macluster top                                  # 终端面板
 macluster top --once                           # 单次表格
-macluster --web 127.0.0.1:8080                 # 本机浏览器面板
+macluster --web                                # 本机浏览器面板，自动选择端口
+macluster --web 127.0.0.1:8080                 # 可选指定本机 IP 和端口
 ```
 
 终端中，方向键或 `j`/`k` 选择节点，Enter 打开/收起进程详情，`c` 按 CPU 排序，`m` 按内存排序，`q` 退出。进程先显示快速预览，再更新为区间采样结果；预览会注明 CPU 是平均值、内存是 RSS。
 
 CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。GPU、温度、风扇、功耗取决于硬件与 helper 支持情况，无法获取时显示 `N/A`。
 
-浏览器面板只读，监听 `127.0.0.1`；当前 `--web` 只接受回环地址。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
+浏览器面板只读，监听 `127.0.0.1`；`--web` 的本机 IP 和端口都可省略，省略端口时会自动选择空闲端口。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
 
 ## 管理和维护
 
@@ -164,8 +165,8 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 | `macluster fans --auto [--node ID]` | 按 40–80°C 线性调速 |
 | `macluster fans --power [--node ID]` | 按 40–80°C 对数曲线调速 |
 | `macluster fans --reset [--node ID]` | 恢复系统风扇控制 |
-| `macluster init` | 确认重置，归档旧状态，然后重新配置 |
-| `macluster init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
+| `macluster --init` | 确认重置，归档旧状态，然后重新配置 |
+| `macluster --init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
 
 重置清理托管的 NFS 挂载/导出，并保留共享数据文件；请阅读确认提示。风扇控制使用 AppleSMC 私有接口，支持情况取决于机型，不支持的机器维持系统控制。
 
@@ -176,7 +177,7 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 需要独立存储 Mac 时：
 
 ```sh
-macluster init --name home --queue default \
+macluster --init --name home --queue default \
   --primary-nfs 'storage@198.51.100.10:22:/Volumes/Data/macluster' \
   --shared-root /Users/Shared/macluster
 ```

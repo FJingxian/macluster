@@ -406,7 +406,7 @@ fn init_refuses_to_overwrite_an_existing_config_without_reset() {
             config.display().to_string(),
             "--state-dir".into(),
             state.display().to_string(),
-            "init".into(),
+            "--init".into(),
             "--name".into(),
             "replacement".into(),
         ],
@@ -420,13 +420,13 @@ fn init_refuses_to_overwrite_an_existing_config_without_reset() {
 #[test]
 fn init_help_is_available_without_a_cluster_config() {
     let output = macluster_command()
-        .args(["init", "--help"])
+        .args(["--init", "--help"])
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("macluster init"));
+    assert!(stdout.contains("macluster --init"));
     assert!(stdout.contains("--primary-nfs"));
     assert!(!stdout.contains("--reset"));
     assert!(stdout.contains("--force"));
@@ -484,7 +484,7 @@ fn init_in_pty_with_args(
     args: &[String],
     input: &[u8],
 ) -> (std::process::ExitStatus, String) {
-    command_in_pty_with_args(config, state, "init", args, input)
+    command_in_pty_with_args(config, state, "--init", args, input)
 }
 
 fn command_in_pty_with_args(
@@ -1001,7 +1001,7 @@ fn noninteractive_init_requires_explicit_terminal_confirmation() {
         .arg("--state-dir")
         .arg(root.join("state"))
         .args([
-            "init",
+            "--init",
             "--name",
             "no-tty",
             "--queue",
@@ -1044,7 +1044,7 @@ fn init_force_requires_an_existing_cluster_or_recovery_record() {
         .arg(&config)
         .arg("--state-dir")
         .arg(&state)
-        .args(["init", "--force"])
+        .args(["--init", "--force"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -1937,7 +1937,7 @@ fn agent_capabilities_advertise_runtime_features() {
 }
 
 #[test]
-fn operational_command_does_not_skip_preflight_for_an_invalid_existing_config() {
+fn read_only_job_query_validates_an_invalid_existing_config_without_agent_preflight() {
     let (root, _shared, config) = fixture();
     fs::write(&config, "[cluster]\nname = \"broken\"\n").unwrap();
     let state = root.join("controller");
@@ -1956,8 +1956,7 @@ fn operational_command_does_not_skip_preflight_for_an_invalid_existing_config() 
 
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("cannot check Agent builds because the cluster config is invalid"),
+        String::from_utf8_lossy(&output.stderr).contains("missing required key 'default_queue'"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -2054,8 +2053,8 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
         String::from_utf8_lossy(&inspection.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&inspection.stderr).contains("Agent update is deferred"),
-        "{}",
+        !String::from_utf8_lossy(&inspection.stderr).contains("Agent update"),
+        "read-only job inspection must not start or report Agent maintenance: {}",
         String::from_utf8_lossy(&inspection.stderr)
     );
     let listing = String::from_utf8_lossy(&inspection.stdout);
@@ -2074,7 +2073,7 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
 
 #[cfg(target_os = "macos")]
 #[test]
-fn operational_command_updates_a_stale_local_agent_before_dispatch() {
+fn read_only_job_query_does_not_update_a_stale_local_agent() {
     let (root, shared, config) = fixture();
     let stale_binary = root.join("old-macluster");
     fs::write(&stale_binary, b"stale agent build").unwrap();
@@ -2141,15 +2140,10 @@ execution_uid = {}
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Updated Agent on 1 configured node(s)."),
-        "{stdout}"
-    );
     assert!(stdout.contains("[]"), "{stdout}");
     let updated = fs::read_to_string(&config).unwrap();
-    assert!(updated.contains("remote_binary = \""));
-    assert!(updated.contains("machine_uuid = \""));
-    assert!(updated.contains("execution_uid = "));
+    assert!(updated.contains(&format!("remote_binary = \"{}\"", stale_binary.display())));
+    assert!(!state.exists(), "read-only query must not initialize state");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2205,7 +2199,7 @@ fn unfinished_enrollment_is_not_listed_as_a_node_and_errors_remain_available() {
             assert!(!text.contains("SETUP_PENDING"), "{text}");
             assert!(!text.contains("PHASE"), "{text}");
             assert!(
-                text.contains("mini01-a") && text.contains("OFFLINE"),
+                text.contains("mini01-a") && text.contains("ONLINE"),
                 "{text}"
             );
         } else {
@@ -2220,6 +2214,113 @@ fn unfinished_enrollment_is_not_listed_as_a_node_and_errors_remain_available() {
         fs::read(state.join("node-admin.json")).unwrap(),
         original_journal
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pending_enrollment_without_remote_side_effects_can_be_cancelled_after_config_changes() {
+    let (root, _shared, config) = fixture();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    let operations = serde_json::json!({
+        "add:operator@192.0.2.50:22": {
+            "id":"draft-one", "action":"add", "node_id":"draft-001",
+            "endpoint":"operator@192.0.2.50:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":null, "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":false,
+            "detail":"SSH preflight failed"
+        },
+        "add:operator@192.0.2.51:22": {
+            "id":"draft-two", "action":"add", "node_id":"draft-002",
+            "endpoint":"operator@192.0.2.51:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":"old-config", "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":false,
+            "detail":"SSH preflight failed"
+        },
+        "add:operator@192.0.2.52:22": {
+            "id":"draft-three", "action":"add", "node_id":"draft-003",
+            "endpoint":"operator@192.0.2.52:22", "machine_uuid":null,
+            "phase":"SETUP_PENDING", "old_config_sha256":"stale-config", "candidate_config_sha256":null,
+            "managed_export":false, "managed_shares":[], "client_setup_attempted":true,
+            "detail":"NFS setup was interrupted"
+        }
+    });
+    fs::write(
+        state.join("node-admin.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,
+            "config_path":config.canonicalize().unwrap(),
+            "state_dir":state.canonicalize().unwrap(),
+            "reserved_node_ids":["draft-001", "draft-002", "draft-003"],
+            "machine_uuids":{},
+            "operations":operations
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-001"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Cancelled pending enrollment draft-001"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stale_pristine = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-002"])
+        .output()
+        .unwrap();
+    assert!(
+        stale_pristine.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stale_pristine.stderr)
+    );
+
+    let unsafe_cancel = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "-rm", "draft-003"])
+        .output()
+        .unwrap();
+    assert!(!unsafe_cancel.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsafe_cancel.stderr)
+            .contains("remote cleanup cannot be verified"),
+        "{}",
+        String::from_utf8_lossy(&unsafe_cancel.stderr)
+    );
+
+    let failed = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mnode", "--failed"])
+        .output()
+        .unwrap();
+    assert!(failed.status.success());
+    let failures = String::from_utf8_lossy(&failed.stdout);
+    assert!(failures.contains("draft-003"), "{failures}");
+    assert!(!failures.contains("draft-001"), "{failures}");
+    assert!(!failures.contains("draft-002"), "{failures}");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2303,7 +2404,7 @@ execution_uid = {}
 }
 
 #[test]
-fn operational_command_attempts_orphaned_agent_update_recovery() {
+fn unrecoverable_orphaned_update_keeps_monitoring_available_and_blocks_submission() {
     let (root, _shared, config) = fixture();
     use_cli_binary_build(&config);
     let state = root.join("controller");
@@ -2350,29 +2451,42 @@ fn operational_command_attempts_orphaned_agent_update_recovery() {
     )
     .unwrap();
 
-    for args in [
-        vec!["mtop", "--once"],
-        vec!["msub", "--wrap", "echo must-not-submit"],
-    ] {
-        let output = macluster_command()
-            .arg("--config")
-            .arg(&config)
-            .arg("--state-dir")
-            .arg(&state)
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(1));
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("all-node update"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let monitor = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["mtop", "--once"])
+        .output()
+        .unwrap();
+    assert!(
+        monitor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&monitor.stderr)
+    );
+    assert!(
+        barrier.exists(),
+        "monitoring must not mutate update recovery"
+    );
+
+    let submission = macluster_command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["msub", "--wrap", "echo must-not-submit"])
+        .output()
+        .unwrap();
+    assert_eq!(submission.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&submission.stderr).contains("all-node update"),
+        "{}",
+        String::from_utf8_lossy(&submission.stderr)
+    );
     assert!(!state.join("client-submissions").exists());
     assert!(
         !barrier.exists(),
-        "preflight must release its recovery barrier"
+        "preflight recovery must release the orphaned maintenance barrier"
     );
     fs::remove_dir_all(root).unwrap();
 }

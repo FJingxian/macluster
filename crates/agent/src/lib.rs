@@ -399,6 +399,10 @@ fn node_health_with_mount_provider(
     Ok(NodeHealth {
         machine_uuid,
         execution_uid: unsafe { libc::geteuid() },
+        build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+        logical_cpus: std::thread::available_parallelism()
+            .ok()
+            .and_then(|count| u32::try_from(count.get()).ok()),
         execution_digest: config
             .execution_digest()
             .map_err(|error| AgentError::State(error.to_string()))?,
@@ -2328,6 +2332,12 @@ execution_uid = 501
         assert_eq!(mount_reads.get(), 1);
         assert!(health.primary_share_ready);
         assert_eq!(health.shares.get("named"), Some(&true));
+        assert_eq!(
+            health.logical_cpus,
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|count| u32::try_from(count.get()).ok())
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

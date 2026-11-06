@@ -5,6 +5,7 @@ mod sampler;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -26,11 +27,16 @@ const METRIC_INTERVAL: Duration = Duration::from_secs(2);
 const PROCESS_INTERVAL: Duration = Duration::from_secs(1);
 const METRIC_STALE_AFTER: Duration = Duration::from_secs(6);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
+const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_MONITOR_ERROR_BYTES: usize = 1_024;
 const MAX_METRIC_ERROR_FIELDS: usize = 64;
 
 pub type MetricSampleFn =
     dyn Fn(&NodeId, &NodeConfig) -> Result<MetricSnapshot, String> + Send + Sync + 'static;
+/// `needs_full_sample` indicates that the initial snapshot is partial and a
+/// regular full sample should immediately follow it.
+pub type InitialMetricSampleFn =
+    dyn Fn(&NodeId, &NodeConfig) -> Result<(MetricSnapshot, bool), String> + Send + Sync + 'static;
 pub type ProcessSampleFn =
     dyn Fn(&NodeId, &NodeConfig) -> Result<Vec<ProcessRow>, String> + Send + Sync + 'static;
 
@@ -46,6 +52,7 @@ struct MetricCache {
     sampled_at: Option<Instant>,
     request_latency_ms: Option<u64>,
     error: Option<String>,
+    consecutive_failures: u8,
     next_sample_at: Option<Instant>,
 }
 
@@ -54,7 +61,25 @@ struct ProcessCache {
     rows: Option<Vec<ProcessRow>>,
     sampled_at: Option<Instant>,
     error: Option<String>,
+    consecutive_failures: u8,
     next_sample_at: Option<Instant>,
+}
+
+fn metric_retry_delay(consecutive_failures: u8) -> Duration {
+    match consecutive_failures {
+        0 | 1 => METRIC_INTERVAL,
+        2 => Duration::from_secs(4),
+        _ => Duration::from_secs(15),
+    }
+}
+
+fn process_retry_delay(consecutive_failures: u8) -> Duration {
+    match consecutive_failures {
+        0 => PROCESS_INTERVAL,
+        1 => Duration::from_secs(5),
+        2 => Duration::from_secs(10),
+        _ => Duration::from_secs(30),
+    }
 }
 
 /// A single cache and sampler set shared by every authenticated IPC client.
@@ -66,6 +91,9 @@ pub struct MonitorHub {
     process_cache: BTreeMap<NodeId, ProcessCache>,
     metric_sampler: MetricSampler,
     process_sampler: ProcessSampler,
+    liveness_state_dir: Option<PathBuf>,
+    last_liveness_refresh: Option<Instant>,
+    unreachable_nodes: BTreeSet<NodeId>,
     job_counts: HashMap<NodeId, (u32, u32)>,
     sequence: u64,
     metric_cursor: usize,
@@ -74,13 +102,43 @@ pub struct MonitorHub {
 
 impl MonitorHub {
     pub fn new(config: ClusterConfig, namespace: String) -> Self {
+        Self::new_with_optional_liveness(config, namespace, None)
+    }
+
+    /// Construct the production monitor with access to the controller's
+    /// lightweight liveness journal. Nodes with a failed reachability probe are
+    /// omitted from monitor sampling until the controller observes recovery.
+    pub fn new_with_liveness(config: ClusterConfig, namespace: String, state_dir: PathBuf) -> Self {
+        Self::new_with_optional_liveness(config, namespace, Some(state_dir))
+    }
+
+    fn new_with_optional_liveness(
+        config: ClusterConfig,
+        namespace: String,
+        liveness_state_dir: Option<PathBuf>,
+    ) -> Self {
         let metric_pool = crate::ssh::SshPool::new(namespace.clone());
         let process_pool = metric_pool.clone();
-        let metric_sample: Arc<MetricSampleFn> =
-            Arc::new(move |node_id, node| sampler::sample_node(node_id, node, &metric_pool));
+        let initial_pool = metric_pool.clone();
+        let metric_sample: Arc<MetricSampleFn> = Arc::new(move |node_id, node| {
+            sampler::sample_node(node_id, node, &metric_pool, false).map(|(snapshot, _)| snapshot)
+        });
+        let initial_metric_sample: Arc<InitialMetricSampleFn> =
+            Arc::new(move |node_id, node| sampler::sample_node(node_id, node, &initial_pool, true));
         let process_sample: Arc<ProcessSampleFn> =
             Arc::new(move |node_id, node| processes::sample_node(node_id, node, &process_pool));
-        Self::with_samplers(config, metric_sample, process_sample)
+        Self::with_progressive_samplers(
+            config,
+            metric_sample,
+            initial_metric_sample,
+            process_sample,
+        )
+        .with_liveness_state_dir(liveness_state_dir)
+    }
+
+    fn with_liveness_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
+        self.liveness_state_dir = state_dir;
+        self
     }
 
     /// Inject deterministic probes for service-level regression tests and
@@ -88,6 +146,27 @@ impl MonitorHub {
     pub fn with_samplers(
         config: ClusterConfig,
         metric_sample: Arc<MetricSampleFn>,
+        process_sample: Arc<ProcessSampleFn>,
+    ) -> Self {
+        let initial_metric_sample = Arc::clone(&metric_sample);
+        let initial_metric_sample: Arc<InitialMetricSampleFn> = Arc::new(move |node_id, node| {
+            initial_metric_sample(node_id, node).map(|snapshot| (snapshot, false))
+        });
+        Self::with_progressive_samplers(
+            config,
+            metric_sample,
+            initial_metric_sample,
+            process_sample,
+        )
+    }
+
+    /// Construct a monitor with separate first-sample and full-sample probes.
+    /// Existing callers can keep using `with_samplers`; this method lets
+    /// production and deterministic tests publish fast initial data.
+    pub fn with_progressive_samplers(
+        config: ClusterConfig,
+        metric_sample: Arc<MetricSampleFn>,
+        initial_metric_sample: Arc<InitialMetricSampleFn>,
         process_sample: Arc<ProcessSampleFn>,
     ) -> Self {
         let metric_cache = config
@@ -107,8 +186,11 @@ impl MonitorHub {
             subscriptions: HashMap::new(),
             metric_cache,
             process_cache,
-            metric_sampler: MetricSampler::new(metric_sample),
+            metric_sampler: MetricSampler::new(metric_sample, initial_metric_sample),
             process_sampler: ProcessSampler::new(process_sample),
+            liveness_state_dir: None,
+            last_liveness_refresh: None,
+            unreachable_nodes: BTreeSet::new(),
             job_counts: HashMap::new(),
             sequence: 1,
             metric_cursor: 0,
@@ -279,13 +361,16 @@ impl MonitorHub {
         };
         let (running_tasks, waiting_tasks) =
             self.job_counts.get(&node_id).copied().unwrap_or_default();
+        let confirmed_offline = self.unreachable_nodes.contains(&node_id);
         NodeMonitorRow {
             node_id,
             metrics: snapshot,
             age_ms: age,
             stale,
+            confirmed_offline,
             sample_error,
             request_latency_ms: metrics.and_then(|cache| cache.request_latency_ms),
+            consecutive_failures: metrics.map_or(0, |cache| cache.consecutive_failures),
             running_tasks,
             waiting_tasks,
             processes: process_rows,
@@ -296,7 +381,12 @@ impl MonitorHub {
     }
 
     fn poll_and_schedule(&mut self, now: Instant) {
+        self.refresh_liveness(now);
+
         for result in self.metric_sampler.poll() {
+            if self.unreachable_nodes.contains(&result.node_id) {
+                continue;
+            }
             if let Some(cache) = self.metric_cache.get_mut(&result.node_id) {
                 cache.request_latency_ms = Some(result.request_latency_ms);
                 match result.result {
@@ -304,8 +394,16 @@ impl MonitorHub {
                         cache.snapshot = Some(bound_metric_snapshot(snapshot));
                         cache.sampled_at = Some(result.completed_at);
                         cache.error = None;
+                        cache.consecutive_failures = 0;
+                        cache.next_sample_at = Some(result.completed_at + METRIC_INTERVAL);
                     }
-                    Err(error) => cache.error = Some(bound_text(error, MAX_MONITOR_ERROR_BYTES)),
+                    Err(error) => {
+                        cache.error = Some(bound_text(error, MAX_MONITOR_ERROR_BYTES));
+                        cache.consecutive_failures = cache.consecutive_failures.saturating_add(1);
+                        cache.next_sample_at = Some(
+                            result.completed_at + metric_retry_delay(cache.consecutive_failures),
+                        );
+                    }
                 }
                 self.sequence = self.sequence.saturating_add(1);
             }
@@ -317,15 +415,22 @@ impl MonitorHub {
             .flat_map(|subscription| subscription.nodes.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut active_nodes = active_nodes.into_iter().collect::<Vec<_>>();
+        let mut metric_last_scheduled = None;
+        let mut metric_offset = 0;
         if !active_nodes.is_empty() {
-            let offset = self.metric_cursor % active_nodes.len();
-            active_nodes.rotate_left(offset);
-            self.metric_cursor = (offset + 1) % active_nodes.len();
+            metric_offset = self.metric_cursor % active_nodes.len();
+            active_nodes.rotate_left(metric_offset);
         }
-        for node_id in active_nodes {
+        for (index, node_id) in active_nodes.iter().enumerate() {
+            if self.unreachable_nodes.contains(node_id) {
+                continue;
+            }
+            if !self.metric_sampler.has_capacity() {
+                break;
+            }
             let due = self
                 .metric_cache
-                .get(&node_id)
+                .get(node_id)
                 .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next));
             if !due {
                 continue;
@@ -333,14 +438,33 @@ impl MonitorHub {
             let Some(node) = self.config.nodes.get(node_id.as_str()) else {
                 continue;
             };
-            if self.metric_sampler.request(node_id.clone(), node.clone())
-                && let Some(cache) = self.metric_cache.get_mut(&node_id)
-            {
+            let initial = self
+                .metric_cache
+                .get(node_id)
+                .is_some_and(|cache| cache.snapshot.is_none());
+            let requested = if initial {
+                self.metric_sampler
+                    .request_initial(node_id.clone(), node.clone())
+            } else {
+                self.metric_sampler.request(node_id.clone(), node.clone())
+            };
+            if requested && let Some(cache) = self.metric_cache.get_mut(&node_id) {
                 cache.next_sample_at = Some(now + METRIC_INTERVAL);
+                metric_last_scheduled = Some(index);
             }
+        }
+        if !active_nodes.is_empty() {
+            self.metric_cursor = advance_cursor_after_batch(
+                metric_offset,
+                active_nodes.len(),
+                metric_last_scheduled,
+            );
         }
 
         for result in self.process_sampler.poll() {
+            if self.unreachable_nodes.contains(&result.node_id) {
+                continue;
+            }
             let watched = self
                 .subscriptions
                 .values()
@@ -358,8 +482,16 @@ impl MonitorHub {
                         cache.rows = Some(rows);
                         cache.sampled_at = Some(result.completed_at);
                         cache.error = None;
+                        cache.consecutive_failures = 0;
+                        cache.next_sample_at = Some(result.completed_at + PROCESS_INTERVAL);
                     }
-                    Err(error) => cache.error = Some(bound_text(error, MAX_MONITOR_ERROR_BYTES)),
+                    Err(error) => {
+                        cache.error = Some(bound_text(error, MAX_MONITOR_ERROR_BYTES));
+                        cache.consecutive_failures = cache.consecutive_failures.saturating_add(1);
+                        cache.next_sample_at = Some(
+                            result.completed_at + process_retry_delay(cache.consecutive_failures),
+                        );
+                    }
                 }
                 self.sequence = self.sequence.saturating_add(1);
             }
@@ -374,15 +506,22 @@ impl MonitorHub {
             .filter_map(|subscription| subscription.processes.clone())
             .collect::<BTreeSet<_>>();
         let mut watched = watched.iter().cloned().collect::<Vec<_>>();
+        let mut process_last_scheduled = None;
+        let mut process_offset = 0;
         if !watched.is_empty() {
-            let offset = self.process_cursor % watched.len();
-            watched.rotate_left(offset);
-            self.process_cursor = (offset + 1) % watched.len();
+            process_offset = self.process_cursor % watched.len();
+            watched.rotate_left(process_offset);
         }
-        for node_id in watched {
+        for (index, node_id) in watched.iter().enumerate() {
+            if self.unreachable_nodes.contains(node_id) {
+                continue;
+            }
+            if !self.process_sampler.has_capacity() {
+                break;
+            }
             let due = self
                 .process_cache
-                .get(&node_id)
+                .get(node_id)
                 .is_some_and(|cache| cache.next_sample_at.is_none_or(|next| now >= next));
             if !due {
                 continue;
@@ -394,11 +533,105 @@ impl MonitorHub {
                 && let Some(cache) = self.process_cache.get_mut(&node_id)
             {
                 cache.next_sample_at = Some(now + PROCESS_INTERVAL);
-            }
-            if !self.process_sampler.has_capacity() {
-                break;
+                process_last_scheduled = Some(index);
             }
         }
+        if !watched.is_empty() {
+            self.process_cursor =
+                advance_cursor_after_batch(process_offset, watched.len(), process_last_scheduled);
+        }
+    }
+
+    fn refresh_liveness(&mut self, now: Instant) {
+        if self
+            .last_liveness_refresh
+            .is_some_and(|last| now.saturating_duration_since(last) < LIVENESS_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        self.last_liveness_refresh = Some(now);
+        let Some(state_dir) = self.liveness_state_dir.as_deref() else {
+            return;
+        };
+        let Ok(records) = crate::liveness::read(state_dir, &self.config.share_uuid) else {
+            return;
+        };
+
+        let unreachable = self
+            .config
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                let node_id = NodeId::new(id.clone()).ok()?;
+                let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+                let record = records.get(id)?;
+                (record.identity_key.eq_ignore_ascii_case(expected_identity)
+                    && record.is_confirmed_offline())
+                .then_some(node_id)
+            })
+            .collect::<BTreeSet<_>>();
+
+        if unreachable == self.unreachable_nodes {
+            return;
+        }
+        for node_id in unreachable.difference(&self.unreachable_nodes) {
+            if let Some(cache) = self.metric_cache.get_mut(node_id) {
+                cache.error = Some("node is unreachable; waiting for a successful probe".into());
+                cache.consecutive_failures = cache
+                    .consecutive_failures
+                    .max(crate::liveness::OFFLINE_AFTER_FAILURES);
+                cache.next_sample_at = None;
+            }
+            if let Some(cache) = self.process_cache.get_mut(node_id) {
+                cache.error = Some("node is unreachable; waiting for a successful probe".into());
+                cache.consecutive_failures = cache
+                    .consecutive_failures
+                    .max(crate::liveness::OFFLINE_AFTER_FAILURES);
+                cache.next_sample_at = None;
+            }
+        }
+        for node_id in self.unreachable_nodes.difference(&unreachable) {
+            if let Some(cache) = self.metric_cache.get_mut(node_id) {
+                cache.snapshot = None;
+                cache.sampled_at = None;
+                cache.error = None;
+                cache.consecutive_failures = 0;
+                cache.next_sample_at = Some(now);
+            }
+            if let Some(cache) = self.process_cache.get_mut(node_id) {
+                cache.rows = None;
+                cache.sampled_at = None;
+                cache.error = None;
+                cache.consecutive_failures = 0;
+                cache.next_sample_at = Some(now);
+            }
+        }
+        self.unreachable_nodes = unreachable;
+        self.sequence = self.sequence.saturating_add(1);
+    }
+}
+
+fn advance_cursor_after_batch(start: usize, len: usize, last_scheduled: Option<usize>) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (start + last_scheduled.map_or(1, |index| index.saturating_add(1))) % len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_cursor_after_batch;
+
+    #[test]
+    fn cursor_advances_past_the_last_scheduled_node_in_a_rotated_batch() {
+        assert_eq!(advance_cursor_after_batch(0, 5, Some(2)), 3);
+        assert_eq!(advance_cursor_after_batch(4, 5, Some(1)), 1);
+    }
+
+    #[test]
+    fn cursor_advances_one_position_when_no_node_was_scheduled() {
+        assert_eq!(advance_cursor_after_batch(2, 5, None), 3);
+        assert_eq!(advance_cursor_after_batch(0, 0, None), 0);
     }
 }
 

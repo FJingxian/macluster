@@ -5,7 +5,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_core::{
@@ -23,7 +23,6 @@ use macluster_protocol::{
     },
     framing::{ChunkAssembler, MAX_SNAPSHOT_BYTES},
     identifiers::{Id128, NodeId},
-    types::JobState,
 };
 
 use crate::compatibility::{
@@ -83,7 +82,11 @@ impl ControlApi {
             config.clone(),
             hello.namespace.clone(),
         );
-        let monitor = MonitorHub::new(config.clone(), hello.namespace.clone());
+        let monitor = MonitorHub::new_with_liveness(
+            config.clone(),
+            hello.namespace.clone(),
+            storage.root().to_path_buf(),
+        );
         let task_resources = resource_hub(config_path.clone(), &hello);
         Self {
             config,
@@ -198,7 +201,11 @@ impl ControlApi {
             self.config.clone(),
             self.hello.namespace.clone(),
         );
-        self.monitor = MonitorHub::new(self.config.clone(), self.hello.namespace.clone());
+        self.monitor = MonitorHub::new_with_liveness(
+            self.config.clone(),
+            self.hello.namespace.clone(),
+            self.storage.root().to_path_buf(),
+        );
         self.last_monitor_job_counts_at = None;
         self.task_resources = resource_hub(self.config_path.clone(), &self.hello);
         Ok(())
@@ -579,6 +586,13 @@ impl ControlApi {
                 Ok(ControlPayload::Jobs(JobPage { jobs, next_offset }))
             }
             ControlCommand::QueryQueues => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                let liveness = crate::liveness::read(self.storage.root(), &self.config.share_uuid)
+                    .unwrap_or_default();
                 let counts = self
                     .storage
                     .queue_job_counts()
@@ -594,7 +608,21 @@ impl ControlApi {
                         let counts = counts.get(name);
                         QueueSummary {
                             name: name.clone(),
-                            nodes: self.config.queue_compute_nodes(name),
+                            nodes: self
+                                .config
+                                .queue_compute_nodes(name)
+                                .into_iter()
+                                .filter(|node_id| {
+                                    let Some(node) = self.config.nodes.get(node_id) else {
+                                        return false;
+                                    };
+                                    let expected_identity =
+                                        node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+                                    liveness.get(node_id).is_some_and(|record| {
+                                        record.was_recently_reachable(expected_identity, now_ms)
+                                    })
+                                })
+                                .collect(),
                             pending: counts.map_or(0, |counts| counts.pending),
                             running: counts.map_or(0, |counts| counts.running),
                             completed: counts.map_or(0, |counts| counts.completed),
@@ -726,7 +754,7 @@ impl ControlApi {
     }
 
     fn refresh_monitor_job_counts(&mut self) -> Result<(), ControlError> {
-        let jobs = self.storage.list_monitor_jobs().map_err(storage_error)?;
+        let job_counts = self.storage.monitor_job_counts().map_err(storage_error)?;
         let mut counts = self
             .config
             .nodes
@@ -734,30 +762,27 @@ impl ControlApi {
             .filter_map(|id| NodeId::new(id.clone()).ok())
             .map(|node_id| (node_id, (0_u32, 0_u32)))
             .collect::<std::collections::HashMap<_, _>>();
-        for job in jobs {
-            match job.state {
-                JobState::Starting | JobState::Running | JobState::Cancelling => {
-                    if let Some(target) = job.node.as_ref()
-                        && let Ok(node_id) = NodeId::new(target.to_string())
-                        && let Some((running, _)) = counts.get_mut(&node_id)
-                    {
-                        *running = running.saturating_add(1);
-                    }
+        for (queue, pending) in job_counts.pending_by_queue {
+            for target in self.config.queue_compute_nodes(&queue) {
+                if let Ok(node_id) = NodeId::new(target)
+                    && let Some((_, waiting)) = counts.get_mut(&node_id)
+                {
+                    *waiting = waiting.saturating_add(pending);
                 }
-                JobState::Pending => {
-                    let targets = job.spec.node.as_ref().map_or_else(
-                        || self.config.queue_compute_nodes(job.spec.queue.as_str()),
-                        |node| vec![node.to_string()],
-                    );
-                    for target in targets {
-                        if let Ok(node_id) = NodeId::new(target)
-                            && let Some((_, waiting)) = counts.get_mut(&node_id)
-                        {
-                            *waiting = waiting.saturating_add(1);
-                        }
-                    }
-                }
-                _ => {}
+            }
+        }
+        for (target, pending) in job_counts.pending_by_node {
+            if let Ok(node_id) = NodeId::new(target)
+                && let Some((_, waiting)) = counts.get_mut(&node_id)
+            {
+                *waiting = waiting.saturating_add(pending);
+            }
+        }
+        for (target, running) in job_counts.running_by_node {
+            if let Ok(node_id) = NodeId::new(target)
+                && let Some((count, _)) = counts.get_mut(&node_id)
+            {
+                *count = count.saturating_add(running);
             }
         }
         self.monitor.update_job_counts(counts);

@@ -169,6 +169,8 @@ impl NodeTransport for FakeTransport {
                 macluster_protocol::types::NodeHealth {
                     machine_uuid: String::new(),
                     execution_uid: 0,
+                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+                    logical_cpus: None,
                     execution_digest: String::new(),
                     primary_share_ready: true,
                     shares: BTreeMap::new(),

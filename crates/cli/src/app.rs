@@ -106,6 +106,11 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             args.truncate(command_index);
             args.extend(controller_args);
             command = Some("controller".into());
+        } else if command_arg == "init" {
+            return Err((
+                2,
+                "`init` is an option, not a command; use `macluster --init`".into(),
+            ));
         } else {
             command = alias_to_command(&command_arg).map(str::to_owned);
             if command.is_some() {
@@ -128,6 +133,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         return Err((2, "msub -Is requires terminal stdin and stdout".into()));
     }
     let mut address_migration_deferred = false;
+    let mut address_migration_deferred_error = None;
     let local_read_query = is_read_only_query(&command, &args);
     let refresh_node_addresses = !local_read_query
         && is_macluster_executable()
@@ -159,6 +165,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                     "Node address discovery needs attention: {error}. Continuing with `{command}`; automatic Agent updates are deferred."
                 );
                 address_migration_deferred = true;
+                address_migration_deferred_error = Some(error);
                 false
             }
             Err(error) => return Err(error),
@@ -192,6 +199,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 Ok(stopped) => stopped,
                 Err((_, error)) if can_defer => {
                     address_migration_deferred = true;
+                    address_migration_deferred_error = Some(error.clone());
                     eprintln!(
                         "Node address/NFS migration could not finish yet: {error}. Continuing with `{command}`; migration progress is preserved."
                     );
@@ -224,7 +232,13 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
         "top" => top(global, &args, address_migration_deferred),
-        "controller" => controller(global, &args, false),
+        "controller" => controller(
+            global,
+            &args,
+            false,
+            address_migration_deferred,
+            address_migration_deferred_error,
+        ),
         "init" => {
             let config_path = resolved_config_path(global.config.as_deref());
             let state_dir = state_root(global.state_dir.as_deref())?;
@@ -234,12 +248,6 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
             let disabled_for_test = env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some();
             if !help && !disabled_for_test && is_macluster_executable() && config_path.is_file() {
-                let config = load_config(global.config.as_deref()).map_err(config_error)?;
-                if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
-                    eprintln!(
-                        "Power sampler setup is incomplete: {error}. Open mtop in Terminal to retry authorization."
-                    );
-                }
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
                     manager.start(Duration::from_secs(5)).map_err(service_error)
                 }) {
@@ -274,7 +282,39 @@ fn controller_is_running(global: &GlobalOptions, state_dir: &Path) -> bool {
     crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200)).is_ok()
 }
 
+fn controller_build_mismatch(global: &GlobalOptions, state_dir: &Path) -> bool {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let Ok(binding) = ServiceBinding::load(&config_path, state_dir) else {
+        return false;
+    };
+    let Ok(client) =
+        crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200))
+    else {
+        return false;
+    };
+    crate::service::current_executable_build_id()
+        .is_ok_and(|expected| client.hello().build_id != expected)
+}
+
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    // Monitoring is read-only and must remain available while an Agent update
+    // is pending or a compute node is unreachable. mtop reports the mismatch
+    // inside its UI instead of starting cluster-wide maintenance first.
+    if command == "top" {
+        return false;
+    }
+    // Local inspection must not acquire the cluster maintenance lock or
+    // trigger a cluster-wide Agent/helper update. These commands can still
+    // report jobs, queue counts, or status while an update is pending; the
+    // next operation that needs an Agent will resume the update workflow.
+    if is_read_only_query(command, args) {
+        return false;
+    }
+    // Network discovery only probes the configured login subnet. It must not
+    // trigger address migration or an Agent refresh before the read-only scan.
+    if is_node_network_scan(command, args) {
+        return false;
+    }
     // Init owns reset/recovery and stages any artifacts needed by a new cluster.
     // Updating the old cluster first can block the very operation repairing it.
     if command == "init" {
@@ -299,6 +339,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     if command == "node" && args.first().is_some_and(|arg| arg == "--failed") {
         return false;
     }
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list"))
+    {
+        return false;
+    }
     let help_requested = if command == "submit" {
         submit_help_requested(args)
     } else {
@@ -309,7 +356,7 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 }
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
-    if matches!(command, "internal" | "agent" | "init") {
+    if matches!(command, "internal" | "agent" | "init") || is_node_network_scan(command, args) {
         return false;
     }
     if command == "fans"
@@ -389,6 +436,7 @@ fn defer_update_without_terminal(
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "kill" | "top")
+        || controller_web_monitor_requested(command, args)
         || command == "fans"
             && args
                 .iter()
@@ -397,6 +445,12 @@ fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
             && args
                 .first()
                 .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
+}
+
+fn controller_web_monitor_requested(command: &str, args: &[String]) -> bool {
+    command == "controller"
+        && args.first().is_some_and(|arg| arg == "run")
+        && args.iter().any(|arg| arg == "--web")
 }
 
 fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
@@ -578,14 +632,59 @@ fn preflight_agent_update_with_compatibility(
             .0
         }
     };
-    let helper_refresh_pending =
-        crate::node_admin::agent_helper_refresh_pending(&state_dir).map_err(|error| (1, error))?;
-    let agent_mismatch = compatibility.requires_update() || local_validation.requires_update();
-    let update_required = recovery_pending || agent_mismatch || helper_refresh_pending;
-    if !local_validation.missing_required_features.is_empty() {
+    let helper_pending_nodes =
+        crate::node_admin::agent_helper_refresh_pending_nodes(&state_dir, &config)
+            .map_err(|error| (1, error))?;
+    let mut agent_update_candidates = std::collections::BTreeSet::new();
+    for validation in [&compatibility, &local_validation] {
+        agent_update_candidates.extend(validation.stale.iter().cloned());
+        agent_update_candidates.extend(validation.missing_required_features.iter().cloned());
+    }
+    let mut probe_candidates = agent_update_candidates.clone();
+    probe_candidates.extend(helper_pending_nodes.iter().cloned());
+    if recovery_pending {
+        probe_candidates.extend(config.nodes.keys().cloned());
+    }
+    let reachable_nodes =
+        crate::node_admin::reachable_configured_node_ids(&config, &probe_candidates);
+    let agent_mismatch = agent_update_candidates
+        .iter()
+        .any(|node| reachable_nodes.contains(node));
+    let helper_refresh_pending = helper_pending_nodes
+        .iter()
+        .any(|node| reachable_nodes.contains(node));
+    // A resident controller must understand the same build identity as this
+    // CLI before it can safely schedule jobs. This also upgrades the
+    // controller when every stale compute node is currently offline, so that
+    // it fences those nodes immediately when they reconnect.
+    let controller_mismatch = controller_build_mismatch(global, &state_dir);
+    if controller_mismatch {
+        eprintln!(
+            "Controller build mismatch detected; it will be restarted after Agent maintenance."
+        );
+    }
+    let update_required =
+        recovery_pending || agent_mismatch || helper_refresh_pending || controller_mismatch;
+    let deferred_nodes = probe_candidates
+        .difference(&reachable_nodes)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !deferred_nodes.is_empty() {
+        eprintln!(
+            "Agent/helper update deferred for unreachable node(s): {}. They remain unavailable for new jobs until refreshed.",
+            deferred_nodes.join(", ")
+        );
+    }
+    let missing_online_features = local_validation
+        .missing_required_features
+        .iter()
+        .filter(|node| reachable_nodes.contains(*node))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_online_features.is_empty() {
         eprintln!(
             "Agent capability mismatch detected on {}; updating the cluster before `{command}`.",
-            local_validation.missing_required_features.join(", ")
+            missing_online_features.join(", ")
         );
     }
     if update_required
@@ -824,43 +923,36 @@ fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
 }
 
 fn parse_web_shortcut_args(args: &[String]) -> AppResult<Vec<String>> {
-    let Some(address) = args.first() else {
-        return Err((
-            2,
-            "usage: macluster --web 127.0.0.1:PORT [--no-open]".into(),
-        ));
-    };
-    let Some((host, port)) = address.rsplit_once(':') else {
-        return Err((
-            2,
-            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
-        ));
-    };
-    let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
-        (
-            2,
-            format!("invalid web address '{address}'; expected 127.0.0.1:PORT"),
-        )
-    })?;
-    if host != std::net::Ipv4Addr::LOCALHOST {
-        return Err((
-            2,
-            "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
-        ));
+    let mut normalized = vec!["run".into(), "--web".into()];
+    let mut option_index = 0;
+    if let Some(address) = args.first().filter(|argument| !argument.starts_with('-')) {
+        let (host, port) = address
+            .rsplit_once(':')
+            .map_or((address.as_str(), None), |(host, port)| (host, Some(port)));
+        let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
+            (
+                2,
+                format!("invalid web address '{address}'; expected 127.0.0.1 or 127.0.0.1:PORT"),
+            )
+        })?;
+        if host != std::net::Ipv4Addr::LOCALHOST {
+            return Err((
+                2,
+                "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
+            ));
+        }
+        if let Some(port) = port {
+            let port = port.parse::<u16>().map_err(|_| {
+                (
+                    2,
+                    format!("invalid web port '{port}'; expected a number from 0 to 65535"),
+                )
+            })?;
+            normalized.extend(["--web-port".into(), port.to_string()]);
+        }
+        option_index = 1;
     }
-    let port = port.parse::<u16>().map_err(|_| {
-        (
-            2,
-            format!("invalid web port '{port}'; expected a number from 0 to 65535"),
-        )
-    })?;
-    let mut normalized = vec![
-        "run".into(),
-        "--web".into(),
-        "--web-port".into(),
-        port.to_string(),
-    ];
-    for argument in &args[1..] {
+    for argument in &args[option_index..] {
         if argument == "--no-open" {
             normalized.push(argument.clone());
         } else {
@@ -874,7 +966,7 @@ fn web_shortcut_help(mode: HelpMode) -> &'static str {
     match mode {
         HelpMode::Short => {
             r#"Usage
-  macluster --web 127.0.0.1:PORT [--no-open]
+  macluster --web [127.0.0.1[:PORT]] [--no-open]
 
 Open the read-only browser monitor.
 
@@ -882,13 +974,16 @@ The monitor is local-only."#
         }
         HelpMode::Long => {
             r#"Usage
-  macluster --web 127.0.0.1:PORT [--no-open]
+  macluster --web [127.0.0.1[:PORT]] [--no-open]
 
 OPTIONS
-  127.0.0.1:PORT  Choose the local monitor port; use 0 for an automatic port.
+  127.0.0.1       Optional loopback address; omitted ports are selected automatically.
+  :PORT           Optional local port; use 0 for an automatic port.
   --no-open       Print the monitor address without opening a browser.
 
 EXAMPLES
+  macluster --web
+  macluster --web 127.0.0.1 --no-open
   macluster --web 127.0.0.1:8080
   macluster --web 127.0.0.1:0 --no-open
 
@@ -906,7 +1001,6 @@ fn alias_to_command(name: &str) -> Option<&'static str> {
         "kill" | "mkill" => "kill",
         "top" | "mtop" => "top",
         "controller" => "controller",
-        "init" => "init",
         "agent" => "agent",
         "internal" => "internal",
         "node" | "mnode" => "node",
@@ -2021,6 +2115,36 @@ fn prepare_task_environment_with_policy(
         .map(|prefix| validate_active_environment(config, prefix))
         .transpose()?;
 
+    let cargo_offline = task_env
+        .get("CARGO_NET_OFFLINE")
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1"));
+    if cargo_offline
+        && !explicit_env_keys.iter().any(|key| key == "CARGO_HOME")
+        && task_env
+            .get("CARGO_HOME")
+            .is_none_or(|value| value.is_empty())
+        && let Some(home) = env::var_os("HOME").map(PathBuf::from)
+        && let Some(cargo_home) = configured_shared_cargo_home(config, &home)
+    {
+        task_env.insert(
+            "CARGO_HOME".into(),
+            cargo_home.to_string_lossy().into_owned(),
+        );
+    }
+
+    if let Some(prefix) = selected_prefix.as_deref()
+        && let Some(python) = active_environment_python(prefix)
+    {
+        let python = python.to_string_lossy().into_owned();
+        for key in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+            if !explicit_env_keys.iter().any(|explicit| explicit == key)
+                && task_env.get(key).is_none_or(|value| value.is_empty())
+            {
+                task_env.insert(key.into(), python.clone());
+            }
+        }
+    }
+
     let login_path = task_env.get("PATH").cloned().unwrap_or_default();
     let mut unused_build_keys = Vec::new();
     for (key, value) in &mut task_env {
@@ -2099,6 +2223,35 @@ fn prepare_task_environment_with_policy(
         };
     }
     Ok(task_env)
+}
+
+fn configured_shared_cargo_home(config: &ClusterConfig, login_home: &Path) -> Option<PathBuf> {
+    if !login_home.is_absolute() {
+        return None;
+    }
+    let cargo_home = login_home.join(".cargo");
+    (cargo_home.is_dir() && remap_shared_path(config, &cargo_home).is_some()).then_some(cargo_home)
+}
+
+fn active_environment_python(prefix: &Path) -> Option<PathBuf> {
+    let bin = prefix.join("bin");
+    ["python3", "python"]
+        .iter()
+        .map(|name| bin.join(name))
+        .find(|path| path.is_file())
+        .or_else(|| {
+            fs::read_dir(&bin)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|name| name.starts_with("python3."))
+                        && path.is_file()
+                })
+                .min()
+        })
 }
 
 // Only known system utilities qualify. Scripts, shell expressions, Python,
@@ -3570,6 +3723,7 @@ fn validate_shared_output_path(
 
 fn is_read_only_query(command: &str, args: &[String]) -> bool {
     matches!(command, "job" | "queue" | "top")
+        || is_node_network_scan(command, args)
         || command == "controller" && args.first().is_some_and(|arg| arg == "status")
         || command == "node"
             && args
@@ -3579,6 +3733,10 @@ fn is_read_only_query(command: &str, args: &[String]) -> bool {
             && args
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
+}
+
+fn is_node_network_scan(command: &str, args: &[String]) -> bool {
+    command == "node" && args.first().is_some_and(|arg| arg == "--scan")
 }
 
 fn job_listing_uses_local_store(args: &[String]) -> bool {
@@ -4102,6 +4260,14 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         return Err((2, format!("queue '{selected}' is not configured")));
     }
     loop {
+        let liveness = match macluster_controller::liveness::read(&state_dir, &config.share_uuid) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("macluster: could not read cached node reachability: {error}");
+                BTreeMap::new()
+            }
+        };
+        let liveness_now_ms = now_unix_ms();
         let storage = match fs::symlink_metadata(state_dir.join("controller.sqlite3")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err((1, format!("cannot inspect job database: {error}"))),
@@ -4128,7 +4294,7 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 let counts = counts_by_queue.get(name);
                 QueueRow {
                     name: name.clone(),
-                    nodes: config.queue_compute_nodes(name),
+                    nodes: visible_queue_nodes(&config, name, &liveness, liveness_now_ms),
                     pending: counts.map_or(0, |counts| counts.pending as usize),
                     running: counts.map_or(0, |counts| counts.running as usize),
                     completed: counts.map_or(0, |counts| counts.completed as usize),
@@ -4155,57 +4321,14 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 serde_json::to_string_pretty(&rows).map_err(|error| (1, error.to_string()))?
             );
         } else {
-            let queue_width = rows
-                .iter()
-                .map(|row| row.name.len())
-                .max()
-                .unwrap_or(0)
-                .max("QUEUE".len());
-            let nodes_width = rows
-                .iter()
-                .map(|row| row.nodes.join(",").len())
-                .max()
-                .unwrap_or(0)
-                .max("NODES".len());
-            let pending_width = rows
-                .iter()
-                .map(|row| row.pending.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("PENDING".len());
-            let running_width = rows
-                .iter()
-                .map(|row| row.running.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("RUNNING".len());
-            let completed_width = rows
-                .iter()
-                .map(|row| row.completed.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("COMPLETED".len());
-            let failed_width = rows
-                .iter()
-                .map(|row| row.failed.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("FAILED".len());
-            println!(
-                "{:<queue_width$}  {:<nodes_width$}  {:<pending_width$}  {:<running_width$}  {:<completed_width$}  {:<failed_width$}",
-                "QUEUE", "NODES", "PENDING", "RUNNING", "COMPLETED", "FAILED",
-            );
-            for row in &rows {
-                println!(
-                    "{:<queue_width$}  {:<nodes_width$}  {:<pending_width$}  {:<running_width$}  {:<completed_width$}  {:<failed_width$}",
-                    row.name,
-                    row.nodes.join(","),
-                    row.pending,
-                    row.running,
-                    row.completed,
-                    row.failed
-                );
-            }
+            let terminal_width = if io::stdout().is_terminal() {
+                crossterm::terminal::size()
+                    .map(|(width, _)| usize::from(width))
+                    .unwrap_or(120)
+            } else {
+                120
+            };
+            print!("{}", format_queue_table(&rows, terminal_width));
             if show_jobs {
                 let mut queue_jobs: Vec<_> = jobs
                     .as_ref()
@@ -4261,8 +4384,9 @@ EXAMPLES
   mqueue --watch 5
 
 NOTES
-  Reads saved queue counts locally. It does not start the controller or
-  probe nodes. A stopped controller leaves the last saved counts visible."#
+  Reads saved queue counts and recent node reachability locally. It does not
+  start the controller or probe nodes. Unverified, confirmed-offline, or stale
+  nodes are omitted; use `mnode -l --all` to inspect them."#
         }
     }
 }
@@ -4565,6 +4689,181 @@ struct QueueRow {
     failed: usize,
 }
 
+fn visible_queue_nodes(
+    config: &ClusterConfig,
+    queue: &str,
+    liveness: &BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    now_ms: u64,
+) -> Vec<String> {
+    config
+        .queue_compute_nodes(queue)
+        .into_iter()
+        .filter(|node_id| {
+            let Some(node) = config.nodes.get(node_id) else {
+                return false;
+            };
+            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            let Some(record) = liveness.get(node_id) else {
+                // Queue membership is not proof of availability. Require at
+                // least one recent successful liveness observation before
+                // presenting the node as usable.
+                return false;
+            };
+            record.was_recently_reachable(identity_key, now_ms)
+        })
+        .collect()
+}
+
+fn format_queue_table(rows: &[QueueRow], terminal_width: usize) -> String {
+    use std::fmt::Write as _;
+
+    let headers = [
+        "QUEUE",
+        "NODES",
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+    ];
+    let queue_width = rows
+        .iter()
+        .map(|row| display_width(&row.name))
+        .max()
+        .unwrap_or(0)
+        .max(headers[0].len());
+    let count_nodes_width = rows
+        .iter()
+        .map(|row| row.nodes.len().to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[1].len());
+    let inline_nodes_width = rows
+        .iter()
+        .map(|row| display_width(&row.nodes.join(", ")))
+        .max()
+        .unwrap_or(0)
+        .max(headers[1].len());
+    let numeric_widths = [
+        rows.iter()
+            .map(|row| row.pending.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[2].len()),
+        rows.iter()
+            .map(|row| row.running.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[3].len()),
+        rows.iter()
+            .map(|row| row.completed.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[4].len()),
+        rows.iter()
+            .map(|row| row.failed.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[5].len()),
+    ];
+    let separators = (headers.len() - 1) * 2;
+    let inline_width =
+        queue_width + inline_nodes_width + numeric_widths.iter().sum::<usize>() + separators;
+    let inline_nodes = inline_width <= terminal_width;
+    let widths = [
+        queue_width,
+        if inline_nodes {
+            inline_nodes_width
+        } else {
+            count_nodes_width
+        },
+        numeric_widths[0],
+        numeric_widths[1],
+        numeric_widths[2],
+        numeric_widths[3],
+    ];
+    let table_width = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+    let mut output = String::new();
+    if table_width <= terminal_width {
+        let _ = writeln!(
+            output,
+            "{:<queue$}  {:<nodes$}  {:<pending$}  {:<running$}  {:<completed$}  {:<failed$}",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            headers[5],
+            queue = widths[0],
+            nodes = widths[1],
+            pending = widths[2],
+            running = widths[3],
+            completed = widths[4],
+            failed = widths[5],
+        );
+        for row in rows {
+            let nodes = if inline_nodes {
+                row.nodes.join(", ")
+            } else {
+                row.nodes.len().to_string()
+            };
+            let _ = writeln!(
+                output,
+                "{:<queue$}  {:<nodes$}  {:<pending$}  {:<running$}  {:<completed$}  {:<failed$}",
+                row.name,
+                nodes,
+                row.pending,
+                row.running,
+                row.completed,
+                row.failed,
+                queue = widths[0],
+                nodes = widths[1],
+                pending = widths[2],
+                running = widths[3],
+                completed = widths[4],
+                failed = widths[5],
+            );
+            if !inline_nodes {
+                append_queue_node_lines(&mut output, &row.nodes, terminal_width);
+            }
+        }
+    } else {
+        for row in rows {
+            let _ = writeln!(output, "QUEUE  {}", row.name);
+            let _ = writeln!(output, "  NODES      {}", row.nodes.len());
+            let _ = writeln!(output, "  PENDING    {}", row.pending);
+            let _ = writeln!(output, "  RUNNING    {}", row.running);
+            let _ = writeln!(output, "  COMPLETED  {}", row.completed);
+            let _ = writeln!(output, "  FAILED     {}", row.failed);
+            append_queue_node_lines(&mut output, &row.nodes, terminal_width);
+        }
+    }
+    output
+}
+
+fn append_queue_node_lines(output: &mut String, nodes: &[String], terminal_width: usize) {
+    use std::fmt::Write as _;
+
+    if nodes.is_empty() {
+        return;
+    }
+    let width = terminal_width.max(24);
+    let first_prefix = "  Nodes: ";
+    let next_prefix = "         ";
+    let mut line = first_prefix.to_owned();
+    for node in nodes {
+        let separator = if line == first_prefix { "" } else { ", " };
+        let next_width = display_width(&line) + separator.len() + display_width(node);
+        if next_width > width && line != first_prefix {
+            let _ = writeln!(output, "{line}");
+            line = format!("{next_prefix}{node}");
+        } else {
+            line.push_str(separator);
+            line.push_str(node);
+        }
+    }
+    let _ = writeln!(output, "{line}");
+}
+
 fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     if let Some(mode) = help_mode(args) {
         println!("{}", kill_help(mode));
@@ -4767,6 +5066,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                 Ok(action)
             },
             |action| match action {
+                #[cfg(test)]
                 crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
                     preflight_agent_update_with_compatibility(
                         "top",
@@ -4775,13 +5075,16 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                         Some(compatibility),
                     )
                 }
+                #[cfg(test)]
                 crate::mtop::MtopPostAction::RecoverMaintenance => {
                     preflight_agent_update("top", args, &global)
                 }
                 crate::mtop::MtopPostAction::SetupLocalPower => {
                     power_setup_attempted.set(true);
                     let config = load_config(global.config.as_deref()).map_err(config_error)?;
-                    if let Err(error) = crate::node_admin::ensure_local_power_sampler(&config) {
+                    if let Err(error) =
+                        crate::node_admin::ensure_local_power_sampler(&config, &state_dir)
+                    {
                         eprintln!(
                             "Power sampler setup remains incomplete: {error}. Monitoring continues; reopen mtop to retry authorization."
                         );
@@ -4859,6 +5162,7 @@ fn run_tui_with_updates(
     loop {
         let action = match view()? {
             None | Some(crate::mtop::MtopPostAction::UpdateDeferred) => return Ok(()),
+            #[cfg(test)]
             Some(crate::mtop::MtopPostAction::CheckBuilds(ref compatibility))
                 if !compatibility.requires_update() =>
             {
@@ -4882,7 +5186,13 @@ fn run_tui_with_updates(
     }
 }
 
-fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> AppResult<()> {
+fn controller(
+    global: GlobalOptions,
+    args: &[String],
+    service_child: bool,
+    address_migration_deferred: bool,
+    address_migration_deferred_error: Option<String>,
+) -> AppResult<()> {
     let requested_help = if args.is_empty() {
         Some(HelpMode::Short)
     } else {
@@ -5163,15 +5473,19 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
             );
             let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir)
                 .map_err(|error| (1, error))?;
-            service.set_dispatch_enabled(
-                !sync_pending && !crate::node_admin::address_migration_pending(&state_dir),
-            );
+            let address_migration = address_migration_deferred
+                || crate::node_admin::address_migration_pending(&state_dir);
+            service.set_dispatch_enabled(!sync_pending && !address_migration);
             if sync_pending {
                 eprintln!(
                     "macluster: peer config synchronization is pending; controller will reconcile status and cancellations but will not dispatch new jobs"
                 );
             }
-            let address_migration = crate::node_admin::address_migration_pending(&state_dir);
+            if address_migration_deferred {
+                eprintln!(
+                    "Browser monitoring will start, but new job dispatch is paused until the login node address can be verified."
+                );
+            }
             let maintenance_pending =
                 macluster_core::maintenance::maintenance_barrier_path(&config_file).exists();
             let lifecycle = if sync_pending || address_migration {
@@ -5263,6 +5577,19 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                     state_dir.clone(),
                 )?;
                 let pending = watcher.pending_flag();
+                let address_errors = watcher.error_reporter();
+                if let Some(error) = address_migration_deferred_error.as_deref() {
+                    // The command preflight already showed this error. Reuse
+                    // the same reporter so the background retries do not
+                    // immediately print the identical warning again.
+                    address_errors.remember(error);
+                }
+                if address_migration_deferred {
+                    // Keep dispatch paused and ask the existing background
+                    // watcher to retry discovery until the login interface can
+                    // be identified safely.
+                    pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let requested = std::sync::Arc::clone(&pending);
                 let mut maintenance_lock = Some(maintenance_lock);
                 let _signal_guard = ControllerSignalGuard::install()?;
@@ -5298,12 +5625,17 @@ fn controller(global: GlobalOptions, args: &[String], service_child: bool) -> Ap
                                 Ok(_) => {
                                     let next = load_config(global.config.as_deref()).map_err(|error| io::Error::other(error.to_string()))?;
                                     service.apply_idle_address_config(next)?;
-                                    service.set_dispatch_enabled(!crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?);
+                                    let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?;
+                                    let address_pending = crate::node_admin::address_migration_pending(&state_dir);
+                                    service.set_dispatch_enabled(!sync_pending && !address_pending);
                                     pending.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    address_errors.clear();
                                     Ok(true)
                                 }
                                 Err((_, error)) => {
-                                    eprintln!("macluster: address migration needs attention: {error}. If administrator authorization is required, run a foreground macluster command to resume it.");
+                                    if address_errors.should_report(&error) {
+                                        eprintln!("macluster: address migration needs attention: {error}. If administrator authorization is required, run a foreground macluster command to resume it.");
+                                    }
                                     Ok(false)
                                 }
                             }
@@ -5403,7 +5735,7 @@ fn online_controller(
         ServiceIntent::Resetting => {
             return Err((
                 1,
-                "cluster reset is in progress; finish `macluster init` before this operation"
+                "cluster reset is in progress; finish `macluster --init` before this operation"
                     .into(),
             ));
         }
@@ -5543,7 +5875,7 @@ impl ControllerSignalGuard {
     fn install() -> AppResult<Self> {
         CONTROLLER_SHUTDOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = controller_signal_handler as usize;
+        action.sa_sigaction = controller_signal_handler as *const () as usize;
         action.sa_flags = 0;
         unsafe { libc::sigemptyset(&mut action.sa_mask) };
         let mut old_term: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -5608,6 +5940,39 @@ fn sample_cluster(
     state_dir: &Path,
     config_path: &Path,
 ) -> ClusterMetricView {
+    let selected_nodes = selected_queue.map(|queue| config.queue_compute_nodes(queue.as_str()));
+    let is_selected = |id: &str| {
+        selected_nodes
+            .as_ref()
+            .is_none_or(|members| members.iter().any(|member| member == id))
+    };
+    let unreachable_nodes = macluster_controller::liveness::read(state_dir, &config.share_uuid)
+        .ok()
+        .into_iter()
+        .flat_map(|records| records.into_iter())
+        .filter_map(|(id, record)| {
+            let node = config.nodes.get(&id)?;
+            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            (record.identity_key.eq_ignore_ascii_case(identity_key)
+                && record.is_confirmed_offline()
+                && !config.is_login_node(&id))
+            .then_some(id)
+        })
+        .filter(|id| is_selected(id))
+        .collect::<std::collections::BTreeSet<_>>();
+    let sample_config = if unreachable_nodes.is_empty() {
+        None
+    } else {
+        let mut filtered = config.clone();
+        filtered
+            .nodes
+            .retain(|id, _| !unreachable_nodes.contains(id));
+        for queue in filtered.queues.values_mut() {
+            queue.nodes.retain(|id| !unreachable_nodes.contains(id));
+        }
+        Some(filtered)
+    };
+    let sample_config = sample_config.as_ref().unwrap_or(config);
     let local_uuid = local_machine_uuid().ok();
     let login_compute_node_id = config
         .nodes
@@ -5627,34 +5992,28 @@ fn sample_cluster(
             is_local && selected && !config.is_login_node(id)
         })
         .map(|(id, _)| id.clone());
-    let (login, samples) = cached_monitor_samples(config, config_path, state_dir, selected_queue)
-        .unwrap_or_else(|| {
-            crate::mtop::sample_one_shot(config, selected_queue.map(QueueName::as_str))
+    let (login, samples) =
+        cached_monitor_samples(sample_config, config_path, state_dir, selected_queue)
+            .unwrap_or_else(|| {
+                crate::mtop::sample_one_shot(sample_config, selected_queue.map(QueueName::as_str))
+            });
+    let mut rows = Vec::new();
+    let mut missing_nodes = unreachable_nodes.len();
+    for (id, node, result) in samples {
+        let Ok(mut metrics) = result else {
+            missing_nodes = missing_nodes.saturating_add(1);
+            continue;
+        };
+        explain_legacy_power_agent(&mut metrics);
+        rows.push(NodeMetricRow {
+            id,
+            host: node.host,
+            reachable: true,
+            metrics: Some(metrics),
+            error: None,
         });
-    let mut rows: Vec<NodeMetricRow> = samples
-        .into_iter()
-        .map(|(id, node, result)| match result {
-            Ok(mut metrics) => {
-                explain_legacy_power_agent(&mut metrics);
-                NodeMetricRow {
-                    id,
-                    host: node.host,
-                    reachable: true,
-                    metrics: Some(metrics),
-                    error: None,
-                }
-            }
-            Err(error) => NodeMetricRow {
-                id,
-                host: node.host,
-                reachable: false,
-                metrics: None,
-                error: Some(error),
-            },
-        })
-        .collect();
+    }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
-    let missing_nodes = rows.iter().filter(|row| !row.reachable).count();
     let pool_total = aggregate_metrics(&rows);
     ClusterMetricView {
         sampled_unix_ms: now_unix_ms(),
@@ -5821,6 +6180,7 @@ fn aggregate_metrics(nodes: &[NodeMetricRow]) -> MetricSnapshot {
         sampled_unix_ms: now_unix_ms(),
         cpu_percent: sum(|metric| metric.cpu_percent),
         cpu_max_percent: sum(|metric| metric.cpu_max_percent),
+        logical_cpu_percent: None,
         memory_total_bytes: sum_u64(|metric| metric.memory_total_bytes),
         memory_used_bytes: sum_u64(|metric| metric.memory_used_bytes),
         swap_used_bytes: sum_u64(|metric| metric.swap_used_bytes),
@@ -5880,10 +6240,10 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
     } else {
         println!("MACLUSTER NODE MONITOR");
     }
+    let total_compute_nodes = view.nodes.len().saturating_add(view.missing_nodes);
     println!(
         "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
-        view.missing_nodes,
-        view.nodes.len()
+        view.missing_nodes, total_compute_nodes
     );
 
     let mut rows = Vec::with_capacity(view.nodes.len() + 2);
@@ -6230,7 +6590,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
             }
-            controller(global, &["run".into()], true)
+            controller(global, &["run".into()], true, false, None)
         }
         Some("claim-agent") => {
             let node_id = option_value(args, "--node")?
@@ -6460,6 +6820,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         Some("capabilities") => {
             if args.iter().any(|arg| arg == "--json") {
                 let report = serde_json::json!({
+                    "build_id": macluster_protocol::BUILD_ID,
                     "protocol_version": PROTOCOL_VERSION,
                     "features": [
                         "config.local-transport.v1",
@@ -6468,6 +6829,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "config.execution-digest.v1",
                         "config.primary-storage-source.v1",
                         "metrics.cpu-temperature.v1",
+                        "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,
                         INTERACTIVE_PTY_FEATURE,
                         macluster_protocol::types::NAMESPACED_JOBS_FEATURE
@@ -6598,7 +6960,7 @@ fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
     let reply = if request_bytes.len() > macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES
     {
         macluster_protocol::nfs_admin::NfsAdminReply::failure(
-            "nfs-admin-1",
+            macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
             "NFS admin request exceeds the 1 MiB limit",
         )
     } else {
@@ -6607,7 +6969,7 @@ fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
         ) {
             Ok(request) => crate::node_admin::apply_privileged_nfs_admin_request(request, peer_uid),
             Err(error) => macluster_protocol::nfs_admin::NfsAdminReply::failure(
-                "nfs-admin-1",
+                macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
                 format!("invalid NFS admin request: {error}"),
             ),
         }
@@ -6937,13 +7299,25 @@ mod tests {
     #[test]
     fn web_shortcut_only_accepts_loopback_and_maps_controller_options() {
         assert_eq!(
+            super::parse_web_shortcut_args(&[]).unwrap(),
+            ["run", "--web"]
+        );
+        assert_eq!(
+            super::parse_web_shortcut_args(&["127.0.0.1".into()]).unwrap(),
+            ["run", "--web"]
+        );
+        assert_eq!(
+            super::parse_web_shortcut_args(&["--no-open".into()]).unwrap(),
+            ["run", "--web", "--no-open"]
+        );
+        assert_eq!(
             super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--no-open".into(),])
                 .unwrap(),
             ["run", "--web", "--web-port", "8080", "--no-open"]
         );
+        assert!(super::parse_web_shortcut_args(&["192.0.2.10".into()]).is_err());
         assert!(super::parse_web_shortcut_args(&["192.0.2.10:8080".into()]).is_err());
         assert!(super::parse_web_shortcut_args(&["127.0.0.1:nope".into()]).is_err());
-        assert!(super::parse_web_shortcut_args(&[]).is_err());
         assert!(
             super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--unknown".into(),])
                 .is_err()
@@ -7027,6 +7401,7 @@ mod tests {
             ("agent", vec!["--stdio".into()]),
             ("top", vec!["--help".into()]),
             ("node", vec!["-h".into()]),
+            ("node", vec!["--scan".into()]),
             ("init", vec!["--help".into()]),
             ("init", vec![]),
             ("init", vec!["--force".into()]),
@@ -7036,18 +7411,16 @@ mod tests {
                 "{command} {args:?} must bypass build preflight"
             );
         }
-        for command in [
-            "submit",
-            "job",
-            "queue",
-            "kill",
-            "top",
-            "node",
-            "controller",
-        ] {
+        for command in ["submit", "kill", "node", "controller"] {
             assert!(
                 should_preflight_agent_update(command, &[]),
                 "{command} must run build preflight"
+            );
+        }
+        for command in ["job", "queue"] {
+            assert!(
+                !should_preflight_agent_update(command, &[]),
+                "{command} is a local read-only query and must not start Agent maintenance"
             );
         }
         assert!(should_preflight_agent_update(
@@ -7060,6 +7433,9 @@ mod tests {
             &["python".into(), "-h".into()]
         ));
         assert!(!super::should_refresh_node_addresses("init", &[]));
+        let scan_args = ["--scan".into()];
+        assert!(!super::should_refresh_node_addresses("node", &scan_args));
+        assert!(super::is_read_only_query("node", &scan_args));
         for lifecycle_command in ["start", "stop", "restart", "status"] {
             assert!(!should_preflight_agent_update(
                 "controller",
@@ -7069,6 +7445,16 @@ mod tests {
                 "controller",
                 &[lifecycle_command.into()]
             ));
+        }
+    }
+
+    #[test]
+    fn node_listing_does_not_preflight_agents() {
+        for flag in ["-l", "--list"] {
+            assert!(
+                !should_preflight_agent_update("node", &[flag.into()]),
+                "mnode {flag} must report current reachability without starting Agent maintenance"
+            );
         }
     }
 
@@ -9069,8 +9455,10 @@ mod tests {
                         metrics: login,
                         age_ms: Some(age_ms),
                         stale,
+                        confirmed_offline: false,
                         sample_error: None,
                         request_latency_ms: None,
+                        consecutive_failures: 0,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,
@@ -9083,8 +9471,10 @@ mod tests {
                         metrics: worker,
                         age_ms: Some(age_ms),
                         stale,
+                        confirmed_offline: false,
                         sample_error: None,
                         request_latency_ms: None,
+                        consecutive_failures: 0,
                         running_tasks: 0,
                         waiting_tasks: 0,
                         processes: None,
@@ -9236,37 +9626,29 @@ fn print_help() {
 macOS cluster task manager
 
 Usage
-  macluster [GLOBAL OPTIONS] COMMAND [OPTIONS]
-  macluster --init [OPTIONS]
-  macluster --web 127.0.0.1:PORT [--no-open]
-  msub|mjob|mqueue|mkill|mtop|mnode|mfans [OPTIONS]
+  macluster [OPTIONS] <MODULE> [ARGS...]
+  macluster <MODULE> [-h|--help]
 
-COMMANDS
-  init (--init)   Create or reset a cluster.
-  submit (msub)   Submit a task or open an interactive session.
-  job (mjob)      List jobs, read logs, or watch task resources.
-  queue (mqueue)  Show queue membership and job counts.
-  kill (mkill)    Cancel one or more jobs.
-  top (mtop)      View node resources in a live display.
-  node (mnode)    Add, list, and remove nodes or shared paths.
-  fans (mfans)    Inspect or set node fan policies.
+Modes
+  macluster --init [OPTIONS]              Create or reset a cluster.
+  macluster --web [IP[:PORT]] [OPTIONS]   Open the read-only web monitor.
 
-WEB MONITOR
-  --web starts the read-only monitor through the background service.
-  It listens on 127.0.0.1 only.
+Options
+  -h, --help           Show this help message.
+  -V, --version        Show version and protocol information.
+  --config PATH        Use a cluster config file.
+  --state-dir PATH     Use a service state directory.
 
-GLOBAL OPTIONS
-  --config PATH      Use a cluster config file.
-  --state-dir PATH   Use a service state directory.
-  -V, --version      Print the version.
+Modules
+  submit (msub)        Submit a task or open an interactive session.
+  job (mjob)           List jobs, read logs, or watch task resources.
+  queue (mqueue)       Show queue membership and job counts.
+  kill (mkill)         Cancel one or more jobs.
+  top (mtop)           View node resources in a live display.
+  node (mnode)         Add, list, and remove nodes or shared paths.
+  fans (mfans)         Inspect or set node fan policies.
 
-EXAMPLES
-  macluster --init
-  macluster --web 127.0.0.1:8080
-  msub -q default python analysis.py
-  mtop
-
-Run `macluster COMMAND --help` for command details."#
+Run `macluster <MODULE> --help` for module details."#
     );
 }
 

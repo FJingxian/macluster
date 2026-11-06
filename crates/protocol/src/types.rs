@@ -275,6 +275,10 @@ pub struct MetricSnapshot {
     pub sampled_unix_ms: u64,
     pub cpu_percent: Option<f64>,
     pub cpu_max_percent: Option<f64>,
+    /// Per-logical-processor utilization, scaled independently from 0 to 100.
+    /// Older Agents omit this optional detail metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_cpu_percent: Option<Vec<f64>>,
     pub memory_total_bytes: Option<u64>,
     pub memory_used_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
@@ -433,6 +437,7 @@ mod metric_snapshot_tests {
             sampled_unix_ms: 1,
             cpu_percent: None,
             cpu_max_percent: None,
+            logical_cpu_percent: None,
             memory_total_bytes: None,
             memory_used_bytes: None,
             swap_used_bytes: None,
@@ -506,6 +511,14 @@ mod metric_snapshot_tests {
 pub struct NodeHealth {
     pub machine_uuid: String,
     pub execution_uid: u32,
+    /// Source build identity for safe rolling Agent updates. Missing on older
+    /// Agents, which controllers must keep out of the dispatch pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    /// Number of logical processors reported by the node's Agent.
+    /// Optional so older Agents remain compatible during rolling updates.
+    #[serde(default)]
+    pub logical_cpus: Option<u32>,
     pub execution_digest: String,
     pub primary_share_ready: bool,
     pub shares: BTreeMap<String, bool>,
@@ -724,8 +737,9 @@ mod interactive_job_compatibility_tests {
         });
 
         let decoded: NodeHealth = serde_json::from_value(legacy).unwrap();
-        let encoded = serde_json::to_value(decoded).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
 
+        assert_eq!(decoded.logical_cpus, None);
         assert_eq!(encoded["features"], json!([]));
     }
 }

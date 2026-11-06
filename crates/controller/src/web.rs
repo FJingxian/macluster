@@ -75,6 +75,8 @@ const LOG_READ_TIMEOUT: Duration = Duration::from_secs(4);
 const IPC_TIMEOUT: Duration = Duration::from_secs(3);
 const MONITOR_INTERVAL: Duration = Duration::from_secs(2);
 const BACKGROUND_MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+const INITIAL_SAMPLE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const INITIAL_SAMPLE_POLL_WINDOW: Duration = Duration::from_secs(5);
 const JOB_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const QUEUE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -443,6 +445,7 @@ impl HistoryStore {
                 || row.metrics.power_watts.is_some()
             {
                 let mut history_sample = row.metrics.clone();
+                history_sample.logical_cpu_percent = None;
                 history_sample.fan_readings = None;
                 samples.push_back(history_sample);
             }
@@ -965,6 +968,7 @@ struct EventFeed {
     next_queue_refresh: Instant,
     next_status_refresh: Instant,
     next_connect: Instant,
+    initial_sample_deadline: Option<Instant>,
     backoff: Duration,
     first: bool,
     shutdown_receiver: watch::Receiver<bool>,
@@ -985,6 +989,7 @@ impl EventFeed {
             next_queue_refresh: Instant::now(),
             next_status_refresh: Instant::now(),
             next_connect: Instant::now(),
+            initial_sample_deadline: None,
             backoff: Duration::from_secs(1),
             first: true,
         }
@@ -1005,7 +1010,10 @@ impl EventFeed {
             auth.touch_view(&self.session, &self.view_id)
         });
         match view {
-            Some(view) => (view.monitor_interval, view.cadence_changed),
+            Some(view) => (
+                monitor_event_wait(view.monitor_interval, self.initial_sample_deadline, now),
+                view.cadence_changed,
+            ),
             None => (BACKGROUND_MONITOR_INTERVAL, Arc::new(Notify::new())),
         }
     }
@@ -1044,6 +1052,7 @@ impl EventFeed {
         };
         let selected_nodes = view.visible_nodes.clone();
         let selected_detail = view.detail_node.clone();
+        let nodes_changed = self.subscribed_nodes.as_ref() != Some(&selected_nodes);
         let needs_subscription = self.subscribed_nodes.as_ref() != Some(&selected_nodes)
             || self.watched_node != selected_detail
             || now >= self.next_renew;
@@ -1066,6 +1075,11 @@ impl EventFeed {
             self.subscribed_nodes = Some(selected_nodes.clone());
             self.watched_node = selected_detail;
             self.next_renew = now + Duration::from_secs(15);
+            if nodes_changed && !selected_nodes.is_empty() {
+                self.initial_sample_deadline = Some(now + INITIAL_SAMPLE_POLL_WINDOW);
+            } else if nodes_changed {
+                self.initial_sample_deadline = None;
+            }
         }
         let mut monitor = match client.request(ControlCommand::MonitorSnapshot { page: 0 }) {
             Ok(ControlPayload::MonitorSnapshot(snapshot)) => snapshot,
@@ -1078,6 +1092,17 @@ impl EventFeed {
                 return WebEvent::error(event_id, format!("Monitor query failed: {error}"));
             }
         };
+        if let Err(error) = append_monitor_pages(client, &mut monitor) {
+            self.disconnect_for_retry(now);
+            return WebEvent::error(event_id, format!("Monitor query failed: {error}"));
+        }
+        if self.initial_sample_deadline.is_some() {
+            if initial_monitor_data_ready(&selected_nodes, &monitor)
+                || self.initial_sample_deadline.is_some_and(|end| now >= end)
+            {
+                self.initial_sample_deadline = None;
+            }
+        }
         let visible = selected_nodes
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
@@ -1142,6 +1167,66 @@ impl EventFeed {
         self.watched_node = None;
         self.schedule_retry(now);
     }
+}
+
+fn append_monitor_pages(
+    client: &mut WebControlClient,
+    snapshot: &mut MonitorSnapshot,
+) -> Result<(), ApiError> {
+    for page in 1..snapshot.total_pages {
+        let additional = match client.request(ControlCommand::MonitorSnapshot { page })? {
+            ControlPayload::MonitorSnapshot(snapshot) => snapshot,
+            _ => {
+                return Err(ApiError::unavailable(
+                    "Controller returned invalid monitor data.",
+                ));
+            }
+        };
+        append_monitor_page(snapshot, additional, page)?;
+    }
+    Ok(())
+}
+
+fn append_monitor_page(
+    snapshot: &mut MonitorSnapshot,
+    additional: MonitorSnapshot,
+    expected_page: usize,
+) -> Result<(), ApiError> {
+    if additional.page != expected_page
+        || additional.page >= snapshot.total_pages
+        || additional.generation != snapshot.generation
+        || additional.total_pages != snapshot.total_pages
+    {
+        return Err(ApiError::unavailable(
+            "Controller returned inconsistent monitor pages.",
+        ));
+    }
+    snapshot.sequence = snapshot.sequence.max(additional.sequence);
+    snapshot.sampled_unix_ms = snapshot.sampled_unix_ms.max(additional.sampled_unix_ms);
+    snapshot.nodes.extend(additional.nodes);
+    Ok(())
+}
+
+fn monitor_event_wait(
+    normal_interval: Duration,
+    initial_sample_deadline: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    if initial_sample_deadline.is_some_and(|deadline| deadline > now) {
+        normal_interval.min(INITIAL_SAMPLE_POLL_INTERVAL)
+    } else {
+        normal_interval
+    }
+}
+
+fn initial_monitor_data_ready(selected_nodes: &[String], snapshot: &MonitorSnapshot) -> bool {
+    !selected_nodes.is_empty()
+        && selected_nodes.iter().all(|id| {
+            snapshot.nodes.iter().any(|row| {
+                row.node_id.as_str() == id
+                    && (row.metrics.cpu_percent.is_some() || row.sample_error.is_some())
+            })
+        })
 }
 
 impl Drop for EventFeed {
@@ -1388,13 +1473,18 @@ async fn isolated_log_read<T: Send + 'static>(
     timeout: Duration,
     read: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    slots
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < MAX_LOG_READS).then_some(active + 1)
-        })
-        .map_err(|_| {
-            ApiError::too_many("Log readers are busy; shared storage may be unavailable.")
-        })?;
+    let mut active = slots.load(Ordering::Acquire);
+    loop {
+        if active >= MAX_LOG_READS {
+            return Err(ApiError::too_many(
+                "Log readers are busy; shared storage may be unavailable.",
+            ));
+        }
+        match slots.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => active = actual,
+        }
+    }
     let permit = LogReadPermit(slots);
     let (send, receive) = oneshot::channel();
     thread::Builder::new()
@@ -1726,6 +1816,169 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod blocker_tests {
     use super::*;
+    use macluster_protocol::control::NodeMonitorRow;
+
+    #[test]
+    fn changing_browser_view_closes_and_clears_the_old_event_source_before_reconnecting() {
+        let update_view = APP_JS
+            .split("async function updateView() {")
+            .nth(1)
+            .and_then(|source| source.split("function connectEvents() {").next())
+            .expect("updateView JavaScript function is present");
+
+        assert!(
+            update_view.contains("if (state.events) closeEvents();"),
+            "view changes must clear the closed EventSource reference so the new view can reconnect"
+        );
+        assert!(
+            update_view.contains("if (visible.length || detail) connectEvents();"),
+            "active views must reconnect to the monitor event stream"
+        );
+    }
+
+    #[test]
+    fn initial_monitor_sampling_uses_a_short_poll_interval_only_during_warmup() {
+        let now = Instant::now();
+        let normal = Duration::from_secs(2);
+        assert_eq!(
+            monitor_event_wait(normal, Some(now + Duration::from_secs(3)), now),
+            Duration::from_millis(250)
+        );
+        assert_eq!(monitor_event_wait(normal, Some(now), now), normal);
+        assert_eq!(monitor_event_wait(normal, None, now), normal);
+    }
+
+    #[test]
+    fn partial_fast_sample_does_not_end_the_initial_resource_warmup() {
+        let node = "node-a".to_owned();
+        let mut snapshot = MonitorSnapshot {
+            sequence: 1,
+            sampled_unix_ms: 100,
+            generation: 1,
+            page: 0,
+            total_pages: 1,
+            nodes: vec![monitor_row("node-a", 100)],
+        };
+        assert!(!initial_monitor_data_ready(
+            std::slice::from_ref(&node),
+            &snapshot
+        ));
+
+        snapshot.nodes[0].metrics.cpu_percent = Some(12.5);
+        assert!(initial_monitor_data_ready(
+            std::slice::from_ref(&node),
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn monitor_page_merge_rejects_a_generation_change() {
+        let mut first = MonitorSnapshot {
+            sequence: 4,
+            sampled_unix_ms: 100,
+            generation: 7,
+            page: 0,
+            total_pages: 2,
+            nodes: Vec::new(),
+        };
+        let next = MonitorSnapshot {
+            sequence: 5,
+            sampled_unix_ms: 200,
+            generation: 8,
+            page: 1,
+            total_pages: 2,
+            nodes: Vec::new(),
+        };
+        assert!(append_monitor_page(&mut first, next, 1).is_err());
+    }
+
+    #[test]
+    fn monitor_page_merge_combines_rows_from_all_pages() {
+        let mut first = MonitorSnapshot {
+            sequence: 4,
+            sampled_unix_ms: 100,
+            generation: 7,
+            page: 0,
+            total_pages: 2,
+            nodes: vec![monitor_row("node-a", 100)],
+        };
+        let next = MonitorSnapshot {
+            sequence: 5,
+            sampled_unix_ms: 200,
+            generation: 7,
+            page: 1,
+            total_pages: 2,
+            nodes: vec![monitor_row("node-b", 200)],
+        };
+
+        append_monitor_page(&mut first, next, 1).unwrap();
+
+        assert_eq!(first.nodes.len(), 2);
+        assert_eq!(first.nodes[0].node_id.as_str(), "node-a");
+        assert_eq!(first.nodes[1].node_id.as_str(), "node-b");
+        assert_eq!(first.sequence, 5);
+        assert_eq!(first.sampled_unix_ms, 200);
+    }
+
+    fn monitor_row(node_id: &str, sampled_unix_ms: u64) -> NodeMonitorRow {
+        NodeMonitorRow {
+            node_id: NodeId::new(node_id).unwrap(),
+            metrics: macluster_metrics::unavailable(sampled_unix_ms, "test"),
+            age_ms: Some(0),
+            stale: false,
+            confirmed_offline: false,
+            sample_error: None,
+            request_latency_ms: Some(1),
+            consecutive_failures: 0,
+            running_tasks: 0,
+            waiting_tasks: 0,
+            processes: None,
+            process_age_ms: None,
+            process_stale: false,
+            process_error: None,
+        }
+    }
+
+    #[test]
+    fn web_history_omits_per_logical_cpu_vectors_but_keeps_current_sample_source() {
+        let sampled_unix_ms = now_unix_ms();
+        let mut metrics = macluster_metrics::unavailable(sampled_unix_ms, "test");
+        metrics.cpu_percent = Some(125.0);
+        metrics.logical_cpu_percent = Some(vec![80.0, 45.0]);
+        let snapshot = MonitorSnapshot {
+            sequence: 1,
+            sampled_unix_ms,
+            generation: 1,
+            page: 0,
+            total_pages: 1,
+            nodes: vec![NodeMonitorRow {
+                node_id: NodeId::new("node-1").unwrap(),
+                metrics,
+                age_ms: Some(0),
+                stale: false,
+                confirmed_offline: false,
+                sample_error: None,
+                request_latency_ms: Some(5),
+                consecutive_failures: 0,
+                running_tasks: 0,
+                waiting_tasks: 0,
+                processes: None,
+                process_age_ms: None,
+                process_stale: false,
+                process_error: None,
+            }],
+        };
+
+        let live = snapshot.nodes[0].metrics.logical_cpu_percent.clone();
+        let mut history = HistoryStore::default();
+        history.push(&snapshot);
+        let retained = history.get("node-1");
+
+        assert_eq!(live, Some(vec![80.0, 45.0]));
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].logical_cpu_percent.is_none());
+    }
+
     #[test]
     fn slow_initializer_cannot_hold_the_startup_timeout_path() {
         let (release, wait) = mpsc::channel();

@@ -7,6 +7,7 @@ use std::{
 use macluster_protocol::types::MetricSnapshot;
 
 const METRICS_STALE_AFTER: Duration = Duration::from_secs(6);
+const MONITOR_LIVENESS_STALE_AFTER: Duration = Duration::from_secs(20);
 const CPU_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,6 +115,11 @@ pub enum MetricView {
 pub struct NodeMetricCache {
     last_success: Option<(MetricSnapshot, Instant)>,
     last_error: Option<String>,
+    last_error_at: Option<Instant>,
+    consecutive_failures: u8,
+    controller_liveness_managed: bool,
+    confirmed_offline: bool,
+    controller_liveness_at: Option<Instant>,
 }
 
 impl NodeMetricCache {
@@ -152,14 +158,55 @@ impl NodeMetricCache {
         }
         self.last_success = Some((snapshot, received_at));
         self.last_error = None;
+        self.last_error_at = None;
+        self.consecutive_failures = 0;
+        if !self.controller_liveness_managed {
+            self.confirmed_offline = false;
+        }
     }
 
     pub fn apply_error(&mut self, reason: String) {
         self.last_error = Some(reason);
+        self.last_error_at.get_or_insert_with(Instant::now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
     }
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    pub fn set_consecutive_failures(&mut self, failures: u8) {
+        self.consecutive_failures = failures;
+    }
+
+    pub fn set_controller_liveness(&mut self, confirmed_offline: bool, observed_at: Instant) {
+        self.controller_liveness_managed = true;
+        self.confirmed_offline = confirmed_offline;
+        self.controller_liveness_at = Some(observed_at);
+    }
+
+    pub fn set_confirmed_offline(&mut self, confirmed_offline: bool) {
+        self.confirmed_offline = confirmed_offline;
+    }
+
+    pub fn should_display(&self, now: Instant) -> bool {
+        if self.confirmed_offline {
+            return false;
+        }
+        let Some((_, sampled_at)) = self.last_success.as_ref() else {
+            return false;
+        };
+        if self.controller_liveness_managed {
+            return self.controller_liveness_at.is_some_and(|observed_at| {
+                now.saturating_duration_since(observed_at) < MONITOR_LIVENESS_STALE_AFTER
+            });
+        }
+        let failures = macluster_controller::liveness::OFFLINE_AFTER_FAILURES;
+        if self.consecutive_failures >= failures {
+            return false;
+        }
+        self.consecutive_failures > 0
+            || now.saturating_duration_since(*sampled_at) < METRICS_STALE_AFTER
     }
 
     pub fn view_at(&self, now: Instant) -> MetricView {
@@ -200,6 +247,7 @@ pub struct ResourceValues {
     pub fresh: bool,
     pub cpu_percent: Option<f64>,
     pub cpu_max_percent: Option<f64>,
+    pub logical_cpu_percent: Option<Vec<f64>>,
     pub cpu_temp_celsius: Option<f64>,
     pub memory_used_bytes: Option<u64>,
     pub memory_total_bytes: Option<u64>,

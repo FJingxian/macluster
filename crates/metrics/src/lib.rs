@@ -24,6 +24,7 @@ pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
         sampled_unix_ms,
         cpu_percent: None,
         cpu_max_percent: None,
+        logical_cpu_percent: None,
         memory_total_bytes: None,
         memory_used_bytes: None,
         swap_used_bytes: None,
@@ -101,6 +102,12 @@ mod macos {
         gpu_window_ms: Option<u32>,
         #[serde(default)]
         gpu_reason: Option<String>,
+        #[serde(default)]
+        cpu_temp_celsius: Option<f64>,
+        #[serde(default)]
+        fan_readings: Option<Vec<FanReading>>,
+        #[serde(default)]
+        hardware_age_ms: Option<u64>,
     }
 
     #[derive(Debug)]
@@ -146,6 +153,9 @@ mod macos {
         gpu_source: Option<String>,
         gpu_age_ms: Option<u64>,
         gpu_window_ms: Option<u32>,
+        cpu_temp_celsius: Option<f64>,
+        fan_readings: Option<Vec<FanReading>>,
+        hardware_age_ms: Option<u64>,
     }
 
     #[derive(Default)]
@@ -178,11 +188,12 @@ mod macos {
         fn vm_deallocate(task: MachPort, address: u64, size: u64) -> KernReturn;
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     struct CpuCounters {
         busy: u64,
         total: u64,
         cpus: u32,
+        per_logical_cpu: Vec<(u64, u64)>,
     }
 
     pub fn sample_local() -> MetricSnapshot {
@@ -196,9 +207,13 @@ mod macos {
         let network_after = network_totals();
         let disk_after = disk_totals();
 
+        let logical_cpu_percent = match (&cpu_before, &cpu_after) {
+            (Ok(before), Ok(after)) => logical_cpu_utilization(before, after),
+            _ => None,
+        };
         let (cpu_percent, cpu_max_percent) = match (cpu_before, cpu_after) {
             (Ok(before), Ok(after)) if before.cpus == after.cpus => {
-                match cpu_utilization(before, after) {
+                match cpu_utilization(&before, &after) {
                     Some(value) => (Some(value), Some(after.cpus as f64 * 100.0)),
                     None => {
                         errors.insert("cpu".into(), "CPU counters reset or did not advance".into());
@@ -248,15 +263,23 @@ mod macos {
         };
         let mut power = power_sample(&mut errors);
         let (system_disk_capacity, external_disk_capacities) = disk_capacity_sample();
-        let hardware = sample_hardware_metrics();
+        let cached_hardware = power.hardware_age_ms.is_some_and(|age| age <= 18_000);
+        let hardware = if cached_hardware {
+            helper_hardware_metrics(&power)
+        } else {
+            sample_hardware_metrics()
+        };
         if let Some(error) = hardware.cpu_temp_error.as_ref() {
             errors.insert("cpu_temp".into(), error.clone());
         }
-        apply_gpu_fallback(&mut power, &hardware, &mut errors);
+        if !cached_hardware {
+            apply_gpu_fallback(&mut power, &hardware, &mut errors);
+        }
         MetricSnapshot {
             sampled_unix_ms,
             cpu_percent,
             cpu_max_percent,
+            logical_cpu_percent,
             memory_total_bytes,
             memory_used_bytes,
             swap_used_bytes,
@@ -294,15 +317,23 @@ mod macos {
         let (memory_total_bytes, memory_used_bytes, swap_used_bytes) = memory_sample(&mut errors);
         let mut power = power_sample(&mut errors);
         let (system_disk_capacity, external_disk_capacities) = disk_capacity_sample();
-        let hardware = sample_hardware_metrics();
+        let cached_hardware = power.hardware_age_ms.is_some_and(|age| age <= 18_000);
+        let hardware = if cached_hardware {
+            helper_hardware_metrics(&power)
+        } else {
+            sample_hardware_metrics()
+        };
         if let Some(error) = hardware.cpu_temp_error.as_ref() {
             errors.insert("cpu_temp".into(), error.clone());
         }
-        apply_gpu_fallback(&mut power, &hardware, &mut errors);
+        if !cached_hardware {
+            apply_gpu_fallback(&mut power, &hardware, &mut errors);
+        }
         MetricSnapshot {
             sampled_unix_ms,
             cpu_percent: None,
             cpu_max_percent,
+            logical_cpu_percent: None,
             memory_total_bytes,
             memory_used_bytes,
             swap_used_bytes,
@@ -544,6 +575,27 @@ mod macos {
         }
     }
 
+    fn helper_hardware_metrics(power: &PowerMetrics) -> HardwareMetrics {
+        let fan_readings = power
+            .fan_readings
+            .as_ref()
+            .map(|fans| fans.iter().take(16).cloned().collect::<Vec<_>>())
+            .filter(|fans| !fans.is_empty());
+        let fan_speed_rpm = fan_readings.as_ref().and_then(|fans| {
+            average_fan_speed_rpm(&fans.iter().map(|fan| fan.rpm).collect::<Vec<_>>())
+        });
+        let cpu_temp_celsius = power
+            .cpu_temp_celsius
+            .filter(|value| value.is_finite() && *value > 0.0 && *value < 150.0);
+        HardwareMetrics {
+            cpu_temp_celsius,
+            fan_speed_rpm,
+            fan_readings,
+            cpu_temp_error: None,
+            ..HardwareMetrics::default()
+        }
+    }
+
     fn power_sample(errors: &mut BTreeMap<String, String>) -> PowerMetrics {
         let request_started = Instant::now();
         let result = retry_transient_power_request(request_power_sample);
@@ -551,6 +603,9 @@ mod macos {
             Ok(sample) => {
                 let request_age = request_started.elapsed();
                 let power = power_response(sample.clone(), request_age, errors);
+                let cpu_temp_celsius = sample.cpu_temp_celsius;
+                let fan_readings = sample.fan_readings.clone();
+                let hardware_age_ms = sample.hardware_age_ms;
                 let gpu = gpu_response(sample, request_age, errors);
                 PowerMetrics {
                     watts: power.0,
@@ -560,6 +615,9 @@ mod macos {
                     gpu_source: gpu.1,
                     gpu_age_ms: gpu.2,
                     gpu_window_ms: gpu.3,
+                    cpu_temp_celsius,
+                    fan_readings,
+                    hardware_age_ms,
                 }
             }
             Err(error) => {
@@ -679,8 +737,9 @@ mod macos {
     #[cfg(test)]
     mod power_tests {
         use super::{
-            HardwareMetrics, PowerMetrics, PowerRequestError, PowerSample, apply_gpu_fallback,
-            gpu_response, power_response, retry_transient_power_request, validated_gpu_percent,
+            FanReading, HardwareMetrics, PowerMetrics, PowerRequestError, PowerSample,
+            apply_gpu_fallback, gpu_response, helper_hardware_metrics, power_response,
+            retry_transient_power_request, validated_gpu_percent,
         };
         use std::{collections::BTreeMap, time::Duration};
 
@@ -698,6 +757,9 @@ mod macos {
                 gpu_age_ms: None,
                 gpu_window_ms: None,
                 gpu_reason: None,
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             };
 
             let result = retry_transient_power_request(|| {
@@ -729,6 +791,9 @@ mod macos {
                 gpu_age_ms: None,
                 gpu_window_ms: None,
                 gpu_reason: None,
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             };
             let mut errors = BTreeMap::new();
             let reading = power_response(sample, Duration::from_millis(200), &mut errors);
@@ -750,6 +815,9 @@ mod macos {
                 gpu_age_ms: Some(3_000),
                 gpu_window_ms: Some(100),
                 gpu_reason: Some("temperature read failed; serving recent GPU sample".into()),
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             };
             let mut errors = BTreeMap::new();
             let reading = gpu_response(sample, Duration::from_millis(200), &mut errors);
@@ -774,6 +842,9 @@ mod macos {
                 gpu_age_ms: Some(0),
                 gpu_window_ms: Some(100),
                 gpu_reason: None,
+                cpu_temp_celsius: None,
+                fan_readings: None,
+                hardware_age_ms: None,
             };
             let mut errors = BTreeMap::new();
             let power = power_response(sample.clone(), Duration::ZERO, &mut errors);
@@ -830,6 +901,33 @@ mod macos {
         }
 
         #[test]
+        fn helper_hardware_snapshot_supplies_temperature_and_average_fan_speed() {
+            let power = PowerMetrics {
+                cpu_temp_celsius: Some(51.5),
+                fan_readings: Some(vec![
+                    FanReading {
+                        name: "Fan 1".into(),
+                        rpm: 1_000,
+                        max_rpm: None,
+                    },
+                    FanReading {
+                        name: "Fan 2".into(),
+                        rpm: 2_000,
+                        max_rpm: Some(5_000),
+                    },
+                ]),
+                hardware_age_ms: Some(4_000),
+                ..PowerMetrics::default()
+            };
+
+            let hardware = helper_hardware_metrics(&power);
+
+            assert_eq!(hardware.cpu_temp_celsius, Some(51.5));
+            assert_eq!(hardware.fan_speed_rpm, Some(1_500.0));
+            assert_eq!(hardware.fan_readings.unwrap().len(), 2);
+        }
+
+        #[test]
         fn gpu_residency_validation_accepts_idle_and_rejects_unsupported_or_invalid_values() {
             assert_eq!(validated_gpu_percent(true, 0.0), Ok(0.0));
             assert_eq!(validated_gpu_percent(true, 1.0), Ok(100.0));
@@ -867,14 +965,17 @@ mod macos {
         let states = unsafe { std::slice::from_raw_parts(info, expected) };
         let mut busy = 0_u64;
         let mut total = 0_u64;
+        let mut per_logical_cpu = Vec::with_capacity(cpu_count as usize);
         for cpu in states.chunks_exact(CPU_STATES) {
             let mut core_total = 0_u64;
             for state in cpu {
                 core_total += *state as u32 as u64;
             }
             let idle = cpu[CPU_STATE_IDLE] as u32 as u64;
+            let core_busy = core_total.saturating_sub(idle);
             total += core_total;
-            busy += core_total.saturating_sub(idle);
+            busy += core_busy;
+            per_logical_cpu.push((core_busy, core_total));
         }
         unsafe {
             vm_deallocate(mach_task_self_, info as usize as u64, info_count as u64 * 4);
@@ -883,16 +984,46 @@ mod macos {
             busy,
             total,
             cpus: cpu_count,
+            per_logical_cpu,
         })
     }
 
-    fn cpu_utilization(before: CpuCounters, after: CpuCounters) -> Option<f64> {
+    fn cpu_utilization(before: &CpuCounters, after: &CpuCounters) -> Option<f64> {
         if before.cpus != after.cpus || after.busy < before.busy || after.total <= before.total {
             return None;
         }
         let busy = after.busy - before.busy;
         let total = after.total - before.total;
         Some((busy as f64 / total as f64) * after.cpus as f64 * 100.0)
+    }
+
+    fn logical_cpu_utilization(before: &CpuCounters, after: &CpuCounters) -> Option<Vec<f64>> {
+        if before.cpus != after.cpus
+            || before.per_logical_cpu.len() != after.per_logical_cpu.len()
+            || after.per_logical_cpu.len() != after.cpus as usize
+        {
+            return None;
+        }
+
+        before
+            .per_logical_cpu
+            .iter()
+            .zip(&after.per_logical_cpu)
+            .map(
+                |(&(before_busy, before_total), &(after_busy, after_total))| {
+                    if after_busy < before_busy || after_total <= before_total {
+                        return None;
+                    }
+                    let total_delta = after_total - before_total;
+                    let busy_delta = after_busy - before_busy;
+                    if busy_delta > total_delta {
+                        return None;
+                    }
+                    let percent = busy_delta as f64 / total_delta as f64 * 100.0;
+                    (percent.is_finite() && (0.0..=100.0).contains(&percent)).then_some(percent)
+                },
+            )
+            .collect()
     }
 
     fn memory_sample(
@@ -1075,18 +1206,19 @@ mod macos {
         before: (u64, u64, u32),
         after: (u64, u64, u32),
     ) -> Option<f64> {
-        cpu_utilization(
-            CpuCounters {
-                busy: before.0,
-                total: before.1,
-                cpus: before.2,
-            },
-            CpuCounters {
-                busy: after.0,
-                total: after.1,
-                cpus: after.2,
-            },
-        )
+        let before = CpuCounters {
+            busy: before.0,
+            total: before.1,
+            cpus: before.2,
+            per_logical_cpu: Vec::new(),
+        };
+        let after = CpuCounters {
+            busy: after.0,
+            total: after.1,
+            cpus: after.2,
+            per_logical_cpu: Vec::new(),
+        };
+        cpu_utilization(&before, &after)
     }
 }
 

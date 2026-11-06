@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::helper_update;
 use macluster_protocol::nfs_admin::{
     MAX_NFS_ADMIN_REQUEST_BYTES, NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply,
     NfsAdminRequest,
@@ -77,8 +78,18 @@ pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
                     Ok(mut stream) => {
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-                        if let Err(error) = serve_client(&mut stream, peer_uid) {
-                            eprintln!("macluster-power: NFS admin request failed: {error}");
+                        match serve_client(&mut stream, peer_uid) {
+                            Ok(true) => {
+                                // The updater has replaced this executable. Let the
+                                // response reach SSH before exiting; launchd KeepAlive
+                                // then starts the newly installed version.
+                                thread::sleep(Duration::from_millis(150));
+                                std::process::exit(0);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("macluster-power: NFS admin request failed: {error}");
+                            }
                         }
                     }
                     Err(error) => eprintln!("macluster-power: accept NFS admin client: {error}"),
@@ -118,45 +129,99 @@ pub(crate) fn client() -> Result<(), String> {
     Ok(())
 }
 
-fn serve_client(stream: &mut UnixStream, peer_uid: libc::uid_t) -> Result<(), String> {
+fn serve_client(stream: &mut UnixStream, peer_uid: libc::uid_t) -> Result<bool, String> {
     let actual_uid =
         peer_uid_for(stream).map_err(|error| format!("inspect socket peer: {error}"))?;
     if !authorized_peer(actual_uid, peer_uid) {
-        return write_reply(
+        write_reply(
             stream,
             NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, "unauthorized local user"),
-        );
+        )?;
+        return Ok(false);
     }
     let request_bytes = read_limited(stream, MAX_NFS_ADMIN_REQUEST_BYTES)?;
     let request: NfsAdminRequest = match serde_json::from_slice(&request_bytes) {
         Ok(request) => request,
         Err(error) => {
-            return write_reply(
+            write_reply(
                 stream,
                 NfsAdminReply::failure(
                     NFS_ADMIN_SERVICE_VERSION,
                     format!("invalid request: {error}"),
                 ),
-            );
+            )?;
+            return Ok(false);
         }
     };
     if let Err(error) = request.validate(actual_uid) {
-        return write_reply(
+        write_reply(
             stream,
             NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error),
-        );
+        )?;
+        return Ok(false);
+    }
+    if let NfsAdminOperation::UpdateHelpers {
+        manifest,
+        signature,
+        stage_dir,
+    } = &request.operation
+    {
+        let result = helper_update::apply(actual_uid, manifest, signature, stage_dir);
+        let reply = match &result {
+            Ok(_) => NfsAdminReply::success(NFS_ADMIN_SERVICE_VERSION),
+            Err(error) => NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error.clone()),
+        };
+        let reply_result = write_reply(stream, reply);
+        return match helper_update_response_action(result, reply_result) {
+            HelperUpdateResponseAction::Restart => Ok(true),
+            HelperUpdateResponseAction::Continue => Ok(false),
+            HelperUpdateResponseAction::Fail(error) => Err(error),
+        };
+    }
+    if let NfsAdminOperation::ForgetClusterUpdater { cluster_id } = &request.operation {
+        let result = helper_update::forget_cluster(actual_uid, cluster_id);
+        let reply = match &result {
+            Ok(()) => NfsAdminReply::success(NFS_ADMIN_SERVICE_VERSION),
+            Err(error) => NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error.clone()),
+        };
+        write_reply(stream, reply)?;
+        result?;
+        return Ok(false);
     }
     if let Err(error) = preflight_mounts(&request) {
-        return write_reply(
+        write_reply(
             stream,
             NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error),
-        );
+        )?;
+        return Ok(false);
     }
     let response = match run_root_admin_cli(&request_bytes, actual_uid) {
         Ok(reply) => reply,
         Err(error) => NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error),
     };
-    write_reply(stream, response)
+    write_reply(stream, response)?;
+    Ok(false)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum HelperUpdateResponseAction {
+    Continue,
+    Restart,
+    Fail(String),
+}
+
+fn helper_update_response_action(
+    update_result: Result<bool, String>,
+    reply_result: Result<(), String>,
+) -> HelperUpdateResponseAction {
+    match (update_result, reply_result) {
+        (Ok(true), _) => HelperUpdateResponseAction::Restart,
+        (Ok(false), Ok(())) => HelperUpdateResponseAction::Continue,
+        (Ok(false), Err(error)) | (Err(error), Ok(())) => HelperUpdateResponseAction::Fail(error),
+        (Err(update_error), Err(reply_error)) => HelperUpdateResponseAction::Fail(format!(
+            "{update_error}; could not send the privileged helper update response: {reply_error}"
+        )),
+    }
 }
 
 fn preflight_mounts(request: &NfsAdminRequest) -> Result<(), String> {
@@ -166,7 +231,9 @@ fn preflight_mounts(request: &NfsAdminRequest) -> Result<(), String> {
         | NfsAdminOperation::RemoveMarker { .. }
         | NfsAdminOperation::CheckMarker { .. }
         | NfsAdminOperation::CheckAlias { .. }
-        | NfsAdminOperation::UpdateExports { .. } => return Ok(()),
+        | NfsAdminOperation::UpdateExports { .. }
+        | NfsAdminOperation::UpdateHelpers { .. }
+        | NfsAdminOperation::ForgetClusterUpdater { .. } => return Ok(()),
     };
     if mounts.is_empty() {
         return Ok(());
@@ -463,7 +530,10 @@ fn classify_mount(output: &str, expected_source: &str, target: &str) -> MountSta
 
 #[cfg(test)]
 mod tests {
-    use super::{MountStatus, authorized_peer, classify_mount, run_child_bounded};
+    use super::{
+        HelperUpdateResponseAction, MountStatus, authorized_peer, classify_mount,
+        helper_update_response_action, run_child_bounded,
+    };
     use std::{
         process::{Command, Stdio},
         time::{Duration, Instant},
@@ -507,6 +577,22 @@ mod tests {
         assert!(authorized_peer(501, 501));
         assert!(!authorized_peer(502, 501));
         assert!(!authorized_peer(0, 501));
+    }
+
+    #[test]
+    fn committed_helper_update_restarts_even_if_the_client_disconnects_before_reply() {
+        assert_eq!(
+            helper_update_response_action(Ok(true), Err("broken pipe".into())),
+            HelperUpdateResponseAction::Restart
+        );
+        assert_eq!(
+            helper_update_response_action(Ok(false), Ok(())),
+            HelperUpdateResponseAction::Continue
+        );
+        assert_eq!(
+            helper_update_response_action(Ok(false), Err("broken pipe".into())),
+            HelperUpdateResponseAction::Fail("broken pipe".into())
+        );
     }
 
     #[test]

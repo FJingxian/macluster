@@ -4,6 +4,7 @@ pub mod compatibility;
 mod control;
 pub mod events;
 mod ipc;
+pub mod liveness;
 pub mod maintenance;
 pub mod monitor;
 mod runtime;
@@ -265,8 +266,10 @@ impl<T: NodeTransport> ControllerService<T> {
                         self.idle_since.remove(id);
                         availability.push(NodeEligibility {
                             id: node_id,
+                            logical_cpus: None,
                             idle_since_unix_ms: 0,
                             online: false,
+                            agent_current: false,
                             storage_ready: false,
                             drain_requested: self.node_is_maintenance_scoped(id),
                             occupied: true,
@@ -312,6 +315,10 @@ impl<T: NodeTransport> ControllerService<T> {
                     .iter()
                     .any(|feature| feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE)
             });
+            let agent_current = health.as_ref().is_some_and(|health| {
+                health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
+            });
+            let logical_cpus = health.as_ref().and_then(|health| health.logical_cpus);
             let node_storage_ready =
                 if !requires_health {
                     true
@@ -329,8 +336,10 @@ impl<T: NodeTransport> ControllerService<T> {
                 let idle_since = *self.idle_since.entry(id.clone()).or_insert(now);
                 availability.push(NodeEligibility {
                     id: node_id,
+                    logical_cpus,
                     idle_since_unix_ms: idle_since,
                     online,
+                    agent_current,
                     storage_ready: storage_ready && node_storage_ready,
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
@@ -341,8 +350,10 @@ impl<T: NodeTransport> ControllerService<T> {
                 self.idle_since.remove(id);
                 availability.push(NodeEligibility {
                     id: node_id,
+                    logical_cpus,
                     idle_since_unix_ms: 0,
                     online,
+                    agent_current,
                     storage_ready,
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
@@ -382,6 +393,10 @@ impl<T: NodeTransport> ControllerService<T> {
                         "job is pinned to login node '{}', which is excluded from compute jobs; cancel it with mkill and resubmit on a compute node",
                         pinned
                     ))
+                } else if let Some(reason) =
+                    agent_build_waiting_reason(&head, &queue_config, &availability)
+                {
+                    Some(reason)
                 } else if let Some(reason) =
                     namespace_waiting_reason(&head, &queue_config, &availability)
                 {
@@ -677,6 +692,41 @@ fn namespace_waiting_reason(
         node.online && node.namespaced_jobs && queue.nodes.iter().any(|id| id == node.id.as_str())
             && job.spec.node.as_ref().is_none_or(|pinned| pinned == &node.id)
     })).then(|| "waiting for an online node that advertises namespaced job storage support; this job remains queued while nodes reconnect or are updated".into())
+}
+
+pub(crate) fn agent_build_waiting_reason(
+    job: &macluster_protocol::types::JobRecord,
+    queue: &macluster_core::config::QueueConfig,
+    nodes: &[NodeEligibility],
+) -> Option<String> {
+    let matches_job = |node: &&NodeEligibility| {
+        queue.nodes.iter().any(|member| member == node.id.as_str())
+            && job
+                .spec
+                .node
+                .as_ref()
+                .is_none_or(|pinned| pinned == &node.id)
+            && (job.spec.mode != JobMode::Interactive || node.interactive_pty)
+            && (job.spec.storage_namespace.is_none() || node.namespaced_jobs)
+    };
+    let has_current_agent = nodes.iter().filter(matches_job).any(|node| {
+        node.online && node.agent_current && node.storage_ready && !node.drain_requested
+    });
+    if has_current_agent {
+        return None;
+    }
+    let stale = nodes
+        .iter()
+        .filter(matches_job)
+        .filter(|node| node.online && !node.agent_current)
+        .map(|node| node.id.to_string())
+        .collect::<Vec<_>>();
+    (!stale.is_empty()).then(|| {
+        format!(
+            "waiting for the current Agent build on {}; retry an Agent-dependent macluster command after the node is reachable",
+            stale.join(", ")
+        )
+    })
 }
 
 pub fn verify_shared_storage(config: &ClusterConfig) -> bool {

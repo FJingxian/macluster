@@ -68,6 +68,43 @@
     if (value != null) node.textContent = value;
     return node;
   }
+  const iconPaths = {
+    overview: ["M4 4h6v6H4z", "M14 4h6v4h-6z", "M14 12h6v8h-6z", "M4 14h6v6H4z"],
+    jobs: ["M8 3h8v4H8z", "M6 5H4v16h16V5h-2", "M8 12h8", "M8 16h5"],
+    queues: ["M4 5h16", "M4 12h16", "M4 19h16", "M7 5v.01", "M7 12v.01", "M7 19v.01"],
+    refresh: ["M20 7v5h-5", "M20 12a8 8 0 1 0 2 5"],
+    nodes: ["M5 5h14v14H5z", "M9 5V3h6v2", "M8 10h8", "M8 14h8"],
+    running: ["M8 5v14l11-7z"],
+    waiting: ["M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0-18", "M12 7v5l4 2"],
+    cpu: ["M8 8h8v8H8z", "M9 1v3", "M15 1v3", "M9 20v3", "M15 20v3", "M1 9h3", "M1 15h3", "M20 9h3", "M20 15h3"],
+    memory: ["M4 6h16v12H4z", "M8 9v6", "M12 9v6", "M16 9v6", "M2 9v6", "M22 9v6"],
+    gpu: ["M3 6h18v12H3z", "M7 10h10", "M9 14h6", "M10 21h4"],
+    power: ["M13 2 5 13h6l-1 9 9-12h-6z"],
+    temp: ["M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z", "M12 12v6"],
+    fan: ["M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0-4 0", "M12 10c-1-6 3-7 5-5 1 2-1 4-5 5", "M14 12c6-1 7 3 5 5-2 1-4-1-5-5", "M12 14c1 6-3 7-5 5-1-2 1-4 5-5", "M10 12c-6 1-7-3-5-5 2-1 4 1 5 5"],
+    disk: ["M4 5h16v14H4z", "M7 9h10", "M7 15h.01", "M10 15h7"],
+    network: ["M12 4v6", "M5 20v-5h14v5", "M5 15v-4h14v4", "M8 4h8"],
+    info: ["M12 11v6", "M12 7h.01", "M21 12a9 9 0 1 0-18 0a9 9 0 1 0 18 0"]
+  };
+  function iconSvg(name) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.7");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    for (const pathData of iconPaths[name] || iconPaths.info) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", pathData);
+      svg.append(path);
+    }
+    return svg;
+  }
+  function installStaticIcons() {
+    for (const target of $$("[data-icon]")) target.replaceChildren(iconSvg(target.dataset.icon));
+  }
   function setBanner(message, kind = "info") {
     const banner = $("#banner");
     if (!message) { banner.className = "banner hidden"; text(banner, ""); return; }
@@ -185,10 +222,18 @@
     const query = $("#node-search").value.trim().toLowerCase();
     const queue = $("#queue-filter").value;
     return [...state.nodes.values()].filter(node => {
+      const row = state.rows.get(node.id);
+      if (!hasFreshNodeSample(row)) return false;
       const matchesText = !query || node.id.toLowerCase().includes(query);
       const matchesQueue = !queue || node.queues.includes(queue);
       return matchesText && matchesQueue;
     }).sort((a, b) => compareNodes(a, b, state.sort.key, state.sort.descending));
+  }
+  function hasFreshNodeSample(row) {
+    // Keep the last sample visible during the controller's reconnect grace
+    // period. The controller marks a node offline only after three probes;
+    // this age bound also removes cards if the monitor stream itself stops.
+    return Boolean(row && row.age_ms != null && !row.confirmed_offline && row.age_ms < 20000);
   }
   function compareNodes(a, b, key, descending) {
     const left = state.rows.get(a.id), right = state.rows.get(b.id);
@@ -218,8 +263,9 @@
     $("#node-empty").classList.toggle("hidden", nodes.length > 0);
     $("#node-count-label").textContent = `${nodes.length} ${nodes.length === 1 ? "node" : "nodes"}`;
     $("#nav-node-count").textContent = nodes.length;
-    const allRows = [...state.rows.values()].filter(row => state.nodes.has(row.node_id));
-    const fresh = allRows.filter(row => !row.stale && !row.sample_error);
+    const visibleIds = new Set(nodes.map(node => node.id));
+    const allRows = [...state.rows.values()].filter(row => visibleIds.has(row.node_id));
+    const fresh = allRows.filter(hasFreshNodeSample);
     text($("#kpi-nodes"), fresh.length);
     text($("#kpi-nodes-note"), `of ${state.nodes.size} configured`);
     const active = state.activeJobs.filter(job => ["RUNNING", "STARTING", "CANCELLING"].includes(job.state));
@@ -259,11 +305,15 @@
   function resourceGauge(label, used, capacity, kind, caption) {
     const gauge = element("div", "resource-gauge");
     gauge.dataset.resource = kind;
+    const heading = element("div", "resource-gauge-heading");
+    const glyph = element("span", `resource-icon icon-${kind}`);
+    glyph.append(iconSvg(kind));
+    heading.append(glyph, element("b", "", label));
     const ring = element("div", `resource-ring ${kind}`);
     setRing(ring, used, capacity);
     const valid = Number.isFinite(used) && Number.isFinite(capacity) && capacity > 0;
     ring.append(element("strong", "", valid ? `${num(used / capacity * 100)}%` : "N/A"));
-    gauge.append(ring, element("b", "", label), element("small", "", caption));
+    gauge.append(heading, ring, element("small", "", caption));
     return gauge;
   }
   function sparkline(id) {
@@ -299,11 +349,13 @@
     return card;
   }
   function updateNodeRow(card, node, row) {
-    const m = row?.metrics || {}, online = Boolean(row && !row.stale && !row.sample_error);
+    const m = row?.metrics || {};
+    const online = Boolean(row && !row.confirmed_offline && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
+    const reconnecting = Boolean(row && !row.confirmed_offline && (row.consecutive_failures || 0) > 0);
     card.classList.toggle("is-stale", !online);
     if (!card.querySelector(".node-card-heading")) {
       const head = element("div", "node-card-heading"), identity = element("div", "node-identity");
-      const icon = element("span", "mac-icon"); icon.setAttribute("aria-hidden", "true");
+      const icon = element("span", "mac-icon"); icon.setAttribute("aria-hidden", "true"); icon.append(iconSvg("nodes"));
       const label = element("div"); label.append(element("h3", "", node.id), element("span", "muted small", `${nodeRole(node.id)} · ${(node.queues || []).join(", ") || "login"}`));
       identity.append(icon, label);
       head.append(identity, element("span", "node-health"));
@@ -311,14 +363,16 @@
       gauges.append(resourceGauge("CPU", null, null, "cpu", "No reading"), resourceGauge("Memory", null, null, "memory", "No reading"), resourceGauge("GPU", null, 100, "gpu", "GPU activity"));
       const trend = element("div", "node-trend");
       const foot = element("div", "node-card-footer");
-      for (const labelText of ["Power", "Temperature", "Jobs"]) {
-        const item = element("div"); item.append(element("small", "", labelText), element("strong", "")); foot.append(item);
+      for (const [labelText, iconName] of [["Power", "power"], ["Temperature", "temp"], ["Jobs", "jobs"]]) {
+        const item = element("div", "node-stat"), label = element("small", "node-stat-label");
+        label.append(iconSvg(iconName), element("span", "", labelText));
+        item.append(label, element("strong", "")); foot.append(item);
       }
       card.append(head, gauges, trend, foot);
     }
     const status = card.querySelector(".node-health");
-    status.className = `node-health ${online ? "online" : "offline"}`;
-    status.textContent = online ? `Online · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
+    status.className = `node-health ${online ? "online" : reconnecting ? "reconnecting" : "offline"}`;
+    status.textContent = online ? `Online · ${sampleAge(row?.age_ms || 0)}` : reconnecting ? `Reconnecting · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
     const gauges = card.querySelector(".node-gauges");
     const gaugeValues = [
       ["cpu", "CPU", m.cpu_percent, m.cpu_max_percent, m.cpu_percent == null ? "No reading" : `${num(m.cpu_percent)} / ${num(m.cpu_max_percent)} CPU%`],
@@ -364,7 +418,7 @@
     try {
       await api("/api/v1/view", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ view_id: state.viewId, visible_nodes: visible.slice(0, 128), detail_node: detail }) });
     } catch (error) { setBanner(error.message, "error"); }
-    if (state.events) state.events.close();
+    if (state.events) closeEvents();
     if (visible.length || detail) connectEvents();
   }
   function connectEvents() {
@@ -396,7 +450,10 @@
         state.lastUpdated = Date.now();
         text($("#last-updated"), new Date(state.lastUpdated).toLocaleTimeString());
         renderOverview();
-        if (state.selectedNode) renderNodeDetail();
+        if (state.selectedNode) {
+          if (!hasFreshNodeSample(state.rows.get(state.selectedNode))) closeNode();
+          else renderNodeDetail();
+        }
       }
       if (update.jobs) { state.activeJobs = update.jobs.jobs; renderOverview(); }
       if (update.queues) { state.queues = update.queues; renderQueueFilter(); renderQueues(); renderOverview(); }
@@ -428,7 +485,10 @@
     $("#queues-empty").classList.toggle("hidden", state.queues.length > 0);
     for (const queue of state.queues) {
       const card = element("article", "queue-card");
-      const heading = element("div", "queue-title"); heading.append(element("strong", "", queue.name), element("span", "", `${queue.nodes.length} ${queue.nodes.length === 1 ? "node" : "nodes"}`)); card.append(heading);
+      const heading = element("div", "queue-title"), name = element("div", "queue-name"), glyph = element("span", "queue-icon");
+      glyph.append(iconSvg("queues"));
+      name.append(glyph, element("strong", "", queue.name));
+      heading.append(name, element("span", "", `${queue.nodes.length} ${queue.nodes.length === 1 ? "node" : "nodes"}`)); card.append(heading);
       const counts = element("div", "queue-counts");
       for (const [label, value] of [["Pending", queue.pending], ["Running", queue.running], ["Done", queue.completed], ["Failed", queue.failed]]) {
         const item = element("div", "queue-count"); item.append(element("b", "", value), element("span", "", label)); counts.append(item);
@@ -477,8 +537,7 @@
       ["FAN", metrics.fan_speed_rpm == null ? "N/A" : `${num(metrics.fan_speed_rpm, 0)} RPM`],
       ["DISK(R/W)", `${rate(metrics.disk_read_bytes_per_sec)} / ${rate(metrics.disk_write_bytes_per_sec)}`],
       ["NET(down/up)", `${rate(metrics.network_rx_bytes_per_sec)} / ${rate(metrics.network_tx_bytes_per_sec)}`],
-      ["SWAP", metrics.swap_used_bytes == null ? "N/A" : `${gib(metrics.swap_used_bytes)} GiB`],
-      ["POWER SCOPE", metrics.power_scope || "N/A"]
+      ["SWAP", metrics.swap_used_bytes == null ? "N/A" : `${gib(metrics.swap_used_bytes)} GiB`]
     ];
     const root = $("#detail-metrics"); root.replaceChildren();
     root.append(
@@ -486,7 +545,55 @@
       resourceGauge("Memory", metrics.memory_used_bytes, metrics.memory_total_bytes, "memory", `${items[1][1]} GiB`),
       resourceGauge("GPU", metrics.gpu_percent, 100, "gpu", "GPU activity")
     );
-    for (const [label, value] of items.slice(3)) { const tile = element("div", "detail-tile"); tile.append(element("span", "", label), element("strong", "", value)); root.append(tile); }
+    const logicalCpus = Array.isArray(metrics.logical_cpu_percent) ? metrics.logical_cpu_percent : null;
+    const logicalPanel = element("section", "logical-cpu-panel");
+    const logicalHeading = element("div", "logical-cpu-heading");
+    const logicalTitle = element("div", "logical-cpu-title");
+    logicalTitle.append(
+      element("h3", "", "Logical processors"),
+      element("p", "muted small", "Current load per logical processor")
+    );
+    logicalHeading.append(
+      logicalTitle,
+      element("span", "logical-cpu-count", logicalCpus?.length ? `${logicalCpus.length} processors` : "Per-core load")
+    );
+    logicalPanel.append(logicalHeading);
+    if (logicalCpus?.length) {
+      const coreGrid = element("div", "logical-cpu-grid");
+      logicalCpus.forEach((percent, index) => {
+        const valid = Number.isFinite(percent);
+        const value = valid ? Math.max(0, Math.min(100, percent)) : 0;
+        const loadClass = value >= 90 ? "critical" : value >= 70 ? "high" : "normal";
+        const meter = element("div", "logical-cpu-meter");
+        meter.setAttribute("role", "img");
+        meter.setAttribute("aria-label", `CPU ${index}: ${valid ? `${num(value, 0)}%` : "unavailable"}`);
+        const track = element("span", "logical-cpu-track");
+        track.setAttribute("aria-hidden", "true");
+        const fill = element("span", `logical-cpu-fill ${loadClass}`);
+        fill.style.width = `${value}%`;
+        track.append(fill);
+        meter.append(
+          element("span", "logical-cpu-label", `CPU ${index}`),
+          track,
+          element("strong", "logical-cpu-value", valid ? `${num(value, 0)}%` : "N/A")
+        );
+        coreGrid.append(meter);
+      });
+      logicalPanel.append(coreGrid);
+    } else {
+      logicalPanel.append(
+        element("p", "logical-cpu-unavailable", "Per-processor load unavailable; update the Agent if this persists.")
+      );
+    }
+    root.append(logicalPanel);
+    const tileIcons = { POWER: "power", TEMP: "temp", FAN: "fan", "DISK(R/W)": "disk", "NET(down/up)": "network", SWAP: "memory" };
+    for (const [label, value] of items.slice(3)) {
+      const tile = element("div", "detail-tile"), heading = element("div", "detail-tile-heading");
+      const glyph = element("span", `detail-icon icon-${tileIcons[label] || "info"}`);
+      glyph.append(iconSvg(tileIcons[label] || "info"));
+      heading.append(glyph, element("span", "", label));
+      tile.append(heading, element("strong", "", value)); root.append(tile);
+    }
     const processRows = [...(row?.processes || [])].sort((a, b) => state.processSort === "cpu" ? b.cpu_percent - a.cpu_percent : ((b.memory_bytes ?? -1) - (a.memory_bytes ?? -1)));
     const body = $("#process-rows"); body.replaceChildren();
     $("#process-empty").classList.toggle("hidden", processRows.length > 0);
@@ -541,8 +648,9 @@
       }
       if (count) ctx.stroke();
     };
-    draw("#238467", sample => sample.cpu_percent == null || !sample.cpu_max_percent ? null : sample.cpu_percent / sample.cpu_max_percent * 100);
-    draw("#6488d6", sample => sample.memory_used_bytes == null || !sample.memory_total_bytes ? null : sample.memory_used_bytes / sample.memory_total_bytes * 100);
+    const palette = getComputedStyle(document.documentElement);
+    draw(palette.getPropertyValue("--accent").trim() || "#16816d", sample => sample.cpu_percent == null || !sample.cpu_max_percent ? null : sample.cpu_percent / sample.cpu_max_percent * 100);
+    draw(palette.getPropertyValue("--blue").trim() || "#477be0", sample => sample.memory_used_bytes == null || !sample.memory_total_bytes ? null : sample.memory_used_bytes / sample.memory_total_bytes * 100);
   }
 
   async function loadJobs(reset = false) {
@@ -563,7 +671,9 @@
 
       const card = element("article", "job-card"); card.tabIndex = 0; card.setAttribute("role", "button");
       const heading = element("div", "job-card-heading");
-      const badge = element("span", "job-state " + String(job.state).toLowerCase(), stateLabel(job.state));
+      const badge = element("span", "job-state " + String(job.state).toLowerCase());
+      const stateIcon = ["RUNNING", "STARTING"].includes(job.state) ? "running" : job.state === "PENDING" ? "waiting" : job.state === "FAILED" || job.state === "NODE_LOST" || job.state === "TIMEOUT" ? "info" : "jobs";
+      badge.append(iconSvg(stateIcon), element("span", "", stateLabel(job.state)));
       heading.append(element("span", "muted small", "JOB " + job.id), badge);
       card.append(heading, element("h3", "", job.name));
       const track = element("div", "job-progress");
@@ -637,5 +747,6 @@
   function closeJob() { clearInterval(state.logTimer); state.logTimer = null; state.selectedJob = null; $("#job-detail").classList.add("hidden"); }
 
   window.addEventListener("resize", () => { if (state.selectedNode) drawHistory(); });
+  installStaticIcons();
   initialize();
 })();

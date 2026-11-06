@@ -13,11 +13,23 @@ const INVENTORY_FILE: &str = "node-addresses.json";
 const MIGRATION_FILE: &str = "node-address-migration.json";
 const PROPOSAL_FILE: &str = "node-address-proposal.json";
 const CHECK_INTERVAL_MS: u64 = 30_000;
+const RECOVERY_CHECK_INTERVAL_MS: u64 = 5_000;
 const SUBNET_SCAN_INTERVAL_MS: u64 = 30_000;
+const RECOVERY_SUBNET_SCAN_INTERVAL_MS: u64 = 10_000;
+const ADDRESS_WATCH_INTERVAL_SECS: u64 = 5;
 pub(super) const MAINTENANCE_OPERATION: &str = "node address and NFS migration";
 
 fn full_subnet_scan_due(last_scan_ms: u64, now_ms: u64, force: bool) -> bool {
-    force || last_scan_ms == 0 || now_ms.saturating_sub(last_scan_ms) >= SUBNET_SCAN_INTERVAL_MS
+    full_subnet_scan_due_with_interval(last_scan_ms, now_ms, force, SUBNET_SCAN_INTERVAL_MS)
+}
+
+fn full_subnet_scan_due_with_interval(
+    last_scan_ms: u64,
+    now_ms: u64,
+    force: bool,
+    interval_ms: u64,
+) -> bool {
+    force || last_scan_ms == 0 || now_ms.saturating_sub(last_scan_ms) >= interval_ms
 }
 
 #[derive(Clone, Debug)]
@@ -585,6 +597,7 @@ fn discover_remote(
     interfaces: &[InterfaceAddress],
     arp: &[(Ipv4Addr, String)],
     force: bool,
+    allow_neighbor_fallback: bool,
 ) -> AppResult<Option<(NodeConfig, AddressRecord)>> {
     let Ok(old_address) = node.host.parse::<Ipv4Addr>() else {
         return Ok(None);
@@ -623,6 +636,9 @@ fn discover_remote(
             interface.interface, node.host
         );
     }
+    if !allow_neighbor_fallback && record.and_then(|entry| entry.mac.as_deref()).is_none() {
+        return Ok(None);
+    }
     let (mut preferred, _) = subnet_candidates(
         interface,
         interfaces,
@@ -632,7 +648,10 @@ fn discover_remote(
     // A node can return through a different interface (for example, wired to
     // Wi-Fi). In that case its old MAC no longer matches, so use live
     // neighbors only as candidates and still require the pinned key and UUID.
-    if preferred.is_empty() && record.and_then(|entry| entry.mac.as_deref()).is_some() {
+    if allow_neighbor_fallback
+        && preferred.is_empty()
+        && record.and_then(|entry| entry.mac.as_deref()).is_some()
+    {
         preferred = subnet_candidates(interface, interfaces, &arp, None).0;
     }
     scan_candidates(node, &preferred)
@@ -910,7 +929,8 @@ fn migration_preflight(
     old: &ClusterConfig,
     new: &ClusterConfig,
 ) -> AppResult<()> {
-    verify_registered_node_identities(new)?;
+    let node_ids = new.nodes.keys().cloned().collect();
+    verify_registered_node_identities(new, &node_ids)?;
     for (node_id, connection) in &new.nodes {
         let mut agent = connection.clone();
         agent.remote_binary = old.nodes[node_id].remote_binary.clone();
@@ -1206,7 +1226,7 @@ pub(crate) fn watch_node_addresses(
         .name("macluster-node-addresses".into())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                for _ in 0..30 {
+                for _ in 0..ADDRESS_WATCH_INTERVAL_SECS {
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
@@ -1291,8 +1311,70 @@ fn check_addresses(
     let mut inventory = read_private_json::<Inventory>(&inventory_path)?
         .filter(|record| record.share_uuid == config.share_uuid)
         .unwrap_or_default();
-    let allow_full_subnet_scan =
-        full_subnet_scan_due(inventory.last_subnet_scan_ms, now_ms(), force);
+    let checked_at_ms = now_ms();
+    let liveness_records =
+        macluster_controller::liveness::read(state_dir, &config.share_uuid).unwrap_or_default();
+    let mut discovery_neighbors = neighbors();
+    let mut recovery_nodes = BTreeSet::new();
+    let mut accelerate_subnet_scan = false;
+    for (node_id, node) in &config.nodes {
+        if node.transport != Transport::Ssh {
+            continue;
+        }
+        let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+        if let Some(record) = liveness_records
+            .get(node_id)
+            .filter(|record| record.identity_key.eq_ignore_ascii_case(expected_identity))
+        {
+            let recent_failed_probe = record.last_failed_probe_unix_ms.is_some_and(|failed_at| {
+                checked_at_ms.saturating_sub(failed_at)
+                    <= macluster_controller::liveness::RECENTLY_ONLINE_TTL_MS
+            });
+            if record.is_confirmed_offline() {
+                accelerate_subnet_scan = true;
+                recovery_nodes.insert(node_id.clone());
+            } else if record.consecutive_failures > 0 && recent_failed_probe {
+                recovery_nodes.insert(node_id.clone());
+            }
+        }
+        let Some(registered_address) = node.host.parse::<Ipv4Addr>().ok() else {
+            continue;
+        };
+        let known_mac = inventory
+            .nodes
+            .get(node_id)
+            .filter(|address| {
+                node.machine_uuid
+                    .as_deref()
+                    .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&address.machine_uuid))
+            })
+            .and_then(|address| address.mac.as_deref());
+        if known_mac.is_some_and(|expected_mac| {
+            discovery_neighbors
+                .iter()
+                .find(|(address, _)| *address == registered_address)
+                .is_some_and(|(_, current_mac)| !current_mac.eq_ignore_ascii_case(expected_mac))
+        }) {
+            accelerate_subnet_scan = true;
+            recovery_nodes.insert(node_id.clone());
+        }
+    }
+    let recovery_check = !recovery_nodes.is_empty();
+    let check_interval_ms = if recovery_check {
+        RECOVERY_CHECK_INTERVAL_MS
+    } else {
+        CHECK_INTERVAL_MS
+    };
+    let allow_full_subnet_scan = if accelerate_subnet_scan {
+        full_subnet_scan_due_with_interval(
+            inventory.last_subnet_scan_ms,
+            checked_at_ms,
+            force,
+            RECOVERY_SUBNET_SCAN_INTERVAL_MS,
+        )
+    } else {
+        full_subnet_scan_due(inventory.last_subnet_scan_ms, checked_at_ms, force)
+    };
     let interfaces = local_interfaces()?;
     let local_current = interfaces
         .iter()
@@ -1307,8 +1389,8 @@ fn check_addresses(
         })
         && inventory.config_digest
             == sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?
-        && inventory.checked_ms <= now_ms()
-        && now_ms().saturating_sub(inventory.checked_ms) < CHECK_INTERVAL_MS
+        && inventory.checked_ms <= checked_at_ms
+        && checked_at_ms.saturating_sub(inventory.checked_ms) < check_interval_ms
     {
         return Ok(false);
     }
@@ -1344,7 +1426,6 @@ fn check_addresses(
     } else if !local_current {
         return Err((1, "login address changed but no unambiguous interface remains in the registered subnet; select the intended cluster interface explicitly".into()));
     }
-    let mut discovery_neighbors = neighbors();
     let mut scanned_full_subnet = false;
     if allow_full_subnet_scan {
         let mut sweep_targets = BTreeMap::<(u32, u32, u16), InterfaceAddress>::new();
@@ -1387,12 +1468,12 @@ fn check_addresses(
                 sweep_targets.insert((subnet, interface.mask, port), interface.clone());
             }
         }
-        let mut all_sweeps_completed = !sweep_targets.is_empty();
+        let mut all_sweeps_completed = true;
         for ((_, _, port), interface) in &sweep_targets {
             let (_, candidates) = subnet_candidates(interface, &interfaces, &[], None);
             all_sweeps_completed &= sweep_registered_subnet(&candidates, *port);
         }
-        scanned_full_subnet = all_sweeps_completed;
+        scanned_full_subnet = sweep_targets.is_empty() || all_sweeps_completed;
         if !sweep_targets.is_empty() {
             discovery_neighbors = neighbors();
         }
@@ -1402,12 +1483,38 @@ fn check_addresses(
         if node.transport != Transport::Ssh {
             continue;
         }
+        if recovery_check
+            && !force
+            && !recovery_nodes.contains(node_id)
+            && liveness_records.get(node_id).is_some_and(|record| {
+                let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+                let inventory_is_current = inventory.nodes.get(node_id).is_some_and(|address| {
+                    address.host == node.host
+                        && node
+                            .machine_uuid
+                            .as_deref()
+                            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&address.machine_uuid))
+                });
+                record.consecutive_failures == 0
+                    && record.was_recently_reachable(expected_identity, checked_at_ms)
+                    && inventory_is_current
+            })
+        {
+            continue;
+        }
         let known = inventory.nodes.get(node_id).filter(|record| {
             node.machine_uuid
                 .as_deref()
                 .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&record.machine_uuid))
         });
-        let discovered = discover_remote(node, known, &interfaces, &discovery_neighbors, force)?;
+        let discovered = discover_remote(
+            node,
+            known,
+            &interfaces,
+            &discovery_neighbors,
+            force,
+            force || allow_full_subnet_scan,
+        )?;
         match discovered {
             Some((connection, record)) => {
                 if let Some((pin, _)) = node.ssh_host_key_pin()

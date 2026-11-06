@@ -230,7 +230,10 @@
     }).sort((a, b) => compareNodes(a, b, state.sort.key, state.sort.descending));
   }
   function hasFreshNodeSample(row) {
-    return Boolean(row && row.age_ms != null && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
+    // Keep the last sample visible during the controller's reconnect grace
+    // period. The controller marks a node offline only after three probes;
+    // this age bound also removes cards if the monitor stream itself stops.
+    return Boolean(row && row.age_ms != null && !row.confirmed_offline && row.age_ms < 20000);
   }
   function compareNodes(a, b, key, descending) {
     const left = state.rows.get(a.id), right = state.rows.get(b.id);
@@ -346,7 +349,9 @@
     return card;
   }
   function updateNodeRow(card, node, row) {
-    const m = row?.metrics || {}, online = Boolean(row && !row.stale && !row.sample_error);
+    const m = row?.metrics || {};
+    const online = Boolean(row && !row.confirmed_offline && !row.stale && !row.sample_error && !(row.consecutive_failures || 0));
+    const reconnecting = Boolean(row && !row.confirmed_offline && (row.consecutive_failures || 0) > 0);
     card.classList.toggle("is-stale", !online);
     if (!card.querySelector(".node-card-heading")) {
       const head = element("div", "node-card-heading"), identity = element("div", "node-identity");
@@ -366,8 +371,8 @@
       card.append(head, gauges, trend, foot);
     }
     const status = card.querySelector(".node-health");
-    status.className = `node-health ${online ? "online" : "offline"}`;
-    status.textContent = online ? `Online · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
+    status.className = `node-health ${online ? "online" : reconnecting ? "reconnecting" : "offline"}`;
+    status.textContent = online ? `Online · ${sampleAge(row?.age_ms || 0)}` : reconnecting ? `Reconnecting · ${sampleAge(row?.age_ms || 0)}` : row?.stale ? "Stale" : "Unavailable";
     const gauges = card.querySelector(".node-gauges");
     const gaugeValues = [
       ["cpu", "CPU", m.cpu_percent, m.cpu_max_percent, m.cpu_percent == null ? "No reading" : `${num(m.cpu_percent)} / ${num(m.cpu_max_percent)} CPU%`],

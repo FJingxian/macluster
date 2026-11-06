@@ -27,7 +27,7 @@ const METRIC_INTERVAL: Duration = Duration::from_secs(2);
 const PROCESS_INTERVAL: Duration = Duration::from_secs(1);
 const METRIC_STALE_AFTER: Duration = Duration::from_secs(6);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
-const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_MONITOR_ERROR_BYTES: usize = 1_024;
 const MAX_METRIC_ERROR_FIELDS: usize = 64;
 
@@ -361,11 +361,13 @@ impl MonitorHub {
         };
         let (running_tasks, waiting_tasks) =
             self.job_counts.get(&node_id).copied().unwrap_or_default();
+        let confirmed_offline = self.unreachable_nodes.contains(&node_id);
         NodeMonitorRow {
             node_id,
             metrics: snapshot,
             age_ms: age,
             stale,
+            confirmed_offline,
             sample_error,
             request_latency_ms: metrics.and_then(|cache| cache.request_latency_ms),
             consecutive_failures: metrics.map_or(0, |cache| cache.consecutive_failures),
@@ -564,8 +566,7 @@ impl MonitorHub {
                 let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
                 let record = records.get(id)?;
                 (record.identity_key.eq_ignore_ascii_case(expected_identity)
-                    && (record.consecutive_failures > 0
-                        || record.unreachable_since_unix_ms.is_some()))
+                    && record.is_confirmed_offline())
                 .then_some(node_id)
             })
             .collect::<BTreeSet<_>>();
@@ -576,12 +577,16 @@ impl MonitorHub {
         for node_id in unreachable.difference(&self.unreachable_nodes) {
             if let Some(cache) = self.metric_cache.get_mut(node_id) {
                 cache.error = Some("node is unreachable; waiting for a successful probe".into());
-                cache.consecutive_failures = cache.consecutive_failures.max(1);
+                cache.consecutive_failures = cache
+                    .consecutive_failures
+                    .max(crate::liveness::OFFLINE_AFTER_FAILURES);
                 cache.next_sample_at = None;
             }
             if let Some(cache) = self.process_cache.get_mut(node_id) {
                 cache.error = Some("node is unreachable; waiting for a successful probe".into());
-                cache.consecutive_failures = cache.consecutive_failures.max(1);
+                cache.consecutive_failures = cache
+                    .consecutive_failures
+                    .max(crate::liveness::OFFLINE_AFTER_FAILURES);
                 cache.next_sample_at = None;
             }
         }

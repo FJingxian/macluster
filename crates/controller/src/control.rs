@@ -5,7 +5,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_core::{
@@ -586,6 +586,13 @@ impl ControlApi {
                 Ok(ControlPayload::Jobs(JobPage { jobs, next_offset }))
             }
             ControlCommand::QueryQueues => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                let liveness = crate::liveness::read(self.storage.root(), &self.config.share_uuid)
+                    .unwrap_or_default();
                 let counts = self
                     .storage
                     .queue_job_counts()
@@ -601,7 +608,21 @@ impl ControlApi {
                         let counts = counts.get(name);
                         QueueSummary {
                             name: name.clone(),
-                            nodes: self.config.queue_compute_nodes(name),
+                            nodes: self
+                                .config
+                                .queue_compute_nodes(name)
+                                .into_iter()
+                                .filter(|node_id| {
+                                    let Some(node) = self.config.nodes.get(node_id) else {
+                                        return false;
+                                    };
+                                    let expected_identity =
+                                        node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+                                    liveness.get(node_id).is_some_and(|record| {
+                                        record.was_recently_reachable(expected_identity, now_ms)
+                                    })
+                                })
+                                .collect(),
                             pending: counts.map_or(0, |counts| counts.pending),
                             running: counts.map_or(0, |counts| counts.running),
                             completed: counts.map_or(0, |counts| counts.completed),

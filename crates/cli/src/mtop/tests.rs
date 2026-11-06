@@ -88,6 +88,7 @@ fn controller_monitor_request_latency_reaches_node_details() {
         request_latency_ms: Some(87),
         consecutive_failures: 0,
         stale: false,
+        confirmed_offline: false,
         sample_error: None,
         running_tasks: 0,
         waiting_tasks: 0,
@@ -296,7 +297,7 @@ fn failed_request_keeps_last_sample_and_marks_it_stale_by_age() {
 }
 
 #[test]
-fn mtop_shows_compute_nodes_only_after_a_fresh_successful_sample() {
+fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
     let sampled_at = Instant::now();
     let identities = vec![
         DisplayNodeIdentity {
@@ -334,7 +335,6 @@ fn mtop_shows_compute_nodes_only_after_a_fresh_successful_sample() {
     let mut worker_cache = NodeMetricCache::default();
     worker_cache.apply_success(metric(Some(20.0), Some(800.0), None), sampled_at);
     worker_cache.apply_error("SSH timeout".into());
-    worker_cache.apply_error("SSH timeout".into());
     let mut healthy_cache = NodeMetricCache::default();
     healthy_cache.apply_success(metric(Some(25.0), Some(800.0), None), sampled_at);
     let mut initial_failure_cache = NodeMetricCache::default();
@@ -358,15 +358,41 @@ fn mtop_shows_compute_nodes_only_after_a_fresh_successful_sample() {
     );
     assert_eq!(
         state.nodes.len(),
-        2,
-        "hide failed and unverified compute nodes while retaining the login node"
+        3,
+        "retain a node's last sample during the reconnect grace period"
+    );
+    assert!(
+        state
+            .nodes
+            .iter()
+            .any(|node| node.identity.id == "worker-a")
     );
 
     caches
         .get_mut("worker-a")
         .unwrap()
         .apply_error("SSH timeout".into());
-    let expired_at = initial_failure_at + Duration::from_millis(2);
+    let retry_at = initial_failure_at + Duration::from_millis(2);
+    update_visible_nodes(
+        &mut state,
+        &identities,
+        &caches,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        retry_at,
+    );
+    assert!(
+        state
+            .nodes
+            .iter()
+            .any(|node| node.identity.id == "worker-a")
+    );
+
+    caches
+        .get_mut("worker-a")
+        .unwrap()
+        .apply_error("SSH timeout".into());
+    let expired_at = initial_failure_at + Duration::from_millis(3);
     update_visible_nodes(
         &mut state,
         &identities,

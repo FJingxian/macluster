@@ -13,6 +13,7 @@ pub struct NodeEligibility {
     pub logical_cpus: Option<u32>,
     pub idle_since_unix_ms: u64,
     pub online: bool,
+    pub agent_current: bool,
     pub storage_ready: bool,
     pub drain_requested: bool,
     pub occupied: bool,
@@ -49,6 +50,7 @@ pub fn next_dispatch(
                 .iter()
                 .any(|member| member == node.id.as_str())
                 && node.online
+                && node.agent_current
                 && node.storage_ready
                 && !node.drain_requested
                 && !node.occupied

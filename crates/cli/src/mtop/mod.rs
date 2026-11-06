@@ -308,16 +308,15 @@ pub fn run_interactive(
                 continue;
             };
             let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
-            let cached_unreachable = liveness.get(&identity.id).filter(|record| {
+            let cached_offline = liveness.get(&identity.id).filter(|record| {
                 record.identity_key.eq_ignore_ascii_case(identity_key)
-                    && (record.consecutive_failures > 0
-                        || record.unreachable_since_unix_ms.is_some())
+                    && record.is_confirmed_offline()
             });
-            if let Some(record) = cached_unreachable {
+            if cached_offline.is_some() {
                 caches
                     .entry(identity.id.clone())
                     .or_default()
-                    .set_consecutive_failures(record.consecutive_failures.max(1));
+                    .set_confirmed_offline(true);
             }
         }
     }
@@ -832,6 +831,7 @@ fn apply_monitor_row(
         metric_cache.apply_error("waiting for first monitor sample".into());
     }
     metric_cache.set_consecutive_failures(row.consecutive_failures);
+    metric_cache.set_controller_liveness(row.confirmed_offline, received_at);
 
     let process_cache = processes.entry(display_id.to_owned()).or_default();
     if let Some(rows) = &row.processes {
@@ -874,7 +874,7 @@ fn update_visible_nodes(
             }
             caches
                 .get(&identity.id)
-                .is_some_and(|cache| cache.has_fresh_sample(now))
+                .is_some_and(|cache| cache.should_display(now))
         })
         .map(|identity| {
             let cache = caches.get(&identity.id);

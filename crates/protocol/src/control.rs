@@ -281,6 +281,9 @@ pub struct NodeMonitorRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
     pub stale: bool,
+    /// True only after the controller's three-probe offline threshold is met.
+    #[serde(default)]
+    pub confirmed_offline: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

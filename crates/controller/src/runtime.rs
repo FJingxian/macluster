@@ -188,6 +188,7 @@ struct NodeStatusCache {
 struct NodeHealthCache {
     valid: bool,
     ready: bool,
+    agent_current: bool,
     interactive_pty: bool,
     namespaced_jobs: bool,
     logical_cpus: Option<u32>,
@@ -267,12 +268,13 @@ fn node_probe_retry_delay() -> Duration {
 }
 
 fn node_probe_retry_delay_for_failures(failures: u8) -> Duration {
-    // Retry quickly while confirming a disconnect, then reduce network noise
-    // for a node that has remained absent across the full failure threshold.
+    // Retry quickly while confirming a disconnect. Keep a bounded 10-second
+    // recovery cadence after the node is hidden so cable/Wi-Fi rejoin is
+    // reflected promptly; the probe pool caps aggregate work for large pools.
     if failures < crate::liveness::OFFLINE_AFTER_FAILURES {
         Duration::from_secs(5)
     } else {
-        Duration::from_secs(30)
+        Duration::from_secs(10)
     }
 }
 
@@ -983,6 +985,7 @@ impl RuntimeState {
                 NodeHealthCache {
                     valid: true,
                     ready,
+                    agent_current: health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID),
                     namespaced_jobs: health.features.iter().any(|feature| {
                         feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE
                     }),
@@ -1003,6 +1006,7 @@ impl RuntimeState {
             _ => NodeHealthCache {
                 valid: false,
                 ready: false,
+                agent_current: false,
                 interactive_pty: false,
                 namespaced_jobs: false,
                 logical_cpus: None,
@@ -1567,6 +1571,10 @@ impl RuntimeState {
                     pinned
                 ))
             } else if let Some(reason) =
+                crate::agent_build_waiting_reason(&head, &queue_config, &availability)
+            {
+                Some(reason)
+            } else if let Some(reason) =
                 crate::namespace_waiting_reason(&head, &queue_config, &availability)
             {
                 Some(reason)
@@ -1692,6 +1700,8 @@ impl RuntimeState {
                     logical_cpus: health.and_then(|health| health.logical_cpus),
                     idle_since_unix_ms,
                     online,
+                    agent_current: health_fresh
+                        && health.is_some_and(|health| health.agent_current),
                     storage_ready: self.share_ready(now) && node_storage_ready,
                     drain_requested: service.node_is_maintenance_scoped(id),
                     occupied: busy,
@@ -2624,6 +2634,7 @@ mod tests {
                     macluster_protocol::types::NodeHealth {
                         machine_uuid: String::new(),
                         execution_uid: 0,
+                        build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
                         logical_cpus: None,
                         execution_digest: String::new(),
                         primary_share_ready: true,
@@ -2671,6 +2682,7 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
                     execution_uid: 501,
+                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
                     logical_cpus: None,
                     execution_digest: self.execution_digest.clone(),
                     primary_share_ready: true,
@@ -2725,6 +2737,7 @@ mod tests {
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: String::new(),
                     execution_uid: 0,
+                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
                     logical_cpus: None,
                     execution_digest: String::new(),
                     primary_share_ready: true,
@@ -2855,6 +2868,7 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            agent_current: true,
             interactive_pty: true,
             namespaced_jobs: true,
             logical_cpus: None,
@@ -3064,6 +3078,7 @@ scheduler = "fifo"
                 state.health = Some(NodeHealthCache {
                     valid: true,
                     ready: true,
+                    agent_current: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
                     logical_cpus: None,
@@ -3230,6 +3245,7 @@ scheduler = "fifo"
                 state.health = Some(NodeHealthCache {
                     valid: true,
                     ready: true,
+                    agent_current: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
                     logical_cpus: None,
@@ -3331,6 +3347,7 @@ scheduler = "fifo"
             node.health = Some(NodeHealthCache {
                 valid: true,
                 ready: true,
+                agent_current: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
                 logical_cpus: None,
@@ -3887,6 +3904,7 @@ scheduler = "fifo"
         node.health = Some(NodeHealthCache {
             valid: true,
             ready: false,
+            agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
             logical_cpus: None,

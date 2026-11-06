@@ -399,6 +399,7 @@ fn node_health_with_mount_provider(
     Ok(NodeHealth {
         machine_uuid,
         execution_uid: unsafe { libc::geteuid() },
+        build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
         logical_cpus: std::thread::available_parallelism()
             .ok()
             .and_then(|count| u32::try_from(count.get()).ok()),

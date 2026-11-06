@@ -511,6 +511,10 @@ mod metric_snapshot_tests {
 pub struct NodeHealth {
     pub machine_uuid: String,
     pub execution_uid: u32,
+    /// Source build identity for safe rolling Agent updates. Missing on older
+    /// Agents, which controllers must keep out of the dispatch pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
     /// Number of logical processors reported by the node's Agent.
     /// Optional so older Agents remain compatible during rolling updates.
     #[serde(default)]

@@ -89,6 +89,7 @@ select { min-height:34px; padding:0 28px 0 10px; border:1px solid var(--line-str
 .mac-icon::after { content:""; width:3px; height:3px; border-radius:50%; background:var(--accent); position:absolute; bottom:4px; right:4px; }
 .node-health { font-size:10px; padding:5px 9px; border-radius:20px; white-space:nowrap; }
 .node-health.online { color:var(--accent); background:var(--accent-soft); }
+.node-health.reconnecting { color:var(--amber); background:var(--amber-soft); }
 .node-health.offline { color:var(--red); background:var(--red-soft); }
 .node-gauges { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
 .resource-gauge { display:flex; flex-direction:column; align-items:center; gap:8px; min-width:0; }
@@ -312,6 +313,7 @@ select,.search-box { min-height: 38px; border-radius: 11px; }
 .node-health { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border: 1px solid transparent; border-radius: 999px; font-size: 10px; font-weight: 650; }
 .node-health.online::before,.node-health.offline::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 .node-health.online { border-color: color-mix(in srgb, var(--accent) 20%, var(--line)); }
+.node-health.reconnecting { border-color: color-mix(in srgb, var(--amber) 24%, var(--line)); }
 .node-health.offline { border-color: color-mix(in srgb, var(--red) 22%, var(--line)); }
 .node-gauges { gap: 9px; }
 .resource-gauge {

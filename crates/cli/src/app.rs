@@ -282,11 +282,32 @@ fn controller_is_running(global: &GlobalOptions, state_dir: &Path) -> bool {
     crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200)).is_ok()
 }
 
+fn controller_build_mismatch(global: &GlobalOptions, state_dir: &Path) -> bool {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let Ok(binding) = ServiceBinding::load(&config_path, state_dir) else {
+        return false;
+    };
+    let Ok(client) =
+        crate::control_client::ControlClient::connect(&binding, Duration::from_millis(200))
+    else {
+        return false;
+    };
+    crate::service::current_executable_build_id()
+        .is_ok_and(|expected| client.hello().build_id != expected)
+}
+
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     // Monitoring is read-only and must remain available while an Agent update
     // is pending or a compute node is unreachable. mtop reports the mismatch
     // inside its UI instead of starting cluster-wide maintenance first.
     if command == "top" {
+        return false;
+    }
+    // Local inspection must not acquire the cluster maintenance lock or
+    // trigger a cluster-wide Agent/helper update. These commands can still
+    // report jobs, queue counts, or status while an update is pending; the
+    // next operation that needs an Agent will resume the update workflow.
+    if is_read_only_query(command, args) {
         return false;
     }
     // Network discovery only probes the configured login subnet. It must not
@@ -611,14 +632,59 @@ fn preflight_agent_update_with_compatibility(
             .0
         }
     };
-    let helper_refresh_pending =
-        crate::node_admin::agent_helper_refresh_pending(&state_dir).map_err(|error| (1, error))?;
-    let agent_mismatch = compatibility.requires_update() || local_validation.requires_update();
-    let update_required = recovery_pending || agent_mismatch || helper_refresh_pending;
-    if !local_validation.missing_required_features.is_empty() {
+    let helper_pending_nodes =
+        crate::node_admin::agent_helper_refresh_pending_nodes(&state_dir, &config)
+            .map_err(|error| (1, error))?;
+    let mut agent_update_candidates = std::collections::BTreeSet::new();
+    for validation in [&compatibility, &local_validation] {
+        agent_update_candidates.extend(validation.stale.iter().cloned());
+        agent_update_candidates.extend(validation.missing_required_features.iter().cloned());
+    }
+    let mut probe_candidates = agent_update_candidates.clone();
+    probe_candidates.extend(helper_pending_nodes.iter().cloned());
+    if recovery_pending {
+        probe_candidates.extend(config.nodes.keys().cloned());
+    }
+    let reachable_nodes =
+        crate::node_admin::reachable_configured_node_ids(&config, &probe_candidates);
+    let agent_mismatch = agent_update_candidates
+        .iter()
+        .any(|node| reachable_nodes.contains(node));
+    let helper_refresh_pending = helper_pending_nodes
+        .iter()
+        .any(|node| reachable_nodes.contains(node));
+    // A resident controller must understand the same build identity as this
+    // CLI before it can safely schedule jobs. This also upgrades the
+    // controller when every stale compute node is currently offline, so that
+    // it fences those nodes immediately when they reconnect.
+    let controller_mismatch = controller_build_mismatch(global, &state_dir);
+    if controller_mismatch {
+        eprintln!(
+            "Controller build mismatch detected; it will be restarted after Agent maintenance."
+        );
+    }
+    let update_required =
+        recovery_pending || agent_mismatch || helper_refresh_pending || controller_mismatch;
+    let deferred_nodes = probe_candidates
+        .difference(&reachable_nodes)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !deferred_nodes.is_empty() {
+        eprintln!(
+            "Agent/helper update deferred for unreachable node(s): {}. They remain unavailable for new jobs until refreshed.",
+            deferred_nodes.join(", ")
+        );
+    }
+    let missing_online_features = local_validation
+        .missing_required_features
+        .iter()
+        .filter(|node| reachable_nodes.contains(*node))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_online_features.is_empty() {
         eprintln!(
             "Agent capability mismatch detected on {}; updating the cluster before `{command}`.",
-            local_validation.missing_required_features.join(", ")
+            missing_online_features.join(", ")
         );
     }
     if update_required
@@ -4194,6 +4260,14 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         return Err((2, format!("queue '{selected}' is not configured")));
     }
     loop {
+        let liveness = match macluster_controller::liveness::read(&state_dir, &config.share_uuid) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("macluster: could not read cached node reachability: {error}");
+                BTreeMap::new()
+            }
+        };
+        let liveness_now_ms = now_unix_ms();
         let storage = match fs::symlink_metadata(state_dir.join("controller.sqlite3")) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err((1, format!("cannot inspect job database: {error}"))),
@@ -4220,7 +4294,7 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 let counts = counts_by_queue.get(name);
                 QueueRow {
                     name: name.clone(),
-                    nodes: config.queue_compute_nodes(name),
+                    nodes: visible_queue_nodes(&config, name, &liveness, liveness_now_ms),
                     pending: counts.map_or(0, |counts| counts.pending as usize),
                     running: counts.map_or(0, |counts| counts.running as usize),
                     completed: counts.map_or(0, |counts| counts.completed as usize),
@@ -4247,57 +4321,14 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 serde_json::to_string_pretty(&rows).map_err(|error| (1, error.to_string()))?
             );
         } else {
-            let queue_width = rows
-                .iter()
-                .map(|row| row.name.len())
-                .max()
-                .unwrap_or(0)
-                .max("QUEUE".len());
-            let nodes_width = rows
-                .iter()
-                .map(|row| row.nodes.join(",").len())
-                .max()
-                .unwrap_or(0)
-                .max("NODES".len());
-            let pending_width = rows
-                .iter()
-                .map(|row| row.pending.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("PENDING".len());
-            let running_width = rows
-                .iter()
-                .map(|row| row.running.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("RUNNING".len());
-            let completed_width = rows
-                .iter()
-                .map(|row| row.completed.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("COMPLETED".len());
-            let failed_width = rows
-                .iter()
-                .map(|row| row.failed.to_string().len())
-                .max()
-                .unwrap_or(0)
-                .max("FAILED".len());
-            println!(
-                "{:<queue_width$}  {:<nodes_width$}  {:<pending_width$}  {:<running_width$}  {:<completed_width$}  {:<failed_width$}",
-                "QUEUE", "NODES", "PENDING", "RUNNING", "COMPLETED", "FAILED",
-            );
-            for row in &rows {
-                println!(
-                    "{:<queue_width$}  {:<nodes_width$}  {:<pending_width$}  {:<running_width$}  {:<completed_width$}  {:<failed_width$}",
-                    row.name,
-                    row.nodes.join(","),
-                    row.pending,
-                    row.running,
-                    row.completed,
-                    row.failed
-                );
-            }
+            let terminal_width = if io::stdout().is_terminal() {
+                crossterm::terminal::size()
+                    .map(|(width, _)| usize::from(width))
+                    .unwrap_or(120)
+            } else {
+                120
+            };
+            print!("{}", format_queue_table(&rows, terminal_width));
             if show_jobs {
                 let mut queue_jobs: Vec<_> = jobs
                     .as_ref()
@@ -4353,8 +4384,9 @@ EXAMPLES
   mqueue --watch 5
 
 NOTES
-  Reads saved queue counts locally. It does not start the controller or
-  probe nodes. A stopped controller leaves the last saved counts visible."#
+  Reads saved queue counts and recent node reachability locally. It does not
+  start the controller or probe nodes. Unverified, confirmed-offline, or stale
+  nodes are omitted; use `mnode -l --all` to inspect them."#
         }
     }
 }
@@ -4655,6 +4687,181 @@ struct QueueRow {
     running: usize,
     completed: usize,
     failed: usize,
+}
+
+fn visible_queue_nodes(
+    config: &ClusterConfig,
+    queue: &str,
+    liveness: &BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    now_ms: u64,
+) -> Vec<String> {
+    config
+        .queue_compute_nodes(queue)
+        .into_iter()
+        .filter(|node_id| {
+            let Some(node) = config.nodes.get(node_id) else {
+                return false;
+            };
+            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            let Some(record) = liveness.get(node_id) else {
+                // Queue membership is not proof of availability. Require at
+                // least one recent successful liveness observation before
+                // presenting the node as usable.
+                return false;
+            };
+            record.was_recently_reachable(identity_key, now_ms)
+        })
+        .collect()
+}
+
+fn format_queue_table(rows: &[QueueRow], terminal_width: usize) -> String {
+    use std::fmt::Write as _;
+
+    let headers = [
+        "QUEUE",
+        "NODES",
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+    ];
+    let queue_width = rows
+        .iter()
+        .map(|row| display_width(&row.name))
+        .max()
+        .unwrap_or(0)
+        .max(headers[0].len());
+    let count_nodes_width = rows
+        .iter()
+        .map(|row| row.nodes.len().to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[1].len());
+    let inline_nodes_width = rows
+        .iter()
+        .map(|row| display_width(&row.nodes.join(", ")))
+        .max()
+        .unwrap_or(0)
+        .max(headers[1].len());
+    let numeric_widths = [
+        rows.iter()
+            .map(|row| row.pending.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[2].len()),
+        rows.iter()
+            .map(|row| row.running.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[3].len()),
+        rows.iter()
+            .map(|row| row.completed.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[4].len()),
+        rows.iter()
+            .map(|row| row.failed.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(headers[5].len()),
+    ];
+    let separators = (headers.len() - 1) * 2;
+    let inline_width =
+        queue_width + inline_nodes_width + numeric_widths.iter().sum::<usize>() + separators;
+    let inline_nodes = inline_width <= terminal_width;
+    let widths = [
+        queue_width,
+        if inline_nodes {
+            inline_nodes_width
+        } else {
+            count_nodes_width
+        },
+        numeric_widths[0],
+        numeric_widths[1],
+        numeric_widths[2],
+        numeric_widths[3],
+    ];
+    let table_width = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+    let mut output = String::new();
+    if table_width <= terminal_width {
+        let _ = writeln!(
+            output,
+            "{:<queue$}  {:<nodes$}  {:<pending$}  {:<running$}  {:<completed$}  {:<failed$}",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            headers[5],
+            queue = widths[0],
+            nodes = widths[1],
+            pending = widths[2],
+            running = widths[3],
+            completed = widths[4],
+            failed = widths[5],
+        );
+        for row in rows {
+            let nodes = if inline_nodes {
+                row.nodes.join(", ")
+            } else {
+                row.nodes.len().to_string()
+            };
+            let _ = writeln!(
+                output,
+                "{:<queue$}  {:<nodes$}  {:<pending$}  {:<running$}  {:<completed$}  {:<failed$}",
+                row.name,
+                nodes,
+                row.pending,
+                row.running,
+                row.completed,
+                row.failed,
+                queue = widths[0],
+                nodes = widths[1],
+                pending = widths[2],
+                running = widths[3],
+                completed = widths[4],
+                failed = widths[5],
+            );
+            if !inline_nodes {
+                append_queue_node_lines(&mut output, &row.nodes, terminal_width);
+            }
+        }
+    } else {
+        for row in rows {
+            let _ = writeln!(output, "QUEUE  {}", row.name);
+            let _ = writeln!(output, "  NODES      {}", row.nodes.len());
+            let _ = writeln!(output, "  PENDING    {}", row.pending);
+            let _ = writeln!(output, "  RUNNING    {}", row.running);
+            let _ = writeln!(output, "  COMPLETED  {}", row.completed);
+            let _ = writeln!(output, "  FAILED     {}", row.failed);
+            append_queue_node_lines(&mut output, &row.nodes, terminal_width);
+        }
+    }
+    output
+}
+
+fn append_queue_node_lines(output: &mut String, nodes: &[String], terminal_width: usize) {
+    use std::fmt::Write as _;
+
+    if nodes.is_empty() {
+        return;
+    }
+    let width = terminal_width.max(24);
+    let first_prefix = "  Nodes: ";
+    let next_prefix = "         ";
+    let mut line = first_prefix.to_owned();
+    for node in nodes {
+        let separator = if line == first_prefix { "" } else { ", " };
+        let next_width = display_width(&line) + separator.len() + display_width(node);
+        if next_width > width && line != first_prefix {
+            let _ = writeln!(output, "{line}");
+            line = format!("{next_prefix}{node}");
+        } else {
+            line.push_str(separator);
+            line.push_str(node);
+        }
+    }
+    let _ = writeln!(output, "{line}");
 }
 
 fn kill(global: GlobalOptions, args: &[String]) -> AppResult<()> {
@@ -5747,7 +5954,7 @@ fn sample_cluster(
             let node = config.nodes.get(&id)?;
             let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
             (record.identity_key.eq_ignore_ascii_case(identity_key)
-                && (record.consecutive_failures > 0 || record.unreachable_since_unix_ms.is_some())
+                && record.is_confirmed_offline()
                 && !config.is_login_node(&id))
             .then_some(id)
         })
@@ -6613,6 +6820,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         Some("capabilities") => {
             if args.iter().any(|arg| arg == "--json") {
                 let report = serde_json::json!({
+                    "build_id": macluster_protocol::BUILD_ID,
                     "protocol_version": PROTOCOL_VERSION,
                     "features": [
                         "config.local-transport.v1",
@@ -6621,6 +6829,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "config.execution-digest.v1",
                         "config.primary-storage-source.v1",
                         "metrics.cpu-temperature.v1",
+                        "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,
                         INTERACTIVE_PTY_FEATURE,
                         macluster_protocol::types::NAMESPACED_JOBS_FEATURE
@@ -7202,10 +7411,16 @@ mod tests {
                 "{command} {args:?} must bypass build preflight"
             );
         }
-        for command in ["submit", "job", "queue", "kill", "node", "controller"] {
+        for command in ["submit", "kill", "node", "controller"] {
             assert!(
                 should_preflight_agent_update(command, &[]),
                 "{command} must run build preflight"
+            );
+        }
+        for command in ["job", "queue"] {
+            assert!(
+                !should_preflight_agent_update(command, &[]),
+                "{command} is a local read-only query and must not start Agent maintenance"
             );
         }
         assert!(should_preflight_agent_update(
@@ -9240,6 +9455,7 @@ mod tests {
                         metrics: login,
                         age_ms: Some(age_ms),
                         stale,
+                        confirmed_offline: false,
                         sample_error: None,
                         request_latency_ms: None,
                         consecutive_failures: 0,
@@ -9255,6 +9471,7 @@ mod tests {
                         metrics: worker,
                         age_ms: Some(age_ms),
                         stale,
+                        confirmed_offline: false,
                         sample_error: None,
                         request_latency_ms: None,
                         consecutive_failures: 0,

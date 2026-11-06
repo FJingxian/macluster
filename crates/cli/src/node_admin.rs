@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Read, Write},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::process::CommandExt,
@@ -1858,9 +1858,12 @@ pub(crate) struct RemoteFacts {
 #[derive(Deserialize)]
 struct CapabilityReport {
     features: Vec<String>,
+    #[serde(default)]
+    build_id: Option<String>,
 }
 
 const REQUIRED_AGENT_FEATURES: &[&str] = &[
+    "agent.build-id.v1",
     "agent.idle-handoff.v1",
     INTERACTIVE_PTY_FEATURE,
     "config.local-transport.v1",
@@ -1972,6 +1975,7 @@ pub(crate) fn agent_update_recovery_pending(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn agent_helper_refresh_pending(state_dir: &Path) -> Result<bool, String> {
     let path = state_dir.join(HELPER_REFRESH_PENDING_FILE);
     let metadata = match fs::symlink_metadata(&path) {
@@ -1992,6 +1996,72 @@ pub(crate) fn agent_helper_refresh_pending(state_dir: &Path) -> Result<bool, Str
     Ok(true)
 }
 
+pub(crate) fn agent_helper_refresh_pending_nodes(
+    state_dir: &Path,
+    config: &ClusterConfig,
+) -> Result<BTreeSet<String>, String> {
+    let path = state_dir.join(HELPER_REFRESH_PENDING_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(format!("cannot inspect helper refresh marker: {error}")),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.len() > 64 * 1024
+    {
+        return Err(format!(
+            "helper refresh marker {} has unsafe ownership, permissions, type, or size",
+            path.display()
+        ));
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read helper refresh marker: {error}"))?;
+    if contents.trim() == "pending" {
+        // Upgrade the old cluster-wide marker conservatively. New writes track
+        // the specific Macs whose helper refresh still needs attention.
+        return Ok(config.nodes.keys().cloned().collect());
+    }
+    let pending: AgentHelperRefreshPending = serde_json::from_str(&contents)
+        .map_err(|error| format!("helper refresh marker is invalid: {error}"))?;
+    if pending.schema != HELPER_REFRESH_PENDING_SCHEMA
+        || pending
+            .nodes
+            .iter()
+            .any(|node| !config.nodes.contains_key(node))
+    {
+        return Err("helper refresh marker does not match the active node configuration".into());
+    }
+    Ok(pending.nodes)
+}
+
+fn set_agent_helper_refresh_pending_nodes(state_dir: &Path, nodes: BTreeSet<String>) {
+    let path = state_dir.join(HELPER_REFRESH_PENDING_FILE);
+    if nodes.is_empty() {
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("macluster: could not clear helper refresh marker: {error}");
+        }
+        return;
+    }
+    let pending = AgentHelperRefreshPending {
+        schema: HELPER_REFRESH_PENDING_SCHEMA,
+        nodes,
+    };
+    match serde_json::to_vec(&pending) {
+        Ok(bytes) => {
+            if let Err((_, error)) = atomic_write(&path, &bytes) {
+                eprintln!("macluster: could not preserve pending helper refresh state: {error}");
+            }
+        }
+        Err(error) => eprintln!("macluster: could not encode helper refresh state: {error}"),
+    }
+}
+
+#[cfg(test)]
 fn set_agent_helper_refresh_pending(state_dir: &Path, pending: bool) {
     let path = state_dir.join(HELPER_REFRESH_PENDING_FILE);
     if pending {
@@ -2252,6 +2322,13 @@ const AGENT_VALIDATION_CACHE_TTL_MS: u64 = 60_000;
 const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 3;
 const AGENT_VALIDATION_CACHE_MAX_BYTES: u64 = 64 * 1024;
 const HELPER_REFRESH_PENDING_FILE: &str = "agent-helper-refresh.pending";
+const HELPER_REFRESH_PENDING_SCHEMA: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct AgentHelperRefreshPending {
+    schema: u32,
+    nodes: BTreeSet<String>,
+}
 
 pub(crate) fn current_agent_sha256() -> AppResult<String> {
     let executable = std::env::current_exe().map_err(io_error)?;
@@ -2283,6 +2360,58 @@ pub(crate) fn configured_agent_build_compatibility(
     }
     compatibility.missing_required_features = bounded_agent_feature_probes(config);
     Ok(compatibility)
+}
+
+/// Probe only the SSH endpoints relevant to a pending update. This is a
+/// bounded TCP check; it does not authenticate, start an Agent, or wait for an
+/// SSH timeout on an unreachable node.
+pub(crate) fn reachable_configured_node_ids(
+    config: &ClusterConfig,
+    candidates: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    const WORKERS: usize = 32;
+    const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
+    let tasks =
+        Mutex::new(VecDeque::from_iter(candidates.iter().filter_map(|id| {
+            config.nodes.get(id).cloned().map(|node| (id.clone(), node))
+        })));
+    let workers = WORKERS.min(tasks.lock().map_or(0, |tasks| tasks.len()));
+    std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                let tasks = &tasks;
+                scope.spawn(move || {
+                    let mut reachable = Vec::new();
+                    loop {
+                        let Some((id, node)) =
+                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                        else {
+                            break;
+                        };
+                        let online = if node.transport == Transport::Local {
+                            true
+                        } else {
+                            node.host.parse::<IpAddr>().ok().is_some_and(|ip| {
+                                TcpStream::connect_timeout(
+                                    &SocketAddr::new(ip, node.ssh_port.unwrap_or(22)),
+                                    ENDPOINT_TIMEOUT,
+                                )
+                                .is_ok()
+                            })
+                        };
+                        if online {
+                            reachable.push(id);
+                        }
+                    }
+                    reachable
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    })
 }
 
 /// Check locally available build evidence without contacting any node.
@@ -2401,7 +2530,9 @@ fn probe_configured_agent_features(node: &NodeConfig) -> AgentFeatureState {
     let Ok(report) = serde_json::from_slice::<CapabilityReport>(&output.stdout) else {
         return AgentFeatureState::Missing;
     };
-    if missing_required_agent_features(&report.features).is_empty() {
+    if report.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
+        && missing_required_agent_features(&report.features).is_empty()
+    {
         AgentFeatureState::Current
     } else {
         AgentFeatureState::Missing
@@ -2677,8 +2808,14 @@ fn parse_agent_build_probe(output: &str) -> Option<AgentBuildProbe> {
     Some(AgentBuildProbe { version, sha256 })
 }
 
-fn verify_registered_node_identities(config: &ClusterConfig) -> AppResult<()> {
+fn verify_registered_node_identities(
+    config: &ClusterConfig,
+    nodes: &BTreeSet<String>,
+) -> AppResult<()> {
     for (node_id, node) in &config.nodes {
+        if !nodes.contains(node_id) {
+            continue;
+        }
         let (machine_uuid, execution_uid) = if node.transport == Transport::Local {
             (local_platform_uuid()?, unsafe { libc::geteuid() })
         } else {
@@ -2743,6 +2880,18 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
         let config_path = config_path.canonicalize().map_err(io_error)?;
         let source = fs::read_to_string(&config_path).map_err(io_error)?;
         let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let all_nodes = config.nodes.keys().cloned().collect::<BTreeSet<_>>();
+        let reachable_nodes = reachable_configured_node_ids(&config, &all_nodes);
+        let deferred_nodes = all_nodes
+            .difference(&reachable_nodes)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !deferred_nodes.is_empty() {
+            eprintln!(
+                "Agent update deferred for unreachable node(s): {}. They will stay out of the dispatch pool; the next Agent-dependent command after they reconnect will retry the update.",
+                deferred_nodes.join(", ")
+            );
+        }
         let old_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
         let journal_path = state_dir.join("node-admin.json");
         let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
@@ -2777,12 +2926,22 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
                 .operations
                 .insert(operation_key.to_owned(), operation.clone());
             save_admin_state(&journal_path, &state)?;
-            verify_registered_node_identities(&config).map_err(|(code, error)| {
-                (
-                    code,
-                    format!("cannot verify node identities before Agent update: {error}"),
-                )
-            })?;
+            verify_registered_node_identities(&config, &reachable_nodes).map_err(
+                |(code, error)| {
+                    (
+                        code,
+                        format!("cannot verify node identities before Agent update: {error}"),
+                    )
+                },
+            )?;
+            let deferred = refresh_agent_helpers_for_update(
+                &config,
+                &operation.id,
+                state_dir,
+                &reachable_nodes,
+            )?;
+            set_agent_helper_refresh_pending_nodes(state_dir, deferred.clone());
+            helper_refresh_deferred = Some(deferred);
             finish_update_sync(
                 &mut state,
                 &journal_path,
@@ -2792,7 +2951,10 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
                 &source,
                 state_dir,
             )?;
-            println!("Recovered the all-node update and peer config synchronization.");
+            println!(
+                "Recovered Agent update sync for {} reachable node(s).",
+                reachable_nodes.len()
+            );
             return Ok(maintenance.controller_was_running);
         }
 
@@ -2823,14 +2985,16 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
         operation.phase = "UPDATE_STAGING".into();
         operation.old_config_sha256 = Some(old_digest.clone());
         operation.candidate_config_sha256 = None;
-        operation.detail =
-            Some("staging and verifying the current Agent on every configured node".into());
+        operation.detail = Some(format!(
+            "staging and verifying the current Agent on {} reachable node(s)",
+            reachable_nodes.len()
+        ));
         state
             .operations
             .insert(operation_key.to_owned(), operation.clone());
         save_admin_state(&journal_path, &state)?;
 
-        if let Err((code, error)) = verify_registered_node_identities(&config) {
+        if let Err((code, error)) = verify_registered_node_identities(&config, &reachable_nodes) {
             operation.phase = "UPDATE_FAILED".into();
             operation.detail = Some(error.clone());
             state.operations.insert(operation_key.to_owned(), operation);
@@ -2843,11 +3007,12 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             ));
         }
 
-        let (candidate, candidate_config) = match stage_current_agents(
+        let (candidate, candidate_config) = match stage_current_agents_for_nodes(
             &config,
             &source,
             &operation.id,
             AgentStagePurpose::Update,
+            Some(&reachable_nodes),
         ) {
             Ok(candidate) => candidate,
             Err((code, error)) => {
@@ -2884,8 +3049,19 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             .operations
             .insert(operation_key.to_owned(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        match refresh_agent_helpers_for_update(&candidate_config, &operation.id, state_dir) {
-            Ok(deferred) => helper_refresh_deferred = Some(deferred),
+        match refresh_agent_helpers_for_update(
+            &candidate_config,
+            &operation.id,
+            state_dir,
+            &reachable_nodes,
+        ) {
+            Ok(deferred) => {
+                // Persist this before config activation/sync. If a later step
+                // is interrupted, recovery must still know which offline
+                // nodes have a helper refresh to perform when they return.
+                set_agent_helper_refresh_pending_nodes(state_dir, deferred.clone());
+                helper_refresh_deferred = Some(deferred);
+            }
             Err((code, error)) => {
                 operation.phase = "UPDATE_FAILED".into();
                 operation.detail = Some(error.clone());
@@ -2934,7 +3110,10 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
                 &candidate,
                 state_dir,
             )?;
-            println!("All configured nodes already use the current Agent.");
+            println!(
+                "All {} reachable node(s) already use the current Agent.",
+                reachable_nodes.len()
+            );
             return Ok(maintenance.controller_was_running);
         }
 
@@ -2962,15 +3141,15 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             state_dir,
         )?;
         println!(
-            "Updated Agent on {} configured node(s).",
-            config.nodes.len()
+            "Updated Agent on {} reachable node(s).",
+            reachable_nodes.len()
         );
         Ok(maintenance.controller_was_running)
     })();
     if result.is_ok()
         && let Some(deferred) = helper_refresh_deferred
     {
-        set_agent_helper_refresh_pending(state_dir, deferred);
+        set_agent_helper_refresh_pending_nodes(state_dir, deferred);
     }
     finish_node_maintenance_with_success_notice(maintenance, result, false)
 }
@@ -3015,7 +3194,11 @@ fn finish_update_sync(
             save_admin_state(journal_path, state)?;
         }
     }
-    if let Err(error) = sync_remote_configs(config, source, state_dir, &operation.id, None) {
+    let all_nodes = config.nodes.keys().cloned().collect::<BTreeSet<_>>();
+    let reachable_nodes = reachable_configured_node_ids(config, &all_nodes);
+    if let Err(error) =
+        sync_remote_configs_on_nodes(config, source, state_dir, &operation.id, &reachable_nodes)
+    {
         operation.phase = "SYNC_PENDING".into();
         operation.detail = Some(error.clone());
         state.operations.insert(operation_key.to_owned(), operation);
@@ -3315,8 +3498,9 @@ EXAMPLES
   mnode -rm default-001
 
 `mnode -l` lists compute nodes only after recent successful reachability checks.
-Unverified, reconnecting, and offline nodes stay hidden until they respond;
-use `mnode -l --all` to inspect their states.
+One or two missed probes show `RECONNECTING` during the short recovery grace;
+three confirmed failures hide the node. Stale or unverified nodes stay hidden;
+use `mnode -l --all` to inspect them.
 
 ADD NODES
   Setup is verified before a node is listed. Failed attempts stay outside the
@@ -3743,6 +3927,17 @@ pub(crate) fn ensure_agent_capabilities(node: &NodeConfig) -> AppResult<()> {
             format!("agent capability report was invalid JSON: {error}"),
         )
     })?;
+    if report.build_id.as_deref() != Some(macluster_protocol::BUILD_ID) {
+        return Err((
+            1,
+            format!(
+                "agent on {} has build {:?}; expected {}",
+                node.host,
+                report.build_id,
+                macluster_protocol::BUILD_ID
+            ),
+        ));
+    }
     let missing = missing_required_agent_features(&report.features);
     if !missing.is_empty() {
         return Err((
@@ -3763,6 +3958,16 @@ pub(crate) fn stage_current_agents(
     operation_id: &str,
     purpose: AgentStagePurpose,
 ) -> AppResult<(String, ClusterConfig)> {
+    stage_current_agents_for_nodes(config, source, operation_id, purpose, None)
+}
+
+fn stage_current_agents_for_nodes(
+    config: &ClusterConfig,
+    source: &str,
+    operation_id: &str,
+    purpose: AgentStagePurpose,
+    included_nodes: Option<&BTreeSet<String>>,
+) -> AppResult<(String, ClusterConfig)> {
     let mut candidate = source.to_owned();
     let local_binary = std::env::current_exe()
         .map_err(io_error)?
@@ -3778,6 +3983,9 @@ pub(crate) fn stage_current_agents(
         ));
     }
     for (node_id, node) in &config.nodes {
+        if included_nodes.is_some_and(|nodes| !nodes.contains(node_id)) {
+            continue;
+        }
         let (destination, machine_uuid, execution_uid, remote_arch) = if node.transport
             == Transport::Local
         {
@@ -5858,15 +6066,17 @@ fn refresh_agent_helpers_for_update(
     config: &ClusterConfig,
     operation_id: &str,
     state_dir: &Path,
-) -> AppResult<bool> {
-    refresh_agent_helpers_with_signed_updater(config, operation_id, state_dir)
+    reachable_nodes: &BTreeSet<String>,
+) -> AppResult<BTreeSet<String>> {
+    refresh_agent_helpers_with_signed_updater(config, operation_id, state_dir, reachable_nodes)
 }
 
 fn refresh_agent_helpers_with_signed_updater(
     config: &ClusterConfig,
     operation_id: &str,
     state_dir: &Path,
-) -> AppResult<bool> {
+    reachable_nodes: &BTreeSet<String>,
+) -> AppResult<BTreeSet<String>> {
     let signing_key =
         crate::update_signing::ensure_cluster_update_key(state_dir, &config.share_uuid)
             .map_err(|error| (1, error))?;
@@ -5874,12 +6084,20 @@ fn refresh_agent_helpers_with_signed_updater(
         cluster_id: signing_key.cluster_id().to_owned(),
         public_key: signing_key.public_key_bytes(),
     };
-    let mut deferred = false;
+    let mut deferred = config
+        .nodes
+        .keys()
+        .filter(|node_id| !reachable_nodes.contains(*node_id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     for (node_id, node) in &config.nodes {
+        if !reachable_nodes.contains(node_id) {
+            continue;
+        }
         let (uid, arch) = match update_node_facts(node) {
             Ok(facts) => facts,
             Err(error) => {
-                deferred = true;
+                deferred.insert(node_id.clone());
                 eprintln!("Privileged helper update on {node_id} is pending: {error}");
                 continue;
             }
@@ -5897,7 +6115,7 @@ fn refresh_agent_helpers_with_signed_updater(
         };
         if let Err(error) = refresh_one_privileged_helper_bundle(&update) {
             if !io::stdin().is_terminal() && admin_authorization_required(&error) {
-                deferred = true;
+                deferred.insert(node_id.clone());
                 eprintln!(
                     "One-time administrator authorization is required to enable passwordless helper updates on {node_id}; rerun from Terminal."
                 );
@@ -6675,10 +6893,33 @@ pub(crate) fn sync_remote_configs(
     operation_id: &str,
     skip_node: Option<&str>,
 ) -> Result<(), String> {
+    sync_remote_configs_inner(config, source, state_dir, operation_id, skip_node, None)
+}
+
+fn sync_remote_configs_on_nodes(
+    config: &ClusterConfig,
+    source: &str,
+    state_dir: &Path,
+    operation_id: &str,
+    nodes: &BTreeSet<String>,
+) -> Result<(), String> {
+    sync_remote_configs_inner(config, source, state_dir, operation_id, None, Some(nodes))
+}
+
+fn sync_remote_configs_inner(
+    config: &ClusterConfig,
+    source: &str,
+    state_dir: &Path,
+    operation_id: &str,
+    skip_node: Option<&str>,
+    include_nodes: Option<&BTreeSet<String>>,
+) -> Result<(), String> {
     let candidate = compatible_agent_config(source).map_err(|(_, error)| error)?;
     let mut failures = Vec::new();
     for (node_id, node) in &config.nodes {
-        if skip_node == Some(node_id.as_str()) {
+        if skip_node == Some(node_id.as_str())
+            || include_nodes.is_some_and(|nodes| !nodes.contains(node_id))
+        {
             continue;
         }
         if node.transport == Transport::Local {
@@ -11044,7 +11285,8 @@ fn verified_node_health<'a>(
     let node = config.nodes.get(node_id)?;
     let digest = config.execution_digest().ok()?;
     health.filter(|health| {
-        health.execution_digest == digest
+        health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
+            && health.execution_digest == digest
             && node
                 .machine_uuid
                 .as_deref()
@@ -11196,7 +11438,7 @@ const NODE_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_LIST_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 
 const NODE_LIST_HEALTH_CACHE_TTL_MS: u64 = 120_000;
-const NODE_LIST_LIVENESS_CACHE_TTL_MS: u64 = 90_000;
+const NODE_LIST_LIVENESS_CACHE_TTL_MS: u64 = macluster_controller::liveness::RECENTLY_ONLINE_TTL_MS;
 
 fn node_list_probe_worker_count(node_count: usize) -> usize {
     node_count.min(MAX_NODE_LIST_PROBES)
@@ -11214,11 +11456,11 @@ fn cached_node_list_state(
     if !login_node && confirmed_offline {
         return show_all.then_some("OFFLINE");
     }
-    if !login_node && consecutive_failures > 0 {
-        return show_all.then_some("RECONNECTING");
-    }
     if !login_node && !known_online {
         return show_all.then_some("UNKNOWN");
+    }
+    if !login_node && consecutive_failures > 0 {
+        return Some("RECONNECTING");
     }
     Some(if digest_matches && shares_ready {
         "READY"
@@ -17090,6 +17332,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let mut health = NodeHealth {
             machine_uuid: config.nodes["login"].machine_uuid.clone().unwrap(),
             execution_uid: 501,
+            build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
             logical_cpus: None,
             execution_digest: config.execution_digest().unwrap(),
             primary_share_ready: true,
@@ -18575,6 +18818,7 @@ remote_binary = "/usr/local/bin/macluster"
         let health = NodeHealth {
             machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
             execution_uid: 501,
+            build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
             logical_cpus: None,
             execution_digest: "test-digest".into(),
             primary_share_ready: true,
@@ -18647,17 +18891,17 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
-    fn node_list_hides_unverified_and_reconnecting_compute_nodes_by_default() {
+    fn node_list_keeps_reconnecting_nodes_until_confirmed_offline() {
         assert_eq!(
-            cached_node_list_state(false, false, 1, false, false, false, false),
-            None
+            cached_node_list_state(false, true, 1, false, false, false, false),
+            Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 2, false, false, false, false),
-            None
+            cached_node_list_state(false, true, 2, false, false, false, false),
+            Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 1, false, false, false, true),
+            cached_node_list_state(false, true, 1, false, false, false, true),
             Some("RECONNECTING")
         );
         assert_eq!(

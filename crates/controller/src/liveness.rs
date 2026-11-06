@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 const STATE_FILE: &str = "node-liveness.json";
 const LOCK_FILE: &str = "node-liveness.lock";
 pub const OFFLINE_AFTER_FAILURES: u8 = 3;
+pub const RECENTLY_ONLINE_TTL_MS: u64 = 90_000;
 const MIN_FAILURE_PROBE_INTERVAL_MS: u64 = 3_000;
 const LAST_SEEN_PERSIST_INTERVAL_MS: u64 = 60_000;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +46,18 @@ impl NodeLiveness {
         self.consecutive_failures >= OFFLINE_AFTER_FAILURES
             && self.unreachable_since_unix_ms.is_some()
     }
+
+    /// Whether a recent successful probe still makes this node visible as
+    /// available. One or two missed probes remain inside the reconnect grace
+    /// period; a confirmed outage or an expired reachability record does not.
+    pub fn was_recently_reachable(&self, expected_identity: &str, now_ms: u64) -> bool {
+        self.identity_key.eq_ignore_ascii_case(expected_identity)
+            && !self.is_confirmed_offline()
+            && self.unreachable_since_unix_ms.is_none()
+            && self
+                .last_reachable_unix_ms
+                .is_some_and(|sampled| now_ms.saturating_sub(sampled) <= RECENTLY_ONLINE_TTL_MS)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,13 +76,15 @@ struct LivenessFile {
 /// Read persisted node liveness and the latest Agent health snapshot.
 pub fn read(state_dir: &Path, cluster_uuid: &str) -> io::Result<BTreeMap<String, NodeLiveness>> {
     with_locked_file(state_dir, cluster_uuid, |state, changed| {
-        // Older versions began the reconnect grace period after one failed
-        // probe. Treat that persisted state as one miss so an upgrade does
-        // not immediately hide nodes before the new three-miss threshold.
+        // Older versions persisted unreachable_since before the three-miss
+        // threshold existed. Convert those records back into reconnecting
+        // observations so an upgrade does not keep nodes hidden indefinitely.
         for record in state.nodes.values_mut() {
-            if record.unreachable_since_unix_ms.is_some() && record.consecutive_failures == 0 {
+            if record.unreachable_since_unix_ms.is_some()
+                && record.consecutive_failures < OFFLINE_AFTER_FAILURES
+            {
                 record.unreachable_since_unix_ms = None;
-                record.consecutive_failures = 1;
+                record.consecutive_failures = record.consecutive_failures.max(1);
                 record.last_failed_probe_unix_ms = Some(record.last_transition_unix_ms);
                 *changed = true;
             }

@@ -75,6 +75,11 @@ struct LivenessFile {
 
 /// Read persisted node liveness and the latest Agent health snapshot.
 pub fn read(state_dir: &Path, cluster_uuid: &str) -> io::Result<BTreeMap<String, NodeLiveness>> {
+    match fs::symlink_metadata(state_dir.join(STATE_FILE)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    }
     with_locked_file(state_dir, cluster_uuid, |state, changed| {
         // Older versions persisted unreachable_since before the three-miss
         // threshold existed. Convert those records back into reconnecting
@@ -369,6 +374,18 @@ fn write_atomic(path: &Path, state: &LivenessFile) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_missing_liveness_state_does_not_create_state_directory() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "macluster-liveness-read-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        assert!(read(&state_dir, "cluster").unwrap().is_empty());
+        assert!(!state_dir.exists());
+    }
     use std::path::PathBuf;
 
     fn temp_dir() -> PathBuf {

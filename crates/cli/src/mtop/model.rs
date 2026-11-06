@@ -209,17 +209,6 @@ impl NodeMetricCache {
             || now.saturating_duration_since(*sampled_at) < METRICS_STALE_AFTER
     }
 
-    #[cfg(test)]
-    pub fn failed_for(&self, now: Instant) -> Option<Duration> {
-        self.last_error.as_ref()?;
-        let since = self
-            .last_success
-            .as_ref()
-            .map(|(_, sampled_at)| *sampled_at)
-            .or(self.last_error_at)?;
-        Some(now.saturating_duration_since(since))
-    }
-
     pub fn view_at(&self, now: Instant) -> MetricView {
         if let Some((snapshot, received_at)) = &self.last_success {
             let age = now.saturating_duration_since(*received_at);

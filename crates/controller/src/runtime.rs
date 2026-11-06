@@ -3066,7 +3066,7 @@ scheduler = "fifo"
         let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
         let now = Instant::now();
         runtime.share_ready = Some((true, now));
-        for (id, node) in &service.config.nodes {
+        for id in service.config.nodes.keys() {
             let state = runtime.nodes.get_mut(id).unwrap();
             state.fenced = true;
             state.status = Some(NodeStatusCache {
@@ -3074,18 +3074,16 @@ scheduler = "fifo"
                 occupied: false,
                 sampled_at: now,
             });
-            if node.transport == macluster_core::config::Transport::Local {
-                state.health = Some(NodeHealthCache {
-                    valid: true,
-                    ready: true,
-                    agent_current: true,
-                    interactive_pty: true,
-                    namespaced_jobs: true,
-                    logical_cpus: None,
-                    sampled_at: now,
-                    retry_at: now,
-                });
-            }
+            state.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                agent_current: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                logical_cpus: None,
+                sampled_at: now,
+                retry_at: now,
+            });
         }
         let jobs = service.storage.list_reconcile_jobs().unwrap();
 
@@ -3556,6 +3554,16 @@ scheduler = "fifo"
                 online: true,
                 occupied: false,
                 sampled_at: now,
+            });
+            node.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                agent_current: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                logical_cpus: None,
+                sampled_at: now,
+                retry_at: now,
             });
         }
         service.set_maintenance_scope(Some(MaintenanceScope::Nodes(vec![

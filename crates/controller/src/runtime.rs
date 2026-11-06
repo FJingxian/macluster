@@ -14,6 +14,9 @@ use std::{
 use macluster_core::{
     config::Transport,
     maintenance::ResetBarrierPolicy,
+    nfs_reconcile::{
+        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareMarkerCleanup,
+    },
     scheduler::{NodeEligibility, next_dispatch},
     storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
@@ -21,9 +24,10 @@ use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
     control::MaintenanceScope,
     identifiers::{Id128, NodeId},
+    nfs_admin::{NfsAlias, NfsMount},
     types::{
-        ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, Operation,
-        ProtocolError, ResponseBody,
+        ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, NfsShareMarker,
+        Operation, ProtocolError, ResponseBody,
     },
 };
 
@@ -38,14 +42,17 @@ const PROBE_WORKERS: usize = 8;
 const CONTROL_WORKERS: usize = 4;
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
+const NFS_RECONCILE_WORKERS: usize = 2;
 const WORK_QUEUE_FACTOR: usize = 1;
 const NODE_STATUS_TTL: Duration = Duration::from_secs(6);
 const IDLE_NODE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const NODE_HEALTH_TTL: Duration = Duration::from_secs(60);
 const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
+const NODE_STALE_AGENT_RETRY: Duration = Duration::from_secs(30);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
+const MAX_NFS_RECONCILE_RESULT_AGE: Duration = Duration::from_secs(180);
 const MAX_IDLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const JOB_STORAGE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const JOB_STORAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -127,6 +134,7 @@ impl<R: Send + 'static> WorkerPool<R> {
 enum WorkKind {
     Probe,
     Health,
+    ReconcileNfs,
     Start,
     Cancel,
     ShareHealth,
@@ -155,9 +163,19 @@ struct WorkerCompletion {
 enum WorkerResult {
     Probe(ProbeResult),
     Control(Result<ResponseBody, String>),
+    ReconcileNfs {
+        result: Result<(), String>,
+        acknowledged: NfsCleanupAck,
+    },
     ShareHealth(bool),
     PublishSnapshot(Result<(), String>),
     StorageUsage(Result<u64, String>),
+}
+
+#[derive(Clone, Debug, Default)]
+struct NfsCleanupAck {
+    clients: Vec<DeferredShareClientCleanup>,
+    markers: Vec<DeferredShareMarkerCleanup>,
 }
 
 struct ProbeResult {
@@ -212,10 +230,11 @@ struct NodeRuntime {
     next_probe_at: Instant,
     probe_after_inflight_for_job: Option<u64>,
     probe_failures: u8,
-    unreachable_since_unix_ms: Option<u64>,
     last_probe_error: Option<String>,
     next_control_at: Instant,
     control_failures: u8,
+    nfs_reconcile_attempts: u8,
+    next_nfs_reconcile_at: Instant,
     pending_start: Option<JobRecord>,
 }
 
@@ -230,10 +249,11 @@ impl NodeRuntime {
             next_probe_at: now,
             probe_after_inflight_for_job: None,
             probe_failures: 0,
-            unreachable_since_unix_ms: None,
             last_probe_error: None,
             next_control_at: now,
             control_failures: 0,
+            nfs_reconcile_attempts: 0,
+            next_nfs_reconcile_at: now,
             pending_start: None,
         }
     }
@@ -252,7 +272,7 @@ impl NodeRuntime {
 
     fn health_probe_due(&self, now: Instant) -> bool {
         self.health.as_ref().is_none_or(|health| {
-            if health.valid && health.ready {
+            if health.valid && health.ready && health.agent_current {
                 now.saturating_duration_since(health.sampled_at) >= NODE_HEALTH_TTL
             } else {
                 now >= health.retry_at
@@ -260,9 +280,8 @@ impl NodeRuntime {
         })
     }
 
-    fn confirmed_offline(&self) -> bool {
+    fn management_unavailable(&self) -> bool {
         self.probe_failures >= crate::liveness::OFFLINE_AFTER_FAILURES
-            && self.unreachable_since_unix_ms.is_some()
     }
 }
 
@@ -271,6 +290,16 @@ fn probe_delay(configured_interval: Duration, occupied: bool) -> Duration {
         configured_interval
     } else {
         IDLE_NODE_PROBE_INTERVAL
+    }
+}
+
+fn health_retry_delay(identity_matches: bool, ready: bool, agent_current: bool) -> Duration {
+    if identity_matches && !agent_current {
+        NODE_STALE_AGENT_RETRY
+    } else if ready && agent_current {
+        NODE_HEALTH_TTL
+    } else {
+        NODE_HEALTH_RETRY
     }
 }
 
@@ -396,10 +425,12 @@ struct RuntimeState {
     nodes: HashMap<String, NodeRuntime>,
     node_probe_pool: WorkerPool<WorkerCompletion>,
     control_pool: WorkerPool<WorkerCompletion>,
+    nfs_reconcile_pool: WorkerPool<WorkerCompletion>,
     share_pool: WorkerPool<WorkerCompletion>,
     snapshot_pool: WorkerPool<WorkerCompletion>,
     storage_usage_pool: WorkerPool<WorkerCompletion>,
     storage_usage_result: Option<Result<u64, String>>,
+    nfs_cleanup_journal_blocked: bool,
     share_in_flight: Option<u64>,
     share_ready: Option<(bool, Instant)>,
     next_share_probe: Instant,
@@ -437,6 +468,17 @@ impl RuntimeState {
                     Default::default()
                 }
             };
+        let nfs_cleanup_journal_blocked = match DeferredShareCleanupState::load_from_dir(
+            service.storage.root(),
+        ) {
+            Ok(_) => false,
+            Err(error) => {
+                eprintln!(
+                    "macluster: both NFS cleanup journal copies are unavailable; job dispatch is paused until the journal is restored: {error}"
+                );
+                true
+            }
+        };
         Ok(Self {
             digest: service.config.execution_digest().unwrap_or_default(),
             previous_digest: None,
@@ -455,7 +497,6 @@ impl RuntimeState {
                                 .unwrap_or(config.host.as_str()),
                         )
                     {
-                        runtime.unreachable_since_unix_ms = record.unreachable_since_unix_ms;
                         runtime.probe_failures = record.consecutive_failures;
                     }
                     (id.clone(), runtime)
@@ -471,6 +512,11 @@ impl RuntimeState {
                 control_workers * WORK_QUEUE_FACTOR,
                 signal.clone(),
             )?,
+            nfs_reconcile_pool: WorkerPool::new(
+                NFS_RECONCILE_WORKERS,
+                NFS_RECONCILE_WORKERS * WORK_QUEUE_FACTOR,
+                signal.clone(),
+            )?,
             share_pool: WorkerPool::new(
                 SHARE_WORKERS,
                 SHARE_WORKERS * WORK_QUEUE_FACTOR,
@@ -483,6 +529,7 @@ impl RuntimeState {
             )?,
             storage_usage_pool: WorkerPool::new(1, 1, signal)?,
             storage_usage_result: None,
+            nfs_cleanup_journal_blocked,
             share_in_flight: None,
             share_ready: None,
             next_share_probe: now,
@@ -529,6 +576,7 @@ impl RuntimeState {
     fn pending_work(&self) -> usize {
         self.node_probe_pool.pending
             + self.control_pool.pending
+            + self.nfs_reconcile_pool.pending
             + self.share_pool.pending
             + self.snapshot_pool.pending
     }
@@ -545,11 +593,11 @@ impl RuntimeState {
         };
         for job in service.storage.list_active_jobs()? {
             let scoped = in_scope(job.node.as_ref());
-            let job_node_offline = job
+            let job_node_unavailable = job
                 .node
                 .as_ref()
                 .and_then(|node_id| self.nodes.get(node_id.as_str()))
-                .is_some_and(NodeRuntime::confirmed_offline);
+                .is_some_and(NodeRuntime::management_unavailable);
             let label = match job.state {
                 JobState::Starting | JobState::Running | JobState::Cancelling if scoped => {
                     Some(format!(
@@ -561,7 +609,7 @@ impl RuntimeState {
                 }
                 _ if (scoped || matches!(scope, MaintenanceScope::Cluster))
                     && (job.snapshot_sync_pending || job.log_sync_pending)
-                    && !job_node_offline =>
+                    && !job_node_unavailable =>
                 {
                     Some(format!("job {} output synchronization is pending", job.id))
                 }
@@ -579,9 +627,12 @@ impl RuntimeState {
             if !service.node_is_maintenance_scoped(node_id) {
                 continue;
             }
-            let confirmed_offline = node.confirmed_offline();
+            let management_unavailable = node.management_unavailable();
             let has_mutating_operation = node.in_flight.is_some_and(|operation| {
-                matches!(operation.kind, WorkKind::Start | WorkKind::Cancel)
+                matches!(
+                    operation.kind,
+                    WorkKind::Start | WorkKind::Cancel | WorkKind::ReconcileNfs
+                )
             });
             if has_mutating_operation {
                 blockers.push(format!(
@@ -593,7 +644,7 @@ impl RuntimeState {
                 && node.status.as_ref().is_some_and(|status| status.occupied)
             {
                 blockers.push(format!("node {node_id} still reports an active execution"));
-            } else if !node.status_fresh(Instant::now()) && !confirmed_offline {
+            } else if !node.status_fresh(Instant::now()) && !management_unavailable {
                 if node.in_flight.is_some() {
                     blockers.push(format!(
                         "node {node_id} has a controller operation in flight"
@@ -694,6 +745,7 @@ impl RuntimeState {
             .poll()
             .into_iter()
             .chain(self.control_pool.poll())
+            .chain(self.nfs_reconcile_pool.poll())
             .chain(self.share_pool.poll())
             .chain(self.snapshot_pool.poll())
             .chain(self.storage_usage_pool.poll())
@@ -773,6 +825,80 @@ impl RuntimeState {
                     self.storage_usage_result = Some(result);
                 }
             }
+            WorkKind::ReconcileNfs => {
+                let Some(node_id) = tag.node_id.as_deref() else {
+                    return Ok(());
+                };
+                let Some(runtime) = self.nodes.get_mut(node_id) else {
+                    return Ok(());
+                };
+                if runtime
+                    .in_flight
+                    .is_none_or(|operation| operation.id != tag.operation_id)
+                {
+                    return Ok(());
+                }
+                runtime.in_flight = None;
+                if !identity_current
+                    || !node_result_is_current(
+                        &tag,
+                        service.epoch,
+                        &tag.config_digest,
+                        runtime.generation,
+                        now,
+                    )
+                {
+                    runtime.health = None;
+                    runtime.next_probe_at = now;
+                    return Ok(());
+                }
+                let WorkerResult::ReconcileNfs {
+                    result,
+                    acknowledged,
+                } = completion.result
+                else {
+                    return Ok(());
+                };
+                match result {
+                    Ok(()) => {
+                        if let Err(error) =
+                            remove_acknowledged_nfs_cleanup(service.storage.root(), &acknowledged)
+                        {
+                            self.nfs_cleanup_journal_blocked = true;
+                            eprintln!(
+                                "macluster: NFS reconciliation completed on {node_id}, but its cleanup journal could not be updated; job dispatch is paused until the journal is readable: {error}"
+                            );
+                            runtime.nfs_reconcile_attempts =
+                                runtime.nfs_reconcile_attempts.saturating_add(1);
+                            runtime.next_nfs_reconcile_at =
+                                now + retry_delay(runtime.nfs_reconcile_attempts);
+                        } else {
+                            runtime.nfs_reconcile_attempts = 0;
+                            runtime.next_nfs_reconcile_at = now;
+                        }
+                        runtime.health = None;
+                        runtime.next_probe_at = now;
+                        runtime.last_probe_error = None;
+                    }
+                    Err(error) => {
+                        runtime.nfs_reconcile_attempts =
+                            runtime.nfs_reconcile_attempts.saturating_add(1);
+                        runtime.next_nfs_reconcile_at =
+                            now + retry_delay(runtime.nfs_reconcile_attempts);
+                        if let Some(health) = runtime.health.as_mut() {
+                            health.ready = false;
+                            health.retry_at = runtime.next_nfs_reconcile_at;
+                        }
+                        runtime.last_probe_error = Some(
+                            format!("NFS reconciliation failed: {error}")
+                                .chars()
+                                .take(256)
+                                .collect(),
+                        );
+                        eprintln!("macluster: NFS reconciliation on {node_id} will retry: {error}");
+                    }
+                }
+            }
             WorkKind::Probe | WorkKind::Health | WorkKind::Start | WorkKind::Cancel => {
                 let Some(node_id) = tag.node_id.as_deref() else {
                     return Ok(());
@@ -807,27 +933,29 @@ impl RuntimeState {
                     runtime.probe_after_inflight_for_job.take()
                 };
                 match tag.kind {
-                    WorkKind::Probe | WorkKind::Health => {
+                    WorkKind::Probe => {
                         if let WorkerResult::Probe(probe) = completion.result {
-                            match tag.kind {
-                                WorkKind::Probe => self.apply_probe(
-                                    service,
-                                    node_id,
-                                    &tag,
-                                    completion.received_at,
-                                    probe,
-                                )?,
-                                WorkKind::Health => self.apply_health(
-                                    service,
-                                    node_id,
-                                    &tag,
-                                    completion.received_at,
-                                    probe.health,
-                                    probe.host_reachable,
-                                    probe.agent_responding,
-                                ),
-                                _ => {}
-                            }
+                            self.apply_probe(
+                                service,
+                                node_id,
+                                &tag,
+                                completion.received_at,
+                                probe,
+                            )?;
+                        }
+                    }
+                    WorkKind::Health => {
+                        if let WorkerResult::Probe(probe) = completion.result {
+                            self.apply_health(
+                                service,
+                                node_id,
+                                &tag,
+                                completion.received_at,
+                                probe.health,
+                                probe.host_reachable,
+                                probe.agent_responding,
+                            );
+                            self.schedule_nfs_reconciliation(service, node_id)?;
                         }
                     }
                     WorkKind::Start | WorkKind::Cancel => {
@@ -901,15 +1029,13 @@ impl RuntimeState {
             runtime.fenced = false;
             runtime.status = None;
             runtime.probe_failures = runtime.probe_failures.saturating_add(1);
-            let record = persist_node_liveness(
+            persist_node_liveness(
                 service,
                 node_id,
                 probe.host_reachable,
                 observed_agent_status(probe.agent_responding, probe.host_reachable),
                 super::now_ms(),
             );
-            runtime.unreachable_since_unix_ms =
-                record.and_then(|record| record.unreachable_since_unix_ms);
             if probe.agent_responding {
                 runtime.probe_failures = 0;
             }
@@ -918,15 +1044,13 @@ impl RuntimeState {
             service.idle_since.remove(node_id);
             return Ok(());
         }
-        let record = persist_node_liveness(
+        persist_node_liveness(
             service,
             node_id,
             probe.host_reachable,
             observed_agent_status(probe.agent_responding, probe.host_reachable),
             super::now_ms(),
         );
-        runtime.unreachable_since_unix_ms =
-            record.and_then(|record| record.unreachable_since_unix_ms);
         runtime.fenced = true;
         service.fenced_nodes.insert(node_id.to_owned());
 
@@ -1022,8 +1146,31 @@ impl RuntimeState {
             observed_agent_status(agent_responding, host_reachable),
             super::now_ms(),
         );
-        if let Some(Ok(ResponseBody::Health(health))) = health_result.as_ref() {
+        let response_identity_matches =
+            health_result
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|response| match response {
+                    ResponseBody::Health(health) => Some(health),
+                    _ => None,
+                })
+                .is_some_and(|health| {
+                    service.config.nodes.get(node_id).is_some_and(|registered| {
+                        registered.machine_uuid.as_deref().is_none_or(|expected| {
+                            expected.eq_ignore_ascii_case(&health.machine_uuid)
+                        }) && registered
+                            .execution_uid
+                            .is_none_or(|expected| expected == health.execution_uid)
+                    })
+                });
+        if response_identity_matches
+            && let Some(Ok(ResponseBody::Health(health))) = health_result.as_ref()
+        {
             persist_node_health(service, node_id, health.clone(), super::now_ms());
+        } else if matches!(health_result.as_ref(), Some(Ok(ResponseBody::Health(_)))) {
+            eprintln!(
+                "macluster: registered machine identity mismatch reported by {node_id}; automatic NFS reconciliation is disabled for this response"
+            );
         }
         let Some(runtime) = self.nodes.get_mut(node_id) else {
             return;
@@ -1031,24 +1178,32 @@ impl RuntimeState {
         if matches!(health_result.as_ref(), Some(Ok(ResponseBody::Health(_)))) {
             // A successful authenticated health response proves the Agent has
             // returned even if its execution-status probe has not completed.
-            runtime.unreachable_since_unix_ms = None;
             runtime.probe_failures = 0;
             runtime.next_probe_at = received_at;
+        } else if !agent_responding {
+            // Health-only probes are read-only, but repeated transport failures
+            // still prove this controller cannot manage the node right now.
+            // Feed them into the maintenance drain threshold instead of leaving
+            // the node permanently "in flight" from the maintenance view.
+            runtime.probe_failures = runtime.probe_failures.saturating_add(1);
         }
         runtime.health = Some(match health_result {
             Some(Ok(ResponseBody::Health(health))) => {
                 let expected_digest = service.config.execution_digest().unwrap_or_default();
-                let ready = health.execution_digest == expected_digest
+                let ready = response_identity_matches
+                    && health.execution_digest == expected_digest
                     && health.primary_share_ready
                     && service
                         .config
                         .shares
                         .keys()
                         .all(|share_id| health.shares.get(share_id).copied().unwrap_or(false));
+                let agent_current =
+                    health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID);
                 NodeHealthCache {
-                    valid: true,
+                    valid: response_identity_matches,
                     ready,
-                    agent_current: health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID),
+                    agent_current,
                     namespaced_jobs: health.features.iter().any(|feature| {
                         feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE
                     }),
@@ -1059,11 +1214,7 @@ impl RuntimeState {
                         .any(|feature| feature == INTERACTIVE_PTY_FEATURE),
                     sampled_at: tag.started_at,
                     retry_at: received_at
-                        + if ready {
-                            NODE_HEALTH_TTL
-                        } else {
-                            NODE_HEALTH_RETRY
-                        },
+                        + health_retry_delay(response_identity_matches, ready, agent_current),
                 }
             }
             _ => NodeHealthCache {
@@ -1077,6 +1228,238 @@ impl RuntimeState {
                 retry_at: received_at + NODE_HEALTH_RETRY,
             },
         });
+    }
+
+    fn schedule_nfs_reconciliation<T: NodeTransport>(
+        &mut self,
+        service: &ControllerService<T>,
+        node_id: &str,
+    ) -> Result<(), ControllerError> {
+        let now = Instant::now();
+        let Some(runtime) = self.nodes.get(node_id) else {
+            return Ok(());
+        };
+        let Some(health) = runtime.health.as_ref() else {
+            return Ok(());
+        };
+        let Some(status) = runtime.status.as_ref() else {
+            return Ok(());
+        };
+        let Some(node_config) = service.config.nodes.get(node_id) else {
+            return Ok(());
+        };
+        if !service.dispatch_allowed()
+            || service.node_is_maintenance_scoped(node_id)
+            || runtime.in_flight.is_some()
+            || runtime.pending_start.is_some()
+            || !runtime.status_fresh(now)
+            || !status.online
+            || status.occupied
+            || !health.valid
+            || !health.agent_current
+            || node_config.machine_uuid.is_none()
+        {
+            return Ok(());
+        }
+        let health_ready = health.ready;
+        let reconcile_retry_at = runtime.next_nfs_reconcile_at;
+        let generation = runtime.generation;
+
+        let has_node_activity = service.storage.list_active_jobs()?.iter().any(|job| {
+            job.node
+                .as_ref()
+                .is_some_and(|assigned| assigned.as_str() == node_id)
+                && (!job.state.is_terminal() || job.snapshot_sync_pending || job.log_sync_pending)
+        });
+        if has_node_activity {
+            return Ok(());
+        }
+
+        let Some(config_toml) = service.config_toml_snapshot.clone() else {
+            return Ok(());
+        };
+        let cleanup_state = match DeferredShareCleanupState::load_from_dir(service.storage.root()) {
+            Ok(state) => {
+                if self.nfs_cleanup_journal_blocked {
+                    eprintln!(
+                        "macluster: NFS cleanup journal is readable again; controller reconciliation may resume"
+                    );
+                }
+                self.nfs_cleanup_journal_blocked = false;
+                state
+            }
+            Err(error) => {
+                if !self.nfs_cleanup_journal_blocked {
+                    eprintln!(
+                        "macluster: both NFS cleanup journal copies are unreadable; job dispatch is paused until the journal is restored: {error}"
+                    );
+                }
+                self.nfs_cleanup_journal_blocked = true;
+                if let Some(runtime) = self.nodes.get_mut(node_id) {
+                    runtime.nfs_reconcile_attempts =
+                        runtime.nfs_reconcile_attempts.saturating_add(1);
+                    runtime.next_nfs_reconcile_at =
+                        now + retry_delay(runtime.nfs_reconcile_attempts);
+                }
+                return Ok(());
+            }
+        };
+        let has_deferred_cleanup = cleanup_state
+            .entries
+            .values()
+            .any(|entry| entry.node_id == node_id)
+            || cleanup_state
+                .marker_entries
+                .values()
+                .any(|entry| entry.node_id == node_id);
+        if has_deferred_cleanup && health_ready {
+            if let Some(runtime) = self.nodes.get_mut(node_id)
+                && let Some(health) = runtime.health.as_mut()
+            {
+                health.ready = false;
+                health.retry_at = reconcile_retry_at;
+            }
+        }
+        if now < reconcile_retry_at || (health_ready && !has_deferred_cleanup) {
+            return Ok(());
+        }
+        let expected_machine_uuid = node_config.machine_uuid.as_deref().unwrap_or_default();
+        let mut cleanup = NfsCleanupAck::default();
+        for entry in cleanup_state
+            .entries
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+        {
+            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
+                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
+            }) {
+                self.defer_nfs_reconciliation(
+                    node_id,
+                    format!(
+                        "deferred share cleanup identity for {} does not match this node",
+                        entry.share_id
+                    ),
+                    now,
+                );
+                return Ok(());
+            }
+            cleanup.clients.push(entry.clone());
+        }
+        for entry in cleanup_state
+            .marker_entries
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+        {
+            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
+                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
+            }) {
+                self.defer_nfs_reconciliation(
+                    node_id,
+                    format!(
+                        "deferred share marker identity for {} does not match this node",
+                        entry.share_id
+                    ),
+                    now,
+                );
+                return Ok(());
+            }
+            cleanup.markers.push(entry.clone());
+        }
+
+        let obsolete_mounts = cleanup
+            .clients
+            .iter()
+            .map(|entry| NfsMount {
+                source: format!("{}:{}", entry.server_host, entry.source_root),
+                target: entry.mount_root.clone(),
+                share_uuid: entry.share_uuid.clone(),
+                alias: None,
+                allow_existing_contents: false,
+            })
+            .collect::<Vec<_>>();
+        let obsolete_aliases = cleanup
+            .clients
+            .iter()
+            .filter(|entry| entry.source_root != entry.mount_root)
+            .map(|entry| NfsAlias {
+                path: entry.source_root.clone(),
+                target: entry.mount_root.clone(),
+            })
+            .collect::<Vec<_>>();
+        let obsolete_markers = cleanup
+            .markers
+            .iter()
+            .map(|entry| NfsShareMarker {
+                source_root: entry.source_root.clone(),
+                share_uuid: entry.share_uuid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let operation = Operation::ReconcileNfs {
+            controller: service.epoch,
+            config_toml,
+            obsolete_mounts,
+            obsolete_aliases,
+            obsolete_markers,
+        };
+        let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
+        let node_config = node_config.clone();
+        let transport = Arc::clone(&service.transport);
+        let operation_id = self.operation_id();
+        let tag = self.tag(
+            service,
+            Some(node_id.to_owned()),
+            generation,
+            operation_id,
+            WorkKind::ReconcileNfs,
+            None,
+        );
+        let worker_tag = tag.clone();
+        if self.nfs_reconcile_pool.try_spawn(move || {
+            let result = transport
+                .call(&node_id_protocol, &node_config, operation)
+                .and_then(|response| match response {
+                    ResponseBody::Ack => Ok(()),
+                    _ => Err(TransportError::Protocol(
+                        "NFS reconciliation returned an unexpected response".into(),
+                    )),
+                })
+                .map_err(|error| error.to_string());
+            WorkerCompletion {
+                tag: worker_tag,
+                received_at: Instant::now(),
+                result: WorkerResult::ReconcileNfs {
+                    result,
+                    acknowledged: cleanup,
+                },
+            }
+        }) {
+            if let Some(runtime) = self.nodes.get_mut(node_id) {
+                runtime.in_flight = Some(InFlightNodeOperation {
+                    id: operation_id,
+                    kind: WorkKind::ReconcileNfs,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn defer_nfs_reconciliation(&mut self, node_id: &str, error: String, now: Instant) {
+        let Some(runtime) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        runtime.nfs_reconcile_attempts = runtime.nfs_reconcile_attempts.saturating_add(1);
+        runtime.next_nfs_reconcile_at = now + retry_delay(runtime.nfs_reconcile_attempts);
+        if let Some(health) = runtime.health.as_mut() {
+            health.ready = false;
+            health.retry_at = runtime.next_nfs_reconcile_at;
+        }
+        runtime.last_probe_error = Some(
+            format!("NFS reconciliation deferred: {error}")
+                .chars()
+                .take(256)
+                .collect(),
+        );
+        eprintln!("macluster: NFS reconciliation for {node_id} deferred: {error}");
     }
 
     fn schedule_share_probe<T: NodeTransport>(&mut self, service: &ControllerService<T>) {
@@ -1655,7 +2038,11 @@ impl RuntimeState {
         queues: &[String],
     ) -> Result<(), ControllerError> {
         service.refresh_reset_barrier_policy()?;
-        if !self.share_ready(Instant::now()) || !service.dispatch_allowed() || queues.is_empty() {
+        if !self.share_ready(Instant::now())
+            || self.nfs_cleanup_journal_blocked
+            || !service.dispatch_allowed()
+            || queues.is_empty()
+        {
             return Ok(());
         }
         let now = Instant::now();
@@ -1820,7 +2207,9 @@ impl RuntimeState {
                     online,
                     agent_current: health_fresh
                         && health.is_some_and(|health| health.agent_current),
-                    storage_ready: self.share_ready(now) && node_storage_ready,
+                    storage_ready: self.share_ready(now)
+                        && node_storage_ready
+                        && !self.nfs_cleanup_journal_blocked,
                     drain_requested: service.node_is_maintenance_scoped(id),
                     occupied: busy,
                     interactive_pty,
@@ -2063,13 +2452,14 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                     &candidate_config_digest,
                                     &candidate_journal_digest,
                                 ) {
-                                    Ok((next_config, scope)) => {
+                                    Ok((next_config, next_config_toml, scope)) => {
                                         let old_digest = runtime.digest.clone();
                                         match service.reload_quiescent_config(
                                             next_config.clone(),
                                             &scope,
                                         ) {
                                             Ok(()) => {
+                                                service.set_config_toml_snapshot(next_config_toml);
                                                 runtime.apply_config_reload(
                                                     service,
                                                     old_digest,
@@ -2416,6 +2806,23 @@ fn retry_delay(failures: u8) -> Duration {
     Duration::from_secs(seconds)
 }
 
+fn remove_acknowledged_nfs_cleanup(
+    state_dir: &std::path::Path,
+    acknowledged: &NfsCleanupAck,
+) -> io::Result<()> {
+    if acknowledged.clients.is_empty() && acknowledged.markers.is_empty() {
+        return Ok(());
+    }
+    let mut state = DeferredShareCleanupState::load_from_dir(state_dir)?;
+    for entry in &acknowledged.clients {
+        state.remove_client_cleanup_exact(entry);
+    }
+    for entry in &acknowledged.markers {
+        state.remove_marker_cleanup_exact(entry);
+    }
+    state.save_to_dir(state_dir)
+}
+
 fn node_result_is_current(
     tag: &WorkTag,
     epoch: ControllerEpoch,
@@ -2423,10 +2830,14 @@ fn node_result_is_current(
     generation: u64,
     now: Instant,
 ) -> bool {
+    let max_age = match tag.kind {
+        WorkKind::ReconcileNfs => MAX_NFS_RECONCILE_RESULT_AGE,
+        _ => MAX_WORK_RESULT_AGE,
+    };
     tag.epoch == epoch
         && tag.config_digest == config_digest
         && tag.generation == generation
-        && now.saturating_duration_since(tag.started_at) <= MAX_WORK_RESULT_AGE
+        && now.saturating_duration_since(tag.started_at) <= max_age
 }
 
 fn now_ms() -> u64 {
@@ -2450,23 +2861,51 @@ fn should_measure_job_storage(
 mod tests {
     use super::{
         IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL,
-        NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState,
-        WakeForwarder, WorkKind, WorkTag, WorkerCompletion, WorkerPool, WorkerResult,
-        maintenance_drain_complete, node_probe_retry_delay, node_result_is_current, now_ms,
-        pending_queue_heads, probe_delay, reset_drain_complete, retry_delay, run_forever,
-        should_measure_job_storage,
+        NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache,
+        RuntimeState, WakeForwarder, WorkKind, WorkTag, WorkerCompletion, WorkerPool, WorkerResult,
+        health_retry_delay, maintenance_drain_complete, node_probe_retry_delay,
+        node_result_is_current, now_ms, pending_queue_heads, probe_delay, reset_drain_complete,
+        retry_delay, run_forever, should_measure_job_storage,
     };
     use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
+    use macluster_core::nfs_reconcile::{
+        DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
+        DeferredShareMarkerCleanup, client_cleanup_key, marker_cleanup_key,
+    };
     use macluster_core::scheduler::next_dispatch;
     use macluster_protocol::control::MaintenanceScope;
     use macluster_protocol::{
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
-        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState},
+        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, Operation, ResponseBody},
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     struct IsolatedNodeTransport;
+
+    struct NfsReconcileTransport {
+        operations: Arc<Mutex<Vec<Operation>>>,
+        fail: bool,
+    }
+
+    impl crate::transport::NodeTransport for NfsReconcileTransport {
+        fn call(
+            &self,
+            _node_id: &NodeId,
+            _node: &macluster_core::config::NodeConfig,
+            operation: Operation,
+        ) -> Result<ResponseBody, crate::transport::TransportError> {
+            self.operations.lock().unwrap().push(operation);
+            if self.fail {
+                Err(crate::transport::TransportError::Timeout)
+            } else {
+                Ok(ResponseBody::Ack)
+            }
+        }
+    }
 
     #[test]
     fn job_storage_scan_requires_fresh_shared_storage_health() {
@@ -2923,6 +3362,427 @@ scheduler = "fifo"
             shared_root.display()
         ))
         .unwrap()
+    }
+
+    fn nfs_reconcile_config_source(root: &std::path::Path) -> String {
+        let shared_root = root.join("shared");
+        std::fs::create_dir_all(&shared_root).unwrap();
+        format!(
+            "[cluster]\nname = \"test\"\ndefault_queue = \"mini01\"\nlogin_node = \"login\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.mini01]\nnodes = [\"login\", \"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdee\"\nexecution_uid = 501\n",
+            shared_root.display()
+        )
+    }
+
+    #[test]
+    fn ready_agent_retries_unacknowledged_cleanup_and_only_clears_acknowledged_tombstones() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-nfs-reconcile-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+
+        let client = DeferredShareClientCleanup {
+            share_id: "old_data".into(),
+            node_id: "worker".into(),
+            source_root: "/srv/old_data".into(),
+            mount_root: "/mnt/old_data".into(),
+            server_host: "192.0.2.9".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+        };
+        let marker = DeferredShareMarkerCleanup {
+            share_id: "old_data".into(),
+            node_id: "worker".into(),
+            source_root: "/srv/old_data".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+        };
+        let mut journal = DeferredShareCleanupState {
+            version: 1,
+            ..DeferredShareCleanupState::default()
+        };
+        journal.entries.insert(
+            client_cleanup_key("old_data", "worker", &client.share_uuid),
+            client,
+        );
+        journal.marker_entries.insert(
+            marker_cleanup_key("old_data", "worker", &marker.share_uuid),
+            marker,
+        );
+        journal.save_to_dir(service.storage.root()).unwrap();
+
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: true,
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+        assert_eq!(
+            runtime.nodes["worker"].in_flight.unwrap().kind,
+            WorkKind::ReconcileNfs
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.nodes["worker"].health.is_some() {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "NFS reconciliation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let operations = operations.lock().unwrap();
+        assert_eq!(operations.len(), 1, "reconciliation must be single-flight");
+        let Operation::ReconcileNfs {
+            config_toml,
+            obsolete_mounts,
+            obsolete_aliases,
+            obsolete_markers,
+            ..
+        } = &operations[0]
+        else {
+            panic!("expected an NFS reconciliation operation")
+        };
+        assert!(config_toml.contains("name = \"test\""));
+        assert_eq!(obsolete_mounts.len(), 1);
+        assert_eq!(obsolete_mounts[0].source, "192.0.2.9:/srv/old_data");
+        assert_eq!(obsolete_aliases.len(), 1);
+        assert_eq!(obsolete_markers.len(), 1);
+        drop(operations);
+
+        let remaining = DeferredShareCleanupState::load_from_dir(service.storage.root()).unwrap();
+        assert!(remaining.entries.is_empty());
+        assert!(remaining.marker_entries.is_empty());
+        assert!(runtime.nodes["worker"].health.is_none());
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn returning_node_with_stale_config_is_reconciled_without_a_cleanup_tombstone() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-stale-config-reconcile-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: false,
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+        assert_eq!(
+            runtime.nodes["worker"].in_flight.unwrap().kind,
+            WorkKind::ReconcileNfs,
+            "a returning node with a stale config must receive the current config before it can become schedulable"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.nodes["worker"].in_flight.is_some() {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "config reconciliation did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let operations = operations.lock().unwrap();
+        assert_eq!(operations.len(), 1, "reconciliation must be single-flight");
+        assert!(matches!(
+            &operations[0],
+            Operation::ReconcileNfs { config_toml, .. } if config_toml.contains("name = \"test\"")
+        ));
+        drop(operations);
+        assert!(runtime.nodes["worker"].health.is_none());
+
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scoped_maintenance_blocks_nfs_reconciliation_of_drained_node() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-nfs-maintenance-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+        service.set_maintenance_scope(Some(MaintenanceScope::Nodes(vec![
+            NodeId::new("worker").unwrap(),
+        ])));
+
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: false,
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+
+        assert!(runtime.nodes["worker"].in_flight.is_none());
+        assert!(operations.lock().unwrap().is_empty());
+
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unrecoverable_cleanup_journal_blocks_dispatch_until_repaired() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-nfs-reconcile-corrupt-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+        std::fs::write(
+            service.storage.root().join(DEFERRED_SHARE_CLEANUP_FILE),
+            b"not valid json",
+        )
+        .unwrap();
+
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: true,
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+        runtime.share_ready = Some((true, now));
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+
+        assert!(runtime.nodes["worker"].health.as_ref().unwrap().ready);
+        assert!(runtime.nodes["worker"].in_flight.is_none());
+        assert!(operations.lock().unwrap().is_empty());
+        assert!(
+            !runtime
+                .availability(&service, now)
+                .iter()
+                .find(|node| node.id.as_str() == "worker")
+                .unwrap()
+                .storage_ready,
+            "an unreadable cleanup journal must not silently permit dispatch"
+        );
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_nfs_cleanup_keeps_a_node_unschedulable_during_retry_backoff() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-nfs-reconcile-backoff-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+        let cleanup = DeferredShareClientCleanup {
+            share_id: "removed".into(),
+            node_id: "worker".into(),
+            source_root: "/srv/removed".into(),
+            mount_root: "/mnt/removed".into(),
+            server_host: "192.0.2.9".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+        };
+        let mut journal = DeferredShareCleanupState::default();
+        journal.entries.insert(
+            client_cleanup_key("removed", "worker", &cleanup.share_uuid),
+            cleanup,
+        );
+        journal.save_to_dir(service.storage.root()).unwrap();
+
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: true,
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+        worker.next_nfs_reconcile_at = now + Duration::from_secs(30);
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+
+        assert!(!runtime.nodes["worker"].health.as_ref().unwrap().ready);
+        assert!(runtime.nodes["worker"].in_flight.is_none());
+        assert!(operations.lock().unwrap().is_empty());
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn submit_dispatch_test_job(
@@ -4045,6 +4905,18 @@ scheduler = "fifo"
         node.health.as_mut().unwrap().retry_at = sampled_at + NODE_HEALTH_TTL;
         assert!(!node.health_probe_due(sampled_at + Duration::from_secs(30)));
         assert!(node.health_probe_due(sampled_at + NODE_HEALTH_TTL));
+
+        node.health.as_mut().unwrap().agent_current = false;
+        node.health.as_mut().unwrap().retry_at =
+            sampled_at + health_retry_delay(true, false, false);
+        assert!(!node.health_probe_due(sampled_at + Duration::from_secs(4)));
+        assert!(
+            !node.health_probe_due(sampled_at + NODE_STALE_AGENT_RETRY - Duration::from_secs(1))
+        );
+        assert!(node.health_probe_due(sampled_at + NODE_STALE_AGENT_RETRY));
+        assert_eq!(health_retry_delay(false, false, false), NODE_HEALTH_RETRY);
+        assert_eq!(health_retry_delay(true, false, true), NODE_HEALTH_RETRY);
+        assert_eq!(health_retry_delay(true, true, true), NODE_HEALTH_TTL);
     }
 
     #[test]
@@ -4302,6 +5174,23 @@ transport = "ssh"
             "config-a",
             3,
             now + Duration::from_secs(13),
+        ));
+
+        let mut reconcile_tag = tag;
+        reconcile_tag.kind = WorkKind::ReconcileNfs;
+        assert!(node_result_is_current(
+            &reconcile_tag,
+            epoch,
+            "config-a",
+            3,
+            now + Duration::from_secs(13),
+        ));
+        assert!(!node_result_is_current(
+            &reconcile_tag,
+            epoch,
+            "config-a",
+            3,
+            now + Duration::from_secs(181),
         ));
     }
 }

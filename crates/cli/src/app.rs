@@ -417,6 +417,65 @@ fn should_block_agent_update_for_pending_node_recovery(
         && !should_defer_agent_update_for_node_recovery(command, recovery_pending)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControllerStartupPolicy {
+    dispatch_enabled: bool,
+    lifecycle: ControllerLifecycle,
+    peer_config_sync_pending: bool,
+}
+
+fn controller_startup_policy(
+    peer_config_sync_pending: bool,
+    address_migration_pending: bool,
+    maintenance_pending: bool,
+) -> ControllerStartupPolicy {
+    ControllerStartupPolicy {
+        // A config that has been committed locally remains authoritative. The
+        // controller fences any peer that has not received it via its health
+        // digest check and reconciles that peer when it reconnects; do not
+        // pause unrelated healthy nodes while a peer is offline.
+        dispatch_enabled: !address_migration_pending,
+        lifecycle: if address_migration_pending {
+            ControllerLifecycle::RecoveryPending
+        } else if maintenance_pending {
+            ControllerLifecycle::Paused
+        } else {
+            ControllerLifecycle::Ready
+        },
+        peer_config_sync_pending,
+    }
+}
+
+fn recover_controller_generation_if_committed_node_config(
+    maintenance: &mut macluster_controller::maintenance::MaintenanceCoordinator,
+    config_path: &Path,
+    state_dir: &Path,
+    active_config_digest: &str,
+    maintenance_barrier_active: bool,
+    reset_barrier_active: bool,
+) -> Result<bool, String> {
+    if !maintenance.startup_config_mismatch()
+        || maintenance.inspect().is_some()
+        || maintenance_barrier_active
+        || reset_barrier_active
+    {
+        return Ok(false);
+    }
+    let previous_digest = maintenance.config_digest().to_owned();
+    if !crate::node_admin::has_committed_config_generation_path(
+        config_path,
+        state_dir,
+        &previous_digest,
+        active_config_digest,
+    )? {
+        return Ok(false);
+    }
+    maintenance
+        .recover_committed_config_transition(&previous_digest, active_config_digest)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
 // Read-only inspection and cancellation must remain usable from scripts even
 // when a new build needs privileged installation. Submissions still fail closed.
 fn defer_update_without_terminal(
@@ -546,7 +605,10 @@ fn preflight_agent_update_with_compatibility(
         && !checked_compatibility
             .as_ref()
             .is_some_and(|compatibility| compatibility.requires_update())
-        && !crate::node_admin::configured_agent_build_mismatch_local(&config)?
+        && !crate::node_admin::configured_agent_build_mismatch_local(
+            &config,
+            &state_dir.join("mtop-cache"),
+        )?
     {
         return Ok(());
     }
@@ -5492,16 +5554,26 @@ fn controller(
                     )
                 })?;
             let config = load_config(global.config.as_deref()).map_err(config_error)?;
+            let config_toml = fs::read_to_string(&config_file).map_err(|error| {
+                (
+                    1,
+                    format!("cannot read controller config snapshot: {error}"),
+                )
+            })?;
             let storage = Storage::open(&state_dir).map_err(operation_error)?;
-            let mut service = macluster_controller::ControllerService::new(
-                config.clone(),
-                storage,
+            let mut cluster_transport =
                 macluster_controller::transport::ClusterTransport::new_with_namespace(
                     config_file.clone(),
                     config.share_uuid.clone(),
-                ),
+                );
+            cluster_transport.set_agent_cache_root(state_dir.join("mtop-cache"));
+            let mut service = macluster_controller::ControllerService::new(
+                config.clone(),
+                storage,
+                cluster_transport,
             )
             .map_err(|error| (1, error.to_string()))?;
+            service.set_config_toml_snapshot(config_toml);
             if let Some((_, login)) = config
                 .nodes
                 .iter()
@@ -5548,14 +5620,23 @@ fn controller(
                 barrier_config,
                 state_dir.clone(),
             );
-            let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir)
-                .map_err(|error| (1, error))?;
+            let sync_pending =
+                crate::node_admin::peer_config_sync_pending(&config_file, &state_dir)
+                    .map_err(|error| (1, error))?;
             let address_migration = address_migration_deferred
                 || crate::node_admin::address_migration_pending(&state_dir);
-            service.set_dispatch_enabled(!sync_pending && !address_migration);
-            if sync_pending {
+            let maintenance_barrier_active =
+                macluster_core::maintenance::maintenance_barrier_path(&config_file).exists();
+            let reset_barrier_active = crate::init::reset::journal_path(&config_file).exists();
+            let startup_policy = controller_startup_policy(
+                sync_pending,
+                address_migration,
+                maintenance_barrier_active,
+            );
+            service.set_dispatch_enabled(startup_policy.dispatch_enabled);
+            if startup_policy.peer_config_sync_pending {
                 eprintln!(
-                    "macluster: peer config synchronization is pending; controller will reconcile status and cancellations but will not dispatch new jobs"
+                    "macluster: peer config synchronization is pending; nodes with stale configuration remain out of scheduling until they reconnect and reconcile"
                 );
             }
             if address_migration_deferred {
@@ -5563,15 +5644,7 @@ fn controller(
                     "Browser monitoring will start, but new job dispatch is paused until the login node address can be verified."
                 );
             }
-            let maintenance_pending =
-                macluster_core::maintenance::maintenance_barrier_path(&config_file).exists();
-            let lifecycle = if sync_pending || address_migration {
-                ControllerLifecycle::RecoveryPending
-            } else if maintenance_pending {
-                ControllerLifecycle::Paused
-            } else {
-                ControllerLifecycle::Ready
-            };
+            let lifecycle = startup_policy.lifecycle;
             let mut control_listener = None;
             let mut control_maintenance = None;
             let control_hello = if once {
@@ -5583,17 +5656,38 @@ fn controller(
                     fs::read(&config_file).map_err(|error| (1, error.to_string()))?;
                 let config_digest =
                     sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
-                let maintenance = macluster_controller::maintenance::MaintenanceCoordinator::open(
+                let mut maintenance =
+                    macluster_controller::maintenance::MaintenanceCoordinator::open(
+                        &state_dir,
+                        binding.binding_digest(),
+                        &config_digest,
+                    )
+                    .map_err(|error| {
+                        (
+                            1,
+                            format!("controller maintenance metadata failed: {error}"),
+                        )
+                    })?;
+                if recover_controller_generation_if_committed_node_config(
+                    &mut maintenance,
+                    &config_file,
                     &state_dir,
-                    binding.binding_digest(),
                     &config_digest,
+                    maintenance_barrier_active,
+                    reset_barrier_active,
                 )
                 .map_err(|error| {
                     (
                         1,
-                        format!("controller maintenance metadata failed: {error}"),
+                        format!(
+                            "cannot recover the committed controller config generation: {error}"
+                        ),
                     )
-                })?;
+                })? {
+                    eprintln!(
+                        "macluster: recovered the controller config generation from a committed node operation; stale nodes will reconcile when they reconnect"
+                    );
+                }
                 if maintenance.startup_config_mismatch() {
                     service.set_maintenance_recovery_blocked(true);
                     eprintln!(
@@ -5702,9 +5796,8 @@ fn controller(
                                 Ok(_) => {
                                     let next = load_config(global.config.as_deref()).map_err(|error| io::Error::other(error.to_string()))?;
                                     service.apply_idle_address_config(next)?;
-                                    let sync_pending = crate::node_admin::dispatch_sync_pending(&config_file, &state_dir).map_err(io::Error::other)?;
                                     let address_pending = crate::node_admin::address_migration_pending(&state_dir);
-                                    service.set_dispatch_enabled(!sync_pending && !address_pending);
+                                    service.set_dispatch_enabled(!address_pending);
                                     pending.store(false, std::sync::atomic::Ordering::SeqCst);
                                     address_errors.clear();
                                     Ok(true)
@@ -6922,18 +7015,20 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         Some("agent-stdio") => {
             let node = option_value(args, "--node")?
                 .ok_or_else(|| (2, "agent-stdio requires --node ID".into()))?;
-            let config = load_config(global.config.as_deref()).map_err(config_error)?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
             let state_dir = global
                 .state_dir
                 .unwrap_or_else(macluster_agent::default_state_dir);
             let stdin = io::stdin();
             let stdout = io::stdout();
-            macluster_agent::serve_stdio(
+            macluster_agent::serve_stdio_with_config_path(
                 &mut stdin.lock(),
                 &mut stdout.lock(),
                 &config,
                 &state_dir,
                 &node,
+                &config_path,
             )
             .map_err(|error| (1, error.to_string()))
         }
@@ -7353,12 +7448,12 @@ mod tests {
     };
 
     use super::{
-        ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
-        aggregate_metrics, build_submission, cached_monitor_samples,
+        ACTIVE_ENV_PREFIX_ENV, CARGO_HOME_SEED_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV,
+        NodeMetricRow, aggregate_metrics, build_submission, cached_monitor_samples,
         can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
-        explain_legacy_power_agent, format_job_details, format_jobs_table, format_power,
-        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
-        prepare_task_environment, promote_inline_command,
+        controller_startup_policy, explain_legacy_power_agent, format_job_details,
+        format_jobs_table, format_power, is_macluster_binary_path, maybe_run_agent_update,
+        metric_row, metric_table_header, prepare_task_environment, promote_inline_command,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
     };
@@ -7372,6 +7467,25 @@ mod tests {
         identifiers::{Id128, NodeId, QueueName},
         types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, MetricSnapshot},
     };
+
+    #[test]
+    fn pending_peer_config_sync_does_not_pause_healthy_cluster_dispatch() {
+        let policy = controller_startup_policy(true, false, false);
+        assert!(policy.peer_config_sync_pending);
+        assert!(policy.dispatch_enabled);
+        assert_eq!(policy.lifecycle, ControllerLifecycle::Ready);
+
+        let address_migration = controller_startup_policy(false, true, false);
+        assert!(!address_migration.dispatch_enabled);
+        assert_eq!(
+            address_migration.lifecycle,
+            ControllerLifecycle::RecoveryPending
+        );
+
+        let maintenance = controller_startup_policy(false, false, true);
+        assert!(maintenance.dispatch_enabled);
+        assert_eq!(maintenance.lifecycle, ControllerLifecycle::Paused);
+    }
 
     #[test]
     fn web_shortcut_only_accepts_loopback_and_maps_controller_options() {
@@ -8572,7 +8686,7 @@ mod tests {
     }
 
     #[test]
-    fn msub_remaps_cargo_and_rustup_homes() {
+    fn msub_seeds_shared_cargo_cache_and_remaps_rustup_homes() {
         use std::fs;
 
         let root = std::env::temp_dir().join(format!(
@@ -8607,8 +8721,9 @@ mod tests {
 
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
 
+        assert!(!task_env.contains_key("CARGO_HOME"));
         assert_eq!(
-            task_env["CARGO_HOME"],
+            task_env[CARGO_HOME_SEED_ENV],
             software_root.join(".cargo").to_string_lossy()
         );
         assert_eq!(

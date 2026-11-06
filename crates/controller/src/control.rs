@@ -135,7 +135,7 @@ impl ControlApi {
         ticket: &MaintenanceTicket,
         candidate_config_digest: &str,
         candidate_journal_digest: &str,
-    ) -> Result<(ClusterConfig, MaintenanceScope), ControlError> {
+    ) -> Result<(ClusterConfig, String, MaintenanceScope), ControlError> {
         let manager = self
             .maintenance
             .as_mut()
@@ -176,7 +176,7 @@ impl ControlApi {
                 &actual_journal_digest,
             )
             .map_err(maintenance_manager_error)?;
-        Ok((config, status.scope))
+        Ok((config, source.to_owned(), status.scope))
     }
 
     pub fn finish_maintenance_completion(

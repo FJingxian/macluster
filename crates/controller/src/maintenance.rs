@@ -268,6 +268,36 @@ impl MaintenanceCoordinator {
         self.startup_config_mismatch
     }
 
+    /// Adopt a config generation only after the caller has verified a
+    /// committed node-admin journal transition from the current generation to
+    /// this active config. This repairs the case where maintenance stopped the
+    /// controller before the config transaction committed locally.
+    pub fn recover_committed_config_transition(
+        &mut self,
+        previous_config_digest: &str,
+        candidate_config_digest: &str,
+    ) -> Result<(), MaintenanceError> {
+        if self.session.is_some()
+            || !self.startup_config_mismatch
+            || self.generation_record.config_digest != previous_config_digest
+            || candidate_config_digest == previous_config_digest
+        {
+            return Err(MaintenanceError::StaleTicket);
+        }
+        self.generation_record = GenerationRecord {
+            version: GENERATION_VERSION,
+            binding_digest: self.binding_digest.clone(),
+            generation: self.generation_record.generation.saturating_add(1),
+            config_digest: candidate_config_digest.to_owned(),
+        };
+        write_json_atomic(
+            &self.state_dir.join("controller-generation.json"),
+            &self.generation_record,
+        )?;
+        self.startup_config_mismatch = false;
+        Ok(())
+    }
+
     pub fn scope(&self) -> Option<MaintenanceScope> {
         self.session.as_ref().map(|record| record.scope.clone())
     }
@@ -831,6 +861,29 @@ mod tests {
 
         let recovered = MaintenanceCoordinator::open(&fixture.0, "binding-a", "config-b").unwrap();
         assert!(recovered.startup_config_mismatch());
+    }
+
+    #[test]
+    fn verified_committed_config_change_can_advance_generation_after_controller_was_stopped() {
+        let fixture = Fixture::new();
+        let coordinator =
+            MaintenanceCoordinator::open(&fixture.0, "binding-a", "config-a").unwrap();
+        drop(coordinator);
+
+        let mut recovered =
+            MaintenanceCoordinator::open(&fixture.0, "binding-a", "config-b").unwrap();
+        assert!(recovered.startup_config_mismatch());
+        recovered
+            .recover_committed_config_transition("config-a", "config-b")
+            .unwrap();
+
+        assert_eq!(recovered.generation(), 1);
+        assert_eq!(recovered.config_digest(), "config-b");
+        assert!(!recovered.startup_config_mismatch());
+
+        let reopened = MaintenanceCoordinator::open(&fixture.0, "binding-a", "config-b").unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert!(!reopened.startup_config_mismatch());
     }
 
     #[test]

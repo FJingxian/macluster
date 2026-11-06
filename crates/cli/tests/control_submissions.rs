@@ -273,7 +273,7 @@ fn online_submit_is_idempotent_and_request_id_reuse_conflicts() {
 }
 
 #[test]
-fn online_job_lookup_and_queue_summary_reflect_durable_submissions() {
+fn submissions_remain_pending_until_a_compute_node_is_online() {
     let fixture = Fixture::new();
     let (mut api, mut listener, binding) = setup(&fixture, ControllerLifecycle::Ready);
     let request_id = RequestId::random();

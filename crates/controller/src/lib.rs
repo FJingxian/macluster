@@ -56,6 +56,7 @@ pub enum ControllerError {
 
 pub struct ControllerService<T: NodeTransport> {
     pub(crate) config: ClusterConfig,
+    pub(crate) config_toml_snapshot: Option<String>,
     pub(crate) storage: Storage,
     pub(crate) transport: Arc<T>,
     pub(crate) epoch: ControllerEpoch,
@@ -79,6 +80,7 @@ impl<T: NodeTransport> ControllerService<T> {
         let epoch = storage.begin_controller_epoch()?;
         Ok(Self {
             config,
+            config_toml_snapshot: None,
             storage,
             transport: Arc::new(transport),
             epoch,
@@ -92,6 +94,10 @@ impl<T: NodeTransport> ControllerService<T> {
             maintenance_barrier_context: None,
             maintenance_scope: None,
         })
+    }
+
+    pub fn set_config_toml_snapshot(&mut self, snapshot: String) {
+        self.config_toml_snapshot = Some(snapshot);
     }
 
     pub fn set_dispatch_enabled(&mut self, enabled: bool) {
@@ -226,6 +232,18 @@ impl<T: NodeTransport> ControllerService<T> {
     pub fn tick_with_storage_health(&mut self, storage_ready: bool) -> Result<(), ControllerError> {
         let reset_policy = self.refresh_reset_barrier_policy()?;
         self.refresh_maintenance_barrier()?;
+        let cleanup_journal_ready =
+            match macluster_core::nfs_reconcile::DeferredShareCleanupState::load_from_dir(
+                self.storage.root(),
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    eprintln!(
+                        "macluster: both NFS cleanup journal copies are unavailable; job dispatch is paused until the journal is restored: {error}"
+                    );
+                    false
+                }
+            };
         if storage_ready && !reset_policy.is_some_and(|policy| policy.discard_terminal_sync) {
             let pending: Vec<_> = self
                 .storage
@@ -340,7 +358,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     idle_since_unix_ms: idle_since,
                     online,
                     agent_current,
-                    storage_ready: storage_ready && node_storage_ready,
+                    storage_ready: storage_ready && node_storage_ready && cleanup_journal_ready,
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
@@ -354,7 +372,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     idle_since_unix_ms: 0,
                     online,
                     agent_current,
-                    storage_ready,
+                    storage_ready: storage_ready && cleanup_journal_ready,
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
@@ -365,7 +383,7 @@ impl<T: NodeTransport> ControllerService<T> {
 
         self.deliver_cancellations()?;
         self.refresh_reset_barrier_policy()?;
-        if !storage_ready || !self.dispatch_allowed() {
+        if !storage_ready || !cleanup_journal_ready || !self.dispatch_allowed() {
             return Ok(());
         }
 

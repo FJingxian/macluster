@@ -13,7 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs},
     os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::process::CommandExt,
@@ -27,8 +27,13 @@ use std::{
 use macluster_controller::ssh::{ConnectionKey, SshPool};
 use macluster_controller::transport::{ClusterTransport, NodeTransport};
 use macluster_core::{
+    agent_update::AutoAgentUpdateReceipts,
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
+    nfs_reconcile::{
+        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareMarkerCleanup,
+        client_cleanup_key, marker_cleanup_key,
+    },
     service::ServiceBinding,
     storage::{ReadOnlyJobStore, Storage},
 };
@@ -61,7 +66,6 @@ const NFS_EXPORTS_TEMP_PATH: &str = "/etc/exports.macluster.tmp";
 const NFS_EXPORTS_BACKUP_PATH: &str = "/etc/exports.macluster.bak";
 const NFS_DAEMON_PATH: &str = "/sbin/nfsd";
 const POWER_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/org.macluster.power";
-const DEFERRED_SHARE_CLEANUP_FILE: &str = "deferred-share-cleanup.json";
 const NFS_ADMIN_CLI_PATH: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs-admin";
 const NFS_ADMIN_VERSION_PATH: &str =
     "/Library/PrivilegedHelperTools/org.macluster.nfs-admin.version";
@@ -425,6 +429,28 @@ fn try_acquire_live_maintenance(
         .set_timeouts(Duration::from_secs(5))
         .map_err(control_client_error)?;
     let client_lock = acquire_maintenance_client_lock(state_dir)?;
+    let current_build =
+        crate::service::current_executable_build_id().map_err(|error| (1, error.to_string()))?;
+    if client.hello().build_id != current_build {
+        eprintln!(
+            "Controller build mismatch detected; refreshing the idle controller before {operation}."
+        );
+        crate::service::ServiceManager::current(binding.clone())
+            .map_err(|error| (1, error.to_string()))?
+            .ensure_running(Duration::from_secs(10))
+            .map_err(|error| (1, error.to_string()))?;
+        client = ControlClient::connect(&binding, Duration::from_secs(5))
+            .map_err(control_client_error)?;
+        if client.hello().build_id != current_build {
+            return Err((
+                1,
+                "controller did not restart with the current macluster build; retry the maintenance command".into(),
+            ));
+        }
+        client
+            .set_timeouts(Duration::from_secs(5))
+            .map_err(control_client_error)?;
+    }
     let config = read_config(config_path)?;
     if let MaintenanceScope::Nodes(nodes) = &mut scope {
         nodes.sort();
@@ -1938,7 +1964,7 @@ pub fn ensure_controller_recovery_clean(
     Ok(())
 }
 
-pub fn dispatch_sync_pending(config_path: &Path, state_dir: &Path) -> Result<bool, String> {
+pub fn peer_config_sync_pending(config_path: &Path, state_dir: &Path) -> Result<bool, String> {
     let canonical = config_path
         .canonicalize()
         .map_err(|error| format!("cannot resolve cluster config: {error}"))?;
@@ -1955,6 +1981,53 @@ pub fn dispatch_sync_pending(config_path: &Path, state_dir: &Path) -> Result<boo
         operation.phase == "SYNC_PENDING"
             && operation.candidate_config_sha256.as_deref() == Some(digest.as_str())
     }))
+}
+
+pub(crate) fn has_committed_config_generation_path(
+    config_path: &Path,
+    state_dir: &Path,
+    previous_config_digest: &str,
+    active_config_digest: &str,
+) -> Result<bool, String> {
+    if previous_config_digest == active_config_digest {
+        return Ok(false);
+    }
+    let canonical = config_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve cluster config: {error}"))?;
+    let journal_path = state_dir.join("node-admin.json");
+    if !journal_path.exists() {
+        return Ok(false);
+    }
+    let state =
+        read_admin_state(&journal_path, &canonical, state_dir).map_err(|(_, error)| error)?;
+    let mut reachable_digests = BTreeSet::from([previous_config_digest.to_owned()]);
+    loop {
+        let before = reachable_digests.len();
+        for operation in state.operations.values() {
+            if !matches!(
+                operation.phase.as_str(),
+                "SYNC_PENDING" | "READY" | "REMOVED"
+            ) {
+                continue;
+            }
+            let (Some(old), Some(candidate)) = (
+                operation.old_config_sha256.as_deref(),
+                operation.candidate_config_sha256.as_deref(),
+            ) else {
+                continue;
+            };
+            if reachable_digests.contains(old) {
+                reachable_digests.insert(candidate.to_owned());
+            }
+        }
+        if reachable_digests.contains(active_config_digest) {
+            return Ok(true);
+        }
+        if reachable_digests.len() == before {
+            return Ok(false);
+        }
+    }
 }
 
 pub(crate) fn agent_update_recovery_pending(
@@ -2320,7 +2393,7 @@ struct AgentValidationCache {
 }
 
 const AGENT_VALIDATION_CACHE_TTL_MS: u64 = 60_000;
-const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 3;
+const AGENT_VALIDATION_CACHE_SCHEMA: u32 = 4;
 const AGENT_VALIDATION_CACHE_MAX_BYTES: u64 = 64 * 1024;
 const HELPER_REFRESH_PENDING_FILE: &str = "agent-helper-refresh.pending";
 const HELPER_REFRESH_PENDING_SCHEMA: u32 = 1;
@@ -2337,13 +2410,17 @@ pub(crate) fn current_agent_sha256() -> AppResult<String> {
     local_sha256(&executable)
 }
 
-pub(crate) fn configured_agent_build_compatibility(
+fn configured_agent_build_compatibility_excluding_offline(
     config: &ClusterConfig,
+    confirmed_offline: &BTreeSet<String>,
 ) -> AppResult<AgentBuildCompatibility> {
     let current_digest = current_agent_sha256()?;
     let mut legacy_ssh = Vec::new();
     let mut compatibility = classify_configured_agents(config, |node_id, node| {
-        if node.transport == Transport::Ssh && managed_binary_digest(&node.remote_binary).is_none()
+        if confirmed_offline.contains(node_id) {
+            AgentBuildState::Unknown
+        } else if node.transport == Transport::Ssh
+            && managed_binary_digest(&node.remote_binary).is_none()
         {
             legacy_ssh.push((node_id.to_owned(), node.clone()));
             AgentBuildState::Unknown
@@ -2354,12 +2431,14 @@ pub(crate) fn configured_agent_build_compatibility(
 
     // A legacy path has no digest in the config. Probe all such nodes in
     // parallel so one offline host does not delay a blocked submission by
-    // one SSH timeout per queue member.
+    // one SSH timeout per queue member. Confirmed offline nodes are omitted;
+    // their Unknown state is retried when liveness changes.
     let probed = bounded_legacy_agent_probes(legacy_ssh, &current_digest);
     for (node_id, state) in probed {
         compatibility.record(node_id, state);
     }
-    compatibility.missing_required_features = bounded_agent_feature_probes(config);
+    compatibility.missing_required_features =
+        bounded_agent_feature_probes(config, confirmed_offline);
     Ok(compatibility)
 }
 
@@ -2371,7 +2450,6 @@ pub(crate) fn reachable_configured_node_ids(
     candidates: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     const WORKERS: usize = 32;
-    const ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
     let tasks =
         Mutex::new(VecDeque::from_iter(candidates.iter().filter_map(|id| {
             config.nodes.get(id).cloned().map(|node| (id.clone(), node))
@@ -2389,17 +2467,7 @@ pub(crate) fn reachable_configured_node_ids(
                         else {
                             break;
                         };
-                        let online = if node.transport == Transport::Local {
-                            true
-                        } else {
-                            node.host.parse::<IpAddr>().ok().is_some_and(|ip| {
-                                TcpStream::connect_timeout(
-                                    &SocketAddr::new(ip, node.ssh_port.unwrap_or(22)),
-                                    ENDPOINT_TIMEOUT,
-                                )
-                                .is_ok()
-                            })
-                        };
+                        let online = node_ssh_endpoint_reachable(&node);
                         if online {
                             reachable.push(id);
                         }
@@ -2416,12 +2484,16 @@ pub(crate) fn reachable_configured_node_ids(
 }
 
 /// Check locally available build evidence without contacting any node.
-pub(crate) fn configured_agent_build_mismatch_local(config: &ClusterConfig) -> AppResult<bool> {
+pub(crate) fn configured_agent_build_mismatch_local(
+    config: &ClusterConfig,
+    cache_root: &Path,
+) -> AppResult<bool> {
     let digest = current_agent_sha256()?;
-    Ok(config
-        .nodes
-        .values()
-        .any(|node| inspect_configured_agent_build(node, &digest) == AgentBuildState::Stale))
+    let receipts = AutoAgentUpdateReceipts::load_from_dir(cache_root).unwrap_or_default();
+    Ok(config.nodes.iter().any(|(node_id, node)| {
+        inspect_configured_agent_build(node, &digest) == AgentBuildState::Stale
+            && !auto_agent_update_receipt_matches(&receipts, config, node_id, node)
+    }))
 }
 
 pub(crate) fn configured_agent_build_compatibility_cached(
@@ -2436,14 +2508,22 @@ pub(crate) fn configured_agent_build_compatibility_cached_with_age(
     config: &ClusterConfig,
     cache_root: &Path,
 ) -> AppResult<(AgentBuildCompatibility, u64)> {
-    let key = agent_validation_cache_key(config)?;
+    let confirmed_offline = configured_offline_probe_exclusions_from_cache(config, cache_root);
+    let key = agent_validation_cache_key_with_offline(config, &confirmed_offline)?;
     let cache_path = cache_root.join("mtop-agent-validation.json");
-    if let Some((cache, age_ms)) = read_agent_validation_cache(&cache_path, &key) {
+    if let Some((mut cache, age_ms)) = read_agent_validation_cache(&cache_path, &key) {
+        apply_auto_agent_update_receipts(config, cache_root, &mut cache);
         return Ok((cache, age_ms));
     }
 
-    let compatibility = configured_agent_build_compatibility(config)?;
-    if agent_validation_cache_key(config).is_ok_and(|after| after == key) {
+    let mut compatibility =
+        configured_agent_build_compatibility_excluding_offline(config, &confirmed_offline)?;
+    apply_auto_agent_update_receipts(config, cache_root, &mut compatibility);
+    let offline_after = configured_offline_probe_exclusions_from_cache(config, cache_root);
+    if offline_after == confirmed_offline
+        && agent_validation_cache_key_with_offline(config, &offline_after)
+            .is_ok_and(|after| after == key)
+    {
         write_agent_validation_cache(
             &cache_path,
             AgentValidationCache {
@@ -2455,6 +2535,61 @@ pub(crate) fn configured_agent_build_compatibility_cached_with_age(
         );
     }
     Ok((compatibility, 0))
+}
+
+fn apply_auto_agent_update_receipts(
+    config: &ClusterConfig,
+    cache_root: &Path,
+    compatibility: &mut AgentBuildCompatibility,
+) {
+    let Ok(receipts) = AutoAgentUpdateReceipts::load_from_dir(cache_root) else {
+        return;
+    };
+    let updated = config
+        .nodes
+        .iter()
+        .filter(|(node_id, node)| {
+            compatibility.stale.iter().any(|stale| stale == *node_id)
+                && auto_agent_update_receipt_matches(&receipts, config, node_id, node)
+        })
+        .map(|(node_id, _)| node_id.clone())
+        .collect::<Vec<_>>();
+    for node_id in updated {
+        compatibility.stale.retain(|stale| stale != &node_id);
+        compatibility
+            .missing_required_features
+            .retain(|missing| missing != &node_id);
+        if !compatibility.current.contains(&node_id) {
+            compatibility.current.push(node_id);
+        }
+    }
+}
+
+fn auto_agent_update_receipt_matches(
+    receipts: &AutoAgentUpdateReceipts,
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+) -> bool {
+    if node.transport != Transport::Ssh {
+        return false;
+    }
+    let Some(entry) = receipts.nodes.get(node_id) else {
+        return false;
+    };
+    let Ok(connection) = ConnectionKey::for_node(&config.share_uuid, node_id, node)
+        .and_then(|key| key.cache_fingerprint())
+    else {
+        return false;
+    };
+    entry.remote_binary == node.remote_binary
+        && node
+            .machine_uuid
+            .as_deref()
+            .is_some_and(|uuid| uuid.eq_ignore_ascii_case(&entry.machine_uuid))
+        && node.execution_uid == Some(entry.execution_uid)
+        && entry.connection_fingerprint == connection
+        && entry.build_id == macluster_protocol::BUILD_ID
 }
 
 fn bounded_legacy_agent_probes(
@@ -2540,12 +2675,16 @@ fn probe_configured_agent_features(node: &NodeConfig) -> AgentFeatureState {
     }
 }
 
-fn bounded_agent_feature_probes(config: &ClusterConfig) -> Vec<String> {
+fn bounded_agent_feature_probes(
+    config: &ClusterConfig,
+    confirmed_offline: &BTreeSet<String>,
+) -> Vec<String> {
     const MAX_PROBES: usize = 4;
     let queue = Mutex::new(
         config
             .nodes
             .iter()
+            .filter(|(node_id, _)| !confirmed_offline.contains(*node_id))
             .map(|(node_id, node)| (node_id.clone(), node.clone()))
             .collect::<VecDeque<_>>(),
     );
@@ -2577,7 +2716,10 @@ fn bounded_agent_feature_probes(config: &ClusterConfig) -> Vec<String> {
     })
 }
 
-fn agent_validation_cache_key(config: &ClusterConfig) -> AppResult<String> {
+fn agent_validation_cache_key_with_offline(
+    config: &ClusterConfig,
+    confirmed_offline: &BTreeSet<String>,
+) -> AppResult<String> {
     let executable = std::env::current_exe().map_err(io_error)?;
     let mut identity = format!(
         "schema={AGENT_VALIDATION_CACHE_SCHEMA};uid={};config={config:?};exe={}",
@@ -2599,7 +2741,43 @@ fn agent_validation_cache_key(config: &ClusterConfig) -> AppResult<String> {
             identity.push_str(&format!(";ssh={node_id}:{digest}"));
         }
     }
+    for node_id in confirmed_offline {
+        identity.push_str(&format!(";confirmed-offline={node_id}"));
+    }
     sha256_hex(identity.as_bytes()).map_err(|error| (1, error.to_string()))
+}
+
+fn confirmed_offline_probe_exclusions(
+    config: &ClusterConfig,
+    records: &BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+) -> BTreeSet<String> {
+    config
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
+            if node.transport != Transport::Ssh {
+                return None;
+            }
+            let record = records.get(node_id)?;
+            let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            (record.identity_key.eq_ignore_ascii_case(expected_identity)
+                && record.is_confirmed_offline())
+            .then(|| node_id.clone())
+        })
+        .collect()
+}
+
+fn configured_offline_probe_exclusions_from_cache(
+    config: &ClusterConfig,
+    cache_root: &Path,
+) -> BTreeSet<String> {
+    let Some(state_dir) = cache_root.parent() else {
+        return BTreeSet::new();
+    };
+    let Ok(records) = macluster_controller::liveness::read(state_dir, &config.share_uuid) else {
+        return BTreeSet::new();
+    };
+    confirmed_offline_probe_exclusions(config, &records)
 }
 
 fn file_identity_fingerprint(path: &Path) -> String {
@@ -6903,11 +7081,11 @@ fn sync_remote_configs_online_nodes(
     state_dir: &Path,
     operation_id: &str,
 ) -> Result<(), String> {
-    let offline = confirmed_offline_nodes(config, state_dir);
+    let unavailable = share_removal_unavailable_nodes(config);
     let online = config
         .nodes
         .keys()
-        .filter(|node_id| !offline.contains(*node_id))
+        .filter(|node_id| !unavailable.contains(*node_id))
         .cloned()
         .collect::<BTreeSet<_>>();
     sync_remote_configs_on_nodes(config, source, state_dir, operation_id, &online)
@@ -8829,6 +9007,12 @@ pub(crate) fn remove_managed_nfs_marker(
     share_uuid: &str,
     purpose: &str,
 ) -> Result<(), String> {
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::RemoveMarker {
+            source_root: source_root.to_owned(),
+            share_uuid: share_uuid.to_owned(),
+        },
+    };
     let marker = shell_quote(
         &Path::new(source_root)
             .join(".macluster-share-id")
@@ -8838,7 +9022,18 @@ pub(crate) fn remove_managed_nfs_marker(
     let script = format!(
         "set -eu\nmarker={marker}\nexpected={uuid}\nif marker_type=$(/usr/bin/stat -f '%HT' \"$marker\" 2>&1); then [ \"$marker_type\" = 'Regular File' ] || {{ echo 'share marker is not a regular file' >&2; exit 1; }}; actual=$(/bin/cat \"$marker\" 2>&1) || {{ echo \"$actual\" >&2; exit 1; }}; [ \"$actual\" = \"$expected\" ] || {{ echo 'share marker UUID changed' >&2; exit 1; }}; /bin/rm \"$marker\"; else case \"$marker_type\" in *'No such file or directory'*) : ;; *) echo \"$marker_type\" >&2; exit 1 ;; esac; fi\n"
     );
-    let output = ssh_output(node, &script, None).map_err(|(_, error)| error)?;
+    let output = match ssh_output(node, &script, None) {
+        Ok(output) => output,
+        Err((_, error)) if error.to_ascii_lowercase().contains("timed out") => {
+            // A remote shell can block behind an unresponsive external volume.
+            // Retry only through the bounded helper, which runs marker I/O as
+            // the cluster account and returns a path-specific timeout.
+            return run_nfs_admin_service_operation(node, &request, purpose).map_err(|error| {
+                format!("cannot remove managed NFS marker while attempting to {purpose}: {error}")
+            });
+        }
+        Err((_, error)) => return Err(error),
+    };
     if output.status.success() {
         return Ok(());
     }
@@ -8846,12 +9041,6 @@ pub(crate) fn remove_managed_nfs_marker(
     if !mount_point_permission_error(&detail) {
         return Err(detail);
     }
-    let request = NfsAdminRequest {
-        operation: NfsAdminOperation::RemoveMarker {
-            source_root: source_root.to_owned(),
-            share_uuid: share_uuid.to_owned(),
-        },
-    };
     run_nfs_admin_service_operation(node, &request, purpose).map_err(|error| {
         format!("cannot remove managed NFS marker while attempting to {purpose}: {error}")
     })
@@ -9760,13 +9949,23 @@ enum ShareRemovalRecovery {
 fn share_removal_recovery(
     operation: &NodeOperation,
     current_digest: &str,
+    share_is_still_configured: bool,
 ) -> Result<ShareRemovalRecovery, String> {
     let old_matches = operation.old_config_sha256.as_deref() == Some(current_digest);
     let candidate_matches = operation.candidate_config_sha256.as_deref() == Some(current_digest);
     match operation.phase.as_str() {
         "REMOVED" => Ok(ShareRemovalRecovery::Done),
-        "REMOVAL_PENDING" if old_matches => Ok(ShareRemovalRecovery::Cleanup),
-        "REMOVAL_COMMITTING" if old_matches => Ok(ShareRemovalRecovery::Cleanup),
+        // A different share can be added or removed while this journaled
+        // transaction is paused. The caller has already verified that the
+        // active share still matches the endpoint and UUID recorded here, so
+        // recomputing the candidate from the current config safely preserves
+        // those unrelated changes.
+        "REMOVAL_PENDING" if old_matches || share_is_still_configured => {
+            Ok(ShareRemovalRecovery::Cleanup)
+        }
+        "REMOVAL_COMMITTING" if old_matches || share_is_still_configured => {
+            Ok(ShareRemovalRecovery::Cleanup)
+        }
         "REMOVAL_COMMITTING" | "SYNC_PENDING" if candidate_matches => {
             Ok(ShareRemovalRecovery::Sync)
         }
@@ -9797,43 +9996,23 @@ struct ShareRemovalClientPlan {
     aliases: Vec<NfsAlias>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct DeferredShareClientCleanup {
-    share_id: String,
-    node_id: String,
-    source_root: String,
-    mount_root: String,
-    server_host: String,
-    share_uuid: String,
-    machine_uuid: Option<String>,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct DeferredShareCleanupState {
-    #[serde(default)]
-    version: u32,
-    #[serde(default)]
-    entries: BTreeMap<String, DeferredShareClientCleanup>,
-}
-
-fn deferred_share_cleanup_key(share_id: &str, node_id: &str) -> String {
-    format!("{share_id}/{node_id}")
+fn share_marker_read_timeout(error: &str, source_root: &Path) -> bool {
+    let marker = source_root.join(".macluster-share-id");
+    let lower = error.to_ascii_lowercase();
+    error.contains(&marker.to_string_lossy().to_string())
+        && (lower.contains("timed out") || lower.contains("timeout"))
 }
 
 fn read_deferred_share_cleanup(state_dir: &Path) -> AppResult<DeferredShareCleanupState> {
-    let path = state_dir.join(DEFERRED_SHARE_CLEANUP_FILE);
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(DeferredShareCleanupState::default());
+    DeferredShareCleanupState::load_from_dir(state_dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::InvalidData {
+            (
+                1,
+                format!("deferred NFS cleanup journal is invalid: {error}"),
+            )
+        } else {
+            io_error(error)
         }
-        Err(error) => return Err(io_error(error)),
-    };
-    serde_json::from_slice(&bytes).map_err(|error| {
-        (
-            1,
-            format!("deferred NFS cleanup journal is invalid: {error}"),
-        )
     })
 }
 
@@ -9841,53 +10020,221 @@ fn save_deferred_share_cleanup(
     state_dir: &Path,
     state: &DeferredShareCleanupState,
 ) -> AppResult<()> {
-    let path = state_dir.join(DEFERRED_SHARE_CLEANUP_FILE);
-    if state.entries.is_empty() {
-        match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io_error(error)),
-        }
-    } else {
-        let bytes = serde_json::to_vec_pretty(state).map_err(|error| (1, error.to_string()))?;
-        atomic_write(&path, &bytes)
-    }
+    state.save_to_dir(state_dir).map_err(io_error)
 }
 
-fn confirmed_offline_nodes(config: &ClusterConfig, state_dir: &Path) -> BTreeSet<String> {
-    let records = match macluster_controller::liveness::read(state_dir, &config.share_uuid) {
-        Ok(records) => records,
-        Err(error) => {
-            eprintln!("macluster: could not read node liveness before NFS cleanup: {error}");
-            return BTreeSet::new();
+fn remember_deferred_share_marker_cleanup(
+    state_dir: &Path,
+    share_id: &str,
+    server_id: &str,
+    server: &NodeConfig,
+    share: &ShareConfig,
+    state: &AdminState,
+) -> AppResult<()> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    pending.version = 1;
+    let machine_uuid = server
+        .machine_uuid
+        .clone()
+        .or_else(|| state.machine_uuids.get(server_id).cloned());
+    pending.marker_entries.insert(
+        marker_cleanup_key(share_id, server_id, &share.share_uuid),
+        DeferredShareMarkerCleanup {
+            share_id: share_id.to_owned(),
+            node_id: server_id.to_owned(),
+            source_root: share.source_root.to_string_lossy().into_owned(),
+            share_uuid: share.share_uuid.clone(),
+            machine_uuid,
+        },
+    );
+    save_deferred_share_cleanup(state_dir, &pending)
+}
+
+fn forget_deferred_share_marker_cleanup(
+    state_dir: &Path,
+    share_id: &str,
+    node_id: &str,
+    source_root: &Path,
+    share_uuid: &str,
+) -> AppResult<()> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    pending.remove_marker_cleanup(
+        share_id,
+        node_id,
+        &source_root.to_string_lossy(),
+        share_uuid,
+    );
+    save_deferred_share_cleanup(state_dir, &pending)
+}
+
+fn retry_deferred_share_marker_cleanup(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+    admin_state: &AdminState,
+    share_id: &str,
+) -> AppResult<Vec<String>> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    let keys = pending
+        .marker_entries
+        .iter()
+        .filter(|(_, entry)| entry.share_id == share_id)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let mut deferred = Vec::new();
+
+    for key in keys {
+        let Some(entry) = pending.marker_entries.get(&key).cloned() else {
+            continue;
+        };
+        let Some(node) = config.nodes.get(&entry.node_id) else {
+            deferred.push(format!(
+                "{}:{} (NFS server is no longer registered; marker was preserved)",
+                entry.node_id, entry.source_root
+            ));
+            continue;
+        };
+        if entry.machine_uuid.as_deref().is_some_and(|expected| {
+            node.machine_uuid
+                .as_deref()
+                .or_else(|| {
+                    admin_state
+                        .machine_uuids
+                        .get(&entry.node_id)
+                        .map(String::as_str)
+                })
+                .is_some_and(|actual| !actual.eq_ignore_ascii_case(expected))
+        }) {
+            deferred.push(format!(
+                "{}:{} (machine identity changed; marker was preserved)",
+                entry.node_id, entry.source_root
+            ));
+            continue;
         }
-    };
+        if !node_ssh_endpoint_reachable(node) {
+            deferred.push(format!(
+                "{}:{} (NFS server is offline; marker cleanup is deferred)",
+                entry.node_id, entry.source_root
+            ));
+            continue;
+        }
+        if let Err((_, error)) = verify_registered_node_identity(&entry.node_id, node, admin_state)
+        {
+            deferred.push(format!("{}:{} ({error})", entry.node_id, entry.source_root));
+            continue;
+        }
+        if let Err((_, error)) = check_remote_idle(node, &entry.node_id, config_path) {
+            deferred.push(format!("{}:{} ({error})", entry.node_id, entry.source_root));
+            continue;
+        }
+        match remove_pending_share_marker(
+            node,
+            Path::new(&entry.source_root),
+            &entry.share_uuid,
+            share_id,
+        ) {
+            Ok(()) => {
+                pending.marker_entries.remove(&key);
+                save_deferred_share_cleanup(state_dir, &pending)?;
+            }
+            Err((_, error)) => {
+                deferred.push(format!("{}:{} ({error})", entry.node_id, entry.source_root));
+            }
+        }
+    }
+    Ok(deferred)
+}
+
+fn share_removal_unavailable_nodes(config: &ClusterConfig) -> BTreeSet<String> {
+    config
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| (!node_ssh_endpoint_reachable(node)).then(|| node_id.clone()))
+        .collect()
+}
+
+fn unavailable_share_client_nodes(
+    config: &ClusterConfig,
+    server_id: &str,
+    mut endpoint_reachable: impl FnMut(&NodeConfig) -> bool,
+) -> BTreeSet<String> {
     config
         .nodes
         .iter()
         .filter_map(|(node_id, node)| {
-            let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
-            records.get(node_id).and_then(|record| {
-                (record.identity_key.eq_ignore_ascii_case(identity)
-                    && record.is_confirmed_offline())
-                .then(|| node_id.clone())
-            })
+            (node_id != server_id && !endpoint_reachable(node)).then(|| node_id.clone())
         })
         .collect()
+}
+
+fn deferred_share_cleanup_offline_nodes(
+    config: &ClusterConfig,
+    admin_state: &AdminState,
+    pending: &DeferredShareCleanupState,
+    share_id: &str,
+    server_id: &str,
+) -> AppResult<BTreeSet<String>> {
+    for entry in pending
+        .entries
+        .values()
+        .filter(|entry| entry.share_id == share_id)
+    {
+        let Some(node) = config.nodes.get(&entry.node_id) else {
+            continue;
+        };
+        if let Some(expected) = entry.machine_uuid.as_deref() {
+            let actual = node
+                .machine_uuid
+                .as_deref()
+                .or_else(|| {
+                    admin_state
+                        .machine_uuids
+                        .get(&entry.node_id)
+                        .map(String::as_str)
+                })
+                .ok_or_else(|| {
+                    (
+                        1,
+                        format!(
+                            "deferred share cleanup for {share_id} on {} has no registered machine identity; resolve it before skipping that node",
+                            entry.node_id
+                        ),
+                    )
+                })?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err((
+                    1,
+                    format!(
+                        "deferred share cleanup for {share_id} belongs to a different machine than {}; inspect it before re-adding the share",
+                        entry.node_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(unavailable_share_client_nodes(
+        config,
+        server_id,
+        node_ssh_endpoint_reachable,
+    ))
 }
 
 fn node_ssh_endpoint_reachable(node: &NodeConfig) -> bool {
     if node.transport == Transport::Local {
         return true;
     }
-    let Ok(host) = node.host.parse::<IpAddr>() else {
-        return false;
+    let port = node.ssh_port.unwrap_or(22);
+    let addresses = if let Ok(ip) = node.host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let Ok(addresses) = (node.host.as_str(), port).to_socket_addrs() else {
+            return false;
+        };
+        addresses.take(8).collect()
     };
-    TcpStream::connect_timeout(
-        &SocketAddr::new(host, node.ssh_port.unwrap_or(22)),
-        Duration::from_millis(300),
-    )
-    .is_ok()
+    addresses
+        .into_iter()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok())
 }
 
 fn remember_deferred_share_cleanup(
@@ -9906,7 +10253,7 @@ fn remember_deferred_share_cleanup(
         .clone()
         .or_else(|| state.machine_uuids.get(node_id).cloned());
     pending.entries.insert(
-        deferred_share_cleanup_key(share_id, node_id),
+        client_cleanup_key(share_id, node_id, &share.share_uuid),
         DeferredShareClientCleanup {
             share_id: share_id.to_owned(),
             node_id: node_id.to_owned(),
@@ -10185,13 +10532,28 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     &state,
                     share_id,
                 )?;
-                if deferred.is_empty() {
+                let deferred_marker = retry_deferred_share_marker_cleanup(
+                    &config_path,
+                    state_dir,
+                    &config,
+                    &state,
+                    share_id,
+                )?;
+                if deferred.is_empty() && deferred_marker.is_empty() {
                     println!("Named share {share_id} was already removed.");
                 } else {
-                    println!(
-                        "Named share {share_id} is removed from the cluster; client cleanup is still deferred: {}. Rerun `mnode -rm share:{share_id}` after the listed nodes reconnect.",
-                        deferred.join(", ")
-                    );
+                    if !deferred.is_empty() {
+                        println!(
+                            "Named share {share_id} is removed from the cluster; client cleanup is still deferred: {}. Rerun `mnode -rm share:{share_id}` after the listed nodes reconnect.",
+                            deferred.join(", ")
+                        );
+                    }
+                    if !deferred_marker.is_empty() {
+                        println!(
+                            "Named share {share_id} is removed from the cluster; source marker cleanup is still deferred: {}. The source files were preserved. Rerun `mnode -rm share:{share_id}` after the volume responds.",
+                            deferred_marker.join(", ")
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -10252,8 +10614,12 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 format!("NFS server {server_id} for share {share_id} is missing"),
             )
         })?;
-        let recovery =
-            share_removal_recovery(&operation, &current_digest).map_err(|error| (1, error))?;
+        let recovery = share_removal_recovery(
+            &operation,
+            &current_digest,
+            config.shares.contains_key(share_id),
+        )
+        .map_err(|error| (1, error))?;
         if recovery == ShareRemovalRecovery::Done {
             println!("Named share {share_id} was already removed.");
             return Ok(());
@@ -10289,9 +10655,28 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     ),
                 ));
             }
+            let deferred_marker_cleanup = retry_deferred_share_marker_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &state,
+                share_id,
+            )?;
             operation.phase = "REMOVED".into();
-            operation.detail = (!deferred_cleanup.is_empty())
-                .then(|| format!("deferred client cleanup: {}", deferred_cleanup.join(", ")));
+            let mut deferred_details = Vec::new();
+            if !deferred_cleanup.is_empty() {
+                deferred_details.push(format!(
+                    "deferred client cleanup: {}",
+                    deferred_cleanup.join(", ")
+                ));
+            }
+            if !deferred_marker_cleanup.is_empty() {
+                deferred_details.push(format!(
+                    "deferred source marker cleanup: {}",
+                    deferred_marker_cleanup.join(", ")
+                ));
+            }
+            operation.detail = (!deferred_details.is_empty()).then(|| deferred_details.join("; "));
             state.operations.insert(operation_key, operation);
             save_admin_state(&journal_path, &state)?;
             println!("Removed named NFS share {share_id}; source files were preserved.");
@@ -10301,19 +10686,15 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     deferred_cleanup.join(", ")
                 );
             }
+            if !deferred_marker_cleanup.is_empty() {
+                println!(
+                    "Source marker cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after the volume responds.",
+                    deferred_marker_cleanup.join(", ")
+                );
+            }
             return Ok(());
         }
 
-        if let Some(old_digest) = operation.old_config_sha256.as_deref()
-            && old_digest != current_digest
-        {
-            return Err((
-                1,
-                format!(
-                    "cluster config changed during removal of share {share_id}; inspect node-admin.json before retrying"
-                ),
-            ));
-        }
         if !config.shares.contains_key(share_id) {
             return Err((
                 1,
@@ -10333,7 +10714,11 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             ));
         }
 
-        let offline_nodes = confirmed_offline_nodes(&config, state_dir);
+        // Share removal only needs an SSH-reachable client to remove its exact
+        // managed mount. A host may still answer ping while sshd/Agent is
+        // unavailable, so use the endpoint needed for cleanup and defer that
+        // client's unmount/config sync until it reconnects.
+        let offline_nodes = share_removal_unavailable_nodes(&config);
         let mut deferred_output_sync = Vec::new();
         if state_dir.join("controller.sqlite3").is_file() {
             let jobs = ReadOnlyJobStore::open(state_dir)
@@ -10391,13 +10776,24 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
 
         let existing_removal = resumed_removal;
         if existing_removal {
-            check_managed_nfs_marker(
+            if let Err(error) = check_managed_nfs_marker(
                 server,
                 &share.source_root.to_string_lossy(),
                 share_uuid,
                 &format!("verify source marker for share {share_id} removal"),
-            )
-            .map_err(|error| (1, error))?;
+            ) {
+                // REMOVAL_PENDING is written only after the source marker has
+                // already been matched against this UUID. On resume, a timed
+                // out marker read can therefore be deferred; the exact marker
+                // is checked again before any cleanup or is left in place if
+                // the source volume remains unresponsive.
+                if !share_marker_read_timeout(&error, &share.source_root) {
+                    return Err((1, error));
+                }
+                eprintln!(
+                    "Warning: source marker on {server_id} is not responding; resuming the recorded removal and preserving marker cleanup for retry."
+                );
+            }
         } else {
             verify_named_share_mount(
                 server,
@@ -10457,7 +10853,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &share.mount_root.to_string_lossy(),
             ) {
                 NamedShareMountStatus::Expected => {
-                    verify_named_share_mount(
+                    if let Err((code, error)) = verify_named_share_mount(
                         node,
                         node_id,
                         &server_id,
@@ -10465,7 +10861,19 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                         &share.source_root,
                         &share.mount_root,
                         share_uuid,
-                    )?;
+                    ) {
+                        // The mount table above already proved the exact
+                        // source/target. A stalled NFS marker read must not
+                        // prevent its exact managed mount from being removed;
+                        // the privileged unmount helper still checks its
+                        // recorded UUID before detaching it.
+                        if !share_marker_read_timeout(&error, &share.mount_root) {
+                            return Err((code, error));
+                        }
+                        eprintln!(
+                            "Warning: share marker on client {node_id} is not responding; continuing with exact source/target unmount validation."
+                        );
+                    }
                     client_mounts.push(NfsMount {
                         source: expected_source.clone(),
                         target: share.mount_root.to_string_lossy().into_owned(),
@@ -10598,7 +11006,27 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         if share.source_root != share.mount_root {
             remove_pending_share_alias(server, &share.mount_root, &share.source_root, share_id)?;
         }
-        remove_pending_share_marker(server, &share.source_root, share_uuid, share_id)?;
+        let mut source_marker_cleanup_deferred = false;
+        match remove_pending_share_marker(server, &share.source_root, share_uuid, share_id) {
+            Ok(()) => forget_deferred_share_marker_cleanup(
+                state_dir,
+                share_id,
+                &server_id,
+                &share.source_root,
+                share_uuid,
+            )?,
+            Err((_, error)) if share_marker_read_timeout(&error, &share.source_root) => {
+                // A stalled removable volume must not keep client mounts and
+                // exports registered forever. The operation journal records
+                // the UUID, and this sidecar retries exact marker cleanup once
+                // the source responds again.
+                remember_deferred_share_marker_cleanup(
+                    state_dir, share_id, &server_id, server, &share, &state,
+                )?;
+                source_marker_cleanup_deferred = true;
+            }
+            Err(error) => return Err(error),
+        }
 
         operation.phase = "REMOVAL_COMMITTING".into();
         operation.detail = Some("NFS resources are removed; committing share config change".into());
@@ -10642,8 +11070,20 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             share_id,
         )?;
         operation.phase = "REMOVED".into();
-        operation.detail = (!deferred_cleanup.is_empty())
-            .then(|| format!("deferred client cleanup: {}", deferred_cleanup.join(", ")));
+        let mut deferred_details = Vec::new();
+        if !deferred_cleanup.is_empty() {
+            deferred_details.push(format!(
+                "deferred client cleanup: {}",
+                deferred_cleanup.join(", ")
+            ));
+        }
+        if source_marker_cleanup_deferred {
+            deferred_details.push(format!(
+                "deferred source marker cleanup: {server_id}:{}",
+                share.source_root.display()
+            ));
+        }
+        operation.detail = (!deferred_details.is_empty()).then(|| deferred_details.join("; "));
         state.operations.insert(operation_key, operation);
         save_admin_state(&journal_path, &state)?;
         println!("Removed named NFS share {share_id}; source files were preserved.");
@@ -10651,6 +11091,12 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             println!(
                 "Client cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after those nodes reconnect.",
                 deferred_cleanup.join(", ")
+            );
+        }
+        if source_marker_cleanup_deferred {
+            println!(
+                "Source marker cleanup is deferred for {server_id}:{} because the volume did not respond. Share data was preserved; rerun `mnode -rm share:{share_id}` after the volume responds.",
+                share.source_root.display()
             );
         }
         if !deferred_output_sync.is_empty() {
@@ -12473,26 +12919,6 @@ fn register_named_share(
         let config_path = config_path.canonicalize().map_err(io_error)?;
         let source_text = fs::read_to_string(&config_path).map_err(io_error)?;
         let config = ClusterConfig::parse(&source_text).map_err(|error| (2, error.to_string()))?;
-        let deferred_cleanup = read_deferred_share_cleanup(state_dir)?;
-        if deferred_cleanup
-            .entries
-            .values()
-            .any(|entry| entry.share_id == share_id)
-        {
-            let nodes = deferred_cleanup
-                .entries
-                .values()
-                .filter(|entry| entry.share_id == share_id)
-                .map(|entry| entry.node_id.as_str())
-                .collect::<Vec<_>>();
-            return Err((
-                1,
-                format!(
-                    "share {share_id} still has deferred client cleanup on {}; rerun `mnode -rm share:{share_id}` after those nodes reconnect before re-adding it",
-                    nodes.join(", ")
-                ),
-            ));
-        }
         let server_id = config
             .nodes
             .iter()
@@ -12512,23 +12938,6 @@ fn register_named_share(
         let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
         let server = config.nodes.get(&server_id).expect("server was located");
         let server_facts = read_remote_facts(server)?;
-        for (node_id, node) in &config.nodes {
-            let facts = read_remote_facts(node).map_err(|(_, error)| {
-                (
-                    1,
-                    format!("cannot verify execution account on share client {node_id}: {error}"),
-                )
-            })?;
-            if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
-                return Err((
-                    2,
-                    format!(
-                        "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
-                        facts.uid, facts.gid, server_facts.uid, server_facts.gid
-                    ),
-                ));
-            }
-        }
         let home = checked_remote_path(&server_facts.home)?;
         let source_root = resolve_share_source(requested_source, &home)?;
         let mount_root = named_share_mount_root(share_id, requested_mount_root);
@@ -12546,6 +12955,62 @@ fn register_named_share(
                 ),
             ));
         }
+        if let Some(existing) = config.shares.get(share_id)
+            && !named_share_request_matches(
+                existing,
+                &server_id,
+                &source_root,
+                &mount_root,
+                allow_existing_contents,
+            )
+        {
+            return Err((
+                2,
+                format!(
+                    "share ID '{share_id}' is already configured for a different server, source path, or mount path"
+                ),
+            ));
+        }
+
+        // First try to clear old mounts on reachable clients. Offline clients
+        // keep their exact cleanup records; they must not block the share from
+        // becoming available on the nodes that are currently connected.
+        let _ = retry_deferred_share_client_cleanup(
+            &config_path,
+            state_dir,
+            &config,
+            &source_text,
+            &state,
+            share_id,
+        )?;
+        let deferred_cleanup = read_deferred_share_cleanup(state_dir)?;
+        let deferred_offline_nodes = deferred_share_cleanup_offline_nodes(
+            &config,
+            &state,
+            &deferred_cleanup,
+            share_id,
+            &server_id,
+        )?;
+        for (node_id, node) in &config.nodes {
+            if node_id == &server_id || deferred_offline_nodes.contains(node_id) {
+                continue;
+            }
+            let facts = read_remote_facts(node).map_err(|(_, error)| {
+                (
+                    1,
+                    format!("cannot verify execution account on share client {node_id}: {error}"),
+                )
+            })?;
+            if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
+                return Err((
+                    2,
+                    format!(
+                        "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
+                        facts.uid, facts.gid, server_facts.uid, server_facts.gid
+                    ),
+                ));
+            }
+        }
         let endpoint_key = named_share_operation_endpoint(
             share_id,
             &server_id,
@@ -12554,20 +13019,6 @@ fn register_named_share(
             allow_existing_contents,
         );
         if let Some(existing) = config.shares.get(share_id) {
-            if !named_share_request_matches(
-                existing,
-                &server_id,
-                &source_root,
-                &mount_root,
-                allow_existing_contents,
-            ) {
-                return Err((
-                    2,
-                    format!(
-                        "share ID '{share_id}' is already configured for a different server, source path, or mount path"
-                    ),
-                ));
-            }
             return repair_named_share(
                 &config_path,
                 state_dir,
@@ -12577,6 +13028,7 @@ fn register_named_share(
                 existing,
                 &mut state,
                 &journal_path,
+                &deferred_offline_nodes,
             );
         }
         let pending_operation = pending_named_share_operation_for_request(
@@ -12612,9 +13064,11 @@ fn register_named_share(
         if replaced_child_shares(&config, &share).is_empty() {
             preflight_server_alias(server, &source_root, &mount_root)?;
         }
-        preflight_share_clients(&config, &share)?;
+        preflight_share_clients(&config, &share, &deferred_offline_nodes)?;
         for (node_id, node) in &config.nodes {
-            check_remote_idle(node, node_id, &config_path)?;
+            if !deferred_offline_nodes.contains(node_id) {
+                check_remote_idle(node, node_id, &config_path)?;
+            }
         }
 
         let old_digest =
@@ -12656,11 +13110,18 @@ fn register_named_share(
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
 
-        let (staged_source, staged_config) = stage_current_agents(
+        let active_nodes = config
+            .nodes
+            .keys()
+            .filter(|node_id| !deferred_offline_nodes.contains(*node_id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let (staged_source, staged_config) = stage_current_agents_for_nodes(
             &config,
             &source_text,
             &operation.id,
             AgentStagePurpose::Share,
+            Some(&active_nodes),
         )?;
         let queued_source =
             queue_candidate_with_node(&staged_config, &staged_source, queue_name, &server_id)?;
@@ -12713,7 +13174,7 @@ fn register_named_share(
         }
         prepare_server_alias(server, &source_root, &mount_root)?;
         for (node_id, node) in &config.nodes {
-            if node_id == &server_id {
+            if node_id == &server_id || deferred_offline_nodes.contains(node_id) {
                 continue;
             }
             mount_share_candidate(
@@ -12741,7 +13202,7 @@ fn register_named_share(
             &marker_uuid,
         )?;
         for (node_id, node) in &config.nodes {
-            if node_id != &server_id {
+            if node_id != &server_id && !deferred_offline_nodes.contains(node_id) {
                 verify_named_share_mount(
                     node,
                     node_id,
@@ -12782,12 +13243,12 @@ fn register_named_share(
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        if let Err(error) = sync_remote_configs(
+        if let Err(error) = sync_remote_configs_on_nodes(
             &candidate_config,
             &candidate,
             state_dir,
             &operation.id,
-            None,
+            &active_nodes,
         ) {
             operation.detail = Some(error.clone());
             state.operations.insert(operation_key.clone(), operation);
@@ -12800,13 +13261,34 @@ fn register_named_share(
             ));
         }
         operation.phase = "READY".into();
-        operation.detail = None;
+        operation.detail = (!deferred_offline_nodes.is_empty()).then(|| {
+            format!(
+                "client mount/config deferred until reconnect: {}",
+                deferred_offline_nodes
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
         state.operations.insert(operation_key, operation);
         save_admin_state(&journal_path, &state)?;
-        println!(
-            "NFS share {share_id} is available at {} on every configured node.",
-            mount_root.display()
-        );
+        if deferred_offline_nodes.is_empty() {
+            println!(
+                "NFS share {share_id} is available at {} on every configured node.",
+                mount_root.display()
+            );
+        } else {
+            println!(
+                "NFS share {share_id} is available at {} on reachable nodes; setup is deferred for {}. Rerun the same mnode --add command after those nodes reconnect.",
+                mount_root.display(),
+                deferred_offline_nodes
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
@@ -12821,9 +13303,16 @@ fn repair_named_share(
     share: &ShareConfig,
     state: &mut AdminState,
     journal_path: &Path,
+    deferred_offline_nodes: &BTreeSet<String>,
 ) -> AppResult<()> {
     let server_id = share.server.as_str();
     let server = &config.nodes[server_id];
+    let active_nodes = config
+        .nodes
+        .keys()
+        .filter(|node_id| !deferred_offline_nodes.contains(*node_id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     preflight_server_alias(server, &share.source_root, &share.mount_root)?;
     // The configured data source must still exist with its original identity.
     // Do not recreate a missing source as an empty replacement for user data.
@@ -12836,9 +13325,11 @@ fn repair_named_share(
         &share.source_root,
         &share.share_uuid,
     )?;
-    preflight_share_clients(config, share)?;
+    preflight_share_clients(config, share, deferred_offline_nodes)?;
     for (node_id, node) in &config.nodes {
-        check_remote_idle(node, node_id, config_path)?;
+        if !deferred_offline_nodes.contains(node_id) {
+            check_remote_idle(node, node_id, config_path)?;
+        }
     }
 
     let key = format!("share:{share_id}");
@@ -12918,7 +13409,7 @@ fn repair_named_share(
         operation.managed_export |= managed.iter().any(|managed| *managed);
         export_result.map_err(|error| (1, error))?;
         for (node_id, node) in &config.nodes {
-            if node_id == server_id {
+            if node_id == server_id || deferred_offline_nodes.contains(node_id) {
                 continue;
             }
             mount_share_candidate(
@@ -12937,6 +13428,9 @@ fn repair_named_share(
             })?;
         }
         for (node_id, node) in &config.nodes {
+            if deferred_offline_nodes.contains(node_id) {
+                continue;
+            }
             verify_named_share_mount(
                 node,
                 node_id,
@@ -12950,16 +13444,15 @@ fn repair_named_share(
         operation.phase = "SYNC_PENDING".into();
         state.operations.insert(key.clone(), operation.clone());
         save_admin_state(journal_path, state)?;
-        sync_remote_configs(config, source_text, state_dir, &operation.id, None).map_err(
-            |error| {
+        sync_remote_configs_on_nodes(config, source_text, state_dir, &operation.id, &active_nodes)
+            .map_err(|error| {
                 (
                     1,
                     format!(
                         "share {share_id} is verified, but peer config sync is pending: {error}"
                     ),
                 )
-            },
-        )?;
+            })?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -12969,13 +13462,34 @@ fn repair_named_share(
         return Err(error);
     }
     operation.phase = "READY".into();
-    operation.detail = None;
+    operation.detail = (!deferred_offline_nodes.is_empty()).then(|| {
+        format!(
+            "client mount/config deferred until reconnect: {}",
+            deferred_offline_nodes
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    });
     state.operations.insert(key, operation);
     save_admin_state(journal_path, state)?;
-    println!(
-        "NFS share {share_id} is verified and available at {} on every configured node; missing exports, mounts and aliases were repaired.",
-        share.mount_root.display()
-    );
+    if deferred_offline_nodes.is_empty() {
+        println!(
+            "NFS share {share_id} is verified and available at {} on every configured node; missing exports, mounts and aliases were repaired.",
+            share.mount_root.display()
+        );
+    } else {
+        println!(
+            "NFS share {share_id} is verified and available at {} on reachable nodes; setup is deferred for {}. Rerun the same mnode --add command after those nodes reconnect.",
+            share.mount_root.display(),
+            deferred_offline_nodes
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -13628,7 +14142,11 @@ fn prepare_server_alias(server: &NodeConfig, source: &Path, mount: &Path) -> App
     }
 }
 
-fn preflight_share_clients(config: &ClusterConfig, share: &ShareConfig) -> AppResult<()> {
+fn preflight_share_clients(
+    config: &ClusterConfig,
+    share: &ShareConfig,
+    deferred_offline_nodes: &BTreeSet<String>,
+) -> AppResult<()> {
     let server = &config.nodes[share.server.as_str()];
     let children = replaced_child_shares(config, share)
         .iter()
@@ -13641,7 +14159,7 @@ fn preflight_share_clients(config: &ClusterConfig, share: &ShareConfig) -> AppRe
         })
         .collect::<BTreeMap<_, _>>();
     for (node_id, node) in &config.nodes {
-        if node_id == share.server.as_str() {
+        if node_id == share.server.as_str() || deferred_offline_nodes.contains(node_id) {
             continue;
         }
         preflight_share_mount_with_overlay(
@@ -14369,7 +14887,13 @@ fn verify_named_share_mount(
         node,
         &shell_join(&["test", "-L", &marker.to_string_lossy()]),
         None,
-    )?;
+    )
+    .map_err(|(code, error)| {
+        (
+            code,
+            format!("cannot inspect share marker {}: {error}", marker.display()),
+        )
+    })?;
     if marker_is_symlink.status.success() {
         return Err((
             1,
@@ -14380,7 +14904,13 @@ fn verify_named_share_mount(
         node,
         &shell_join(&["/bin/cat", &marker.to_string_lossy()]),
         None,
-    )?;
+    )
+    .map_err(|(code, error)| {
+        (
+            code,
+            format!("cannot read share marker {}: {error}", marker.display()),
+        )
+    })?;
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != uuid {
         return Err((
             1,
@@ -15923,24 +16453,26 @@ mod tests {
         classify_configured_agents, cleanup_node_from_endpoint, client_mount_admin_request,
         client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
         client_nfs_cleanup_plan, client_share_alias_script, config_path_candidate,
-        controller_command_matches, dispatch_sync_pending, ensure_controller_recovery_clean,
+        controller_command_matches, ensure_controller_recovery_clean,
         ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
-        inspect_configured_agent_build, list_nodes, local_config_candidate,
-        maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
-        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
-        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
-        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
-        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
-        node_admin_recovery_pending, node_nfs_mappings, normalize_binary_path, parse_action,
-        parse_agent_build_probe, parse_nfs_exports_update_baseline,
+        has_committed_config_generation_path, inspect_configured_agent_build, list_nodes,
+        local_config_candidate, maintenance_inputs_unchanged, managed_binary_digest,
+        migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
+        named_share_mount_status, named_share_operation_endpoint, named_share_operation_matches,
+        named_share_request_matches, nfs_exports_read_command,
+        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
+        nfs_exports_update_script_for_expected, nfs_mount_source, node_admin_recovery_pending,
+        node_nfs_mappings, node_ssh_endpoint_reachable, normalize_binary_path, parse_action,
+        parse_agent_build_probe, parse_nfs_exports_update_baseline, peer_config_sync_pending,
         pending_add_may_have_client_state, pending_add_operation_for_endpoint,
         pending_combined_ssh_add, pending_local_share_retry_node,
         pending_managed_export_cleanup_plan, plan_ensure_nfs_exports, plan_remove_nfs_exports,
         power_helper_install_script, power_launch_daemon_plist, preferred_local_host,
-        queue_candidate_with_node, read_admin_state, remote_execution_status,
-        reset_admin_operations, reset_node_from_endpoint, resume_existing_ssh_add_sync,
-        save_admin_state, should_resume_add_operation, shutdown_confirmation_accepted,
-        update_recovery, validate_pending_node_identity, validate_storage_root_access,
+        queue_candidate_with_node, reachable_configured_node_ids, read_admin_state,
+        remote_execution_status, reset_admin_operations, reset_node_from_endpoint,
+        resume_existing_ssh_add_sync, save_admin_state, should_resume_add_operation,
+        shutdown_confirmation_accepted, unavailable_share_client_nodes, update_recovery,
+        validate_pending_node_identity, validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -15952,6 +16484,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        net::TcpListener,
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -15961,6 +16494,62 @@ mod tests {
 
     fn test_exports_path() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-exports-{}.test", Id128::random()))
+    }
+
+    #[test]
+    fn nfs_add_defers_all_confirmed_offline_clients_but_not_the_server() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let config = ClusterConfig::parse(&format!(
+            "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\", \"online\", \"offline\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.online]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\n\n[nodes.offline]\nhost = \"192.0.2.3\"\ntransport = \"ssh\"\n",
+            root.display()
+        ))
+        .unwrap();
+
+        let deferred =
+            unavailable_share_client_nodes(&config, "login", |node| node.host != "192.0.2.3");
+
+        assert_eq!(deferred, BTreeSet::from(["offline".to_owned()]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hostname_share_clients_are_probed_instead_of_assumed_offline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let node = NodeConfig {
+            host: "localhost".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(listener.local_addr().unwrap().port()),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+
+        assert!(node_ssh_endpoint_reachable(&node));
+    }
+
+    #[test]
+    fn update_reachability_probes_dns_node_hosts() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let config = ClusterConfig::parse(&format!(
+            "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\", \"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"127.0.0.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.worker]\nhost = \"localhost\"\ntransport = \"ssh\"\nssh_port = {}\n",
+            root.display(),
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let candidates = BTreeSet::from(["worker".to_owned()]);
+
+        assert_eq!(
+            reachable_configured_node_ids(&config, &candidates),
+            candidates
+        );
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn wait_for_exclusive_maintenance_lock(config: &Path) -> std::io::Result<MaintenanceLock> {
@@ -16492,7 +17081,7 @@ exec "$@"
         };
 
         assert_eq!(
-            super::share_removal_recovery(&operation, "after").unwrap(),
+            super::share_removal_recovery(&operation, "after", false).unwrap(),
             super::ShareRemovalRecovery::Sync
         );
     }
@@ -17407,6 +17996,72 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn auto_updated_agent_receipt_matches_only_the_same_node_and_running_binary() {
+        let mut config = parse_build_test_config();
+        let node_id = "arm-a";
+        let node = config.nodes.get_mut(node_id).unwrap();
+        node.machine_uuid = Some("01234567-89ab-cdef-0123-456789abcdef".into());
+        node.execution_uid = Some(501);
+        node.remote_binary = format!(
+            "/Users/test/.local/share/macluster/clusters/{}/bin/{}/macluster",
+            config.share_uuid,
+            "a".repeat(64)
+        );
+        let digest = super::current_agent_sha256().unwrap();
+        let fingerprint =
+            macluster_controller::ssh::ConnectionKey::for_node(&config.share_uuid, node_id, node)
+                .unwrap()
+                .cache_fingerprint()
+                .unwrap();
+        let entry = macluster_core::agent_update::AutoAgentUpdateEntry {
+            remote_binary: node.remote_binary.clone(),
+            machine_uuid: node.machine_uuid.clone().unwrap(),
+            execution_uid: 501,
+            connection_fingerprint: fingerprint,
+            build_id: macluster_protocol::BUILD_ID.to_owned(),
+            sha256: digest.clone(),
+        };
+        let receipts = macluster_core::agent_update::AutoAgentUpdateReceipts {
+            schema: 1,
+            nodes: BTreeMap::from([(node_id.into(), entry)]),
+        };
+        assert!(super::auto_agent_update_receipt_matches(
+            &receipts,
+            &config,
+            node_id,
+            &config.nodes[node_id],
+        ));
+
+        let receipt_root = test_exports_path();
+        receipts.save_to_dir(&receipt_root).unwrap();
+        let mut compatibility = AgentBuildCompatibility {
+            stale: vec![node_id.into()],
+            ..AgentBuildCompatibility::default()
+        };
+        super::apply_auto_agent_update_receipts(&config, &receipt_root, &mut compatibility);
+        assert!(compatibility.stale.is_empty());
+        assert_eq!(compatibility.current, vec![node_id]);
+        fs::remove_dir_all(receipt_root).unwrap();
+
+        let mut changed_config = config.clone();
+        changed_config.nodes.get_mut(node_id).unwrap().host = "192.0.2.99".into();
+        assert!(!super::auto_agent_update_receipt_matches(
+            &receipts,
+            &changed_config,
+            node_id,
+            &changed_config.nodes[node_id],
+        ));
+        let mut stale_receipts = receipts.clone();
+        stale_receipts.nodes.get_mut(node_id).unwrap().build_id = "older-build".into();
+        assert!(!super::auto_agent_update_receipt_matches(
+            &stale_receipts,
+            &config,
+            node_id,
+            &config.nodes[node_id],
+        ));
+    }
+
+    #[test]
     fn legacy_agent_probe_requires_a_valid_hash_and_reports_version() {
         let digest = "a".repeat(64);
         let parsed = parse_agent_build_probe(&format!(
@@ -17477,11 +18132,60 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let mut config = parse_build_test_config();
         config.nodes.get_mut("arm-a").unwrap().ssh_identity_file =
             Some(identity.display().to_string());
-        let first = super::agent_validation_cache_key(&config).unwrap();
+        let first =
+            super::agent_validation_cache_key_with_offline(&config, &BTreeSet::new()).unwrap();
         fs::write(&identity, b"rotated-key-material-with-new-size").unwrap();
-        let second = super::agent_validation_cache_key(&config).unwrap();
+        let second =
+            super::agent_validation_cache_key_with_offline(&config, &BTreeSet::new()).unwrap();
         assert_ne!(first, second);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn confirmed_offline_probe_exclusions_require_matching_identity_and_threshold() {
+        let config = parse_build_test_config();
+        let offline = macluster_controller::liveness::NodeLiveness {
+            identity_key: config.nodes["arm-a"].host.to_ascii_lowercase(),
+            unreachable_since_unix_ms: Some(1),
+            consecutive_failures: macluster_controller::liveness::OFFLINE_AFTER_FAILURES,
+            ..Default::default()
+        };
+        let reconnecting = macluster_controller::liveness::NodeLiveness {
+            identity_key: config.nodes["arm-b"].host.to_ascii_lowercase(),
+            unreachable_since_unix_ms: Some(1),
+            consecutive_failures: macluster_controller::liveness::OFFLINE_AFTER_FAILURES - 1,
+            ..Default::default()
+        };
+        let mismatched = macluster_controller::liveness::NodeLiveness {
+            identity_key: "different-machine-uuid".into(),
+            unreachable_since_unix_ms: Some(1),
+            consecutive_failures: macluster_controller::liveness::OFFLINE_AFTER_FAILURES,
+            ..Default::default()
+        };
+        let records = BTreeMap::from([
+            ("arm-a".into(), offline),
+            ("arm-b".into(), reconnecting),
+            ("login".into(), mismatched),
+        ]);
+
+        assert_eq!(
+            super::confirmed_offline_probe_exclusions(&config, &records),
+            BTreeSet::from(["arm-a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn agent_validation_cache_key_changes_when_confirmed_offline_set_changes() {
+        let config = parse_build_test_config();
+        let online_key =
+            super::agent_validation_cache_key_with_offline(&config, &BTreeSet::new()).unwrap();
+        let offline_key = super::agent_validation_cache_key_with_offline(
+            &config,
+            &BTreeSet::from(["arm-b".to_owned()]),
+        )
+        .unwrap();
+
+        assert_ne!(online_key, offline_key);
     }
 
     #[test]
@@ -17489,7 +18193,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let root = test_exports_path();
         fs::create_dir_all(&root).unwrap();
         let config = parse_build_test_config();
-        let key = super::agent_validation_cache_key(&config).unwrap();
+        let key =
+            super::agent_validation_cache_key_with_offline(&config, &BTreeSet::new()).unwrap();
         let path = root.join("cache.json");
         let now = super::validation_now_ms();
         let unknown = AgentBuildCompatibility {
@@ -18399,7 +19104,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             share_uuid: "00000000-0000-4000-8000-000000000002".into(),
             allow_existing_contents: false,
         };
-        let error = super::preflight_share_clients(&config, &share).unwrap_err();
+        let error = super::preflight_share_clients(&config, &share, &BTreeSet::new()).unwrap_err();
         assert!(error.1.contains("not empty"), "{error:?}");
         assert!(!source.join(".macluster-share-id").exists());
         assert_eq!(fs::read(&config_path).unwrap(), before);
@@ -18411,7 +19116,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             allow_existing_contents: true,
             ..share.clone()
         };
-        super::preflight_share_clients(&config, &overlay)
+        super::preflight_share_clients(&config, &overlay, &BTreeSet::new())
             .expect("explicit same-path overlay should preserve and allow existing files");
         assert_eq!(
             fs::read_to_string(source.join("keep.txt")).unwrap(),
@@ -21354,7 +22059,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
     }
 
     #[test]
-    fn controller_dispatch_barrier_covers_update_peer_sync() {
+    fn controller_detects_update_peer_config_sync_pending() {
         let root = std::env::temp_dir().join(format!("macluster-update-sync-{}", Id128::random()));
         let config_path = root.join("config.toml");
         let state_dir = root.join("state");
@@ -21376,8 +22081,63 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         state.operations.insert("update:all".into(), operation);
         save_admin_state(&state_dir.join("node-admin.json"), &state).unwrap();
 
-        assert!(dispatch_sync_pending(&config_path, &state_dir).unwrap());
+        assert!(peer_config_sync_pending(&config_path, &state_dir).unwrap());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_node_config_journal_can_recover_generation_after_offline_sync() {
+        let root = test_exports_path();
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("config.toml");
+        let source = "[cluster]\nname = \"test\"\n";
+        fs::write(&config_path, source).unwrap();
+        let config_path = config_path.canonicalize().unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+        let before_digest = sha256_hex(b"config before").unwrap();
+        let intermediate_digest = sha256_hex(b"config between").unwrap();
+        let active_digest = sha256_hex(source.as_bytes()).unwrap();
+        let mut first = update_operation("SYNC_PENDING", &before_digest, &intermediate_digest);
+        first.action = "share".into();
+        let mut second = update_operation("READY", &intermediate_digest, &active_digest);
+        second.action = "update".into();
+        let state = AdminState {
+            version: 1,
+            config_path: config_path.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::new(),
+            operations: BTreeMap::from([
+                ("share:tools".into(), first),
+                ("update:all".into(), second),
+            ]),
+        };
+        save_admin_state(&state_dir.join("node-admin.json"), &state).unwrap();
+
+        assert!(
+            has_committed_config_generation_path(
+                &config_path,
+                &state_dir,
+                &before_digest,
+                &active_digest,
+            )
+            .unwrap()
+        );
+
+        let mut uncommitted = state;
+        uncommitted.operations.get_mut("update:all").unwrap().phase = "UPDATE_COMMITTING".into();
+        save_admin_state(&state_dir.join("node-admin.json"), &uncommitted).unwrap();
+        assert!(
+            !has_committed_config_generation_path(
+                &config_path,
+                &state_dir,
+                &before_digest,
+                &active_digest,
+            )
+            .unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

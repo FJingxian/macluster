@@ -22,9 +22,13 @@ use macluster_core::config::{ClusterConfig, NodeConfig};
 use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, read_frame, sha256_hex, write_frame},
     identifiers::{Id128, StartToken},
+    nfs_admin::{
+        MAX_NFS_ADMIN_REQUEST_BYTES, NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply,
+        NfsAdminRequest, NfsAlias, NfsMount,
+    },
     types::{
         ControllerEpoch, ExecutionStatus, FanControlStatus, FanHelperCommand, FanHelperResponse,
-        INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState, NodeHealth, Operation,
+        INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState, NfsShareMarker, NodeHealth, Operation,
         PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody, RuntimePhase,
         SnapshotRef, StartResult,
     },
@@ -155,12 +159,42 @@ pub fn serve_stdio<R: Read, W: Write>(
     state_dir: &Path,
     local_node_id: &str,
 ) -> Result<(), AgentError> {
+    serve_stdio_inner(input, output, config, state_dir, local_node_id, None)
+}
+
+pub fn serve_stdio_with_config_path<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: &Path,
+) -> Result<(), AgentError> {
+    serve_stdio_inner(
+        input,
+        output,
+        config,
+        state_dir,
+        local_node_id,
+        Some(config_path),
+    )
+}
+
+fn serve_stdio_inner<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: Option<&Path>,
+) -> Result<(), AgentError> {
     let Some(request) =
         read_frame::<_, Request>(input).map_err(|error| AgentError::State(error.to_string()))?
     else {
         return Ok(());
     };
-    let response = handle_request(request, config, state_dir, local_node_id);
+    let response =
+        handle_request_with_config_path(request, config, state_dir, local_node_id, config_path);
     write_frame(output, &response).map_err(|error| AgentError::State(error.to_string()))?;
     Ok(())
 }
@@ -171,6 +205,16 @@ pub fn handle_request(
     state_dir: &Path,
     local_node_id: &str,
 ) -> Response {
+    handle_request_with_config_path(request, config, state_dir, local_node_id, None)
+}
+
+fn handle_request_with_config_path(
+    request: Request,
+    config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: Option<&Path>,
+) -> Response {
     let request_id = request.request_id;
     let result = if request.protocol_version != PROTOCOL_VERSION {
         Err(ProtocolError::IncompatibleVersion)
@@ -179,7 +223,13 @@ pub fn handle_request(
             Some(node) => validate_current_node_identity(node)
                 .map_err(ProtocolError::Failed)
                 .and_then(|_| {
-                    handle_operation(request.operation, config, state_dir, local_node_id)
+                    handle_operation_with_config_path(
+                        request.operation,
+                        config,
+                        state_dir,
+                        local_node_id,
+                        config_path,
+                    )
                 }),
             None => Err(ProtocolError::Failed(format!(
                 "node '{local_node_id}' is absent from the active config"
@@ -193,11 +243,22 @@ pub fn handle_request(
     }
 }
 
+#[cfg(test)]
 fn handle_operation(
     operation: Operation,
     config: &ClusterConfig,
     state_dir: &Path,
     local_node_id: &str,
+) -> Result<ResponseBody, ProtocolError> {
+    handle_operation_with_config_path(operation, config, state_dir, local_node_id, None)
+}
+
+fn handle_operation_with_config_path(
+    operation: Operation,
+    config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: Option<&Path>,
 ) -> Result<ResponseBody, ProtocolError> {
     match operation {
         Operation::TaskResources {
@@ -232,6 +293,29 @@ fn handle_operation(
         Operation::Health => node_health(config, local_node_id)
             .map(ResponseBody::Health)
             .map_err(|error| ProtocolError::Failed(error.to_string())),
+        Operation::ReconcileNfs {
+            controller,
+            config_toml,
+            obsolete_mounts,
+            obsolete_aliases,
+            obsolete_markers,
+        } => {
+            let config_path = config_path.ok_or_else(|| {
+                ProtocolError::Failed("NFS reconciliation requires a config path".into())
+            })?;
+            reconcile_nfs(
+                controller,
+                &config_toml,
+                &obsolete_mounts,
+                &obsolete_aliases,
+                &obsolete_markers,
+                config,
+                state_dir,
+                local_node_id,
+                config_path,
+            )?;
+            Ok(ResponseBody::Ack)
+        }
         Operation::Fence { controller } => fence(controller, state_dir).map(|_| ResponseBody::Ack),
         Operation::StartJob {
             controller,
@@ -263,6 +347,343 @@ fn handle_operation(
             fan_helper_command(FanHelperCommand::Set { policy }).map(ResponseBody::FanControl)
         }
     }
+}
+
+fn validate_reconcile_config_identity(
+    current: &ClusterConfig,
+    candidate: &ClusterConfig,
+    local_node_id: &str,
+) -> Result<(), String> {
+    if current.share_uuid != candidate.share_uuid {
+        return Err("NFS reconciliation config belongs to another cluster".into());
+    }
+    let current_node = current
+        .nodes
+        .get(local_node_id)
+        .ok_or_else(|| format!("current config does not register node {local_node_id}"))?;
+    let candidate_node = candidate
+        .nodes
+        .get(local_node_id)
+        .ok_or_else(|| format!("candidate config removes local node {local_node_id}"))?;
+    let Some(machine_uuid) = current_node.machine_uuid.as_deref() else {
+        return Err("registered machine UUID is required for automatic NFS reconciliation".into());
+    };
+    if candidate_node.machine_uuid.as_deref() != Some(machine_uuid) {
+        return Err("candidate config changes the registered machine identity".into());
+    }
+    let Some(execution_uid) = current_node.execution_uid else {
+        return Err("registered execution UID is required for automatic NFS reconciliation".into());
+    };
+    if candidate_node.execution_uid != Some(execution_uid)
+        || unsafe { libc::geteuid() } != execution_uid
+    {
+        return Err("candidate config changes the registered execution UID".into());
+    }
+    Ok(())
+}
+
+fn desired_client_nfs_mounts(
+    config: &ClusterConfig,
+    local_node_id: &str,
+) -> Result<Vec<NfsMount>, String> {
+    let mut mounts = Vec::with_capacity(config.shares.len().saturating_add(1));
+    if config.storage_server.as_str() != local_node_id {
+        let server = config
+            .nodes
+            .get(config.storage_server.as_str())
+            .ok_or_else(|| "primary NFS server is missing from the config".to_owned())?;
+        mounts.push(NfsMount {
+            source: format!("{}:{}", server.host, config.primary_source_root().display()),
+            target: config.shared_root.to_string_lossy().into_owned(),
+            share_uuid: config.share_uuid.clone(),
+            alias: None,
+            allow_existing_contents: false,
+        });
+    }
+    for share in config.shares.values() {
+        if share.server.as_str() == local_node_id {
+            continue;
+        }
+        let server = config
+            .nodes
+            .get(share.server.as_str())
+            .ok_or_else(|| format!("NFS server {} is missing from the config", share.server))?;
+        mounts.push(NfsMount {
+            source: format!("{}:{}", server.host, share.source_root.display()),
+            target: share.mount_root.to_string_lossy().into_owned(),
+            share_uuid: share.share_uuid.clone(),
+            alias: (share.source_root != share.mount_root)
+                .then(|| share.source_root.to_string_lossy().into_owned()),
+            allow_existing_contents: share.allow_existing_contents,
+        });
+    }
+    Ok(mounts)
+}
+
+fn superseded_nfs_cleanup_plan(
+    desired_config: &ClusterConfig,
+    mount_output: &str,
+    obsolete_mounts: Vec<NfsMount>,
+    obsolete_aliases: Vec<NfsAlias>,
+    obsolete_markers: Vec<NfsShareMarker>,
+    desired_mounts: &[NfsMount],
+) -> (Vec<NfsMount>, Vec<NfsAlias>, Vec<NfsShareMarker>) {
+    let mounts = obsolete_mounts
+        .into_iter()
+        .filter(|obsolete| {
+            !desired_mounts.iter().any(|desired| {
+                desired.target == obsolete.target
+                    && nfs_mount_matches(mount_output, &desired.source, &desired.target)
+            })
+        })
+        .collect();
+    let aliases = obsolete_aliases
+        .into_iter()
+        .filter(|obsolete| {
+            !desired_mounts.iter().any(|desired| {
+                desired.alias.as_deref() == Some(obsolete.path.as_str())
+                    && desired.target == obsolete.target
+            })
+        })
+        .collect();
+    let markers = obsolete_markers
+        .into_iter()
+        .filter(|obsolete| {
+            !desired_config
+                .shares
+                .values()
+                .any(|share| share.source_root.to_string_lossy() == obsolete.source_root)
+        })
+        .collect();
+    (mounts, aliases, markers)
+}
+
+fn nfs_mount_matches(mount_output: &str, source: &str, target: &str) -> bool {
+    let expected = format!("{source} on {target} (nfs");
+    mount_output.lines().any(|line| line.starts_with(&expected))
+}
+
+fn nfs_reconciliation_blocked(store: &AgentStore) -> bool {
+    store.log_sync_shutdown.is_some()
+        || store
+            .active
+            .as_ref()
+            .is_some_and(|record| !record.terminal() || record.log_sync_pending)
+        || store
+            .tombstones
+            .iter()
+            .any(|record| !record.terminal() || record.log_sync_pending)
+}
+
+const NFS_RECONCILIATION_BATCH_SIZE: usize = 128;
+const NFS_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_nfs(
+    controller: ControllerEpoch,
+    config_toml: &str,
+    obsolete_mounts: &[NfsMount],
+    obsolete_aliases: &[NfsAlias],
+    obsolete_markers: &[NfsShareMarker],
+    current_config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: &Path,
+) -> Result<(), ProtocolError> {
+    if config_toml.len() > MAX_SNAPSHOT_BYTES as usize {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let desired_config = ClusterConfig::parse(config_toml).map_err(|error| {
+        ProtocolError::Failed(format!("invalid NFS reconciliation config: {error}"))
+    })?;
+    validate_reconcile_config_identity(current_config, &desired_config, local_node_id)
+        .map_err(ProtocolError::Failed)?;
+    let desired_node = desired_config
+        .nodes
+        .get(local_node_id)
+        .ok_or(ProtocolError::NotPermitted)?;
+    validate_current_node_identity(desired_node).map_err(ProtocolError::Failed)?;
+
+    let desired_mounts =
+        desired_client_nfs_mounts(&desired_config, local_node_id).map_err(ProtocolError::Failed)?;
+    let mount_output = if obsolete_mounts.iter().any(|obsolete| {
+        desired_mounts
+            .iter()
+            .any(|desired| desired.target == obsolete.target)
+    }) {
+        current_mount_output().map_err(protocol_failed)?
+    } else {
+        String::new()
+    };
+    let (mut obsolete_mounts, obsolete_aliases, obsolete_markers) = superseded_nfs_cleanup_plan(
+        &desired_config,
+        &mount_output,
+        obsolete_mounts.to_vec(),
+        obsolete_aliases.to_vec(),
+        obsolete_markers.to_vec(),
+        &desired_mounts,
+    );
+
+    obsolete_mounts.sort_by(|left, right| {
+        (&left.target, &left.source, &left.share_uuid).cmp(&(
+            &right.target,
+            &right.source,
+            &right.share_uuid,
+        ))
+    });
+    obsolete_mounts.dedup();
+    let mut obsolete_aliases = obsolete_aliases.to_vec();
+    obsolete_aliases
+        .sort_by(|left, right| (&left.path, &left.target).cmp(&(&right.path, &right.target)));
+    obsolete_aliases.dedup();
+    let mut obsolete_markers = obsolete_markers.to_vec();
+    obsolete_markers.sort_by(|left, right| {
+        (&left.source_root, &left.share_uuid).cmp(&(&right.source_root, &right.share_uuid))
+    });
+    obsolete_markers.dedup();
+
+    let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
+    let mut store = read_store(state_dir).map_err(protocol_failed)?;
+    if nfs_reconciliation_blocked(&store) {
+        return Err(ProtocolError::Busy);
+    }
+    admit_epoch(&mut store, controller).map_err(ProtocolError::Failed)?;
+
+    for start in (0..obsolete_mounts.len().max(obsolete_aliases.len()))
+        .step_by(NFS_RECONCILIATION_BATCH_SIZE)
+    {
+        let mounts = obsolete_mounts
+            .get(start..(start + NFS_RECONCILIATION_BATCH_SIZE).min(obsolete_mounts.len()))
+            .unwrap_or_default();
+        let aliases = obsolete_aliases
+            .get(start..(start + NFS_RECONCILIATION_BATCH_SIZE).min(obsolete_aliases.len()))
+            .unwrap_or_default();
+        if mounts.is_empty() && aliases.is_empty() {
+            continue;
+        }
+        let request = NfsAdminRequest {
+            operation: NfsAdminOperation::Unmount {
+                mounts: mounts.to_vec(),
+                aliases: aliases.to_vec(),
+                force: false,
+            },
+        };
+        call_nfs_admin_helper(request)?;
+    }
+
+    for marker in obsolete_markers {
+        call_nfs_admin_helper(NfsAdminRequest {
+            operation: NfsAdminOperation::RemoveMarker {
+                source_root: marker.source_root,
+                share_uuid: marker.share_uuid,
+            },
+        })?;
+    }
+
+    for mounts in desired_mounts.chunks(NFS_RECONCILIATION_BATCH_SIZE) {
+        call_nfs_admin_helper(NfsAdminRequest {
+            operation: NfsAdminOperation::Mount {
+                mounts: mounts.to_vec(),
+            },
+        })?;
+    }
+
+    atomic_replace_config(config_path, config_toml).map_err(protocol_failed)?;
+    store.controller = Some(controller);
+    write_store(state_dir, &store).map_err(protocol_failed)?;
+    Ok(())
+}
+
+fn call_nfs_admin_helper(request: NfsAdminRequest) -> Result<(), ProtocolError> {
+    let peer_uid = unsafe { libc::geteuid() };
+    request
+        .validate(peer_uid)
+        .map_err(|_| ProtocolError::InvalidRequest)?;
+    let bytes = serde_json::to_vec(&request)
+        .map_err(|error| ProtocolError::Failed(format!("encode NFS admin request: {error}")))?;
+    if bytes.len() > MAX_NFS_ADMIN_REQUEST_BYTES {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(NFS_ADMIN_SOCKET_PATH).map_err(|error| {
+        ProtocolError::Failed(format!("NFS admin helper is unavailable: {error}"))
+    })?;
+    stream
+        .set_read_timeout(Some(NFS_HELPER_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(NFS_HELPER_TIMEOUT)))
+        .map_err(|error| ProtocolError::Failed(format!("set NFS helper timeout: {error}")))?;
+    stream
+        .write_all(&bytes)
+        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(|error| ProtocolError::Failed(format!("send NFS admin request: {error}")))?;
+    let mut response = Vec::new();
+    stream
+        .take((MAX_NFS_ADMIN_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut response)
+        .map_err(|error| ProtocolError::Failed(format!("read NFS admin response: {error}")))?;
+    if response.len() > MAX_NFS_ADMIN_REQUEST_BYTES {
+        return Err(ProtocolError::Failed(
+            "NFS admin response exceeded the size limit".into(),
+        ));
+    }
+    let reply: NfsAdminReply = serde_json::from_slice(&response)
+        .map_err(|error| ProtocolError::Failed(format!("invalid NFS admin response: {error}")))?;
+    if reply.service_version != NFS_ADMIN_SERVICE_VERSION {
+        return Err(ProtocolError::Failed(format!(
+            "NFS admin helper version {} is incompatible with required {}",
+            reply.service_version, NFS_ADMIN_SERVICE_VERSION
+        )));
+    }
+    if !reply.ok {
+        return Err(ProtocolError::Failed(
+            reply
+                .error
+                .unwrap_or_else(|| "NFS admin helper rejected the request".into()),
+        ));
+    }
+    Ok(())
+}
+
+fn atomic_replace_config(path: &Path, content: &str) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cluster config path must be absolute",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cluster config must be a regular file, not a symlink",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "config has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp = parent.join(format!(".{name}.reconcile-{}.tmp", Id128::random()));
+    let mode = metadata.permissions().mode() & 0o777;
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 fn fan_helper_command(command: FanHelperCommand) -> Result<FanControlStatus, ProtocolError> {
@@ -1244,6 +1665,12 @@ fn verify_share(config: &ClusterConfig, local_node_id: &str) -> Result<(), Agent
 
 fn current_mount_output() -> Result<String, AgentError> {
     let mounts = Command::new("/sbin/mount").output()?;
+    if !mounts.status.success() {
+        return Err(AgentError::State(format!(
+            "could not inspect mounted filesystems: {}",
+            String::from_utf8_lossy(&mounts.stderr).trim()
+        )));
+    }
     Ok(String::from_utf8_lossy(&mounts.stdout).into_owned())
 }
 
@@ -1739,6 +2166,173 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     const TEST_SHARE_UUID: &str = "00000000-0000-4000-8000-000000000001";
+    const TEST_STORAGE_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000002";
+    const TEST_WORKER_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000003";
+
+    fn nfs_reconcile_config() -> ClusterConfig {
+        ClusterConfig::parse(&format!(
+            r#"
+[cluster]
+name = "nfs-reconcile"
+default_queue = "workers"
+shared_root = "/mnt/primary"
+storage_source_root = "/srv/primary"
+share_uuid = "{TEST_SHARE_UUID}"
+storage_server = "storage"
+protocol_version = 1
+
+[queues.workers]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.storage]
+host = "192.0.2.1"
+transport = "ssh"
+machine_uuid = "{TEST_STORAGE_MACHINE_UUID}"
+execution_uid = 501
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+machine_uuid = "{TEST_WORKER_MACHINE_UUID}"
+execution_uid = 501
+
+[shares.data]
+server = "storage"
+source_root = "/srv/data"
+mount_root = "/mnt/data"
+share_uuid = "00000000-0000-4000-8000-000000000004"
+
+[shares.local]
+server = "worker"
+source_root = "/srv/local"
+mount_root = "/mnt/local"
+share_uuid = "00000000-0000-4000-8000-000000000005"
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn nfs_reconciliation_mount_plan_includes_primary_and_remote_named_shares_only() {
+        let config = nfs_reconcile_config();
+        let mounts = desired_client_nfs_mounts(&config, "worker").unwrap();
+
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].source, "192.0.2.1:/srv/primary");
+        assert_eq!(mounts[0].target, "/mnt/primary");
+        assert_eq!(mounts[0].share_uuid, TEST_SHARE_UUID);
+        assert_eq!(mounts[1].source, "192.0.2.1:/srv/data");
+        assert_eq!(mounts[1].target, "/mnt/data");
+        assert_eq!(mounts[1].alias.as_deref(), Some("/srv/data"));
+    }
+
+    #[test]
+    fn nfs_reconciliation_preserves_a_newer_mount_that_replaced_an_old_cleanup_target() {
+        let config = nfs_reconcile_config();
+        let desired_mounts = desired_client_nfs_mounts(&config, "worker").unwrap();
+        let obsolete_mounts = vec![NfsMount {
+            source: "192.0.2.9:/old-data".into(),
+            target: "/mnt/data".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            alias: None,
+            allow_existing_contents: false,
+        }];
+        let obsolete_aliases = vec![NfsAlias {
+            path: "/srv/data".into(),
+            target: "/mnt/data".into(),
+        }];
+        let obsolete_markers = vec![NfsShareMarker {
+            source_root: "/srv/data".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+        }];
+        let mounts = "192.0.2.1:/srv/data on /mnt/data (nfs, nodev)\n";
+
+        let (mounts, aliases, markers) = superseded_nfs_cleanup_plan(
+            &config,
+            mounts,
+            obsolete_mounts,
+            obsolete_aliases,
+            obsolete_markers,
+            &desired_mounts,
+        );
+
+        assert!(mounts.is_empty());
+        assert!(aliases.is_empty());
+        assert!(markers.is_empty());
+
+        let unrelated_mount = "192.0.2.9:/other on /mnt/data (nfs, nodev)\n";
+        let (mounts, aliases, markers) = superseded_nfs_cleanup_plan(
+            &config,
+            unrelated_mount,
+            vec![NfsMount {
+                source: "192.0.2.9:/old-data".into(),
+                target: "/mnt/data".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+                alias: None,
+                allow_existing_contents: false,
+            }],
+            vec![NfsAlias {
+                path: "/srv/data".into(),
+                target: "/mnt/data".into(),
+            }],
+            vec![NfsShareMarker {
+                source_root: "/srv/data".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            }],
+            &desired_mounts,
+        );
+
+        assert_eq!(
+            mounts.len(),
+            1,
+            "unexpected mounts are still checked strictly"
+        );
+        assert!(aliases.is_empty(), "desired aliases must be preserved");
+        assert!(
+            markers.is_empty(),
+            "markers at a desired source stay intact"
+        );
+    }
+
+    #[test]
+    fn nfs_reconciliation_rejects_foreign_cluster_or_changed_node_identity() {
+        let current = nfs_reconcile_config();
+        let same = nfs_reconcile_config();
+        assert!(validate_reconcile_config_identity(&current, &same, "worker").is_ok());
+
+        let mut foreign_cluster = same.clone();
+        foreign_cluster.share_uuid = "00000000-0000-4000-8000-000000000099".into();
+        assert!(validate_reconcile_config_identity(&current, &foreign_cluster, "worker").is_err());
+
+        let mut changed_machine = same.clone();
+        changed_machine
+            .nodes
+            .get_mut("worker")
+            .unwrap()
+            .machine_uuid = Some("00000000-0000-4000-8000-000000000098".into());
+        assert!(validate_reconcile_config_identity(&current, &changed_machine, "worker").is_err());
+
+        let mut changed_uid = same;
+        changed_uid.nodes.get_mut("worker").unwrap().execution_uid = Some(502);
+        assert!(validate_reconcile_config_identity(&current, &changed_uid, "worker").is_err());
+    }
+
+    #[test]
+    fn nfs_reconciliation_waits_for_active_jobs_and_output_sync() {
+        let (root, state_dir, _, _shared) = status_fixture("reconcile-busy", "boot", None, false);
+        let mut store = read_store(&state_dir).unwrap();
+        assert!(nfs_reconciliation_blocked(&store));
+
+        let active = store.active.as_mut().unwrap();
+        active.terminal_state = Some(JobState::Completed);
+        active.phase = RuntimePhase::Idle;
+        assert!(!nfs_reconciliation_blocked(&store));
+        store.active.as_mut().unwrap().log_sync_pending = true;
+        assert!(nfs_reconciliation_blocked(&store));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     pub(super) fn status_fixture(
         label: &str,

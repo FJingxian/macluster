@@ -269,10 +269,11 @@ fn config_reload_increments_generation_and_rejects_old_requests_on_existing_conn
     let candidate_digest = sha256_hex(&candidate_bytes).unwrap();
     let journal_bytes = fs::read(fixture.state_dir().join("node-admin.json")).unwrap_or_default();
     let journal_digest = sha256_hex(&journal_bytes).unwrap();
-    let (next_config, scope) = api
+    let (next_config, next_config_toml, scope) = api
         .prepare_maintenance_completion(&status.ticket, &candidate_digest, &journal_digest)
         .unwrap();
     assert_eq!(scope, MaintenanceScope::Cluster);
+    assert!(next_config_toml.contains("/tmp/macluster-updated"));
     api.finish_maintenance_completion(&status.ticket, next_config)
         .unwrap();
     assert_eq!(api.hello().config_generation, hello.config_generation + 1);

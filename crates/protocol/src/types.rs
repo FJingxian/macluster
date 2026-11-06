@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId, StartToken};
+use crate::nfs_admin::{NfsAlias, NfsMount};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const INTERACTIVE_PTY_FEATURE: &str = "agent.interactive-pty.v1";
@@ -637,6 +638,13 @@ pub enum Operation {
         job_id: u64,
     },
     Health,
+    ReconcileNfs {
+        controller: ControllerEpoch,
+        config_toml: String,
+        obsolete_mounts: Vec<NfsMount>,
+        obsolete_aliases: Vec<NfsAlias>,
+        obsolete_markers: Vec<NfsShareMarker>,
+    },
     Fence {
         controller: ControllerEpoch,
     },
@@ -656,6 +664,12 @@ pub enum Operation {
     SetFanPolicy {
         policy: FanPolicy,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NfsShareMarker {
+    pub source_root: String,
+    pub share_uuid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -706,7 +720,11 @@ pub struct ConfigRevision(pub u64);
 
 #[cfg(test)]
 mod interactive_job_compatibility_tests {
-    use super::{JobSpec, NodeHealth};
+    use super::{ControllerEpoch, JobSpec, NfsShareMarker, NodeHealth, Operation};
+    use crate::{
+        identifiers::{ControllerUuid, Id128},
+        nfs_admin::{NfsAlias, NfsMount},
+    };
     use serde_json::json;
 
     #[test]
@@ -745,5 +763,44 @@ mod interactive_job_compatibility_tests {
 
         assert_eq!(decoded.logical_cpus, None);
         assert_eq!(encoded["features"], json!([]));
+    }
+
+    #[test]
+    fn reconcile_nfs_operation_round_trips_exact_cleanup_and_config_snapshot() {
+        let operation = Operation::ReconcileNfs {
+            controller: ControllerEpoch {
+                controller_uuid: ControllerUuid(
+                    Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+                ),
+                epoch: 7,
+            },
+            config_toml: "[cluster]\nname = \"test\"\n".into(),
+            obsolete_mounts: vec![NfsMount {
+                source: "192.0.2.1:/srv/old".into(),
+                target: "/mnt/data".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                alias: None,
+                allow_existing_contents: false,
+            }],
+            obsolete_aliases: vec![NfsAlias {
+                path: "/srv/old".into(),
+                target: "/mnt/data".into(),
+            }],
+            obsolete_markers: vec![NfsShareMarker {
+                source_root: "/srv/old".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+            }],
+        };
+
+        let encoded = serde_json::to_value(&operation).unwrap();
+        assert_eq!(encoded["type"], "reconcile_nfs");
+        assert_eq!(
+            serde_json::from_value::<Operation>(encoded).unwrap(),
+            operation
+        );
+        assert_eq!(
+            serde_json::to_value(Operation::Ping).unwrap(),
+            json!({ "type": "ping" })
+        );
     }
 }

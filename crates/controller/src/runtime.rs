@@ -259,6 +259,11 @@ impl NodeRuntime {
             }
         })
     }
+
+    fn confirmed_offline(&self) -> bool {
+        self.probe_failures >= crate::liveness::OFFLINE_AFTER_FAILURES
+            && self.unreachable_since_unix_ms.is_some()
+    }
 }
 
 fn probe_delay(configured_interval: Duration, occupied: bool) -> Duration {
@@ -540,6 +545,11 @@ impl RuntimeState {
         };
         for job in service.storage.list_active_jobs()? {
             let scoped = in_scope(job.node.as_ref());
+            let job_node_offline = job
+                .node
+                .as_ref()
+                .and_then(|node_id| self.nodes.get(node_id.as_str()))
+                .is_some_and(NodeRuntime::confirmed_offline);
             let label = match job.state {
                 JobState::Starting | JobState::Running | JobState::Cancelling if scoped => {
                     Some(format!(
@@ -550,7 +560,8 @@ impl RuntimeState {
                     ))
                 }
                 _ if (scoped || matches!(scope, MaintenanceScope::Cluster))
-                    && (job.snapshot_sync_pending || job.log_sync_pending) =>
+                    && (job.snapshot_sync_pending || job.log_sync_pending)
+                    && !job_node_offline =>
                 {
                     Some(format!("job {} output synchronization is pending", job.id))
                 }
@@ -568,9 +579,13 @@ impl RuntimeState {
             if !service.node_is_maintenance_scoped(node_id) {
                 continue;
             }
-            if node.in_flight.is_some() {
+            let confirmed_offline = node.confirmed_offline();
+            let has_mutating_operation = node.in_flight.is_some_and(|operation| {
+                matches!(operation.kind, WorkKind::Start | WorkKind::Cancel)
+            });
+            if has_mutating_operation {
                 blockers.push(format!(
-                    "node {node_id} has a controller operation in flight"
+                    "node {node_id} has a start or cancel operation in flight"
                 ));
             } else if node.pending_start.is_some() {
                 blockers.push(format!("node {node_id} has a pending start operation"));
@@ -578,11 +593,19 @@ impl RuntimeState {
                 && node.status.as_ref().is_some_and(|status| status.occupied)
             {
                 blockers.push(format!("node {node_id} still reports an active execution"));
-            } else if !node.status_fresh(Instant::now()) {
-                blockers.push(match &node.last_probe_error {
-                    Some(error) => format!("node {node_id} execution verification failed: {error}"),
-                    None => format!("node {node_id} execution state is not freshly verified"),
-                });
+            } else if !node.status_fresh(Instant::now()) && !confirmed_offline {
+                if node.in_flight.is_some() {
+                    blockers.push(format!(
+                        "node {node_id} has a controller operation in flight"
+                    ));
+                } else {
+                    blockers.push(match &node.last_probe_error {
+                        Some(error) => {
+                            format!("node {node_id} execution verification failed: {error}")
+                        }
+                        None => format!("node {node_id} execution state is not freshly verified"),
+                    });
+                }
             }
             if blockers.len() >= 32 {
                 break;

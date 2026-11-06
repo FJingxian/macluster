@@ -61,6 +61,7 @@ const NFS_EXPORTS_TEMP_PATH: &str = "/etc/exports.macluster.tmp";
 const NFS_EXPORTS_BACKUP_PATH: &str = "/etc/exports.macluster.bak";
 const NFS_DAEMON_PATH: &str = "/sbin/nfsd";
 const POWER_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/org.macluster.power";
+const DEFERRED_SHARE_CLEANUP_FILE: &str = "deferred-share-cleanup.json";
 const NFS_ADMIN_CLI_PATH: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs-admin";
 const NFS_ADMIN_VERSION_PATH: &str =
     "/Library/PrivilegedHelperTools/org.macluster.nfs-admin.version";
@@ -6896,6 +6897,22 @@ pub(crate) fn sync_remote_configs(
     sync_remote_configs_inner(config, source, state_dir, operation_id, skip_node, None)
 }
 
+fn sync_remote_configs_online_nodes(
+    config: &ClusterConfig,
+    source: &str,
+    state_dir: &Path,
+    operation_id: &str,
+) -> Result<(), String> {
+    let offline = confirmed_offline_nodes(config, state_dir);
+    let online = config
+        .nodes
+        .keys()
+        .filter(|node_id| !offline.contains(*node_id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    sync_remote_configs_on_nodes(config, source, state_dir, operation_id, &online)
+}
+
 fn sync_remote_configs_on_nodes(
     config: &ClusterConfig,
     source: &str,
@@ -9780,6 +9797,273 @@ struct ShareRemovalClientPlan {
     aliases: Vec<NfsAlias>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DeferredShareClientCleanup {
+    share_id: String,
+    node_id: String,
+    source_root: String,
+    mount_root: String,
+    server_host: String,
+    share_uuid: String,
+    machine_uuid: Option<String>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct DeferredShareCleanupState {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    entries: BTreeMap<String, DeferredShareClientCleanup>,
+}
+
+fn deferred_share_cleanup_key(share_id: &str, node_id: &str) -> String {
+    format!("{share_id}/{node_id}")
+}
+
+fn read_deferred_share_cleanup(state_dir: &Path) -> AppResult<DeferredShareCleanupState> {
+    let path = state_dir.join(DEFERRED_SHARE_CLEANUP_FILE);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DeferredShareCleanupState::default());
+        }
+        Err(error) => return Err(io_error(error)),
+    };
+    serde_json::from_slice(&bytes).map_err(|error| {
+        (
+            1,
+            format!("deferred NFS cleanup journal is invalid: {error}"),
+        )
+    })
+}
+
+fn save_deferred_share_cleanup(
+    state_dir: &Path,
+    state: &DeferredShareCleanupState,
+) -> AppResult<()> {
+    let path = state_dir.join(DEFERRED_SHARE_CLEANUP_FILE);
+    if state.entries.is_empty() {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error(error)),
+        }
+    } else {
+        let bytes = serde_json::to_vec_pretty(state).map_err(|error| (1, error.to_string()))?;
+        atomic_write(&path, &bytes)
+    }
+}
+
+fn confirmed_offline_nodes(config: &ClusterConfig, state_dir: &Path) -> BTreeSet<String> {
+    let records = match macluster_controller::liveness::read(state_dir, &config.share_uuid) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("macluster: could not read node liveness before NFS cleanup: {error}");
+            return BTreeSet::new();
+        }
+    };
+    config
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
+            let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            records.get(node_id).and_then(|record| {
+                (record.identity_key.eq_ignore_ascii_case(identity)
+                    && record.is_confirmed_offline())
+                .then(|| node_id.clone())
+            })
+        })
+        .collect()
+}
+
+fn node_ssh_endpoint_reachable(node: &NodeConfig) -> bool {
+    if node.transport == Transport::Local {
+        return true;
+    }
+    let Ok(host) = node.host.parse::<IpAddr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(
+        &SocketAddr::new(host, node.ssh_port.unwrap_or(22)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+fn remember_deferred_share_cleanup(
+    state_dir: &Path,
+    share_id: &str,
+    node_id: &str,
+    node: &NodeConfig,
+    server: &NodeConfig,
+    share: &ShareConfig,
+    state: &AdminState,
+) -> AppResult<()> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    pending.version = 1;
+    let machine_uuid = node
+        .machine_uuid
+        .clone()
+        .or_else(|| state.machine_uuids.get(node_id).cloned());
+    pending.entries.insert(
+        deferred_share_cleanup_key(share_id, node_id),
+        DeferredShareClientCleanup {
+            share_id: share_id.to_owned(),
+            node_id: node_id.to_owned(),
+            source_root: share.source_root.to_string_lossy().into_owned(),
+            mount_root: share.mount_root.to_string_lossy().into_owned(),
+            server_host: server.host.to_string(),
+            share_uuid: share.share_uuid.clone(),
+            machine_uuid,
+        },
+    );
+    save_deferred_share_cleanup(state_dir, &pending)
+}
+
+fn retry_deferred_share_client_cleanup(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+    config_source: &str,
+    admin_state: &AdminState,
+    share_id: &str,
+) -> AppResult<Vec<String>> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    let operation_id = admin_state
+        .operations
+        .get(&format!("share-remove:{share_id}"))
+        .map(|operation| operation.id.as_str())
+        .unwrap_or("deferred-share-cleanup");
+    let keys = pending
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.share_id == share_id)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let mut deferred = Vec::new();
+
+    for key in keys {
+        let Some(entry) = pending.entries.get(&key).cloned() else {
+            continue;
+        };
+        let Some(node) = config.nodes.get(&entry.node_id) else {
+            deferred.push(format!(
+                "{} (no longer registered; client cleanup remains deferred)",
+                entry.node_id
+            ));
+            continue;
+        };
+        if !node_ssh_endpoint_reachable(node) {
+            deferred.push(format!("{} (offline)", entry.node_id));
+            continue;
+        }
+        if entry.machine_uuid.as_deref().is_some_and(|expected| {
+            node.machine_uuid
+                .as_deref()
+                .or_else(|| {
+                    admin_state
+                        .machine_uuids
+                        .get(&entry.node_id)
+                        .map(String::as_str)
+                })
+                .is_some_and(|actual| !actual.eq_ignore_ascii_case(expected))
+        }) {
+            deferred.push(format!(
+                "{} (registered machine identity changed; cleanup was not attempted)",
+                entry.node_id
+            ));
+            continue;
+        }
+        if let Err((_, error)) = verify_registered_node_identity(&entry.node_id, node, admin_state)
+        {
+            deferred.push(format!("{} ({error})", entry.node_id));
+            continue;
+        }
+        if let Err((_, error)) = check_remote_idle(node, &entry.node_id, config_path) {
+            deferred.push(format!("{} ({error})", entry.node_id));
+            continue;
+        }
+        let mounts = match ssh_output(node, "/sbin/mount", None) {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            Ok(output) => {
+                deferred.push(format!(
+                    "{} ({})",
+                    entry.node_id,
+                    command_error("cannot inspect deferred NFS mount", &output)
+                ));
+                continue;
+            }
+            Err((_, error)) => {
+                deferred.push(format!("{} ({error})", entry.node_id));
+                continue;
+            }
+        };
+        let expected_source = format!("{}:{}", entry.server_host, entry.source_root);
+        let mount = match named_share_mount_status(&mounts, &expected_source, &entry.mount_root) {
+            NamedShareMountStatus::Expected => vec![NfsMount {
+                source: expected_source,
+                target: entry.mount_root.clone(),
+                share_uuid: entry.share_uuid.clone(),
+                alias: None,
+                allow_existing_contents: false,
+            }],
+            NamedShareMountStatus::NotMounted => Vec::new(),
+            NamedShareMountStatus::MountedElsewhere(actual) => {
+                deferred.push(format!(
+                    "{} ({} is mounted from {actual}; refusing to unmount it)",
+                    entry.node_id, entry.mount_root
+                ));
+                continue;
+            }
+        };
+        let aliases = if entry.source_root != entry.mount_root {
+            if let Err(error) = check_managed_nfs_alias(
+                node,
+                &entry.source_root,
+                &entry.mount_root,
+                true,
+                &format!("verify deferred share alias on {}", entry.node_id),
+            ) {
+                deferred.push(format!("{} ({error})", entry.node_id));
+                continue;
+            }
+            vec![NfsAlias {
+                path: entry.source_root.clone(),
+                target: entry.mount_root.clone(),
+            }]
+        } else {
+            Vec::new()
+        };
+        if !mount.is_empty() || !aliases.is_empty() {
+            if let Err(error) = unmount_managed_nfs(
+                node,
+                &mount,
+                &aliases,
+                false,
+                &format!("finish deferred NFS share {} cleanup", entry.share_id),
+            ) {
+                deferred.push(format!("{} ({error})", entry.node_id));
+                continue;
+            }
+        }
+        let only_node = BTreeSet::from([entry.node_id.clone()]);
+        if let Err(error) =
+            sync_remote_configs_on_nodes(config, config_source, state_dir, operation_id, &only_node)
+        {
+            deferred.push(format!(
+                "{} (remote config sync pending: {error})",
+                entry.node_id
+            ));
+            continue;
+        }
+        pending.entries.remove(&key);
+        save_deferred_share_cleanup(state_dir, &pending)?;
+    }
+    Ok(deferred)
+}
+
 fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
@@ -9893,7 +10177,22 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 }
             }
             (None, Some(operation)) if operation.phase == "REMOVED" => {
-                println!("Named share {share_id} was already removed.");
+                let deferred = retry_deferred_share_client_cleanup(
+                    &config_path,
+                    state_dir,
+                    &config,
+                    &source_text,
+                    &state,
+                    share_id,
+                )?;
+                if deferred.is_empty() {
+                    println!("Named share {share_id} was already removed.");
+                } else {
+                    println!(
+                        "Named share {share_id} is removed from the cluster; client cleanup is still deferred: {}. Rerun `mnode -rm share:{share_id}` after the listed nodes reconnect.",
+                        deferred.join(", ")
+                    );
+                }
                 return Ok(());
             }
             (None, Some(operation)) if operation.action == "share-remove" => operation,
@@ -9967,8 +10266,16 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 .operations
                 .insert(operation_key.clone(), operation.clone());
             save_admin_state(&journal_path, &state)?;
+            let deferred_cleanup = retry_deferred_share_client_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &source_text,
+                &state,
+                share_id,
+            )?;
             if let Err(error) =
-                sync_remote_configs(&config, &source_text, state_dir, &operation.id, None)
+                sync_remote_configs_online_nodes(&config, &source_text, state_dir, &operation.id)
             {
                 operation.detail = Some(error.clone());
                 state
@@ -9983,10 +10290,17 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 ));
             }
             operation.phase = "REMOVED".into();
-            operation.detail = None;
+            operation.detail = (!deferred_cleanup.is_empty())
+                .then(|| format!("deferred client cleanup: {}", deferred_cleanup.join(", ")));
             state.operations.insert(operation_key, operation);
             save_admin_state(&journal_path, &state)?;
             println!("Removed named NFS share {share_id}; source files were preserved.");
+            if !deferred_cleanup.is_empty() {
+                println!(
+                    "Client cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after those nodes reconnect.",
+                    deferred_cleanup.join(", ")
+                );
+            }
             return Ok(());
         }
 
@@ -10019,23 +10333,58 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             ));
         }
 
-        if state_dir.join("controller.sqlite3").is_file()
-            && ReadOnlyJobStore::open(state_dir)
-                .and_then(|store| store.has_maintenance_work())
+        let offline_nodes = confirmed_offline_nodes(&config, state_dir);
+        let mut deferred_output_sync = Vec::new();
+        if state_dir.join("controller.sqlite3").is_file() {
+            let jobs = ReadOnlyJobStore::open(state_dir)
+                .and_then(|store| store.list_active_jobs())
                 .map_err(|error| {
                     (
                         1,
                         format!("cannot check active jobs and output sync: {error}"),
                     )
-                })?
-        {
+                })?;
+            let mut blockers = Vec::new();
+            for job in jobs {
+                if matches!(
+                    job.state,
+                    macluster_protocol::types::JobState::Starting
+                        | macluster_protocol::types::JobState::Running
+                        | macluster_protocol::types::JobState::Cancelling
+                ) {
+                    blockers.push(format!("job {} is {:?}", job.id, job.state));
+                } else if job.snapshot_sync_pending || job.log_sync_pending {
+                    let job_node = job.node.as_ref().map(NodeId::as_str);
+                    if job_node.is_some_and(|node_id| offline_nodes.contains(node_id)) {
+                        deferred_output_sync.push(format!(
+                            "job {} on {}",
+                            job.id,
+                            job_node.unwrap_or("unknown")
+                        ));
+                    } else {
+                        blockers.push(format!("job {} output synchronization is pending", job.id));
+                    }
+                }
+            }
+            if !blockers.is_empty() {
+                return Err((
+                    1,
+                    format!("cannot remove a named share while {}", blockers.join("; ")),
+                ));
+            }
+        }
+        if offline_nodes.contains(&server_id) {
             return Err((
                 1,
-                "cannot remove a named share while jobs or output synchronization are active"
-                    .into(),
+                format!(
+                    "cannot remove share {share_id} while its NFS server {server_id} is confirmed offline; the server must be reachable to remove its export safely"
+                ),
             ));
         }
         for (node_id, node) in &config.nodes {
+            if offline_nodes.contains(node_id) {
+                continue;
+            }
             verify_registered_node_identity(node_id, node, &state)?;
             check_remote_idle(node, node_id, &config_path)?;
         }
@@ -10075,6 +10424,12 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         let mut clients = Vec::new();
         for (node_id, node) in &config.nodes {
             if node_id == &server_id {
+                continue;
+            }
+            if offline_nodes.contains(node_id) {
+                remember_deferred_share_cleanup(
+                    state_dir, share_id, node_id, node, server, &share, &state,
+                )?;
                 continue;
             }
             let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
@@ -10260,12 +10615,11 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
-        if let Err(error) = sync_remote_configs(
+        if let Err(error) = sync_remote_configs_online_nodes(
             &candidate_config,
             &candidate,
             state_dir,
             &operation.id,
-            None,
         ) {
             operation.detail = Some(error.clone());
             state
@@ -10279,11 +10633,32 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 ),
             ));
         }
+        let deferred_cleanup = retry_deferred_share_client_cleanup(
+            &config_path,
+            state_dir,
+            &candidate_config,
+            &candidate,
+            &state,
+            share_id,
+        )?;
         operation.phase = "REMOVED".into();
-        operation.detail = None;
+        operation.detail = (!deferred_cleanup.is_empty())
+            .then(|| format!("deferred client cleanup: {}", deferred_cleanup.join(", ")));
         state.operations.insert(operation_key, operation);
         save_admin_state(&journal_path, &state)?;
         println!("Removed named NFS share {share_id}; source files were preserved.");
+        if !deferred_cleanup.is_empty() {
+            println!(
+                "Client cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after those nodes reconnect.",
+                deferred_cleanup.join(", ")
+            );
+        }
+        if !deferred_output_sync.is_empty() {
+            println!(
+                "Terminal job output synchronization remains queued for: {}. It was preserved and can resume when those nodes reconnect.",
+                deferred_output_sync.join(", ")
+            );
+        }
         if !still_authorized.is_empty() {
             println!(
                 "Warning: operator-managed NFS exports still authorize: {}.",
@@ -12098,6 +12473,26 @@ fn register_named_share(
         let config_path = config_path.canonicalize().map_err(io_error)?;
         let source_text = fs::read_to_string(&config_path).map_err(io_error)?;
         let config = ClusterConfig::parse(&source_text).map_err(|error| (2, error.to_string()))?;
+        let deferred_cleanup = read_deferred_share_cleanup(state_dir)?;
+        if deferred_cleanup
+            .entries
+            .values()
+            .any(|entry| entry.share_id == share_id)
+        {
+            let nodes = deferred_cleanup
+                .entries
+                .values()
+                .filter(|entry| entry.share_id == share_id)
+                .map(|entry| entry.node_id.as_str())
+                .collect::<Vec<_>>();
+            return Err((
+                1,
+                format!(
+                    "share {share_id} still has deferred client cleanup on {}; rerun `mnode -rm share:{share_id}` after those nodes reconnect before re-adding it",
+                    nodes.join(", ")
+                ),
+            ));
+        }
         let server_id = config
             .nodes
             .iter()

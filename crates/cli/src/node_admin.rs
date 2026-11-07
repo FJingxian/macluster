@@ -9678,6 +9678,20 @@ fn remove_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResu
         .operations
         .get(&format!("share-remove:{share_id}"))
         .is_some_and(|operation| operation.action == "share-remove");
+    let pending_share = state
+        .operations
+        .get(&format!("share:{share_id}"))
+        .is_some_and(|operation| operation.action == "share");
+    if share_id == "primary"
+        && !config.shares.contains_key(share_id)
+        && !removal_pending
+        && !pending_share
+    {
+        return Err((
+            2,
+            "primary storage is not a named share; use `macluster --init` to reset or reconfigure the cluster (shared directory files are preserved)".into(),
+        ));
+    }
     if config.shares.contains_key(share_id) || removal_pending {
         remove_registered_share(&config_path, state_dir, share_id)
     } else {
@@ -10795,7 +10809,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 );
             }
         } else {
-            verify_named_share_mount(
+            let marker_missing = verify_named_share_mount_for_removal(
                 server,
                 &server_id,
                 &server_id,
@@ -10804,6 +10818,11 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &share.mount_root,
                 share_uuid,
             )?;
+            if marker_missing {
+                eprintln!(
+                    "Warning: share marker on NFS server {server_id} is missing; continuing with the configured source path and preserving its files."
+                );
+            }
         }
         if share.source_root != share.mount_root {
             check_managed_nfs_alias(
@@ -10853,7 +10872,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &share.mount_root.to_string_lossy(),
             ) {
                 NamedShareMountStatus::Expected => {
-                    if let Err((code, error)) = verify_named_share_mount(
+                    if let Err((code, error)) = verify_named_share_mount_for_removal(
                         node,
                         node_id,
                         &server_id,
@@ -14880,6 +14899,50 @@ fn verify_named_share_mount(
     mount: &Path,
     uuid: &str,
 ) -> AppResult<()> {
+    verify_named_share_mount_with_missing_marker(
+        node,
+        node_id,
+        server_id,
+        server_host,
+        source,
+        mount,
+        uuid,
+        false,
+    )
+    .map(|_| ())
+}
+
+fn verify_named_share_mount_for_removal(
+    node: &NodeConfig,
+    node_id: &str,
+    server_id: &str,
+    server_host: &str,
+    source: &Path,
+    mount: &Path,
+    uuid: &str,
+) -> AppResult<bool> {
+    verify_named_share_mount_with_missing_marker(
+        node,
+        node_id,
+        server_id,
+        server_host,
+        source,
+        mount,
+        uuid,
+        true,
+    )
+}
+
+fn verify_named_share_mount_with_missing_marker(
+    node: &NodeConfig,
+    node_id: &str,
+    server_id: &str,
+    server_host: &str,
+    source: &Path,
+    mount: &Path,
+    uuid: &str,
+    allow_missing_marker: bool,
+) -> AppResult<bool> {
     let is_server = node_id == server_id;
     let marker_root = if is_server { source } else { mount };
     let marker = marker_root.join(".macluster-share-id");
@@ -14911,12 +14974,54 @@ fn verify_named_share_mount(
             format!("cannot read share marker {}: {error}", marker.display()),
         )
     })?;
-    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != uuid {
+    let marker_missing = if output.status.success() {
+        if String::from_utf8_lossy(&output.stdout).trim() != uuid {
+            return Err((
+                1,
+                format!(
+                    "share marker at {} contains a different UUID; it does not match the configured share",
+                    marker.display()
+                ),
+            ));
+        }
+        false
+    } else if String::from_utf8_lossy(&output.stderr).contains("No such file or directory") {
+        if !allow_missing_marker {
+            return Err((
+                1,
+                format!("share marker at {} is missing", marker.display()),
+            ));
+        }
+        let source_directory = ssh_output(
+            node,
+            &shell_join(&["test", "-d", &marker_root.to_string_lossy()]),
+            None,
+        )
+        .map_err(|(code, error)| {
+            (
+                code,
+                format!(
+                    "cannot verify share directory {} while removing a missing marker: {error}",
+                    marker_root.display()
+                ),
+            )
+        })?;
+        if !source_directory.status.success() {
+            return Err((
+                1,
+                format!(
+                    "share directory {} is missing; refusing to remove the share based only on its config",
+                    marker_root.display()
+                ),
+            ));
+        }
+        true
+    } else {
         return Err((
-            1,
-            format!("share marker at {} did not match", marker.display()),
+            output.status.code().unwrap_or(1),
+            command_error("cannot read share marker", &output),
         ));
-    }
+    };
     if source != mount && is_server {
         let alias = ssh_output(
             node,
@@ -14956,7 +15061,7 @@ fn verify_named_share_mount(
             ));
         }
     }
-    Ok(())
+    Ok(marker_missing)
 }
 
 fn should_resume_add_operation(phase: &str) -> bool {
@@ -19052,6 +19157,47 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn share_removal_allows_a_missing_marker_but_rejects_a_different_uuid() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        let marker = root.join(".macluster-share-id");
+        let node = local_share_test_node();
+
+        assert!(
+            super::verify_named_share_mount_for_removal(
+                &node,
+                "storage",
+                "storage",
+                "192.0.2.2",
+                &root,
+                &root,
+                uuid
+            )
+            .expect("a missing marker on an existing configured directory is recoverable")
+        );
+
+        fs::write(&marker, "00000000-0000-4000-8000-000000000002").unwrap();
+        let error = super::verify_named_share_mount_for_removal(
+            &node,
+            "storage",
+            "storage",
+            "192.0.2.2",
+            &root,
+            &root,
+            uuid,
+        )
+        .unwrap_err();
+        assert!(error.1.contains("different UUID"), "{error:?}");
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "00000000-0000-4000-8000-000000000002",
+            "a different share marker must be preserved"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     fn share_registration_fixture(
         root: &std::path::Path,
@@ -19669,6 +19815,17 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     #[test]
     #[cfg(target_os = "macos")]
     fn registered_share_removal_preserves_source_data_and_removes_only_its_marker() {
+        registered_share_removal_case(true);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn registered_share_removal_recovers_when_legacy_marker_is_missing() {
+        registered_share_removal_case(false);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn registered_share_removal_case(marker_present: bool) {
         let root = test_exports_path();
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -19686,7 +19843,9 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         fs::create_dir_all(&state_dir).unwrap();
         let state_dir = state_dir.canonicalize().unwrap();
         let share_uuid = "00000000-0000-4000-8000-000000000002";
-        fs::write(source.join(".macluster-share-id"), share_uuid).unwrap();
+        if marker_present {
+            fs::write(source.join(".macluster-share-id"), share_uuid).unwrap();
+        }
 
         let mut state =
             super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
@@ -19732,6 +19891,27 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             super::read_admin_state(&state_dir.join("node-admin.json"), &config_path, &state_dir)
                 .unwrap();
         assert_eq!(state.operations["share-remove:tools"].phase, "REMOVED");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn removing_primary_as_a_named_share_explains_the_supported_reset_path() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("unused-share");
+        let config_path = share_registration_fixture(&root, &source, &source, false);
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let config_path = config_path.canonicalize().unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+
+        let error = super::remove_share(&config_path, &state_dir, "primary").unwrap_err();
+
+        assert!(error.1.contains("primary storage is not a named share"));
+        assert!(error.1.contains("macluster --init"));
+        assert!(ClusterConfig::parse(&fs::read_to_string(&config_path).unwrap()).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 

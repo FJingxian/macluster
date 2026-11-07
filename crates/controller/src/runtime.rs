@@ -40,6 +40,7 @@ use crate::{
 
 const PROBE_WORKERS: usize = 8;
 const CONTROL_WORKERS: usize = 4;
+const FAN_CONTROL_WORKERS: usize = 2;
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
 const NFS_RECONCILE_WORKERS: usize = 2;
@@ -425,6 +426,7 @@ struct RuntimeState {
     nodes: HashMap<String, NodeRuntime>,
     node_probe_pool: WorkerPool<WorkerCompletion>,
     control_pool: WorkerPool<WorkerCompletion>,
+    fan_control_pool: WorkerPool<()>,
     nfs_reconcile_pool: WorkerPool<WorkerCompletion>,
     share_pool: WorkerPool<WorkerCompletion>,
     snapshot_pool: WorkerPool<WorkerCompletion>,
@@ -512,6 +514,7 @@ impl RuntimeState {
                 control_workers * WORK_QUEUE_FACTOR,
                 signal.clone(),
             )?,
+            fan_control_pool: WorkerPool::new(FAN_CONTROL_WORKERS, 0, signal.clone())?,
             nfs_reconcile_pool: WorkerPool::new(
                 NFS_RECONCILE_WORKERS,
                 NFS_RECONCILE_WORKERS * WORK_QUEUE_FACTOR,
@@ -576,6 +579,7 @@ impl RuntimeState {
     fn pending_work(&self) -> usize {
         self.node_probe_pool.pending
             + self.control_pool.pending
+            + self.fan_control_pool.pending
             + self.nfs_reconcile_pool.pending
             + self.share_pool.pending
             + self.snapshot_pool.pending
@@ -587,6 +591,9 @@ impl RuntimeState {
         scope: &MaintenanceScope,
     ) -> Result<Vec<String>, ControllerError> {
         let mut blockers = Vec::new();
+        if self.fan_control_pool.pending > 0 {
+            blockers.push("a fan-control operation is still in flight".into());
+        }
         let in_scope = |node: Option<&NodeId>| match scope {
             MaintenanceScope::Cluster => true,
             MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
@@ -740,6 +747,7 @@ impl RuntimeState {
         &mut self,
         service: &mut ControllerService<T>,
     ) -> Result<(), ControllerError> {
+        let _ = self.fan_control_pool.poll();
         let completions = self
             .node_probe_pool
             .poll()
@@ -2426,7 +2434,38 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                     "fan policy changes are paused during controller maintenance",
                                 ))
                             } else {
-                                dispatch_fan_control(service, node_id, policy)
+                                let config = service.config.clone();
+                                let transport = Arc::clone(&service.transport);
+                                let responder = request.responder();
+                                if runtime.fan_control_pool.try_spawn(move || {
+                                    let result = dispatch_fan_control(
+                                        &config,
+                                        &transport,
+                                        node_id,
+                                        policy,
+                                    );
+                                    if let Err(error) = responder.respond(result)
+                                        && !matches!(
+                                            error,
+                                            crate::IpcError::ClientDisconnected
+                                        )
+                                    {
+                                        eprintln!(
+                                            "macluster: could not respond to fan-control request: {error}"
+                                        );
+                                    }
+                                }) {
+                                    // Remote fan operations can wait on SSH for
+                                    // many seconds. Keep the controller's IPC
+                                    // loop free for status, maintenance, and job
+                                    // submissions while they run.
+                                    continue;
+                                }
+                                Err(macluster_protocol::control::ControlError {
+                                    code: macluster_protocol::control::ControlErrorCode::Busy,
+                                    message: "fan-control worker capacity is busy; retry shortly"
+                                        .into(),
+                                })
                             }
                         } else if let macluster_protocol::control::ControlCommand::CompleteMaintenance {
                             ticket,
@@ -2595,7 +2634,8 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
 }
 
 fn dispatch_fan_control<T: NodeTransport>(
-    service: &ControllerService<T>,
+    config: &macluster_core::config::ClusterConfig,
+    shared_transport: &Arc<T>,
     selected_node: Option<NodeId>,
     policy: Option<macluster_protocol::types::FanPolicy>,
 ) -> Result<macluster_protocol::control::ControlPayload, macluster_protocol::control::ControlError>
@@ -2606,18 +2646,17 @@ fn dispatch_fan_control<T: NodeTransport>(
     };
 
     let targets = if let Some(node_id) = selected_node {
-        let node = service.config.nodes.get(node_id.as_str()).ok_or_else(|| {
+        let node = config.nodes.get(node_id.as_str()).ok_or_else(|| {
             crate::control::invalid_request(format!("node '{node_id}' is not in the cluster"))
         })?;
         vec![(node_id, node)]
     } else {
-        if service.config.nodes.len() > 128 {
+        if config.nodes.len() > 128 {
             return Err(crate::control::invalid_request(
                 "cluster-wide fan control supports at most 128 nodes per request; target a node individually",
             ));
         }
-        service
-            .config
+        config
             .nodes
             .iter()
             .filter_map(|(id, node)| NodeId::new(id.clone()).ok().map(|id| (id, node)))
@@ -2631,7 +2670,7 @@ fn dispatch_fan_control<T: NodeTransport>(
 
     let targets = std::sync::Arc::new(targets);
     let next_target = std::sync::atomic::AtomicUsize::new(0);
-    let transport = std::sync::Arc::clone(&service.transport);
+    let transport = std::sync::Arc::clone(shared_transport);
     let results = std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::channel();
         for _ in 0..targets.len().min(8) {
@@ -2876,13 +2915,110 @@ mod tests {
     use macluster_core::scheduler::next_dispatch;
     use macluster_protocol::control::MaintenanceScope;
     use macluster_protocol::{
+        control::{
+            CONTROL_PROTOCOL_VERSION, ClientHello, ControlCommand, ControlPayload, ControlRequest,
+            ControlResponse, ControllerHello, ControllerLifecycle, HelloResponse,
+        },
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
-        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, Operation, ResponseBody},
+        types::{
+            ControllerEpoch, FanControlStatus, FanPolicy, JobMode, JobRecord, JobSpec, JobState,
+            Operation, ResponseBody,
+        },
     };
     use std::{
-        sync::{Arc, Mutex},
+        os::unix::net::UnixStream,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
+
+    struct SlowFanTransport {
+        started: Arc<AtomicUsize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl crate::transport::NodeTransport for SlowFanTransport {
+        fn call(
+            &self,
+            _node_id: &NodeId,
+            _node: &macluster_core::config::NodeConfig,
+            operation: Operation,
+        ) -> Result<ResponseBody, crate::transport::TransportError> {
+            match operation {
+                Operation::SetFanPolicy { policy } => {
+                    self.started.fetch_add(1, Ordering::AcqRel);
+                    let (released, wake) = &*self.release;
+                    let guard = released.lock().unwrap();
+                    let (guard, _) = wake
+                        .wait_timeout_while(guard, Duration::from_secs(5), |value| !*value)
+                        .unwrap();
+                    if !*guard {
+                        return Err(crate::transport::TransportError::Timeout);
+                    }
+                    Ok(ResponseBody::FanControl(FanControlStatus {
+                        policy,
+                        supported: true,
+                        active: false,
+                        average_temperature_deci_celsius: Some(390),
+                        target_rpm: None,
+                        message: Some("test fan policy armed".into()),
+                    }))
+                }
+                _ => Err(crate::transport::TransportError::Timeout),
+            }
+        }
+    }
+
+    fn control_round_trip(
+        binding: &macluster_core::service::ServiceBinding,
+        command: ControlCommand,
+        timeout: Duration,
+    ) -> Result<ControlPayload, String> {
+        use macluster_protocol::framing::{read_frame, write_frame};
+
+        let mut stream = UnixStream::connect(binding.endpoint_path()).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|e| e.to_string())?;
+        write_frame(
+            &mut stream,
+            &ClientHello {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                binding_digest: binding.binding_digest().to_owned(),
+                namespace: binding.namespace().to_owned(),
+                uid: binding.uid(),
+                build_id: "runtime-test".into(),
+                capabilities: vec!["status.v1".into(), "fan-control.v1".into()],
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let hello: HelloResponse = read_frame(&mut stream)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "controller closed before hello".to_owned())?;
+        let HelloResponse::Accepted(hello) = hello else {
+            return Err("controller rejected test hello".into());
+        };
+        let request_id = RequestId(Id128::random());
+        write_frame(
+            &mut stream,
+            &ControlRequest {
+                request_id,
+                expected_generation: Some(hello.config_generation),
+                command,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let response: ControlResponse = read_frame(&mut stream)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "controller closed before response".to_owned())?;
+        if response.request_id != request_id {
+            return Err("controller response request ID did not match".into());
+        }
+        response.result.map_err(|error| error.message)
+    }
 
     struct IsolatedNodeTransport;
 
@@ -4286,6 +4422,127 @@ scheduler = "fifo"
         }
         results.sort_unstable();
         assert_eq!(results, (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn slow_cluster_fan_control_does_not_block_control_status_requests() {
+        use crate::{ControlApi, ControlListener, ControllerService, InstanceLock};
+        use macluster_core::{service::ServiceBinding, storage::Storage};
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-slow-fan-control-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let shared_root = root.join("shared");
+        std::fs::create_dir_all(&shared_root).unwrap();
+        let state_dir = root.join("controller-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let config_path = root.join("config.toml");
+        let config_text = format!(
+            "[cluster]\nname=\"slow-fan-test\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nssh_user=\"worker\"\n",
+            shared_root.display(),
+            unsafe { libc::geteuid() }
+        );
+        std::fs::write(&config_path, &config_text).unwrap();
+        let config = macluster_core::config::ClusterConfig::parse(&config_text).unwrap();
+        let binding = ServiceBinding::load(&config_path, &state_dir).unwrap();
+        let instance = InstanceLock::acquire(&state_dir).unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let storage = Storage::open(&state_dir).unwrap();
+        let service = ControllerService::new(
+            config.clone(),
+            storage,
+            SlowFanTransport {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            },
+        )
+        .unwrap();
+        let hello = ControllerHello {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            binding_digest: binding.binding_digest().to_owned(),
+            namespace: binding.namespace().to_owned(),
+            uid: binding.uid(),
+            build_id: "runtime-test".into(),
+            capabilities: vec!["status.v1".into(), "fan-control.v1".into()],
+            controller_epoch: service.epoch,
+            config_generation: 0,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let mut listener = ControlListener::bind(&binding, &instance, hello.clone()).unwrap();
+        let api = ControlApi::new(config, Storage::open(&state_dir).unwrap(), hello);
+        let result = std::thread::scope(|scope| {
+            let fan_binding = binding.clone();
+            let fan_request = scope.spawn(move || {
+                control_round_trip(
+                    &fan_binding,
+                    ControlCommand::FanControl {
+                        node_id: None,
+                        policy: Some(FanPolicy::Power),
+                    },
+                    Duration::from_secs(3),
+                )
+            });
+            let status_binding = binding.clone();
+            let status_started = Arc::new(Mutex::new(None));
+            let status_started_worker = Arc::clone(&status_started);
+            let status_release = Arc::clone(&release);
+            let status_request = scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while started.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let started_at = Instant::now();
+                let status = control_round_trip(
+                    &status_binding,
+                    ControlCommand::Status,
+                    Duration::from_millis(300),
+                );
+                *status_started_worker.lock().unwrap() = Some((status, started_at.elapsed()));
+                let (released, wake) = &*status_release;
+                *released.lock().unwrap() = true;
+                wake.notify_all();
+            });
+
+            let mut service = service;
+            let mut final_status = None;
+            let mut shutdown_requested = || {
+                if let Some(result) = status_started.lock().unwrap().take() {
+                    final_status = Some(result);
+                    true
+                } else {
+                    false
+                }
+            };
+            let controller_result = super::run_forever_with_control_inner(
+                &mut service,
+                Duration::from_secs(1),
+                Some((&mut listener, api)),
+                &mut shutdown_requested,
+                || false,
+                |_| Ok(false),
+            );
+            status_request.join().unwrap();
+            let fan_result = fan_request.join().unwrap();
+            (final_status, fan_result, controller_result)
+        });
+
+        let (status_result, status_elapsed) = result.0.expect("status request did not finish");
+        assert!(
+            matches!(status_result, Ok(ControlPayload::Status(_))),
+            "status IPC failed while fan control was in flight: {status_result:?}"
+        );
+        assert!(
+            status_elapsed < Duration::from_millis(250),
+            "status IPC waited for the slow fan operation: {:?}",
+            status_elapsed
+        );
+        assert!(matches!(result.1, Ok(ControlPayload::FanControl(_))));
+        assert!(result.2.is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -163,10 +163,10 @@ impl FanEngine {
             return Ok(());
         }
         if !self.supported || self.hardware.is_none() {
-            return Err(self
-                .message
-                .clone()
-                .unwrap_or_else(|| "fan control is unavailable on this node".into()));
+            if self.message.is_none() {
+                self.message = Some("fan control is unavailable on this node".into());
+            }
+            return Ok(());
         }
         if self.restore_pending {
             return Err(self
@@ -538,6 +538,27 @@ struct Hardware {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MAX_FAN_SLOTS: u32 = 16;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn smc_result_error(key: &str, result: u8) -> Option<String> {
+    match result {
+        0 => None,
+        132 => Some(format!("AppleSMC key '{key}' not found (result {result})")),
+        _ => Some(format!("AppleSMC rejected key '{key}' request ({result})")),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fan_probe_count(fnum: Result<u32, String>) -> Result<u32, String> {
+    match fnum {
+        Ok(count) => Ok(count.min(MAX_FAN_SLOTS)),
+        Err(error) if error == smc_result_error("FNum", 132).unwrap() => Ok(MAX_FAN_SLOTS),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Hardware {
     fn open() -> Result<(Self, Vec<FanInfo>), String> {
         use macmon::sources::IOServiceIterator;
@@ -591,8 +612,10 @@ impl Hardware {
         if result != 0 {
             return Err(format!("AppleSMC request failed ({result})"));
         }
-        if output.result != 0 {
-            return Err(format!("AppleSMC rejected the request ({})", output.result));
+        let key_bytes = input.key.to_be_bytes();
+        let key = String::from_utf8_lossy(&key_bytes);
+        if let Some(error) = smc_result_error(&key, output.result) {
+            return Err(error);
         }
         Ok(output)
     }
@@ -665,7 +688,7 @@ impl Hardware {
     }
 
     fn discover_fans(&self) -> Result<Vec<FanInfo>, String> {
-        let count = self.numeric("FNum")?.min(16) as u8;
+        let count = fan_probe_count(self.numeric("FNum"))?;
         let mut fans = Vec::new();
         for index in 0..count {
             let mode_key = [format!("F{index}Md"), format!("F{index}md")]
@@ -694,6 +717,11 @@ impl Hardware {
                     max_rpm,
                 });
             }
+        }
+        if fans.is_empty() {
+            return Err(format!(
+                "AppleSMC did not report controllable fans after probing {count} fan slots"
+            ));
         }
         Ok(fans)
     }
@@ -845,5 +873,38 @@ mod tests {
         assert!(engine.active);
         assert_eq!(engine.target_rpm, Some(2000));
         assert_eq!(engine.last_targets, vec![2000]);
+    }
+
+    #[test]
+    fn unsupported_nodes_return_status_instead_of_rejecting_policy_request() {
+        let mut engine = FanEngine::unsupported("AppleSMC fan keys are unavailable");
+
+        assert!(engine.set_policy(FanPolicy::Power).is_ok());
+        let status = engine.status();
+        assert!(!status.supported);
+        assert_eq!(status.policy, FanPolicy::System);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("AppleSMC fan keys are unavailable")
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn missing_fnum_falls_back_to_a_bounded_fan_slot_probe() {
+        assert_eq!(
+            super::fan_probe_count(Err("AppleSMC key 'FNum' not found (result 132)".into()))
+                .unwrap(),
+            16
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn smc_result_132_is_reported_as_a_missing_key() {
+        assert_eq!(
+            super::smc_result_error("FNum", 132).as_deref(),
+            Some("AppleSMC key 'FNum' not found (result 132)")
+        );
     }
 }

@@ -717,17 +717,28 @@ fn fan_helper_command(command: FanHelperCommand) -> Result<FanControlStatus, Pro
     if let Some(error) = response.error {
         return Err(ProtocolError::Failed(error));
     }
-    if let FanHelperCommand::Set { policy } = command
-        && response.status.policy != policy
-    {
-        return Err(ProtocolError::Failed(
-            response
-                .status
-                .message
-                .unwrap_or_else(|| "fan helper did not accept the requested policy".into()),
-        ));
-    }
+    validate_fan_helper_policy(command, &response.status).map_err(ProtocolError::Failed)?;
     Ok(response.status)
+}
+
+fn validate_fan_helper_policy(
+    command: FanHelperCommand,
+    status: &FanControlStatus,
+) -> Result<(), String> {
+    if !status.supported {
+        // An unsupported fan controller is a node capability result, not an
+        // agent transport failure. Let the controller report it per-node.
+        return Ok(());
+    }
+    if let FanHelperCommand::Set { policy } = command
+        && status.policy != policy
+    {
+        return Err(status
+            .message
+            .clone()
+            .unwrap_or_else(|| "fan helper did not accept the requested policy".into()));
+    }
+    Ok(())
 }
 
 pub fn validate_node_identity(
@@ -2160,7 +2171,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use macluster_protocol::identifiers::{ControllerUuid, NodeId, QueueName};
+    use macluster_protocol::{
+        identifiers::{ControllerUuid, NodeId, QueueName},
+        types::FanPolicy,
+    };
     use std::collections::BTreeMap;
     #[cfg(target_vendor = "apple")]
     use std::os::unix::process::CommandExt;
@@ -2168,6 +2182,51 @@ mod tests {
     const TEST_SHARE_UUID: &str = "00000000-0000-4000-8000-000000000001";
     const TEST_STORAGE_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000002";
     const TEST_WORKER_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000003";
+
+    #[test]
+    fn unsupported_fan_policy_is_reported_as_capability_not_agent_error() {
+        let status = FanControlStatus {
+            policy: FanPolicy::System,
+            supported: false,
+            active: false,
+            average_temperature_deci_celsius: None,
+            target_rpm: None,
+            message: Some("AppleSMC did not report controllable fans".into()),
+        };
+
+        assert!(
+            validate_fan_helper_policy(
+                FanHelperCommand::Set {
+                    policy: FanPolicy::Power,
+                },
+                &status,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn supported_fan_policy_must_match_the_requested_policy() {
+        let status = FanControlStatus {
+            policy: FanPolicy::System,
+            supported: true,
+            active: false,
+            average_temperature_deci_celsius: None,
+            target_rpm: None,
+            message: Some("fan controller stayed in system mode".into()),
+        };
+
+        assert_eq!(
+            validate_fan_helper_policy(
+                FanHelperCommand::Set {
+                    policy: FanPolicy::Power,
+                },
+                &status,
+            )
+            .unwrap_err(),
+            "fan controller stayed in system mode"
+        );
+    }
 
     fn nfs_reconcile_config() -> ClusterConfig {
         ClusterConfig::parse(&format!(

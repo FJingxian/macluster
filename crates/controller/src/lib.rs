@@ -14,7 +14,9 @@ pub mod wake;
 pub mod web;
 
 pub use control::ControlApi;
-pub use ipc::{ControlListener, IpcError, PendingControlEvent, PendingControlRequest};
+pub use ipc::{
+    ControlListener, ControlResponder, IpcError, PendingControlEvent, PendingControlRequest,
+};
 
 use std::{
     collections::{HashMap, HashSet},

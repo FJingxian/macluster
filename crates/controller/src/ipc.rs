@@ -74,6 +74,11 @@ pub struct PendingControlRequest {
     client_session: Id128,
 }
 
+#[derive(Clone)]
+pub struct ControlResponder {
+    response_sender: SyncSender<Result<ControlPayload, ControlError>>,
+}
+
 pub enum PendingControlEvent {
     Request(PendingControlRequest),
     Disconnected(Id128),
@@ -89,6 +94,21 @@ impl PendingControlRequest {
     }
 
     pub fn respond(self, result: Result<ControlPayload, ControlError>) -> Result<(), IpcError> {
+        ControlResponder {
+            response_sender: self.response_sender,
+        }
+        .respond(result)
+    }
+
+    pub fn responder(&self) -> ControlResponder {
+        ControlResponder {
+            response_sender: self.response_sender.clone(),
+        }
+    }
+}
+
+impl ControlResponder {
+    pub fn respond(&self, result: Result<ControlPayload, ControlError>) -> Result<(), IpcError> {
         self.response_sender
             .send(result)
             .map_err(|_| IpcError::ClientDisconnected)

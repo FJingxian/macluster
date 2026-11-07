@@ -21,14 +21,14 @@ use macluster_protocol::{
     control::{
         AgentCompatibilityRecord, AgentCompatibilityState, AgentCompatibilityUpdate,
         ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
-        MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES,
+        MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, NodeFanControlResult,
     },
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
         ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, CARGO_HOME_SEED_ENV,
-        EXPLICIT_TASK_PATH_ENV, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSpec, JobState,
-        METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION, SnapshotRef,
+        EXPLICIT_TASK_PATH_ENV, FanPolicy, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSpec,
+        JobState, METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION, SnapshotRef,
         VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
     },
 };
@@ -4691,65 +4691,7 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             serde_json::to_string(&results).map_err(|error| (1, error.to_string()))?
         );
     } else {
-        println!(
-            "{:<18} {:<8} {:<8} {:<8} {:<10} STATUS",
-            "NODE", "POLICY", "STATE", "TEMP", "TARGET RPM"
-        );
-        for result in &results {
-            if let Some(error) = &result.error {
-                println!(
-                    "{:<18} {:<8} {:<8} {:<8} {:<10} {error}",
-                    result.node_id, "ERROR", "-", "-", "-"
-                );
-                continue;
-            }
-            let Some(status) = &result.status else {
-                println!(
-                    "{:<18} {:<8} {:<8} {:<8} {:<10} no fan status returned",
-                    result.node_id, "ERROR", "-", "-", "-"
-                );
-                continue;
-            };
-            if !status.supported {
-                println!(
-                    "{:<18} {:<8} {:<8} {:<8} {:<10} {}",
-                    result.node_id,
-                    "UNAVAILABLE",
-                    "-",
-                    "-",
-                    "-",
-                    status
-                        .message
-                        .as_deref()
-                        .unwrap_or("fan control is unsupported")
-                );
-                continue;
-            }
-            let mode = match status.policy {
-                FanPolicy::System => "SYSTEM",
-                FanPolicy::Auto => "AUTO",
-                FanPolicy::Power => "POWER",
-            };
-            let detail = status.message.as_deref().unwrap_or("");
-            let active = match (status.policy, status.active) {
-                (FanPolicy::System, _) => "DEFAULT",
-                (_, true) => "ACTIVE",
-                (_, false) if status.average_temperature_deci_celsius.is_none() => "WAIT_TEMP",
-                (_, false) => "ARMED",
-            };
-            let temperature = status
-                .average_temperature_deci_celsius
-                .map(|value| format!("{:.1}°C", f32::from(value) / 10.0))
-                .unwrap_or_else(|| "N/A".into());
-            let target_rpm = status
-                .target_rpm
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| if status.active { "N/A" } else { "SYSTEM" }.into());
-            println!(
-                "{:<18} {:<8} {:<8} {:<8} {:<10} {}",
-                result.node_id, mode, active, temperature, target_rpm, detail
-            );
-        }
+        print!("{}", format_fan_control_table(&results));
     }
     let failed = results
         .iter()
@@ -4772,6 +4714,143 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         ));
     }
     Ok(())
+}
+
+fn format_fan_control_table(results: &[NodeFanControlResult]) -> String {
+    const HEADERS: [&str; 6] = ["NODE", "POLICY", "STATE", "TEMP", "TARGET RPM", "STATUS"];
+
+    let rows = results
+        .iter()
+        .map(fan_control_table_cells)
+        .collect::<Vec<_>>();
+    let widths = std::array::from_fn::<_, 6, _>(|column| {
+        rows.iter()
+            .map(|row| display_width(&row[column]))
+            .max()
+            .unwrap_or(0)
+            .max(display_width(HEADERS[column]))
+    });
+
+    let mut output = String::new();
+    for (column, header) in HEADERS.iter().enumerate() {
+        if column > 0 {
+            output.push_str("  ");
+        }
+        output.push_str(&pad_cell(header, widths[column]));
+    }
+    output.push('\n');
+
+    for row in rows {
+        for (column, cell) in row.iter().enumerate() {
+            if column > 0 {
+                output.push_str("  ");
+            }
+            if column + 1 == row.len() {
+                output.push_str(cell);
+            } else {
+                output.push_str(&pad_cell(cell, widths[column]));
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn fan_control_table_cells(result: &NodeFanControlResult) -> [String; 6] {
+    let node = sanitize_cell(&result.node_id.to_string());
+    if let Some(error) = &result.error {
+        return [
+            node,
+            "ERROR".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            sanitize_cell(error),
+        ];
+    }
+
+    let Some(status) = &result.status else {
+        return [
+            node,
+            "ERROR".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            "no fan status returned".into(),
+        ];
+    };
+
+    if !status.supported {
+        return [
+            node,
+            "UNAVAILABLE".into(),
+            "-".into(),
+            "-".into(),
+            "-".into(),
+            sanitize_cell(
+                status
+                    .message
+                    .as_deref()
+                    .unwrap_or("fan control is unsupported"),
+            ),
+        ];
+    }
+
+    let policy = match status.policy {
+        FanPolicy::System => "SYSTEM",
+        FanPolicy::Auto => "AUTO",
+        FanPolicy::Power => "POWER",
+    };
+    let detail = status.message.as_deref().unwrap_or("");
+    let below_release_threshold = !status.active && detail.starts_with("below 38°C");
+    let state = if status.policy == FanPolicy::System || below_release_threshold {
+        "DEFAULT"
+    } else if status.active {
+        "ACTIVE"
+    } else if status.average_temperature_deci_celsius.is_none() {
+        "WAIT TEMP"
+    } else {
+        "ARMED"
+    };
+    let temperature = status
+        .average_temperature_deci_celsius
+        .map(|value| format!("{:.1}°C", f32::from(value) / 10.0))
+        .unwrap_or_else(|| "N/A".into());
+    let target_rpm = status
+        .target_rpm
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| if status.active { "N/A" } else { "SYSTEM" }.into());
+    let standard_messages = [
+        "macOS controls fan speed",
+        "waiting for a fresh CPU temperature sample; macOS controls fans until activation",
+        "waiting for a fresh CPU temperature sample",
+        "below 40°C; curve armed, macOS controls fan speed",
+        "curve armed; waiting for the 40°C activation threshold",
+        "below 38°C; macOS controls fan speed",
+    ];
+    let is_standard_message = detail.is_empty()
+        || standard_messages.contains(&detail)
+        || detail.ends_with(" curve active");
+    let summary = if !is_standard_message {
+        sanitize_cell(detail)
+    } else if status.policy == FanPolicy::System || below_release_threshold {
+        "macOS default".into()
+    } else if status.active {
+        "Curve active".into()
+    } else if status.average_temperature_deci_celsius.is_none() {
+        "Waiting for temperature".into()
+    } else {
+        "Waiting for 40°C".into()
+    };
+
+    [
+        node,
+        policy.into(),
+        state.into(),
+        temperature,
+        target_rpm,
+        summary,
+    ]
 }
 
 fn fans_help(mode: HelpMode) -> &'static str {
@@ -7451,9 +7530,10 @@ mod tests {
         ACTIVE_ENV_PREFIX_ENV, CARGO_HOME_SEED_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV,
         NodeMetricRow, aggregate_metrics, build_submission, cached_monitor_samples,
         can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
-        controller_startup_policy, explain_legacy_power_agent, format_job_details,
-        format_jobs_table, format_power, is_macluster_binary_path, maybe_run_agent_update,
-        metric_row, metric_table_header, prepare_task_environment, promote_inline_command,
+        controller_startup_policy, display_width, explain_legacy_power_agent,
+        format_fan_control_table, format_job_details, format_jobs_table, format_power,
+        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
+        prepare_task_environment, promote_inline_command,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
     };
@@ -7462,10 +7542,13 @@ mod tests {
         control::{
             AgentCompatibilityRecord, AgentCompatibilityState, CONTROL_PROTOCOL_VERSION,
             ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle, MonitorSnapshot,
-            NodeMonitorRow,
+            NodeFanControlResult, NodeMonitorRow,
         },
         identifiers::{Id128, NodeId, QueueName},
-        types::{ControllerEpoch, JobMode, JobRecord, JobSpec, JobState, MetricSnapshot},
+        types::{
+            ControllerEpoch, FanControlStatus, FanPolicy, JobMode, JobRecord, JobSpec, JobState,
+            MetricSnapshot,
+        },
     };
 
     #[test]
@@ -8009,6 +8092,107 @@ mod tests {
             );
         }
         assert!(row.ends_with("run analysis job"));
+    }
+
+    #[test]
+    fn fan_control_table_aligns_variable_width_rows_and_summarizes_normal_status() {
+        let rows = vec![
+            NodeFanControlResult {
+                node_id: NodeId::new("default-001").unwrap(),
+                status: Some(FanControlStatus {
+                    policy: FanPolicy::Power,
+                    supported: true,
+                    active: true,
+                    average_temperature_deci_celsius: Some(759),
+                    target_rpm: Some(4737),
+                    message: Some("power curve active".into()),
+                }),
+                error: None,
+            },
+            NodeFanControlResult {
+                node_id: NodeId::new("arm-a").unwrap(),
+                status: Some(FanControlStatus {
+                    policy: FanPolicy::Auto,
+                    supported: true,
+                    active: false,
+                    average_temperature_deci_celsius: None,
+                    target_rpm: None,
+                    message: Some("waiting for a fresh CPU temperature sample".into()),
+                }),
+                error: None,
+            },
+            NodeFanControlResult {
+                node_id: NodeId::new("worker-with-long-name").unwrap(),
+                status: Some(FanControlStatus {
+                    policy: FanPolicy::System,
+                    supported: false,
+                    active: false,
+                    average_temperature_deci_celsius: None,
+                    target_rpm: None,
+                    message: Some("this Mac does not expose controllable fans".into()),
+                }),
+                error: None,
+            },
+            NodeFanControlResult {
+                node_id: NodeId::new("login-01").unwrap(),
+                status: None,
+                error: Some("node transport timed out\nretry".into()),
+            },
+        ];
+
+        let rendered = format_fan_control_table(&rows);
+        let lines: Vec<_> = rendered.lines().collect();
+        let header = lines[0];
+        let expected_rows = [
+            [
+                "default-001",
+                "POWER",
+                "ACTIVE",
+                "75.9°C",
+                "4737",
+                "Curve active",
+            ],
+            [
+                "arm-a",
+                "AUTO",
+                "WAIT TEMP",
+                "N/A",
+                "SYSTEM",
+                "Waiting for temperature",
+            ],
+            [
+                "worker-with-long-name",
+                "UNAVAILABLE",
+                "-",
+                "-",
+                "-",
+                "this Mac does not expose controllable fans",
+            ],
+            [
+                "login-01",
+                "ERROR",
+                "-",
+                "-",
+                "-",
+                "node transport timed out\\nretry",
+            ],
+        ];
+        let header_cells = ["NODE", "POLICY", "STATE", "TEMP", "TARGET RPM", "STATUS"];
+        for (line, expected) in lines.iter().skip(1).zip(expected_rows) {
+            let (mut header_cursor, mut row_cursor) = (0, 0);
+            for (column, (header_cell, expected_cell)) in
+                header_cells.iter().zip(expected).enumerate()
+            {
+                let offset = header_cursor + header[header_cursor..].find(header_cell).unwrap();
+                let row_offset = row_cursor + line[row_cursor..].find(expected_cell).unwrap();
+                assert!(
+                    display_width(&header[..offset]) == display_width(&line[..row_offset]),
+                    "column {column} ({header_cell}) is not aligned in {line:?}"
+                );
+                header_cursor = offset + header_cell.len();
+                row_cursor = row_offset + expected_cell.len();
+            }
+        }
     }
 
     #[test]

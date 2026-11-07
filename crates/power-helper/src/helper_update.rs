@@ -46,6 +46,22 @@ struct Replacement {
     mode: u32,
 }
 
+struct PayloadCleanupGuard(BTreeMap<String, PathBuf>);
+
+impl std::ops::Deref for PayloadCleanupGuard {
+    type Target = BTreeMap<String, PathBuf>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for PayloadCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_payloads(&self.0);
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct UpdateJournal {
     version: u16,
@@ -75,6 +91,7 @@ pub(crate) fn apply(
     }
     let _lock = acquire_update_lock()?;
     recover_interrupted_update()?;
+    cleanup_orphaned_payloads()?;
     let cluster_id = read_trusted_text(TRUST_CLUSTER)?;
     let public_key = read_trusted_key()?;
     let signature: [u8; 64] = signature
@@ -96,7 +113,7 @@ pub(crate) fn apply(
         ));
     }
 
-    let staged = prepare_payloads(peer_uid, stage_dir, &manifest)?;
+    let staged = PayloadCleanupGuard(prepare_payloads(peer_uid, stage_dir, &manifest)?);
     let mut replacements = Vec::new();
     let mut recovery_labels = Vec::new();
     let mut restart_power = false;
@@ -189,7 +206,6 @@ pub(crate) fn apply(
     })();
     if let Err(error) = result {
         let rollback = recover_interrupted_update();
-        cleanup_payloads(&staged);
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(format!(
@@ -198,7 +214,6 @@ pub(crate) fn apply(
         };
     }
     finish_update_journal(&journal)?;
-    cleanup_payloads(&staged);
     Ok(restart_power)
 }
 
@@ -892,6 +907,53 @@ fn cleanup_payloads(payloads: &BTreeMap<String, PathBuf>) {
     }
 }
 
+fn cleanup_orphaned_payloads() -> Result<(), String> {
+    cleanup_orphaned_payloads_in(Path::new(TRUST_DIR), 0)
+}
+
+fn cleanup_orphaned_payloads_in(directory: &Path, expected_owner: u32) -> Result<(), String> {
+    let entries =
+        fs::read_dir(directory).map_err(|error| format!("list staged helper payloads: {error}"))?;
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("list staged helper payloads: {error}"))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with("payload-") || !managed_trust_entry(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "inspect orphaned helper payload {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != expected_owner
+            || metadata.mode() & 0o022 != 0
+            || metadata.len() > MAX_ARTIFACT_BYTES
+        {
+            return Err(format!(
+                "orphaned helper payload {} has unsafe ownership, type, permissions, or size",
+                path.display()
+            ));
+        }
+        fs::remove_file(&path).map_err(|error| {
+            format!("remove orphaned helper payload {}: {error}", path.display())
+        })?;
+        removed = true;
+    }
+    if removed {
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync helper payload cleanup: {error}"))?;
+    }
+    Ok(())
+}
+
 fn restart_service(label: &str) -> Result<(), String> {
     if !label.starts_with("org.macluster.nfs.")
         || !label
@@ -1114,6 +1176,63 @@ mod tests {
             ["public-key", "cluster-id"]
         );
         assert!(validated_trust_entry_names(vec!["public-key".into(), "unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn orphaned_helper_payloads_are_removed_without_touching_unknown_entries() {
+        let root = std::env::temp_dir().join(format!("helper-payload-cleanup-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let operation = Id128::random().to_string();
+        let payload = root.join(format!("payload-{operation}-payload-{}", "a".repeat(64)));
+        let unknown = root.join("payload-foreign-state");
+        fs::write(&payload, b"stale verified payload").unwrap();
+        fs::write(&unknown, b"keep").unwrap();
+
+        super::cleanup_orphaned_payloads_in(&root, unsafe { libc::geteuid() as u32 }).unwrap();
+
+        assert!(!payload.exists());
+        assert_eq!(fs::read(unknown).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orphaned_helper_payload_cleanup_refuses_symlinks() {
+        let root = std::env::temp_dir().join(format!("helper-payload-symlink-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let target = root.join("target");
+        fs::write(&target, b"keep").unwrap();
+        let operation = Id128::random().to_string();
+        let payload = root.join(format!("payload-{operation}-payload-{}", "b".repeat(64)));
+        std::os::unix::fs::symlink(&target, &payload).unwrap();
+
+        assert!(
+            super::cleanup_orphaned_payloads_in(&root, unsafe { libc::geteuid() as u32 }).is_err()
+        );
+        assert!(
+            fs::symlink_metadata(&payload)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_payloads_are_cleaned_when_update_exits_early() {
+        let root = std::env::temp_dir().join(format!("helper-payload-guard-{}", Id128::random()));
+        fs::create_dir(&root).unwrap();
+        let payload = root.join("verified-payload");
+        fs::write(&payload, b"payload").unwrap();
+        let staged = std::collections::BTreeMap::from([("payload".into(), payload.clone())]);
+
+        let result: Result<(), ()> = (|| {
+            let _guard = super::PayloadCleanupGuard(staged);
+            Err(())
+        })();
+
+        assert!(result.is_err());
+        assert!(!payload.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

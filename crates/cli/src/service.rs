@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::control_client::{ControlClient, ControlClientError};
 
-const MAX_READY_WAIT: Duration = Duration::from_secs(5);
+const MAX_READY_WAIT: Duration = Duration::from_secs(15);
 const START_LOCK_POLL: Duration = Duration::from_millis(10);
 const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 

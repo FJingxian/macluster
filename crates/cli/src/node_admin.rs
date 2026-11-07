@@ -42,7 +42,7 @@ use macluster_protocol::{
         ControlCommand, ControlErrorCode, ControlPayload, MaintenancePhase, MaintenanceScope,
         MaintenanceTicket,
     },
-    framing::sha256_hex,
+    framing::{FrameError, sha256_hex},
     helper_update::{HelperArtifact, HelperComponent, HelperUpdateManifest},
     identifiers::{Id128, NodeId, QueueName},
     nfs_admin::{
@@ -61,6 +61,7 @@ use crate::control_client::{ControlClient, ControlClientError};
 pub(crate) type AppResult<T> = Result<T, (i32, String)>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAINTENANCE_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_EXPORTS_PATH: &str = "/etc/exports";
 const NFS_EXPORTS_TEMP_PATH: &str = "/etc/exports.macluster.tmp";
 const NFS_EXPORTS_BACKUP_PATH: &str = "/etc/exports.macluster.bak";
@@ -308,8 +309,8 @@ fn reconnect_live_maintenance(live: &mut LiveMaintenance) -> AppResult<()> {
         .ok_or_else(|| (1, "invalid maintenance state directory".into()))?;
     let binding = ServiceBinding::load(&live.config_path, state_dir)
         .map_err(|error| (1, error.to_string()))?;
-    live.client =
-        ControlClient::connect(&binding, Duration::from_secs(5)).map_err(control_client_error)?;
+    live.client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
+        .map_err(control_client_error)?;
     Ok(())
 }
 
@@ -426,7 +427,7 @@ fn try_acquire_live_maintenance(
     // Keep discovery fast, but allow maintenance requests the server's full
     // processing deadline while health reconciliation is in progress.
     client
-        .set_timeouts(Duration::from_secs(5))
+        .set_timeouts(MAINTENANCE_CONTROL_TIMEOUT)
         .map_err(control_client_error)?;
     let client_lock = acquire_maintenance_client_lock(state_dir)?;
     let current_build =
@@ -437,9 +438,9 @@ fn try_acquire_live_maintenance(
         );
         crate::service::ServiceManager::current(binding.clone())
             .map_err(|error| (1, error.to_string()))?
-            .ensure_running(Duration::from_secs(10))
+            .ensure_running(Duration::from_secs(15))
             .map_err(|error| (1, error.to_string()))?;
-        client = ControlClient::connect(&binding, Duration::from_secs(5))
+        client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
             .map_err(control_client_error)?;
         if client.hello().build_id != current_build {
             return Err((
@@ -448,7 +449,7 @@ fn try_acquire_live_maintenance(
             ));
         }
         client
-            .set_timeouts(Duration::from_secs(5))
+            .set_timeouts(MAINTENANCE_CONTROL_TIMEOUT)
             .map_err(control_client_error)?;
     }
     let config = read_config(config_path)?;
@@ -555,7 +556,7 @@ fn try_acquire_live_maintenance(
                         }
                     }
                     // Completing the old ticket can advance the generation.
-                    client = ControlClient::connect(&binding, Duration::from_secs(5))
+                    client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
                         .map_err(control_client_error)?;
                     eprintln!(
                         "Recovered unchanged interrupted maintenance for {}.",
@@ -598,7 +599,7 @@ fn try_acquire_live_maintenance(
                             &journal_path,
                         )
                     })?;
-                    client = ControlClient::connect(&binding, Duration::from_secs(5))
+                    client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
                         .map_err(control_client_error)?;
                     eprintln!(
                         "Recovered interrupted maintenance for {} before starting {operation}.",
@@ -737,11 +738,57 @@ fn wait_for_live_maintenance(
     let mut last_message = Instant::now();
     let mut next_epoch_check = Instant::now();
     let mut epoch_recovered = false;
+    let state_dir = journal_path
+        .parent()
+        .ok_or((1, "maintenance state directory is missing".into()))?;
+    let binding = ServiceBinding::load(config_path, state_dir).map_err(|error| {
+        (
+            1,
+            format!("cannot resolve the controller service binding: {error}"),
+        )
+    })?;
     loop {
-        match client
-            .request(ControlCommand::InspectMaintenance)
-            .map_err(control_client_error)?
-        {
+        let payload = match client.request(ControlCommand::InspectMaintenance) {
+            Ok(payload) => payload,
+            Err(error) if maintenance_control_error_is_retryable(&error) => {
+                let should_reconnect = !matches!(
+                    error,
+                    ControlClientError::Remote {
+                        code: ControlErrorCode::Busy,
+                        ..
+                    }
+                );
+                if should_reconnect {
+                    match ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT) {
+                        Ok(reconnected) => *client = reconnected,
+                        Err(reconnect_error)
+                            if maintenance_control_error_is_retryable(&reconnect_error) => {}
+                        Err(reconnect_error) => {
+                            return Err(control_client_error(reconnect_error));
+                        }
+                    }
+                }
+                if started.elapsed() >= MAINTENANCE_WAIT_LIMIT {
+                    return Err((
+                        1,
+                        format!(
+                            "controller maintenance status remained unavailable for five minutes; ticket {} remains recorded, rerun '{operation}' to resume",
+                            ticket.operation_id
+                        ),
+                    ));
+                }
+                if last_message.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "Controller maintenance status is temporarily unavailable; retrying {operation}."
+                    );
+                    last_message = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            Err(error) => return Err(control_client_error(error)),
+        };
+        match payload {
             ControlPayload::Maintenance(Some(status))
                 if status.ticket == *ticket && status.scope == *scope =>
             {
@@ -887,9 +934,9 @@ fn recover_stale_maintenance_controller(
             ServiceBinding::load(config_path, state_dir).map_err(|error| (1, error.to_string()))?;
         crate::service::ServiceManager::current(binding.clone())
             .map_err(|error| (1, error.to_string()))?
-            .restart(Duration::from_secs(5))
+            .restart(Duration::from_secs(15))
             .map_err(|error| (1, error.to_string()))?;
-        let next = ControlClient::connect(&binding, Duration::from_secs(5))
+        let next = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
             .map_err(control_client_error)?;
         if next.hello().controller_epoch.controller_uuid != running.controller_uuid
             || next.hello().controller_epoch.epoch
@@ -979,6 +1026,31 @@ fn control_client_error(error: ControlClientError) -> (i32, String) {
     match error {
         ControlClientError::Remote { message, .. } => (1, message),
         other => (1, format!("controller maintenance request failed: {other}")),
+    }
+}
+
+fn maintenance_control_error_is_retryable(error: &ControlClientError) -> bool {
+    match error {
+        ControlClientError::Remote {
+            code: ControlErrorCode::Busy,
+            ..
+        } => true,
+        ControlClientError::Io(error) | ControlClientError::Frame(FrameError::Io(error)) => {
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::NotFound
+            )
+        }
+        ControlClientError::Frame(FrameError::Truncated { .. }) => true,
+        _ => false,
     }
 }
 
@@ -3689,7 +3761,7 @@ EXAMPLES
   mnode -rm default-001
 
 `mnode -l` lists compute nodes only after recent successful reachability checks.
-One or two missed probes show `RECONNECTING` during the short recovery grace;
+Missed or inconclusive probes show `RECONNECTING` during the recovery grace;
 three confirmed failures hide the node. Stale or unverified nodes stay hidden;
 use `mnode -l --all` to inspect them.
 
@@ -4545,6 +4617,10 @@ pub(crate) struct PowerHelperSetup {
     staged_trust_key: Option<String>,
 }
 
+fn new_power_helper_stage_id() -> String {
+    Id128::random().to_string()
+}
+
 #[derive(Clone)]
 pub(crate) struct UpdateTrust {
     cluster_id: String,
@@ -4692,7 +4768,7 @@ fn prepare_power_helper_with_admin_revision(
     node: &NodeConfig,
     execution_uid: u32,
     remote_arch: &str,
-    operation_id: &str,
+    _operation_id: &str,
     required_admin_revision: &str,
     trust: Option<&UpdateTrust>,
     force: bool,
@@ -4796,17 +4872,16 @@ fn prepare_power_helper_with_admin_revision(
         return Ok(None);
     }
 
-    let operation_id = operation_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect::<String>();
-    let staged_binary = format!("/tmp/macluster-power-{operation_id}.bin");
-    let staged_admin_cli = format!("/tmp/macluster-nfs-admin-{operation_id}.bin");
-    let staged_plist = format!("/tmp/macluster-power-{operation_id}.plist");
-    let staged_trust_key = trust.map(|_| format!("/tmp/macluster-update-key-{operation_id}.bin"));
-    let local_plist = std::env::temp_dir().join(format!("macluster-power-{operation_id}.plist"));
-    let local_trust_key = trust
-        .map(|_| std::env::temp_dir().join(format!("macluster-update-key-{operation_id}.bin")));
+    // Keep ephemeral files unique across retries of the same durable node
+    // operation. A crashed attempt may leave these paths behind.
+    let stage_id = new_power_helper_stage_id();
+    let staged_binary = format!("/tmp/macluster-power-{stage_id}.bin");
+    let staged_admin_cli = format!("/tmp/macluster-nfs-admin-{stage_id}.bin");
+    let staged_plist = format!("/tmp/macluster-power-{stage_id}.plist");
+    let staged_trust_key = trust.map(|_| format!("/tmp/macluster-update-key-{stage_id}.bin"));
+    let local_plist = std::env::temp_dir().join(format!("macluster-power-{stage_id}.plist"));
+    let local_trust_key =
+        trust.map(|_| std::env::temp_dir().join(format!("macluster-update-key-{stage_id}.bin")));
     let write_result = (|| -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -5016,16 +5091,9 @@ pub(crate) fn ensure_local_power_sampler(
         public_key: signing_key.public_key_bytes(),
     };
     ensure_update_capability(login, login_id, uid, architecture, &operation_id, &trust)?;
-    if let Some((request, stage_dir)) = stage_signed_helper_update(
-        config,
-        login_id,
-        login,
-        uid,
-        architecture,
-        state_dir,
-        &operation_id,
-        &signing_key,
-    )? {
+    if let Some((request, stage_dir)) =
+        stage_signed_helper_update(login, uid, architecture, state_dir, &signing_key)?
+    {
         let result = request_nfs_admin_service(login, &request).and_then(|reply| match reply {
             Some(()) => Ok(()),
             None => Err("signed helper updater is unavailable after enrollment".into()),
@@ -5033,6 +5101,11 @@ pub(crate) fn ensure_local_power_sampler(
         cleanup_helper_update_stage(login, &stage_dir);
         result?;
         wait_for_current_nfs_admin_service(login)?;
+    }
+    if let Err(error) = refresh_stale_nfs_recovery_services(config, login_id.as_str(), login) {
+        eprintln!(
+            "NFS recovery helper refresh on {login_id} is pending; power sampler setup will continue: {error}"
+        );
     }
     if local_power_sampler_files_current()? && !local_power_sampler_socket_ready() {
         wait_for_local_power_sampler_socket()?;
@@ -6201,6 +6274,96 @@ fn client_nfs_recovery_version_probe_script(mounts: &[ClientUnmountRequest]) -> 
     Some(script)
 }
 
+fn nfs_recovery_refresh_requests(
+    mounts: &[ClientUnmountRequest],
+    stale: &BTreeSet<usize>,
+    expected_mounts: &BTreeSet<usize>,
+) -> Vec<ClientMountRequest> {
+    stale
+        .intersection(expected_mounts)
+        .filter_map(|index| mounts.get(*index))
+        .map(|mount| ClientMountRequest {
+            source: mount.source.clone(),
+            mount_root: mount.mount_root.clone(),
+            share_uuid: mount.share_uuid.clone(),
+            source_alias: None,
+            needs_privileged_mkdir: false,
+            needs_mount: false,
+            allow_existing_contents: mount.allow_existing_contents,
+        })
+        .collect()
+}
+
+fn refresh_stale_nfs_recovery_services(
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+) -> Result<(), String> {
+    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
+    if mounts.is_empty() {
+        return Ok(());
+    }
+
+    let mount_table = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| error)?;
+    if !mount_table.status.success() {
+        return Err(command_error(
+            &format!("cannot inspect NFS mounts on {node_id}"),
+            &mount_table,
+        ));
+    }
+    let mount_table = String::from_utf8_lossy(&mount_table.stdout);
+    let expected_mounts = mounts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mount)| {
+            (named_share_mount_status(
+                &mount_table,
+                &mount.source,
+                &mount.mount_root.to_string_lossy(),
+            ) == NamedShareMountStatus::Expected)
+                .then_some(index)
+        })
+        .collect::<BTreeSet<_>>();
+    if expected_mounts.is_empty() {
+        return Ok(());
+    }
+
+    let Some(probe) = client_nfs_recovery_version_probe_script(&mounts) else {
+        return Ok(());
+    };
+    let output = ssh_output(node, &probe, None).map_err(|(_, error)| error)?;
+    if !output.status.success() {
+        return Err(command_error(
+            &format!("cannot inspect NFS recovery helpers on {node_id}"),
+            &output,
+        ));
+    }
+    let mut stale = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let index = line
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("invalid NFS recovery probe response from {node_id}: {line}"))?;
+        if index >= mounts.len() {
+            return Err(format!(
+                "NFS recovery probe returned invalid mount index {index} for {node_id}"
+            ));
+        }
+        stale.insert(index);
+    }
+    let refresh = nfs_recovery_refresh_requests(&mounts, &stale, &expected_mounts);
+    if refresh.is_empty() {
+        return Ok(());
+    }
+
+    match request_nfs_admin_service(node, &client_mount_admin_request(&refresh))? {
+        Some(()) => Ok(()),
+        None => Err(format!(
+            "privileged NFS service is unavailable while refreshing NFS recovery helpers on {node_id}"
+        )),
+    }
+}
+
 #[cfg(test)]
 fn client_nfs_recovery_refresh_script(
     config: &ClusterConfig,
@@ -6294,7 +6457,6 @@ fn refresh_agent_helpers_with_signed_updater(
             }
         };
         let update = PrivilegedHelperUpdate {
-            config,
             node_id,
             node,
             uid,
@@ -6316,6 +6478,11 @@ fn refresh_agent_helpers_with_signed_updater(
                 1,
                 format!("could not update privileged helpers on {node_id}: {error}"),
             ));
+        }
+        if let Err(error) = refresh_stale_nfs_recovery_services(config, node_id, node) {
+            eprintln!(
+                "NFS recovery helper refresh on {node_id} is pending; Agent update will continue: {error}"
+            );
         }
     }
     Ok(deferred)
@@ -6342,7 +6509,6 @@ pub(crate) fn refresh_privileged_helpers_for_node(
     };
     let (uid, arch) = update_node_facts(node)?;
     let update = PrivilegedHelperUpdate {
-        config,
         node_id,
         node,
         uid,
@@ -6356,7 +6522,6 @@ pub(crate) fn refresh_privileged_helpers_for_node(
 }
 
 struct PrivilegedHelperUpdate<'a> {
-    config: &'a ClusterConfig,
     node_id: &'a str,
     node: &'a NodeConfig,
     uid: u32,
@@ -6377,13 +6542,10 @@ fn refresh_one_privileged_helper_bundle(update: &PrivilegedHelperUpdate<'_>) -> 
         update.trust,
     )?;
     let Some((request, stage_dir)) = stage_signed_helper_update(
-        update.config,
-        update.node_id,
         update.node,
         update.uid,
         update.arch,
         update.state_dir,
-        update.operation_id,
         update.signing_key,
     )?
     else {
@@ -6517,18 +6679,12 @@ fn power_helper_admin_setup_allowed(trust_pinned: bool, force: bool) -> bool {
 }
 
 fn stage_signed_helper_update(
-    config: &ClusterConfig,
-    node_id: &str,
     node: &NodeConfig,
     uid: u32,
     arch: &str,
     state_dir: &Path,
-    operation_id: &str,
     signing_key: &crate::update_signing::UpdateSigningKey,
 ) -> Result<Option<(NfsAdminRequest, String)>, String> {
-    let operation_id = Id128::parse(operation_id)
-        .map_err(|_| "helper update operation ID is invalid".to_owned())?
-        .to_string();
     let mut artifacts = Vec::new();
     let mut sources = BTreeMap::<String, PathBuf>::new();
 
@@ -6583,41 +6739,6 @@ fn stage_signed_helper_update(
         sources.insert(stage_name, local_cli.clone());
     }
 
-    let (mounts, _) = client_nfs_cleanup_plan(config, node_id);
-    if let Some(probe) = client_nfs_recovery_version_probe_script(&mounts) {
-        let output = ssh_output(node, &probe, None).map_err(|(_, error)| error)?;
-        if !output.status.success() {
-            return Err(command_error(
-                "cannot inspect NFS recovery helper versions",
-                &output,
-            ));
-        }
-        let mut stale = BTreeSet::new();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let index = line
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| format!("invalid NFS recovery version probe response: {line}"))?;
-            if index >= mounts.len() {
-                return Err("NFS recovery version probe returned an invalid mount index".into());
-            }
-            stale.insert(index);
-        }
-        for index in stale {
-            let mount = &mounts[index];
-            let stage_name = format!("payload-{local_cli_digest}");
-            artifacts.push(HelperArtifact {
-                component: HelperComponent::NfsRecovery {
-                    target: mount.mount_root.to_string_lossy().into_owned(),
-                    share_uuid: mount.share_uuid.clone(),
-                },
-                revision: crate::nfs_recovery::helper_version(),
-                sha256: local_cli_digest.clone(),
-                stage_name: stage_name.clone(),
-            });
-            sources.insert(stage_name, local_cli.clone());
-        }
-    }
     if artifacts.is_empty() {
         return Ok(None);
     }
@@ -6633,7 +6754,7 @@ fn stage_signed_helper_update(
     manifest.validate()?;
     let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
     let signature = signing_key.sign_manifest(&manifest_bytes);
-    let stage_dir = format!("/tmp/macluster-update-{operation_id}");
+    let stage_dir = new_helper_update_stage_dir();
     let mkdir = format!(
         "umask 077; /bin/mkdir -p {} && /bin/chmod 700 {}",
         shell_quote(&stage_dir),
@@ -6659,6 +6780,10 @@ fn stage_signed_helper_update(
     };
     request.validate(uid)?;
     Ok(Some((request, stage_dir)))
+}
+
+fn new_helper_update_stage_dir() -> String {
+    format!("/tmp/macluster-update-{}", Id128::random())
 }
 
 fn cleanup_helper_update_stage(node: &NodeConfig, stage_dir: &str) {
@@ -12306,12 +12431,16 @@ fn cached_node_list_state(
     digest_matches: bool,
     shares_ready: bool,
     show_all: bool,
+    probe_inconclusive: bool,
 ) -> Option<&'static str> {
     if !login_node && confirmed_offline {
         return show_all.then_some("OFFLINE");
     }
     if !login_node && !known_online {
         return show_all.then_some("UNKNOWN");
+    }
+    if !login_node && probe_inconclusive {
+        return Some("RECONNECTING");
     }
     if !login_node && consecutive_failures > 0 {
         return Some("RECONNECTING");
@@ -12410,7 +12539,8 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             BTreeMap::new()
         }
     };
-    let liveness = refresh_node_liveness_for_list(&canonical, state_dir, &config, liveness);
+    let (liveness, probe_results) =
+        refresh_node_liveness_for_list(&canonical, state_dir, &config, liveness);
     let mut rows = Vec::new();
     let mut hidden_unreachable = 0usize;
     for (id, node) in &config.nodes {
@@ -12463,6 +12593,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                         liveness_now_ms.saturating_sub(sampled) <= NODE_LIST_LIVENESS_CACHE_TTL_MS
                     })
             });
+        let probe_inconclusive = probe_results.get(id).is_some_and(Option::is_none);
         let Some(state_name) = cached_node_list_state(
             login_node,
             known_online,
@@ -12472,6 +12603,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             digest_matches,
             all_shares_ready,
             show_all,
+            probe_inconclusive,
         ) else {
             hidden_unreachable += 1;
             continue;
@@ -12522,9 +12654,12 @@ fn refresh_node_liveness_for_list(
     state_dir: &Path,
     config: &ClusterConfig,
     cached: BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
-) -> BTreeMap<String, macluster_controller::liveness::NodeLiveness> {
+) -> (
+    BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    BTreeMap<String, Option<bool>>,
+) {
     if config.nodes.is_empty() {
-        return cached;
+        return (cached, BTreeMap::new());
     }
 
     // A list command needs a current answer even while the controller is
@@ -12598,9 +12733,13 @@ fn refresh_node_liveness_for_list(
             .collect::<Vec<_>>()
     });
     if observations.is_empty() {
-        return cached;
+        return (cached, BTreeMap::new());
     }
-    match macluster_controller::liveness::observe_many(
+    let probe_results = observations
+        .iter()
+        .map(|observation| (observation.node_id.clone(), observation.reachable))
+        .collect::<BTreeMap<_, _>>();
+    let liveness = match macluster_controller::liveness::observe_many(
         state_dir,
         &config.share_uuid,
         &observations,
@@ -12611,7 +12750,8 @@ fn refresh_node_liveness_for_list(
             eprintln!("macluster: could not refresh cached node reachability: {error}");
             cached
         }
-    }
+    };
+    (liveness, probe_results)
 }
 
 fn list_failed_operations(config_path: &Path, state_dir: &Path) -> AppResult<()> {
@@ -16857,6 +16997,42 @@ exec "$@"
     }
 
     #[test]
+    fn maintenance_status_retries_busy_and_temporary_control_socket_errors() {
+        use crate::control_client::ControlClientError;
+        use macluster_protocol::control::ControlErrorCode;
+        use macluster_protocol::framing::FrameError;
+        use std::io;
+
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Remote {
+                code: ControlErrorCode::Busy,
+                message: "controller request queue is full".into(),
+            }
+        ));
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Frame(FrameError::Io(io::Error::from(io::ErrorKind::WouldBlock)))
+        ));
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Frame(FrameError::Io(io::Error::from_raw_os_error(libc::EAGAIN)))
+        ));
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Frame(FrameError::Truncated {
+                expected: 8,
+                actual: 3,
+            })
+        ));
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Io(io::Error::from(io::ErrorKind::ConnectionRefused))
+        ));
+        assert!(super::maintenance_control_error_is_retryable(
+            &ControlClientError::Io(io::Error::from(io::ErrorKind::TimedOut))
+        ));
+        assert!(!super::maintenance_control_error_is_retryable(
+            &ControlClientError::WrongCluster
+        ));
+    }
+
+    #[test]
     fn export_requests_are_grouped_by_the_mac_that_serves_them() {
         let request = |root: &str, client_ip: &str, share_uuid: &str, node_id: &str| {
             super::NfsExportRequest {
@@ -18414,6 +18590,63 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             "{}",
             String::from_utf8_lossy(&syntax.stderr)
         );
+    }
+
+    #[test]
+    fn recovery_refresh_selects_only_stale_mounts_that_are_currently_expected() {
+        let mounts = vec![
+            super::ClientUnmountRequest {
+                source: "192.0.2.1:/shared".into(),
+                mount_root: PathBuf::from("/Users/Shared/macluster"),
+                share_uuid: "00000000-0000-4000-8000-000000000001".into(),
+                label: "primary".into(),
+                allow_existing_contents: false,
+            },
+            super::ClientUnmountRequest {
+                source: "192.0.2.1:/tools".into(),
+                mount_root: PathBuf::from("/Users/Shared/tools"),
+                share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                label: "tools".into(),
+                allow_existing_contents: true,
+            },
+        ];
+
+        let refresh = super::nfs_recovery_refresh_requests(
+            &mounts,
+            &BTreeSet::from([0, 1]),
+            &BTreeSet::from([1]),
+        );
+
+        assert_eq!(refresh.len(), 1);
+        assert_eq!(refresh[0].source, "192.0.2.1:/tools");
+        assert_eq!(refresh[0].mount_root, PathBuf::from("/Users/Shared/tools"));
+        assert_eq!(refresh[0].share_uuid, mounts[1].share_uuid);
+        assert!(!refresh[0].needs_mount);
+        assert!(!refresh[0].needs_privileged_mkdir);
+        assert!(refresh[0].source_alias.is_none());
+    }
+
+    #[test]
+    fn helper_update_stage_directory_is_unique_per_attempt() {
+        let first = super::new_helper_update_stage_dir();
+        let second = super::new_helper_update_stage_dir();
+
+        assert_ne!(first, second);
+        for stage in [first, second] {
+            let operation = stage.strip_prefix("/tmp/macluster-update-").unwrap();
+            assert_eq!(Id128::parse(operation).unwrap().to_string(), operation);
+        }
+    }
+
+    #[test]
+    fn power_helper_staging_id_is_unique_per_attempt() {
+        let first = super::new_power_helper_stage_id();
+        let second = super::new_power_helper_stage_id();
+
+        assert_ne!(first, second);
+        for stage_id in [first, second] {
+            assert_eq!(Id128::parse(&stage_id).unwrap().to_string(), stage_id);
+        }
     }
 
     #[test]
@@ -20222,36 +20455,41 @@ remote_binary = "/usr/local/bin/macluster"
     #[test]
     fn node_list_keeps_reconnecting_nodes_until_confirmed_offline() {
         assert_eq!(
-            cached_node_list_state(false, true, 1, false, None, false, false, false),
+            cached_node_list_state(false, true, 1, false, None, false, false, false, false),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, true, 2, false, None, false, false, false),
+            cached_node_list_state(false, true, 2, false, None, false, false, false, false),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, true, 1, false, None, false, false, true),
+            cached_node_list_state(false, true, 1, false, None, false, false, true, false),
             Some("RECONNECTING")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 0, false, None, false, false, false),
+            cached_node_list_state(false, false, 0, false, None, false, false, false, false),
             None
         );
         assert_eq!(
-            cached_node_list_state(false, false, 0, false, None, false, false, true),
+            cached_node_list_state(false, false, 0, false, None, false, false, true, false),
             Some("UNKNOWN")
         );
         assert_eq!(
-            cached_node_list_state(false, false, 3, true, None, false, false, false),
+            cached_node_list_state(false, false, 3, true, None, false, false, false, false),
             None
         );
         assert_eq!(
-            cached_node_list_state(false, false, 3, true, None, false, false, true),
+            cached_node_list_state(false, false, 3, true, None, false, false, true, false),
             Some("OFFLINE")
         );
         assert_eq!(
-            cached_node_list_state(true, true, 3, true, None, false, false, false),
+            cached_node_list_state(true, true, 3, true, None, false, false, false, false),
             Some("ONLINE")
+        );
+        assert_eq!(
+            cached_node_list_state(false, true, 0, false, None, false, false, false, true),
+            Some("RECONNECTING"),
+            "an inconclusive fresh probe must not keep reporting stale cached ONLINE state"
         );
     }
 

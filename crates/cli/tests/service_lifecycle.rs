@@ -275,10 +275,14 @@ fn restart_waits_for_launchd_to_finish_bootout_before_bootstrap() {
     let source = fixture.root().join("macluster-source");
     fs::write(&source, b"fake executable").unwrap();
     let launcher = Arc::new(FakeLauncher::active());
-    launcher.unload_delay_inspections.store(2, Ordering::SeqCst);
+    // A controller may take longer than the former five-second cap to finish
+    // draining its background workers after launchd receives the bootout.
+    launcher
+        .unload_delay_inspections
+        .store(210, Ordering::SeqCst);
     let service = manager(&fixture, Arc::clone(&launcher), source);
 
-    let hello = service.restart(Duration::from_secs(2)).unwrap();
+    let hello = service.restart(Duration::from_secs(15)).unwrap();
 
     assert_eq!(hello.lifecycle, ControllerLifecycle::Ready);
     assert_eq!(launcher.bootouts.load(Ordering::SeqCst), 1);

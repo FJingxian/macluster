@@ -15,7 +15,8 @@ use macluster_core::{
     config::Transport,
     maintenance::ResetBarrierPolicy,
     nfs_reconcile::{
-        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareMarkerCleanup,
+        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
+        DeferredShareMarkerCleanup,
     },
     scheduler::{NodeEligibility, next_dispatch},
     storage::{ReadOnlyJobStore, Storage, SubmitError},
@@ -24,7 +25,7 @@ use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
 use macluster_protocol::{
     control::MaintenanceScope,
     identifiers::{Id128, NodeId},
-    nfs_admin::{NfsAlias, NfsMount},
+    nfs_admin::{NfsAlias, NfsExportCleanup, NfsMount},
     types::{
         ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, NfsShareMarker,
         Operation, ProtocolError, ResponseBody,
@@ -177,6 +178,7 @@ enum WorkerResult {
 struct NfsCleanupAck {
     clients: Vec<DeferredShareClientCleanup>,
     markers: Vec<DeferredShareMarkerCleanup>,
+    exports: Vec<DeferredShareExportCleanup>,
 }
 
 struct ProbeResult {
@@ -1319,6 +1321,10 @@ impl RuntimeState {
             || cleanup_state
                 .marker_entries
                 .values()
+                .any(|entry| entry.node_id == node_id)
+            || cleanup_state
+                .exports
+                .values()
                 .any(|entry| entry.node_id == node_id);
         if has_deferred_cleanup && health_ready {
             if let Some(runtime) = self.nodes.get_mut(node_id)
@@ -1373,6 +1379,26 @@ impl RuntimeState {
             }
             cleanup.markers.push(entry.clone());
         }
+        for entry in cleanup_state
+            .exports
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+        {
+            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
+                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
+            }) {
+                self.defer_nfs_reconciliation(
+                    node_id,
+                    format!(
+                        "deferred NFS export cleanup identity for {} does not match this node",
+                        entry.share_id
+                    ),
+                    now,
+                );
+                return Ok(());
+            }
+            cleanup.exports.push(entry.clone());
+        }
 
         let obsolete_mounts = cleanup
             .clients
@@ -1385,7 +1411,7 @@ impl RuntimeState {
                 allow_existing_contents: false,
             })
             .collect::<Vec<_>>();
-        let obsolete_aliases = cleanup
+        let client_aliases = cleanup
             .clients
             .iter()
             .filter(|entry| entry.source_root != entry.mount_root)
@@ -1400,6 +1426,31 @@ impl RuntimeState {
             .map(|entry| NfsShareMarker {
                 source_root: entry.source_root.clone(),
                 share_uuid: entry.share_uuid.clone(),
+                alias_target: entry.alias_target.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut obsolete_aliases = cleanup
+            .markers
+            .iter()
+            .filter_map(|entry| {
+                entry.alias_target.as_ref().map(|target| NfsAlias {
+                    path: entry.source_root.clone(),
+                    target: target.clone(),
+                })
+            })
+            .chain(client_aliases)
+            .collect::<Vec<_>>();
+        obsolete_aliases
+            .sort_by(|left, right| (&left.path, &left.target).cmp(&(&right.path, &right.target)));
+        obsolete_aliases.dedup();
+        let obsolete_exports = cleanup
+            .exports
+            .iter()
+            .map(|entry| NfsExportCleanup {
+                root: entry.source_root.clone(),
+                client_ip: entry.client_ip.clone(),
+                share_uuid: entry.share_uuid.clone(),
+                node_id: entry.client_node_id.clone(),
             })
             .collect::<Vec<_>>();
         let operation = Operation::ReconcileNfs {
@@ -1408,6 +1459,7 @@ impl RuntimeState {
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
+            obsolete_exports,
         };
         let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
         let node_config = node_config.clone();
@@ -2849,7 +2901,10 @@ fn remove_acknowledged_nfs_cleanup(
     state_dir: &std::path::Path,
     acknowledged: &NfsCleanupAck,
 ) -> io::Result<()> {
-    if acknowledged.clients.is_empty() && acknowledged.markers.is_empty() {
+    if acknowledged.clients.is_empty()
+        && acknowledged.markers.is_empty()
+        && acknowledged.exports.is_empty()
+    {
         return Ok(());
     }
     let mut state = DeferredShareCleanupState::load_from_dir(state_dir)?;
@@ -2858,6 +2913,9 @@ fn remove_acknowledged_nfs_cleanup(
     }
     for entry in &acknowledged.markers {
         state.remove_marker_cleanup_exact(entry);
+    }
+    for entry in &acknowledged.exports {
+        state.remove_export_cleanup_exact(entry);
     }
     state.save_to_dir(state_dir)
 }
@@ -2910,7 +2968,8 @@ mod tests {
     use macluster_core::maintenance::ResetBarrierPolicy;
     use macluster_core::nfs_reconcile::{
         DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
-        DeferredShareMarkerCleanup, client_cleanup_key, marker_cleanup_key,
+        DeferredShareExportCleanup, DeferredShareMarkerCleanup, client_cleanup_key,
+        export_cleanup_key, marker_cleanup_key,
     };
     use macluster_core::scheduler::next_dispatch;
     use macluster_protocol::control::MaintenanceScope;
@@ -3551,6 +3610,16 @@ scheduler = "fifo"
             source_root: "/srv/old_data".into(),
             share_uuid: "00000000-0000-4000-8000-000000000009".into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+            alias_target: Some("/mnt/old_data".into()),
+        };
+        let export = DeferredShareExportCleanup {
+            share_id: "old_data".into(),
+            node_id: "worker".into(),
+            source_root: "/srv/old_data".into(),
+            client_ip: "192.0.2.9".into(),
+            client_node_id: "old-client".into(),
+            share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
         };
         let mut journal = DeferredShareCleanupState {
             version: 1,
@@ -3563,6 +3632,10 @@ scheduler = "fifo"
         journal.marker_entries.insert(
             marker_cleanup_key("old_data", "worker", &marker.share_uuid),
             marker,
+        );
+        journal.exports.insert(
+            export_cleanup_key("old_data", "worker", "old-client", &export.share_uuid),
+            export,
         );
         journal.save_to_dir(service.storage.root()).unwrap();
 
@@ -3613,6 +3686,7 @@ scheduler = "fifo"
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
+            obsolete_exports,
             ..
         } = &operations[0]
         else {
@@ -3623,11 +3697,20 @@ scheduler = "fifo"
         assert_eq!(obsolete_mounts[0].source, "192.0.2.9:/srv/old_data");
         assert_eq!(obsolete_aliases.len(), 1);
         assert_eq!(obsolete_markers.len(), 1);
+        assert_eq!(
+            obsolete_markers[0].alias_target.as_deref(),
+            Some("/mnt/old_data")
+        );
+        assert_eq!(obsolete_exports.len(), 1);
+        assert_eq!(obsolete_exports[0].root, "/srv/old_data");
+        assert_eq!(obsolete_exports[0].client_ip, "192.0.2.9");
+        assert_eq!(obsolete_exports[0].node_id, "old-client");
         drop(operations);
 
         let remaining = DeferredShareCleanupState::load_from_dir(service.storage.root()).unwrap();
         assert!(remaining.entries.is_empty());
         assert!(remaining.marker_entries.is_empty());
+        assert!(remaining.exports.is_empty());
         assert!(runtime.nodes["worker"].health.is_none());
         drop(runtime);
         drop(service);

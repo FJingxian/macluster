@@ -1353,6 +1353,7 @@ mod tests {
             obsolete_mounts: Vec::new(),
             obsolete_aliases: Vec::new(),
             obsolete_markers: Vec::new(),
+            obsolete_exports: Vec::new(),
         };
         assert_eq!(
             operation_timeout(&reconcile, Duration::from_secs(5)),

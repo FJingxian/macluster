@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-use macluster_protocol::identifiers::Id128;
+use macluster_protocol::{identifiers::Id128, nfs_admin::NfsExportCleanup};
 use serde::{Deserialize, Serialize};
 
 pub const DEFERRED_SHARE_CLEANUP_FILE: &str = "deferred-share-cleanup.json";
@@ -32,6 +32,19 @@ pub struct DeferredShareMarkerCleanup {
     pub source_root: String,
     pub share_uuid: String,
     pub machine_uuid: Option<String>,
+    #[serde(default)]
+    pub alias_target: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeferredShareExportCleanup {
+    pub share_id: String,
+    pub node_id: String,
+    pub source_root: String,
+    pub client_ip: String,
+    pub client_node_id: String,
+    pub share_uuid: String,
+    pub machine_uuid: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +55,8 @@ pub struct DeferredShareCleanupState {
     pub entries: BTreeMap<String, DeferredShareClientCleanup>,
     #[serde(default)]
     pub marker_entries: BTreeMap<String, DeferredShareMarkerCleanup>,
+    #[serde(default)]
+    pub exports: BTreeMap<String, DeferredShareExportCleanup>,
 }
 
 pub fn client_cleanup_key(share_id: &str, node_id: &str, share_uuid: &str) -> String {
@@ -50,6 +65,15 @@ pub fn client_cleanup_key(share_id: &str, node_id: &str, share_uuid: &str) -> St
 
 pub fn marker_cleanup_key(share_id: &str, node_id: &str, share_uuid: &str) -> String {
     format!("marker/{share_id}/{node_id}/{share_uuid}")
+}
+
+pub fn export_cleanup_key(
+    share_id: &str,
+    node_id: &str,
+    client_node_id: &str,
+    share_uuid: &str,
+) -> String {
+    format!("export/{share_id}/{node_id}/{client_node_id}/{share_uuid}")
 }
 
 impl DeferredShareCleanupState {
@@ -75,6 +99,32 @@ impl DeferredShareCleanupState {
             .find(|(_, entry)| *entry == expected)
             .map(|(key, _)| key.clone());
         key.is_some_and(|key| self.marker_entries.remove(&key).is_some())
+    }
+
+    pub fn remove_export_cleanup_exact(&mut self, expected: &DeferredShareExportCleanup) -> bool {
+        let key = export_cleanup_key(
+            &expected.share_id,
+            &expected.node_id,
+            &expected.client_node_id,
+            &expected.share_uuid,
+        );
+        if self.exports.get(&key) == Some(expected) {
+            return self.exports.remove(&key).is_some();
+        }
+        false
+    }
+
+    pub fn export_requests_for_node(&self, node_id: &str) -> Vec<NfsExportCleanup> {
+        self.exports
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+            .map(|entry| NfsExportCleanup {
+                root: entry.source_root.clone(),
+                client_ip: entry.client_ip.clone(),
+                share_uuid: entry.share_uuid.clone(),
+                node_id: entry.client_node_id.clone(),
+            })
+            .collect()
     }
 
     pub fn remove_client_cleanup(
@@ -214,8 +264,59 @@ fn atomic_write_journal(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::{
         DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
-        DeferredShareMarkerCleanup, client_cleanup_key, marker_cleanup_key,
+        DeferredShareExportCleanup, DeferredShareMarkerCleanup, client_cleanup_key,
+        export_cleanup_key, marker_cleanup_key,
     };
+
+    #[test]
+    fn exact_export_cleanup_ack_leaves_other_clients_and_share_generations() {
+        let expected = DeferredShareExportCleanup {
+            share_id: "archive".into(),
+            node_id: "storage".into(),
+            source_root: "/Volumes/archive".into(),
+            client_ip: "192.0.2.8".into(),
+            client_node_id: "worker-008".into(),
+            share_uuid: "uuid-old".into(),
+            machine_uuid: Some("machine-storage".into()),
+        };
+        let other_client = DeferredShareExportCleanup {
+            client_ip: "192.0.2.9".into(),
+            client_node_id: "worker-009".into(),
+            ..expected.clone()
+        };
+        let new_generation = DeferredShareExportCleanup {
+            share_uuid: "uuid-new".into(),
+            ..expected.clone()
+        };
+        let mut state = DeferredShareCleanupState::default();
+        for entry in [&expected, &other_client, &new_generation] {
+            state.exports.insert(
+                export_cleanup_key(
+                    &entry.share_id,
+                    &entry.node_id,
+                    &entry.client_node_id,
+                    &entry.share_uuid,
+                ),
+                entry.clone(),
+            );
+        }
+
+        assert!(state.remove_export_cleanup_exact(&expected));
+        assert!(!state.remove_export_cleanup_exact(&expected));
+        assert_eq!(state.exports.len(), 2);
+        assert!(state.exports.contains_key(&export_cleanup_key(
+            "archive",
+            "storage",
+            "worker-009",
+            "uuid-old"
+        )));
+        assert!(state.exports.contains_key(&export_cleanup_key(
+            "archive",
+            "storage",
+            "worker-008",
+            "uuid-new"
+        )));
+    }
 
     #[test]
     fn exact_ack_removal_preserves_other_share_generations_and_marker_entries() {
@@ -257,10 +358,12 @@ mod tests {
                     source_root: "/srv/old".into(),
                     share_uuid: "uuid-old".into(),
                     machine_uuid: Some("machine-2".into()),
+                    alias_target: None,
                 },
             )]
             .into_iter()
             .collect(),
+            exports: Default::default(),
         };
 
         assert!(state.remove_client_cleanup("data", "worker", "uuid-old"));
@@ -368,6 +471,7 @@ mod tests {
             source_root: "/srv/data".into(),
             share_uuid: "uuid-marker".into(),
             machine_uuid: Some("machine-storage".into()),
+            alias_target: None,
         };
         state
             .marker_entries

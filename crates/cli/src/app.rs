@@ -139,9 +139,15 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let refresh_node_addresses = !local_read_query
         && is_macluster_executable()
         && should_refresh_node_addresses(&command, &args);
+    let explicit_local_host = if refresh_node_addresses {
+        local_node_add_host_override(&command, &args)?
+    } else {
+        None
+    };
     let controller_owns_address_discovery = if refresh_node_addresses {
         let state_dir = state_root(global.state_dir.as_deref())?;
-        !crate::node_admin::address_migration_pending(&state_dir)
+        explicit_local_host.is_none()
+            && !crate::node_admin::address_migration_pending(&state_dir)
             && controller_is_running(&global, &state_dir)
     } else {
         false
@@ -156,6 +162,12 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         // inspection until the controller can safely migrate them.
         let preparation = if can_defer && crate::node_admin::address_migration_pending(&state_dir) {
             Ok(true)
+        } else if let Some(host) = explicit_local_host {
+            crate::node_admin::prepare_node_address_migration_with_host(
+                &config_path,
+                &state_dir,
+                host,
+            )
         } else {
             crate::node_admin::prepare_node_address_migration(&config_path, &state_dir)
         };
@@ -334,6 +346,9 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
         && args
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "-rm" | "--remove"))
+        && !args
+            .get(1)
+            .is_some_and(|target| target.starts_with("share:"))
     {
         return false;
     }
@@ -388,6 +403,61 @@ fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
             .iter()
             .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     }
+}
+
+fn local_node_add_host_override(
+    command: &str,
+    args: &[String],
+) -> AppResult<Option<std::net::Ipv4Addr>> {
+    if command != "node" {
+        return Ok(None);
+    }
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let (action, inline_endpoint) = first
+        .split_once('=')
+        .map_or((first.as_str(), None), |(action, endpoint)| {
+            (action, Some(endpoint))
+        });
+    if !matches!(action, "-a" | "--add") {
+        return Ok(None);
+    }
+    let (endpoint, mut index) = if let Some(endpoint) = inline_endpoint {
+        (endpoint, 1)
+    } else {
+        let Some(endpoint) = args.get(1) else {
+            return Ok(None);
+        };
+        (endpoint.as_str(), 2)
+    };
+    if endpoint != "local" && !endpoint.starts_with("local:") {
+        return Ok(None);
+    }
+
+    let mut host = None;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--host" => {
+                if host.is_some() {
+                    return Err((2, "--host may only be specified once".into()));
+                }
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| (2, "--host requires an IPv4 address".into()))?;
+                host = Some(
+                    value
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| (2, "--host must be an IPv4 address".into()))?,
+                );
+                index += 2;
+            }
+            "--overlay-existing" => index += 1,
+            "--queue" | "--share-id" | "--mount-root" => index += 2,
+            _ => index += 1,
+        }
+    }
+    Ok(host)
 }
 
 fn top_will_use_tui(args: &[String]) -> bool {
@@ -7753,6 +7823,55 @@ mod tests {
             "node",
             &["-a".into(), "operator@192.0.2.20".into()]
         ));
+        assert!(
+            should_preflight_agent_update("node", &["-rm".into(), "share:wdisk".into()],),
+            "named-share removal needs the current privileged NFS protocol"
+        );
+    }
+
+    #[test]
+    fn explicit_local_node_host_is_used_before_address_migration_preflight() {
+        let host = super::local_node_add_host_override(
+            "node",
+            &[
+                "-a".into(),
+                "local:/Users/test/share".into(),
+                "--share-id".into(),
+                "data".into(),
+                "--mount-root".into(),
+                "/Users/test/share".into(),
+                "--host".into(),
+                "192.0.2.9".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(host, Some("192.0.2.9".parse().unwrap()));
+        assert_eq!(
+            super::local_node_add_host_override(
+                "node",
+                &[
+                    "-a".into(),
+                    "operator@192.0.2.10".into(),
+                    "--host".into(),
+                    "192.0.2.9".into()
+                ]
+            )
+            .unwrap(),
+            None,
+            "a remote node's --host must not override the login interface"
+        );
+        assert!(
+            super::local_node_add_host_override(
+                "node",
+                &[
+                    "-a".into(),
+                    "local".into(),
+                    "--host".into(),
+                    "not-ip".into()
+                ]
+            )
+            .is_err()
+        );
     }
 
     #[test]

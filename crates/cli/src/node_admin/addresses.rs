@@ -198,6 +198,24 @@ fn matching_interface<'a>(
     }
 }
 
+fn select_explicit_interface<'a>(
+    host: Option<Ipv4Addr>,
+    interfaces: &'a [InterfaceAddress],
+) -> AppResult<Option<&'a InterfaceAddress>> {
+    host.map(|host| {
+        interfaces
+            .iter()
+            .find(|interface| interface.address == host)
+            .ok_or_else(|| {
+                (
+                    2,
+                    format!("--host {host} is not assigned to an active local network interface"),
+                )
+            })
+    })
+    .transpose()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -595,6 +613,7 @@ fn discover_remote(
     node: &NodeConfig,
     record: Option<&AddressRecord>,
     interfaces: &[InterfaceAddress],
+    explicit_interface: Option<&InterfaceAddress>,
     arp: &[(Ipv4Addr, String)],
     force: bool,
     allow_neighbor_fallback: bool,
@@ -602,7 +621,8 @@ fn discover_remote(
     let Ok(old_address) = node.host.parse::<Ipv4Addr>() else {
         return Ok(None);
     };
-    let Some(interface) = matching_interface(old_address, interfaces, None) else {
+    let Some(interface) = matching_interface(old_address, interfaces, None).or(explicit_interface)
+    else {
         return Ok(None);
     };
     let pinned = ensure_host_key_pin(node)?;
@@ -1124,14 +1144,22 @@ pub(crate) fn refresh_node_addresses(
     state_dir: &Path,
     force: bool,
 ) -> AppResult<bool> {
-    check_addresses(config_path, state_dir, force, true)
+    check_addresses(config_path, state_dir, force, true, None)
 }
 
 pub(crate) fn prepare_node_address_migration(
     config_path: &Path,
     state_dir: &Path,
 ) -> AppResult<bool> {
-    check_addresses(config_path, state_dir, false, false)
+    check_addresses(config_path, state_dir, false, false, None)
+}
+
+pub(crate) fn prepare_node_address_migration_with_host(
+    config_path: &Path,
+    state_dir: &Path,
+    host: Ipv4Addr,
+) -> AppResult<bool> {
+    check_addresses(config_path, state_dir, false, false, Some(host))
 }
 
 pub(crate) fn address_migration_pending(state_dir: &Path) -> bool {
@@ -1256,6 +1284,7 @@ fn check_addresses(
     state_dir: &Path,
     force: bool,
     apply: bool,
+    explicit_local_host: Option<Ipv4Addr>,
 ) -> AppResult<bool> {
     if !config_path.is_file() {
         return Ok(false);
@@ -1287,6 +1316,13 @@ fn check_addresses(
         return Ok(false);
     }
     crate::init::reset::ensure_no_reset_in_progress(config_path, state_dir)?;
+    let preloaded_interfaces = explicit_local_host
+        .map(|host| {
+            let interfaces = local_interfaces()?;
+            select_explicit_interface(Some(host), &interfaces)?;
+            Ok::<_, (i32, String)>(interfaces)
+        })
+        .transpose()?;
     let migration_path = state_dir.join(MIGRATION_FILE);
     if let Some(migration) = read_private_json::<Migration>(&migration_path)? {
         return if apply {
@@ -1297,7 +1333,7 @@ fn check_addresses(
     }
     let proposal_path = state_dir.join(PROPOSAL_FILE);
     if let Some(migration) = read_private_json::<Migration>(&proposal_path)? {
-        if migration.old_source == source {
+        if explicit_local_host.is_none() && migration.old_source == source {
             if !apply {
                 return Ok(true);
             }
@@ -1314,6 +1350,14 @@ fn check_addresses(
     let checked_at_ms = now_ms();
     let liveness_records =
         macluster_controller::liveness::read(state_dir, &config.share_uuid).unwrap_or_default();
+    let interfaces = match preloaded_interfaces {
+        Some(interfaces) => interfaces,
+        None => local_interfaces()?,
+    };
+    let explicit_interface = select_explicit_interface(explicit_local_host, &interfaces)?;
+    let explicit_login_address_changed = explicit_local_host
+        .is_some_and(|host| local_node.host.parse::<Ipv4Addr>().ok() != Some(host));
+    let force_discovery = force || explicit_login_address_changed;
     let mut discovery_neighbors = neighbors();
     let mut recovery_nodes = BTreeSet::new();
     let mut accelerate_subnet_scan = false;
@@ -1369,17 +1413,20 @@ fn check_addresses(
         full_subnet_scan_due_with_interval(
             inventory.last_subnet_scan_ms,
             checked_at_ms,
-            force,
+            force_discovery,
             RECOVERY_SUBNET_SCAN_INTERVAL_MS,
         )
     } else {
-        full_subnet_scan_due(inventory.last_subnet_scan_ms, checked_at_ms, force)
+        full_subnet_scan_due(
+            inventory.last_subnet_scan_ms,
+            checked_at_ms,
+            force_discovery,
+        )
     };
-    let interfaces = local_interfaces()?;
     let local_current = interfaces
         .iter()
         .any(|interface| interface.address.to_string() == local_node.host);
-    if !force
+    if !force_discovery
         && local_current
         && config.nodes.iter().all(|(id, node)| {
             inventory
@@ -1399,7 +1446,9 @@ fn check_addresses(
         .host
         .parse::<Ipv4Addr>()
         .map_err(|_| (2, "registered login address is not IPv4".into()))?;
-    let local_interface = if local_current {
+    let local_interface = if let Some(interface) = explicit_interface {
+        Some(interface)
+    } else if local_current {
         interfaces.iter().find(|interface| interface.address == old)
     } else {
         matching_interface(
@@ -1463,9 +1512,25 @@ fn check_addresses(
                     .iter()
                     .any(|(neighbor, found)| *neighbor == address && found == mac)
             });
-            if force || !endpoint_up || (known_mac.is_some() && !mac_still_at_registered_ip) {
+            if force_discovery
+                || !endpoint_up
+                || (known_mac.is_some() && !mac_still_at_registered_ip)
+            {
                 let subnet = u32::from(interface.address) & interface.mask;
                 sweep_targets.insert((subnet, interface.mask, port), interface.clone());
+            }
+        }
+        if explicit_login_address_changed && let Some(interface) = explicit_interface {
+            for node in config
+                .nodes
+                .values()
+                .filter(|node| node.transport == Transport::Ssh)
+            {
+                let subnet = u32::from(interface.address) & interface.mask;
+                sweep_targets.insert(
+                    (subnet, interface.mask, node.ssh_port.unwrap_or(22)),
+                    interface.clone(),
+                );
             }
         }
         let mut all_sweeps_completed = true;
@@ -1484,7 +1549,7 @@ fn check_addresses(
             continue;
         }
         if recovery_check
-            && !force
+            && !force_discovery
             && !recovery_nodes.contains(node_id)
             && liveness_records.get(node_id).is_some_and(|record| {
                 let expected_identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
@@ -1511,9 +1576,10 @@ fn check_addresses(
             node,
             known,
             &interfaces,
+            explicit_interface.filter(|_| explicit_login_address_changed),
             &discovery_neighbors,
-            force,
-            force || allow_full_subnet_scan,
+            force_discovery,
+            force_discovery || allow_full_subnet_scan,
         )?;
         match discovered {
             Some((connection, record)) => {
@@ -1609,6 +1675,35 @@ mod tests {
         ));
         reporter.clear();
         assert!(reporter.should_report("no unambiguous interface"));
+    }
+
+    #[test]
+    fn explicit_login_address_selects_an_assigned_interface_and_rejects_unknown_ip() {
+        let interfaces = [
+            InterfaceAddress {
+                interface: "en0".into(),
+                address: "192.168.3.5".parse().unwrap(),
+                mask: u32::from("255.255.255.0".parse::<Ipv4Addr>().unwrap()),
+                mac: None,
+            },
+            InterfaceAddress {
+                interface: "bridge0".into(),
+                address: "198.18.0.1".parse().unwrap(),
+                mask: u32::from("255.255.255.0".parse::<Ipv4Addr>().unwrap()),
+                mac: None,
+            },
+        ];
+        let selected = select_explicit_interface(Some("192.168.3.5".parse().unwrap()), &interfaces)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.interface, "en0");
+        assert_eq!(selected.address, "192.168.3.5".parse::<Ipv4Addr>().unwrap());
+        assert!(
+            select_explicit_interface(Some("192.168.2.2".parse().unwrap()), &interfaces)
+                .unwrap_err()
+                .1
+                .contains("not assigned")
+        );
     }
 
     #[test]

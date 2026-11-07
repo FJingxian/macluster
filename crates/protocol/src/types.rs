@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId, StartToken};
-use crate::nfs_admin::{NfsAlias, NfsMount};
+use crate::nfs_admin::{NfsAlias, NfsExportCleanup, NfsMount};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const INTERACTIVE_PTY_FEATURE: &str = "agent.interactive-pty.v1";
@@ -644,6 +644,8 @@ pub enum Operation {
         obsolete_mounts: Vec<NfsMount>,
         obsolete_aliases: Vec<NfsAlias>,
         obsolete_markers: Vec<NfsShareMarker>,
+        #[serde(default)]
+        obsolete_exports: Vec<NfsExportCleanup>,
     },
     Fence {
         controller: ControllerEpoch,
@@ -670,6 +672,8 @@ pub enum Operation {
 pub struct NfsShareMarker {
     pub source_root: String,
     pub share_uuid: String,
+    #[serde(default)]
+    pub alias_target: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -723,7 +727,7 @@ mod interactive_job_compatibility_tests {
     use super::{ControllerEpoch, JobSpec, NfsShareMarker, NodeHealth, Operation};
     use crate::{
         identifiers::{ControllerUuid, Id128},
-        nfs_admin::{NfsAlias, NfsMount},
+        nfs_admin::{NfsAlias, NfsExportCleanup, NfsMount},
     };
     use serde_json::json;
 
@@ -789,6 +793,13 @@ mod interactive_job_compatibility_tests {
             obsolete_markers: vec![NfsShareMarker {
                 source_root: "/srv/old".into(),
                 share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                alias_target: Some("/mnt/data".into()),
+            }],
+            obsolete_exports: vec![NfsExportCleanup {
+                root: "/srv/old".into(),
+                client_ip: "192.0.2.8".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                node_id: "worker-008".into(),
             }],
         };
 

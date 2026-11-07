@@ -6,7 +6,7 @@ mod scan;
 
 pub(crate) use addresses::{
     address_migration_has_active_jobs, address_migration_pending, prepare_node_address_migration,
-    refresh_node_addresses, watch_node_addresses,
+    prepare_node_address_migration_with_host, refresh_node_addresses, watch_node_addresses,
 };
 
 use std::{
@@ -31,8 +31,8 @@ use macluster_core::{
     config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
     nfs_reconcile::{
-        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareMarkerCleanup,
-        client_cleanup_key, marker_cleanup_key,
+        DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
+        DeferredShareMarkerCleanup, client_cleanup_key, export_cleanup_key, marker_cleanup_key,
     },
     service::ServiceBinding,
     storage::{ReadOnlyJobStore, Storage},
@@ -47,7 +47,7 @@ use macluster_protocol::{
     identifiers::{Id128, NodeId, QueueName},
     nfs_admin::{
         NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply, NfsAdminRequest, NfsAlias,
-        NfsMount,
+        NfsExportCleanup, NfsMount,
     },
     types::{
         ControllerEpoch, ExecutionStatus, INTERACTIVE_PTY_FEATURE, METRICS_FAN_SPEED_FEATURE,
@@ -73,7 +73,7 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-11";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-12";
 const POWER_HELPER_REVISION: &str = "power-2";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
 const POWER_LAUNCHD_PATH: &str = "/Library/LaunchDaemons/org.macluster.power.plist";
@@ -5982,6 +5982,10 @@ pub(crate) fn apply_privileged_nfs_admin_request(
                     nfs_exports_update_commands(&candidate, &expected_original, &operation_id)?;
                 run_privileged_nfs_script(&script, "updating managed NFS exports")
             }
+            NfsAdminOperation::RemoveExports {
+                operation_id,
+                exports,
+            } => apply_privileged_nfs_export_cleanup(&operation_id, &exports),
             NfsAdminOperation::UpdateHelpers { .. } => {
                 Err("helper updates must use the authenticated privileged updater service".into())
             }
@@ -5995,6 +5999,41 @@ pub(crate) fn apply_privileged_nfs_admin_request(
         Ok(()) => NfsAdminReply::success(NFS_ADMIN_SERVICE_VERSION),
         Err(error) => NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error),
     }
+}
+
+fn apply_privileged_nfs_export_cleanup(
+    operation_id: &str,
+    exports: &[NfsExportCleanup],
+) -> Result<(), String> {
+    let baseline_command =
+        nfs_exports_update_baseline_read_command(NFS_EXPORTS_PATH, NFS_EXPORTS_BACKUP_PATH);
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", &baseline_command]);
+    let output = run_child(command, None, Duration::from_secs(10))
+        .map_err(|(_, error)| format!("cannot inspect local NFS export transaction: {error}"))?;
+    if !output.status.success() {
+        return Err(command_error(
+            "cannot inspect local NFS export transaction",
+            &output,
+        ));
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
+    let (original, transaction_pending) = parse_nfs_exports_update_baseline(&output)?;
+    let requests = exports
+        .iter()
+        .map(|export| NfsExportRequest {
+            root: export.root.clone(),
+            client_ip: export.client_ip.clone(),
+            share_uuid: export.share_uuid.clone(),
+            node_id: export.node_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let (candidate, _, changed) = plan_remove_nfs_exports(&original, &requests)?;
+    if changed || transaction_pending {
+        let script = nfs_exports_update_commands(&candidate, &original, operation_id)?;
+        run_privileged_nfs_script(&script, "removing deferred managed NFS exports")?;
+    }
+    Ok(())
 }
 
 fn apply_privileged_nfs_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(), String> {
@@ -8911,24 +8950,32 @@ fn stale_nfs_admin_reply(
     reply: &NfsAdminReply,
     operation: &NfsAdminOperation,
 ) -> Option<Result<Option<()>, String>> {
-    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-3" {
+    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-4" {
         return Some(Ok(None));
     }
-    if reply.service_version != "nfs-admin-2" || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-3" {
+    if !matches!(
+        reply.service_version.as_str(),
+        "nfs-admin-2" | "nfs-admin-3"
+    ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-4"
+    {
         return None;
     }
     if !reply.ok {
         return Some(Err(reply.error.clone().unwrap_or_else(|| {
-            "nfs-admin-2 rejected a request during its signed self-update".into()
+            format!(
+                "{} rejected a request during its signed self-update",
+                reply.service_version
+            )
         })));
     }
     match operation {
-        // nfs-admin-2 already understands signed self-update. Its daemon
-        // restarts into nfs-admin-3 after installing the new power helper.
+        // nfs-admin-2 and nfs-admin-3 understand signed self-update. Their
+        // daemon restarts into the current protocol after refreshing helpers.
         NfsAdminOperation::Ping | NfsAdminOperation::UpdateHelpers { .. } => Some(Ok(Some(()))),
-        _ => Some(Err(
-            "NFS administrator service version nfs-admin-2 must be refreshed before this operation; rerun the command after the automatic helper update".into(),
-        )),
+        _ => Some(Err(format!(
+            "NFS administrator service version {} must be refreshed before this operation; rerun the command after the automatic helper update",
+            reply.service_version
+        ))),
     }
 }
 
@@ -10181,6 +10228,7 @@ fn remember_deferred_share_marker_cleanup(
     server: &NodeConfig,
     share: &ShareConfig,
     state: &AdminState,
+    alias_target: Option<String>,
 ) -> AppResult<()> {
     let mut pending = read_deferred_share_cleanup(state_dir)?;
     pending.version = 1;
@@ -10196,8 +10244,75 @@ fn remember_deferred_share_marker_cleanup(
             source_root: share.source_root.to_string_lossy().into_owned(),
             share_uuid: share.share_uuid.clone(),
             machine_uuid,
+            alias_target,
         },
     );
+    save_deferred_share_cleanup(state_dir, &pending)
+}
+
+fn remember_deferred_share_server_cleanup(
+    state_dir: &Path,
+    share_id: &str,
+    server_id: &str,
+    server: &NodeConfig,
+    share: &ShareConfig,
+    config: &ClusterConfig,
+    state: &AdminState,
+) -> AppResult<()> {
+    let machine_uuid = server
+        .machine_uuid
+        .clone()
+        .or_else(|| state.machine_uuids.get(server_id).cloned())
+        .ok_or_else(|| {
+            (
+                1,
+                format!(
+                    "cannot defer NFS server cleanup for {server_id}; its machine UUID is not recorded"
+                ),
+            )
+        })?;
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    pending.version = 1;
+    let marker = DeferredShareMarkerCleanup {
+        share_id: share_id.to_owned(),
+        node_id: server_id.to_owned(),
+        source_root: share.source_root.to_string_lossy().into_owned(),
+        share_uuid: share.share_uuid.clone(),
+        machine_uuid: Some(machine_uuid.clone()),
+        alias_target: (share.source_root != share.mount_root)
+            .then(|| share.mount_root.to_string_lossy().into_owned()),
+    };
+    pending.marker_entries.insert(
+        marker_cleanup_key(share_id, server_id, &share.share_uuid),
+        marker,
+    );
+    for (client_node_id, client) in &config.nodes {
+        if client_node_id == server_id {
+            continue;
+        }
+        let client_ip = client.host.to_string();
+        client_ip.parse::<Ipv4Addr>().map_err(|_| {
+            (
+                2,
+                format!(
+                    "cannot defer export cleanup for {client_node_id}; its registered address {client_ip} is not IPv4"
+                ),
+            )
+        })?;
+        let cleanup = DeferredShareExportCleanup {
+            share_id: share_id.to_owned(),
+            node_id: server_id.to_owned(),
+            source_root: share.source_root.to_string_lossy().into_owned(),
+            client_ip,
+            client_node_id: client_node_id.clone(),
+            share_uuid: share.share_uuid.clone(),
+            machine_uuid: Some(machine_uuid.clone()),
+        };
+        pending.exports.insert(
+            export_cleanup_key(share_id, server_id, client_node_id, &share.share_uuid),
+            cleanup,
+        );
+    }
     save_deferred_share_cleanup(state_dir, &pending)
 }
 
@@ -10277,6 +10392,34 @@ fn retry_deferred_share_marker_cleanup(
         if let Err((_, error)) = check_remote_idle(node, &entry.node_id, config_path) {
             deferred.push(format!("{}:{} ({error})", entry.node_id, entry.source_root));
             continue;
+        }
+        if let Some(target) = entry.alias_target.as_deref() {
+            if let Err(error) = check_managed_nfs_alias(
+                node,
+                &entry.source_root,
+                target,
+                true,
+                &format!("verify deferred share alias for {}", entry.share_id),
+            ) {
+                deferred.push(format!("{}:{} ({error})", entry.node_id, entry.source_root));
+                continue;
+            }
+            if let Err(error) = remove_pending_share_alias(
+                node,
+                Path::new(target),
+                Path::new(&entry.source_root),
+                &entry.share_id,
+            ) {
+                deferred.push(format!(
+                    "{}:{} ({})",
+                    entry.node_id, entry.source_root, error.1
+                ));
+                continue;
+            }
+            if let Some(current) = pending.marker_entries.get_mut(&key) {
+                current.alias_target = None;
+            }
+            save_deferred_share_cleanup(state_dir, &pending)?;
         }
         match remove_pending_share_marker(
             node,
@@ -10430,8 +10573,8 @@ fn retry_deferred_share_client_cleanup(
     let operation_id = admin_state
         .operations
         .get(&format!("share-remove:{share_id}"))
-        .map(|operation| operation.id.as_str())
-        .unwrap_or("deferred-share-cleanup");
+        .map(|operation| operation.id.clone())
+        .unwrap_or_else(|| Id128::random().to_string());
     let keys = pending
         .entries
         .iter()
@@ -10547,9 +10690,13 @@ fn retry_deferred_share_client_cleanup(
             }
         }
         let only_node = BTreeSet::from([entry.node_id.clone()]);
-        if let Err(error) =
-            sync_remote_configs_on_nodes(config, config_source, state_dir, operation_id, &only_node)
-        {
+        if let Err(error) = sync_remote_configs_on_nodes(
+            config,
+            config_source,
+            state_dir,
+            &operation_id,
+            &only_node,
+        ) {
             deferred.push(format!(
                 "{} (remote config sync pending: {error})",
                 entry.node_id
@@ -10558,6 +10705,87 @@ fn retry_deferred_share_client_cleanup(
         }
         pending.entries.remove(&key);
         save_deferred_share_cleanup(state_dir, &pending)?;
+    }
+    Ok(deferred)
+}
+
+fn retry_deferred_share_export_cleanup(
+    config_path: &Path,
+    state_dir: &Path,
+    config: &ClusterConfig,
+    admin_state: &AdminState,
+    share_id: &str,
+) -> AppResult<Vec<String>> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    let operation_id = admin_state
+        .operations
+        .get(&format!("share-remove:{share_id}"))
+        .map(|operation| operation.id.as_str())
+        .unwrap_or("deferred-share-cleanup");
+    let keys = pending
+        .exports
+        .iter()
+        .filter(|(_, entry)| entry.share_id == share_id)
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let mut deferred = Vec::new();
+
+    for key in keys {
+        let Some(entry) = pending.exports.get(&key).cloned() else {
+            continue;
+        };
+        let Some(server) = config.nodes.get(&entry.node_id) else {
+            deferred.push(format!(
+                "{} (NFS server is no longer registered)",
+                entry.node_id
+            ));
+            continue;
+        };
+        if !node_ssh_endpoint_reachable(server) {
+            deferred.push(format!("{} (offline)", entry.node_id));
+            continue;
+        }
+        if entry.machine_uuid.as_deref().is_none_or(|expected| {
+            server
+                .machine_uuid
+                .as_deref()
+                .or_else(|| {
+                    admin_state
+                        .machine_uuids
+                        .get(&entry.node_id)
+                        .map(String::as_str)
+                })
+                .is_none_or(|actual| !actual.eq_ignore_ascii_case(expected))
+        }) {
+            deferred.push(format!(
+                "{} (NFS server identity is unresolved or changed)",
+                entry.node_id
+            ));
+            continue;
+        }
+        if let Err((_, error)) =
+            verify_registered_node_identity(&entry.node_id, server, admin_state)
+        {
+            deferred.push(format!("{} ({error})", entry.node_id));
+            continue;
+        }
+        if let Err((_, error)) = check_remote_idle(server, &entry.node_id, config_path) {
+            deferred.push(format!("{} ({error})", entry.node_id));
+            continue;
+        }
+        let request = NfsExportRequest {
+            root: entry.source_root.clone(),
+            client_ip: entry.client_ip.clone(),
+            share_uuid: entry.share_uuid.clone(),
+            node_id: entry.client_node_id.clone(),
+        };
+        match remove_managed_nfs_exports(server, &[request], &operation_id) {
+            Ok(_) => {
+                pending.remove_export_cleanup_exact(&entry);
+                save_deferred_share_cleanup(state_dir, &pending)?;
+            }
+            Err(error) => deferred.push(format!("{} ({error})", entry.node_id)),
+        }
     }
     Ok(deferred)
 }
@@ -10690,7 +10918,15 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     &state,
                     share_id,
                 )?;
-                if deferred.is_empty() && deferred_marker.is_empty() {
+                let deferred_exports = retry_deferred_share_export_cleanup(
+                    &config_path,
+                    state_dir,
+                    &config,
+                    &state,
+                    share_id,
+                )?;
+                if deferred.is_empty() && deferred_marker.is_empty() && deferred_exports.is_empty()
+                {
                     println!("Named share {share_id} was already removed.");
                 } else {
                     if !deferred.is_empty() {
@@ -10701,8 +10937,14 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     }
                     if !deferred_marker.is_empty() {
                         println!(
-                            "Named share {share_id} is removed from the cluster; source marker cleanup is still deferred: {}. The source files were preserved. Rerun `mnode -rm share:{share_id}` after the volume responds.",
+                            "Named share {share_id} is removed from the cluster; source marker cleanup is still deferred: {}. The source files were preserved.",
                             deferred_marker.join(", ")
+                        );
+                    }
+                    if !deferred_exports.is_empty() {
+                        println!(
+                            "Named share {share_id} is removed from the cluster; server export cleanup is still deferred: {}.",
+                            deferred_exports.join(", ")
                         );
                     }
                 }
@@ -10772,7 +11014,51 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         )
         .map_err(|error| (1, error))?;
         if recovery == ShareRemovalRecovery::Done {
-            println!("Named share {share_id} was already removed.");
+            let deferred_clients = retry_deferred_share_client_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &source_text,
+                &state,
+                share_id,
+            )?;
+            let deferred_markers = retry_deferred_share_marker_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &state,
+                share_id,
+            )?;
+            let deferred_exports = retry_deferred_share_export_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &state,
+                share_id,
+            )?;
+            if deferred_clients.is_empty()
+                && deferred_markers.is_empty()
+                && deferred_exports.is_empty()
+            {
+                println!(
+                    "Named share {share_id} was already removed; deferred cleanup is complete."
+                );
+            } else {
+                let mut remaining = Vec::new();
+                if !deferred_clients.is_empty() {
+                    remaining.push(format!("clients: {}", deferred_clients.join(", ")));
+                }
+                if !deferred_exports.is_empty() {
+                    remaining.push(format!("server exports: {}", deferred_exports.join(", ")));
+                }
+                if !deferred_markers.is_empty() {
+                    remaining.push(format!("source marker: {}", deferred_markers.join(", ")));
+                }
+                println!(
+                    "Named share {share_id} is removed from the cluster; cleanup will retry when reachable: {}.",
+                    remaining.join("; ")
+                );
+            }
             return Ok(());
         }
 
@@ -10790,6 +11076,9 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &source_text,
                 &state,
                 share_id,
+            )?;
+            remember_deferred_share_server_cleanup(
+                state_dir, share_id, &server_id, server, &share, &config, &state,
             )?;
             if let Err(error) =
                 sync_remote_configs_online_nodes(&config, &source_text, state_dir, &operation.id)
@@ -10813,6 +11102,13 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &state,
                 share_id,
             )?;
+            let deferred_export_cleanup = retry_deferred_share_export_cleanup(
+                &config_path,
+                state_dir,
+                &config,
+                &state,
+                share_id,
+            )?;
             operation.phase = "REMOVED".into();
             let mut deferred_details = Vec::new();
             if !deferred_cleanup.is_empty() {
@@ -10827,6 +11123,12 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     deferred_marker_cleanup.join(", ")
                 ));
             }
+            if !deferred_export_cleanup.is_empty() {
+                deferred_details.push(format!(
+                    "deferred server export cleanup: {}",
+                    deferred_export_cleanup.join(", ")
+                ));
+            }
             operation.detail = (!deferred_details.is_empty()).then(|| deferred_details.join("; "));
             state.operations.insert(operation_key, operation);
             save_admin_state(&journal_path, &state)?;
@@ -10839,8 +11141,14 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             }
             if !deferred_marker_cleanup.is_empty() {
                 println!(
-                    "Source marker cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after the volume responds.",
+                    "Source marker cleanup is deferred for: {}. It will retry when the source is available.",
                     deferred_marker_cleanup.join(", ")
+                );
+            }
+            if !deferred_export_cleanup.is_empty() {
+                println!(
+                    "Server export cleanup is deferred for: {}. It will retry when the NFS server reconnects.",
+                    deferred_export_cleanup.join(", ")
                 );
             }
             return Ok(());
@@ -10870,6 +11178,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         // unavailable, so use the endpoint needed for cleanup and defer that
         // client's unmount/config sync until it reconnects.
         let offline_nodes = share_removal_unavailable_nodes(&config);
+        let server_offline = offline_nodes.contains(&server_id);
         let mut deferred_output_sync = Vec::new();
         if state_dir.join("controller.sqlite3").is_file() {
             let jobs = ReadOnlyJobStore::open(state_dir)
@@ -10909,14 +11218,6 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 ));
             }
         }
-        if offline_nodes.contains(&server_id) {
-            return Err((
-                1,
-                format!(
-                    "cannot remove share {share_id} while its NFS server {server_id} is confirmed offline; the server must be reachable to remove its export safely"
-                ),
-            ));
-        }
         for (node_id, node) in &config.nodes {
             if offline_nodes.contains(node_id) {
                 continue;
@@ -10926,7 +11227,11 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         }
 
         let existing_removal = resumed_removal;
-        if existing_removal {
+        if server_offline {
+            eprintln!(
+                "Warning: NFS server {server_id} is offline; its exact export, alias and marker cleanup will be applied automatically when it reconnects."
+            );
+        } else if existing_removal {
             if let Err(error) = check_managed_nfs_marker(
                 server,
                 &share.source_root.to_string_lossy(),
@@ -10961,7 +11266,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 );
             }
         }
-        if share.source_root != share.mount_root {
+        if !server_offline && share.source_root != share.mount_root {
             check_managed_nfs_alias(
                 server,
                 &share.mount_root.to_string_lossy(),
@@ -11009,15 +11314,17 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &share.mount_root.to_string_lossy(),
             ) {
                 NamedShareMountStatus::Expected => {
-                    if let Err((code, error)) = verify_named_share_mount_for_removal(
-                        node,
-                        node_id,
-                        &server_id,
-                        &server.host,
-                        &share.source_root,
-                        &share.mount_root,
-                        share_uuid,
-                    ) {
+                    if !server_offline
+                        && let Err((code, error)) = verify_named_share_mount_for_removal(
+                            node,
+                            node_id,
+                            &server_id,
+                            &server.host,
+                            &share.source_root,
+                            &share.mount_root,
+                            share_uuid,
+                        )
+                    {
                         // The mount table above already proved the exact
                         // source/target. A stalled NFS marker read must not
                         // prevent its exact managed mount from being removed;
@@ -11083,7 +11390,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 node_id: node_id.clone(),
             })
             .collect::<Vec<_>>();
-        if !export_requests.is_empty() {
+        if !export_requests.is_empty() && !server_offline {
             let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
                 (
                     1,
@@ -11140,7 +11447,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         }
 
         let mut still_authorized = Vec::new();
-        if !export_requests.is_empty() {
+        if !export_requests.is_empty() && !server_offline {
             let statuses = remove_managed_nfs_exports(server, &export_requests, &operation.id)
                 .map_err(|error| {
                     (
@@ -11159,39 +11466,56 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 }
             }
         }
-        if share.source_root != share.mount_root {
+        if !server_offline && share.source_root != share.mount_root {
             remove_pending_share_alias(server, &share.mount_root, &share.source_root, share_id)?;
         }
-        let mut source_marker_cleanup_deferred = false;
-        match remove_pending_share_marker(server, &share.source_root, share_uuid, share_id) {
-            Ok(()) => forget_deferred_share_marker_cleanup(
-                state_dir,
-                share_id,
-                &server_id,
-                &share.source_root,
-                share_uuid,
-            )?,
-            Err((_, error)) if share_marker_read_timeout(&error, &share.source_root) => {
-                // A stalled removable volume must not keep client mounts and
-                // exports registered forever. The operation journal records
-                // the UUID, and this sidecar retries exact marker cleanup once
-                // the source responds again.
-                remember_deferred_share_marker_cleanup(
-                    state_dir, share_id, &server_id, server, &share, &state,
-                )?;
-                source_marker_cleanup_deferred = true;
+        if !server_offline {
+            match remove_pending_share_marker(server, &share.source_root, share_uuid, share_id) {
+                Ok(()) => forget_deferred_share_marker_cleanup(
+                    state_dir,
+                    share_id,
+                    &server_id,
+                    &share.source_root,
+                    share_uuid,
+                )?,
+                Err((_, error)) if share_marker_read_timeout(&error, &share.source_root) => {
+                    // A stalled removable volume must not keep client mounts and
+                    // exports registered forever. The operation journal records
+                    // the UUID, and this sidecar retries exact marker cleanup once
+                    // the source responds again.
+                    remember_deferred_share_marker_cleanup(
+                        state_dir, share_id, &server_id, server, &share, &state, None,
+                    )?;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
 
         operation.phase = "REMOVAL_COMMITTING".into();
-        operation.detail = Some("NFS resources are removed; committing share config change".into());
+        operation.detail = Some(if server_offline {
+            "NFS server is offline; exact server cleanup will be reconciled after reconnecting"
+                .into()
+        } else {
+            "NFS resources are removed; committing share config change".into()
+        });
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
         backup_config(&config_path, &operation.id)?;
         atomic_write(&config_path, candidate.as_bytes())?;
+
+        if server_offline {
+            remember_deferred_share_server_cleanup(
+                state_dir,
+                share_id,
+                &server_id,
+                server,
+                &share,
+                &candidate_config,
+                &state,
+            )?;
+        }
 
         operation.phase = "SYNC_PENDING".into();
         operation.detail = Some("share is removed locally; synchronizing peer configs".into());
@@ -11225,12 +11549,33 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             &state,
             share_id,
         )?;
+        let deferred_marker_cleanup = retry_deferred_share_marker_cleanup(
+            &config_path,
+            state_dir,
+            &candidate_config,
+            &state,
+            share_id,
+        )?;
+        let deferred_export_cleanup = retry_deferred_share_export_cleanup(
+            &config_path,
+            state_dir,
+            &candidate_config,
+            &state,
+            share_id,
+        )?;
+        let source_marker_cleanup_deferred = !deferred_marker_cleanup.is_empty();
         operation.phase = "REMOVED".into();
         let mut deferred_details = Vec::new();
         if !deferred_cleanup.is_empty() {
             deferred_details.push(format!(
                 "deferred client cleanup: {}",
                 deferred_cleanup.join(", ")
+            ));
+        }
+        if !deferred_export_cleanup.is_empty() {
+            deferred_details.push(format!(
+                "deferred server export cleanup: {}",
+                deferred_export_cleanup.join(", ")
             ));
         }
         if source_marker_cleanup_deferred {
@@ -11249,9 +11594,15 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 deferred_cleanup.join(", ")
             );
         }
+        if !deferred_export_cleanup.is_empty() {
+            println!(
+                "Server export cleanup is deferred for: {}. The controller will retry when the NFS server reconnects.",
+                deferred_export_cleanup.join(", ")
+            );
+        }
         if source_marker_cleanup_deferred {
             println!(
-                "Source marker cleanup is deferred for {server_id}:{} because the volume did not respond. Share data was preserved; rerun `mnode -rm share:{share_id}` after the volume responds.",
+                "Source marker cleanup is deferred for {server_id}:{} because the volume did not respond. The controller will retry when the source is available; share data was preserved.",
                 share.source_root.display()
             );
         }
@@ -16733,6 +17084,7 @@ mod tests {
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
+    use macluster_core::nfs_reconcile::DeferredShareCleanupState;
     use macluster_core::storage::{ReadOnlyJobStore, Storage};
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
@@ -16767,6 +17119,72 @@ mod tests {
             unavailable_share_client_nodes(&config, "login", |node| node.host != "192.0.2.3");
 
         assert_eq!(deferred, BTreeSet::from(["offline".to_owned()]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_nfs_server_removal_persists_exact_marker_alias_and_export_tombstones() {
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("external/share");
+        let mount = root.join("mount/share");
+        let config = ClusterConfig::parse(&format!(
+            "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\", \"storage\", \"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.10\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.storage]\nhost = \"192.0.2.1\"\ntransport = \"ssh\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdee\"\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcded\"\n\n[shares.tools]\nserver = \"storage\"\nsource_root = \"{}\"\nmount_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000002\"\n",
+            root.join("primary").display(),
+            source.display(),
+            mount.display()
+        ))
+        .unwrap();
+        let share = ShareConfig {
+            server: NodeId::new("storage").unwrap(),
+            source_root: source.clone(),
+            mount_root: mount.clone(),
+            share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+            allow_existing_contents: false,
+        };
+        let state = AdminState {
+            version: 1,
+            config_path: root.join("config.toml").to_string_lossy().into_owned(),
+            state_dir: root.join("state").to_string_lossy().into_owned(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::from([(
+                "storage".into(),
+                "01234567-89ab-cdef-0123-456789abcdee".into(),
+            )]),
+            operations: BTreeMap::new(),
+        };
+
+        super::remember_deferred_share_server_cleanup(
+            &root,
+            "tools",
+            "storage",
+            &config.nodes["storage"],
+            &share,
+            &config,
+            &state,
+        )
+        .unwrap();
+
+        let pending = DeferredShareCleanupState::load_from_dir(&root).unwrap();
+        let marker = pending.marker_entries.values().next().unwrap();
+        assert_eq!(marker.node_id, "storage");
+        assert_eq!(marker.source_root, source.to_string_lossy());
+        assert_eq!(
+            marker.alias_target.as_deref(),
+            Some(mount.to_string_lossy().as_ref())
+        );
+        assert_eq!(pending.exports.len(), 2);
+        assert!(pending.exports.values().any(|entry| {
+            entry.node_id == "storage"
+                && entry.client_node_id == "worker"
+                && entry.client_ip == "192.0.2.2"
+                && entry.share_uuid == share.share_uuid
+        }));
+        assert!(pending.exports.values().any(|entry| {
+            entry.node_id == "storage"
+                && entry.client_node_id == "login"
+                && entry.client_ip == "192.0.2.10"
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -21446,7 +21864,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
         );
         assert!(script.contains(super::NFS_ADMIN_CLI_REVISION));
-        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-3");
+        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-4");
     }
 
     #[test]
@@ -21488,6 +21906,24 @@ ssh_port = 22
         );
         assert!(
             super::stale_nfs_admin_reply(&reply("nfs-admin-2", true), &forget)
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &ping)
+                .unwrap()
+                .unwrap(),
+            Some(()),
+            "nfs-admin-3 can authenticate the signed upgrade path to protocol 4"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &update)
+                .unwrap()
+                .unwrap(),
+            Some(())
+        );
+        assert!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &forget)
                 .unwrap()
                 .is_err()
         );

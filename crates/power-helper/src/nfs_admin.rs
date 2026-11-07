@@ -232,6 +232,7 @@ fn preflight_mounts(request: &NfsAdminRequest) -> Result<(), String> {
         | NfsAdminOperation::CheckMarker { .. }
         | NfsAdminOperation::CheckAlias { .. }
         | NfsAdminOperation::UpdateExports { .. }
+        | NfsAdminOperation::RemoveExports { .. }
         | NfsAdminOperation::UpdateHelpers { .. }
         | NfsAdminOperation::ForgetClusterUpdater { .. } => return Ok(()),
     };

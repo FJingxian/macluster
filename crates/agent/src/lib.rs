@@ -24,7 +24,7 @@ use macluster_protocol::{
     identifiers::{Id128, StartToken},
     nfs_admin::{
         MAX_NFS_ADMIN_REQUEST_BYTES, NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply,
-        NfsAdminRequest, NfsAlias, NfsMount,
+        NfsAdminRequest, NfsAlias, NfsExportCleanup, NfsMount,
     },
     types::{
         ControllerEpoch, ExecutionStatus, FanControlStatus, FanHelperCommand, FanHelperResponse,
@@ -299,6 +299,7 @@ fn handle_operation_with_config_path(
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
+            obsolete_exports,
         } => {
             let config_path = config_path.ok_or_else(|| {
                 ProtocolError::Failed("NFS reconciliation requires a config path".into())
@@ -309,6 +310,7 @@ fn handle_operation_with_config_path(
                 &obsolete_mounts,
                 &obsolete_aliases,
                 &obsolete_markers,
+                &obsolete_exports,
                 config,
                 state_dir,
                 local_node_id,
@@ -426,8 +428,14 @@ fn superseded_nfs_cleanup_plan(
     obsolete_mounts: Vec<NfsMount>,
     obsolete_aliases: Vec<NfsAlias>,
     obsolete_markers: Vec<NfsShareMarker>,
+    obsolete_exports: Vec<NfsExportCleanup>,
     desired_mounts: &[NfsMount],
-) -> (Vec<NfsMount>, Vec<NfsAlias>, Vec<NfsShareMarker>) {
+) -> (
+    Vec<NfsMount>,
+    Vec<NfsAlias>,
+    Vec<NfsShareMarker>,
+    Vec<NfsExportCleanup>,
+) {
     let mounts = obsolete_mounts
         .into_iter()
         .filter(|obsolete| {
@@ -437,7 +445,7 @@ fn superseded_nfs_cleanup_plan(
             })
         })
         .collect();
-    let aliases = obsolete_aliases
+    let aliases: Vec<NfsAlias> = obsolete_aliases
         .into_iter()
         .filter(|obsolete| {
             !desired_mounts.iter().any(|desired| {
@@ -449,13 +457,40 @@ fn superseded_nfs_cleanup_plan(
     let markers = obsolete_markers
         .into_iter()
         .filter(|obsolete| {
+            // Marker files are single-UUID sentinels. If a new generation of
+            // a share already owns the same source path, leave its marker in
+            // place even though the old cleanup UUID differs.
             !desired_config
                 .shares
                 .values()
                 .any(|share| share.source_root.to_string_lossy() == obsolete.source_root)
         })
+        .collect::<Vec<_>>();
+    let aliases = aliases
+        .into_iter()
+        .chain(markers.iter().filter_map(|marker| {
+            marker.alias_target.as_ref().and_then(|target| {
+                (!desired_mounts.iter().any(|desired| {
+                    desired.alias.as_deref() == Some(marker.source_root.as_str())
+                        && desired.target == *target
+                }))
+                .then(|| NfsAlias {
+                    path: marker.source_root.clone(),
+                    target: target.clone(),
+                })
+            })
+        }))
         .collect();
-    (mounts, aliases, markers)
+    let exports = obsolete_exports
+        .into_iter()
+        .filter(|obsolete| {
+            !desired_config.shares.values().any(|share| {
+                share.source_root.to_string_lossy() == obsolete.root
+                    && share.share_uuid == obsolete.share_uuid
+            })
+        })
+        .collect();
+    (mounts, aliases, markers, exports)
 }
 
 fn nfs_mount_matches(mount_output: &str, source: &str, target: &str) -> bool {
@@ -486,6 +521,7 @@ fn reconcile_nfs(
     obsolete_mounts: &[NfsMount],
     obsolete_aliases: &[NfsAlias],
     obsolete_markers: &[NfsShareMarker],
+    obsolete_exports: &[NfsExportCleanup],
     current_config: &ClusterConfig,
     state_dir: &Path,
     local_node_id: &str,
@@ -516,14 +552,16 @@ fn reconcile_nfs(
     } else {
         String::new()
     };
-    let (mut obsolete_mounts, obsolete_aliases, obsolete_markers) = superseded_nfs_cleanup_plan(
-        &desired_config,
-        &mount_output,
-        obsolete_mounts.to_vec(),
-        obsolete_aliases.to_vec(),
-        obsolete_markers.to_vec(),
-        &desired_mounts,
-    );
+    let (mut obsolete_mounts, obsolete_aliases, obsolete_markers, mut obsolete_exports) =
+        superseded_nfs_cleanup_plan(
+            &desired_config,
+            &mount_output,
+            obsolete_mounts.to_vec(),
+            obsolete_aliases.to_vec(),
+            obsolete_markers.to_vec(),
+            obsolete_exports.to_vec(),
+            &desired_mounts,
+        );
 
     obsolete_mounts.sort_by(|left, right| {
         (&left.target, &left.source, &left.share_uuid).cmp(&(
@@ -542,6 +580,15 @@ fn reconcile_nfs(
         (&left.source_root, &left.share_uuid).cmp(&(&right.source_root, &right.share_uuid))
     });
     obsolete_markers.dedup();
+    obsolete_exports.sort_by(|left, right| {
+        (&left.root, &left.client_ip, &left.share_uuid, &left.node_id).cmp(&(
+            &right.root,
+            &right.client_ip,
+            &right.share_uuid,
+            &right.node_id,
+        ))
+    });
+    obsolete_exports.dedup();
 
     let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
     let mut store = read_store(state_dir).map_err(protocol_failed)?;
@@ -577,6 +624,15 @@ fn reconcile_nfs(
             operation: NfsAdminOperation::RemoveMarker {
                 source_root: marker.source_root,
                 share_uuid: marker.share_uuid,
+            },
+        })?;
+    }
+
+    for exports in obsolete_exports.chunks(128) {
+        call_nfs_admin_helper(NfsAdminRequest {
+            operation: NfsAdminOperation::RemoveExports {
+                operation_id: Id128::random().to_string(),
+                exports: exports.to_vec(),
             },
         })?;
     }
@@ -2304,24 +2360,27 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         let obsolete_markers = vec![NfsShareMarker {
             source_root: "/srv/data".into(),
             share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+            alias_target: None,
         }];
         let mounts = "192.0.2.1:/srv/data on /mnt/data (nfs, nodev)\n";
 
-        let (mounts, aliases, markers) = superseded_nfs_cleanup_plan(
+        let (mounts, aliases, markers, exports) = superseded_nfs_cleanup_plan(
             &config,
             mounts,
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
+            Vec::new(),
             &desired_mounts,
         );
 
         assert!(mounts.is_empty());
         assert!(aliases.is_empty());
         assert!(markers.is_empty());
+        assert!(exports.is_empty());
 
         let unrelated_mount = "192.0.2.9:/other on /mnt/data (nfs, nodev)\n";
-        let (mounts, aliases, markers) = superseded_nfs_cleanup_plan(
+        let (mounts, aliases, markers, exports) = superseded_nfs_cleanup_plan(
             &config,
             unrelated_mount,
             vec![NfsMount {
@@ -2338,7 +2397,9 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             vec![NfsShareMarker {
                 source_root: "/srv/data".into(),
                 share_uuid: "00000000-0000-4000-8000-000000000009".into(),
+                alias_target: None,
             }],
+            Vec::new(),
             &desired_mounts,
         );
 
@@ -2348,6 +2409,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             "unexpected mounts are still checked strictly"
         );
         assert!(aliases.is_empty(), "desired aliases must be preserved");
+        assert!(exports.is_empty());
         assert!(
             markers.is_empty(),
             "markers at a desired source stay intact"

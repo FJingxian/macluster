@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_NFS_ADMIN_REQUEST_BYTES: usize = 1024 * 1024;
 /// Wire version for requests handled by the privileged NFS service. Keep this
 /// independent from the installed root-owned CLI implementation revision.
-pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-3";
+pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-4";
 const MAX_BATCH_ITEMS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,6 +49,12 @@ pub enum NfsAdminOperation {
         expected_original: String,
         candidate: String,
     },
+    /// Remove only exact managed entries identified by source path, client
+    /// address, share UUID, and node ID after an offline node returns.
+    RemoveExports {
+        operation_id: String,
+        exports: Vec<NfsExportCleanup>,
+    },
     /// Install a signed bundle from a private `/tmp/macluster-update-<uuid>` directory.
     /// Artifact names are derived from their signed manifest order by the root service.
     UpdateHelpers {
@@ -77,6 +83,14 @@ pub struct NfsMount {
 pub struct NfsAlias {
     pub path: String,
     pub target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NfsExportCleanup {
+    pub root: String,
+    pub client_ip: String,
+    pub share_uuid: String,
+    pub node_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,6 +183,27 @@ impl NfsAdminRequest {
                 Id128::parse(operation_id)
                     .map_err(|_| "NFS export operation ID is invalid".to_owned())?;
                 validate_export_transition(expected_original, candidate)
+            }
+            NfsAdminOperation::RemoveExports {
+                operation_id,
+                exports,
+            } => {
+                Id128::parse(operation_id)
+                    .map_err(|_| "NFS export operation ID is invalid".to_owned())?;
+                validate_batch_size(exports.len())?;
+                for export in exports {
+                    validate_path(&export.root, "NFS export path")?;
+                    export
+                        .client_ip
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "NFS export client must be an IPv4 address".to_owned())?;
+                    Id128::parse(&export.share_uuid)
+                        .map_err(|_| "NFS share UUID is invalid".to_owned())?;
+                    if !valid_node_id(&export.node_id) {
+                        return Err("NFS export client node ID is invalid".into());
+                    }
+                }
+                Ok(())
             }
             NfsAdminOperation::UpdateHelpers {
                 manifest,
@@ -347,7 +382,60 @@ fn valid_node_id(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{NfsAdminOperation, NfsAdminRequest, NfsMount, validate_export_transition};
+    use super::{
+        NfsAdminOperation, NfsAdminRequest, NfsExportCleanup, NfsMount, validate_export_transition,
+    };
+
+    #[test]
+    fn deferred_export_cleanup_round_trips_and_rejects_unscoped_requests() {
+        let valid = NfsAdminRequest {
+            operation: NfsAdminOperation::RemoveExports {
+                operation_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                exports: vec![NfsExportCleanup {
+                    root: "/Volumes/archive".into(),
+                    client_ip: "192.0.2.8".into(),
+                    share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                    node_id: "worker-008".into(),
+                }],
+            },
+        };
+
+        valid.validate(501).unwrap();
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<NfsAdminRequest>(&encoded).unwrap(),
+            valid
+        );
+
+        for export in [
+            NfsExportCleanup {
+                root: "/Volumes/../private".into(),
+                client_ip: "192.0.2.8".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                node_id: "worker-008".into(),
+            },
+            NfsExportCleanup {
+                root: "/Volumes/archive".into(),
+                client_ip: "0.0.0.0/0".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                node_id: "worker-008".into(),
+            },
+            NfsExportCleanup {
+                root: "/Volumes/archive".into(),
+                client_ip: "192.0.2.8".into(),
+                share_uuid: "not-a-uuid".into(),
+                node_id: "worker-008".into(),
+            },
+        ] {
+            let request = NfsAdminRequest {
+                operation: NfsAdminOperation::RemoveExports {
+                    operation_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    exports: vec![export],
+                },
+            };
+            assert!(request.validate(501).is_err());
+        }
+    }
 
     #[test]
     fn forget_cluster_update_trust_is_bound_to_a_canonical_cluster_id() {

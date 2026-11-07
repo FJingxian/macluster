@@ -2467,7 +2467,8 @@ pub(crate) fn reachable_configured_node_ids(
                         else {
                             break;
                         };
-                        let online = node_ssh_endpoint_reachable(&node);
+                        let online =
+                            retry_endpoint_reachability(|| node_ssh_endpoint_reachable(&node));
                         if online {
                             reachable.push(id);
                         }
@@ -2481,6 +2482,17 @@ pub(crate) fn reachable_configured_node_ids(
             .flat_map(|handle| handle.join().unwrap_or_default())
             .collect()
     })
+}
+
+fn retry_endpoint_reachability(mut probe: impl FnMut() -> bool) -> bool {
+    if probe() {
+        return true;
+    }
+    // A single short TCP preflight can miss a node while its link or SSH
+    // listener is recovering. Retry once before declaring it unavailable;
+    // the parallel probe pool keeps this bounded for larger clusters.
+    thread::sleep(Duration::from_millis(100));
+    probe()
 }
 
 /// Check locally available build evidence without contacting any node.
@@ -16655,6 +16667,19 @@ mod tests {
         );
         drop(listener);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_reachability_retries_one_transient_endpoint_failure() {
+        let attempts = std::cell::Cell::new(0);
+        let reachable = super::retry_endpoint_reachability(|| {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            attempt > 1
+        });
+
+        assert!(reachable);
+        assert_eq!(attempts.get(), 2);
     }
 
     fn wait_for_exclusive_maintenance_lock(config: &Path) -> std::io::Result<MaintenanceLock> {

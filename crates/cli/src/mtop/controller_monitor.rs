@@ -23,7 +23,7 @@ use macluster_protocol::{
 use crate::control_client::ControlClient;
 use crate::control_client::ControlClientError;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 // Read controller caches more promptly while the first process sample is
@@ -60,24 +60,33 @@ impl MonitorFeed {
             return None;
         }
         let binding = ServiceBinding::load(config_path, state_dir).ok()?;
-        let client = ControlClient::connect(&binding, CONNECT_TIMEOUT).ok()?;
         // An older resident controller may omit telemetry added by this CLI.
         // Use direct sampling until the controller is upgraded when idle.
         let expected_build = crate::service::current_executable_build_id().ok()?;
-        if !monitor_build_matches(client.hello(), &expected_build) {
-            return None;
+        let mut initial_client = ControlClient::connect(&binding, CONNECT_TIMEOUT).ok();
+        let mut initial_generation = 0;
+        let mut initial_shutdown = None;
+        if let Some(client) = initial_client.as_mut() {
+            if !monitor_build_matches(client.hello(), &expected_build)
+                || !client
+                    .hello()
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "monitor.v1")
+            {
+                return None;
+            }
+            if client.set_timeouts(SESSION_TIMEOUT).is_ok()
+                && let Ok(shutdown) = client.shutdown_handle()
+            {
+                initial_generation = client.hello().config_generation;
+                initial_shutdown = Some(shutdown);
+            } else {
+                initial_client = None;
+            }
         }
-        if !client
-            .hello()
-            .capabilities
-            .iter()
-            .any(|capability| capability == "monitor.v1")
-        {
-            return None;
-        }
-        let generation = Arc::new(AtomicU64::new(client.hello().config_generation));
-        let shutdown = Arc::new(Mutex::new(Some(client.shutdown_handle().ok()?)));
-        client.set_timeouts(SESSION_TIMEOUT).ok()?;
+        let generation = Arc::new(AtomicU64::new(initial_generation));
+        let shutdown = Arc::new(Mutex::new(initial_shutdown));
 
         let updates = Arc::new(Mutex::new(None));
         let update_sender = Arc::clone(&updates);
@@ -89,9 +98,27 @@ impl MonitorFeed {
         let worker_shutdown = Arc::clone(&shutdown);
         let config_path = config_path.to_path_buf();
         let state_dir = state_dir.to_path_buf();
+        let worker_expected_build = expected_build.clone();
         let worker = thread::Builder::new()
             .name("mtop-controller-monitor".into())
             .spawn(move || {
+                let (client, nodes) = if let Some(client) = initial_client {
+                    (client, nodes)
+                } else {
+                    let Some((client, nodes, _)) = reconnect_monitor(
+                        &config_path,
+                        &state_dir,
+                        &nodes,
+                        None,
+                        &worker_running,
+                        &worker_generation,
+                        &worker_shutdown,
+                        &worker_expected_build,
+                    ) else {
+                        return;
+                    };
+                    (client, nodes)
+                };
                 monitor_loop(
                     client,
                     config_path,
@@ -102,6 +129,7 @@ impl MonitorFeed {
                     worker_running,
                     worker_generation,
                     worker_shutdown,
+                    worker_expected_build,
                 )
             })
             .ok()?;
@@ -161,6 +189,7 @@ fn monitor_loop(
     running: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
     shutdown: Arc<Mutex<Option<UnixStream>>>,
+    expected_build: String,
 ) {
     let mut last_process_watch: Option<Option<NodeId>> = None;
     if subscribe_monitor(&mut client, &nodes).is_err() {
@@ -172,6 +201,7 @@ fn monitor_loop(
             &running,
             &generation,
             &shutdown,
+            &expected_build,
         ) else {
             return;
         };
@@ -208,6 +238,7 @@ fn monitor_loop(
                         &running,
                         &generation,
                         &shutdown,
+                        &expected_build,
                     ) else {
                         return;
                     };
@@ -233,6 +264,7 @@ fn monitor_loop(
                     &running,
                     &generation,
                     &shutdown,
+                    &expected_build,
                 ) else {
                     return;
                 };
@@ -273,6 +305,7 @@ fn monitor_loop(
                         &running,
                         &generation,
                         &shutdown,
+                        &expected_build,
                     ) else {
                         return;
                     };
@@ -340,11 +373,13 @@ fn reconnect_monitor(
     running: &AtomicBool,
     generation: &AtomicU64,
     shutdown: &Mutex<Option<UnixStream>>,
+    expected_build: &str,
 ) -> Option<(ControlClient, Vec<NodeId>, Option<NodeId>)> {
     let mut delay = RECONNECT_INITIAL_DELAY;
     while running.load(Ordering::Acquire) {
         if let Ok(binding) = ServiceBinding::load(config_path, state_dir)
             && let Ok(mut client) = ControlClient::connect(&binding, CONNECT_TIMEOUT)
+            && monitor_build_matches(client.hello(), expected_build)
             && client
                 .hello()
                 .capabilities
@@ -561,6 +596,73 @@ mod tests {
         let latest = slot.lock().unwrap().take().unwrap();
         assert_eq!(latest.sequence, 4);
         assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn monitor_feed_recovers_when_the_controller_is_temporarily_unavailable() {
+        let fixture = Fixture::new();
+        let binding = ServiceBinding::load(&fixture.config_path(), &fixture.state_dir()).unwrap();
+        let state_dir = fixture.state_dir();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::clone(&server_stop);
+        let server = thread::spawn(move || {
+            // Simulate a busy login node delaying Controller startup beyond
+            // mtop's first connection attempt.
+            thread::sleep(Duration::from_millis(300));
+            let instance = InstanceLock::acquire(&state_dir).unwrap();
+            let current_hello = hello(&binding, 1);
+            let mut listener =
+                ControlListener::bind(&binding, &instance, current_hello.clone()).unwrap();
+            ready_sender.send(()).unwrap();
+            while !stop_server.load(Ordering::Acquire) {
+                match listener.poll_event() {
+                    Some(PendingControlEvent::Request(request)) => {
+                        let response = match request.request().command {
+                            ControlCommand::SubscribeMonitor { .. } => {
+                                Ok(ControlPayload::MonitorSubscribed)
+                            }
+                            ControlCommand::WatchProcesses { .. } => {
+                                Ok(ControlPayload::MonitorAcknowledged)
+                            }
+                            ControlCommand::MonitorSnapshot { page } if page == 0 => {
+                                Ok(ControlPayload::MonitorSnapshot(MonitorSnapshot {
+                                    sequence: 1,
+                                    sampled_unix_ms: 1,
+                                    generation: 1,
+                                    page: 0,
+                                    total_pages: 1,
+                                    nodes: Vec::new(),
+                                }))
+                            }
+                            _ => Err(ControlError {
+                                code: ControlErrorCode::InvalidRequest,
+                                message: "unexpected monitor test request".into(),
+                            }),
+                        };
+                        request.respond(response).unwrap();
+                    }
+                    Some(PendingControlEvent::Disconnected(_)) | None => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        });
+
+        let feed = MonitorFeed::connect(
+            &fixture.config_path(),
+            &fixture.state_dir(),
+            vec!["login".parse().unwrap()],
+        )
+        .expect("a transient Controller startup delay must not disable monitor mode");
+        ready_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("delayed monitor service did not start");
+        wait_for_update(&feed, 1, Duration::from_secs(3));
+
+        drop(feed);
+        server_stop.store(true, Ordering::Release);
+        server.join().unwrap();
     }
 
     #[test]

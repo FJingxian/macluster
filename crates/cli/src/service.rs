@@ -30,6 +30,7 @@ use crate::control_client::{ControlClient, ControlClientError};
 /// launchd is replacing the service and the controller is rebuilding state.
 pub const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_READY_WAIT: Duration = CONTROLLER_READY_TIMEOUT;
+const LAUNCH_AGENT_PROCESS_TYPE: &str = "Adaptive";
 const START_LOCK_POLL: Duration = Duration::from_millis(10);
 const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -803,7 +804,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         let stderr = xml_escape(&logs.join("controller.err.log").to_string_lossy());
         let label_xml = xml_escape(&label);
         let contents = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{label_xml}</string>\n  <key>ProgramArguments</key><array><string>{binary}</string><string>--config</string><string>{config}</string><string>--state-dir</string><string>{state}</string><string>internal</string><string>controller-service</string></array>\n  <key>EnvironmentVariables</key><dict><key>MACLUSTER_SERVICE_BINDING</key><string>{binding}</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>ProcessType</key><string>Background</string>\n  <key>ThrottleInterval</key><integer>5</integer>\n  <key>StandardOutPath</key><string>{stdout}</string>\n  <key>StandardErrorPath</key><string>{stderr}</string>\n</dict>\n</plist>\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{label_xml}</string>\n  <key>ProgramArguments</key><array><string>{binary}</string><string>--config</string><string>{config}</string><string>--state-dir</string><string>{state}</string><string>internal</string><string>controller-service</string></array>\n  <key>EnvironmentVariables</key><dict><key>MACLUSTER_SERVICE_BINDING</key><string>{binding}</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>ProcessType</key><string>{LAUNCH_AGENT_PROCESS_TYPE}</string>\n  <key>ThrottleInterval</key><integer>5</integer>\n  <key>StandardOutPath</key><string>{stdout}</string>\n  <key>StandardErrorPath</key><string>{stderr}</string>\n</dict>\n</plist>\n"
         );
         atomic_write_private(&path, contents.as_bytes(), self.binding.uid())?;
         Ok(path)
@@ -1285,7 +1286,12 @@ mod tests {
 
     use macluster_protocol::identifiers::Id128;
 
-    use super::{prune_old_service_versions, read_plist_version};
+    use super::{LAUNCH_AGENT_PROCESS_TYPE, prune_old_service_versions, read_plist_version};
+
+    #[test]
+    fn controller_launch_agent_is_not_declared_as_background_throttled() {
+        assert_eq!(LAUNCH_AGENT_PROCESS_TYPE, "Adaptive");
+    }
 
     #[test]
     fn service_version_pruning_keeps_current_and_previous_versions() {

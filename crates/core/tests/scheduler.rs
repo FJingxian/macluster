@@ -4,6 +4,8 @@ use macluster_core::{
     config::QueueConfig,
     scheduler::{NodeEligibility, next_dispatch},
 };
+use std::collections::BTreeSet;
+
 use macluster_protocol::{
     identifiers::{NodeId, QueueName},
     types::{JobMode, JobRecord, JobSpec, JobState, SchedulerKind, SnapshotRef},
@@ -14,6 +16,7 @@ fn job(id: u64, queue: &str, pin: Option<&str>, state: JobState) -> JobRecord {
         id,
         spec: JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new(queue).unwrap(),
             node: pin.map(|node| NodeId::new(node).unwrap()),
             name: format!("job-{id}"),
@@ -52,6 +55,8 @@ fn nodes() -> Vec<NodeEligibility> {
             online: true,
             agent_current: true,
             storage_ready: true,
+            configured_shares: BTreeSet::new(),
+            ready_shares: BTreeSet::new(),
             drain_requested: false,
             occupied: false,
             interactive_pty: false,
@@ -64,6 +69,8 @@ fn nodes() -> Vec<NodeEligibility> {
             online: true,
             agent_current: true,
             storage_ready: true,
+            configured_shares: BTreeSet::new(),
+            ready_shares: BTreeSet::new(),
             drain_requested: false,
             occupied: false,
             interactive_pty: false,
@@ -99,17 +106,17 @@ fn queue_config() -> QueueConfig {
 }
 
 #[test]
-fn fifo_head_blocks_later_pinned_job_without_backfill() {
+fn unavailable_pinned_head_backfills_to_another_node() {
     let queue = QueueName::new("mini01").unwrap();
     let jobs = vec![
         job(9, "mini01", Some("mini01-a"), JobState::Pending),
         job(10, "mini01", Some("mini01-b"), JobState::Pending),
     ];
     let availability = vec![nodes()[1].clone()];
-    assert_eq!(
-        next_dispatch(&queue, &queue_config(), &jobs, &availability),
-        None
-    );
+    let dispatch = next_dispatch(&queue, &queue_config(), &jobs, &availability)
+        .expect("an unavailable node-specific job must not block another node");
+    assert_eq!(dispatch.job_id, 10);
+    assert_eq!(dispatch.node_id.as_str(), "mini01-b");
 }
 
 #[test]

@@ -29,6 +29,8 @@ use thiserror::Error;
 use crate::ssh::{ConnectionKey, SshPool};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const FAN_CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const NFS_RECONCILE_TIMEOUT: Duration = Duration::from_secs(150);
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 256 * 1024;
@@ -41,9 +43,24 @@ static OUTSTANDING_PROBES: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_AGENT_AUTO_UPDATES: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONCURRENT_AGENT_AUTO_UPDATES: usize = 4;
 
+fn bounded_timeout(configured: Duration, maximum: Duration) -> Duration {
+    if configured.is_zero() {
+        maximum
+    } else {
+        configured.min(maximum)
+    }
+}
+
 fn operation_timeout(operation: &Operation, configured: Duration) -> Duration {
     match operation {
         Operation::ReconcileNfs { .. } => NFS_RECONCILE_TIMEOUT,
+        Operation::Fence { .. }
+        | Operation::Status
+        | Operation::RecoverJob { .. }
+        | Operation::Health => bounded_timeout(configured, NODE_PROBE_TIMEOUT),
+        Operation::SetFanPolicy { .. } | Operation::QueryFanPolicy => {
+            bounded_timeout(configured, FAN_CONTROL_OPERATION_TIMEOUT)
+        }
         _ if configured.is_zero() => DEFAULT_TIMEOUT,
         _ => configured,
     }
@@ -125,6 +142,15 @@ fn endpoint_probe_error(error: &io::Error) -> Option<bool> {
         // inconclusive; let strict SSH report its own result.
         None
     }
+}
+
+fn is_explicit_host_unreachable(error: &io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        matches!(
+            code,
+            libc::EHOSTUNREACH | libc::ENETUNREACH | libc::EHOSTDOWN
+        )
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -692,7 +718,16 @@ impl NodeTransport for ClusterTransport {
     fn host_reachable(&self, node: &NodeConfig, timeout: Duration) -> Option<bool> {
         match node.transport {
             Transport::Local => Some(true),
-            Transport::Ssh => ping_host(node, timeout),
+            Transport::Ssh => {
+                let address = node.host.parse::<Ipv4Addr>().ok()?;
+                let endpoint = SocketAddr::from((address, node.ssh_port.unwrap_or(22)));
+                if let Err(error) = TcpStream::connect_timeout(&endpoint, timeout)
+                    && is_explicit_host_unreachable(&error)
+                {
+                    return Some(false);
+                }
+                ping_host(node, timeout)
+            }
         }
     }
 
@@ -917,19 +952,29 @@ fn ping_host(node: &NodeConfig, timeout: Duration) -> Option<bool> {
         Ok(output) => {
             let diagnostic = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
             let summary = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-            // Only an explicit ICMP reply timeout or packet-loss summary is
-            // evidence that this host did not answer. Permission, route,
-            // interface and other local ping errors are inconclusive; treating
-            // every nonzero exit as host-down can hide a live node after a
-            // macOS privacy or network-policy denial.
-            let packet_timeout = diagnostic.contains("request timeout for icmp_seq")
-                || diagnostic.contains("100.0% packet loss")
-                || summary.contains("100.0% packet loss")
-                || summary.contains("0 packets received");
-            if packet_timeout {
+            let output_text = format!("{diagnostic}\n{summary}");
+            // Only explicit packet loss or a kernel-reported network-down
+            // condition counts as unreachable. Permission, interface and
+            // other local ping errors remain inconclusive; treating every
+            // nonzero exit as host-down can hide a live node after macOS
+            // privacy or network-policy denial.
+            let packet_timeout = output_text.contains("request timeout for icmp_seq")
+                || output_text.contains("100.0% packet loss")
+                || output_text.contains("0 packets received");
+            let explicit_network_unreachable = [
+                "host is down",
+                "host unreachable",
+                "no route to host",
+                "network is unreachable",
+                "network is down",
+            ]
+            .iter()
+            .any(|message| output_text.contains(message));
+            if packet_timeout || explicit_network_unreachable {
                 Some(false)
-            } else if diagnostic.contains("bytes from")
-                || (summary.contains("packets received") && !summary.contains("0 packets received"))
+            } else if output_text.contains("bytes from")
+                || (output_text.contains("packets received")
+                    && !output_text.contains("0 packets received"))
             {
                 Some(true)
             } else {
@@ -1366,6 +1411,49 @@ mod tests {
         assert_eq!(
             operation_timeout(&Operation::Ping, Duration::ZERO),
             DEFAULT_TIMEOUT
+        );
+        assert_eq!(
+            operation_timeout(&Operation::Status, Duration::from_secs(15)),
+            Duration::from_secs(5),
+            "read-only execution probes must fail fast when a node is unreachable"
+        );
+        assert_eq!(
+            operation_timeout(&Operation::Health, Duration::from_secs(15)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            operation_timeout(&Operation::Health, Duration::from_secs(2)),
+            Duration::from_secs(2),
+            "an explicitly shorter probe timeout must be preserved"
+        );
+        assert_eq!(
+            operation_timeout(
+                &Operation::Fence {
+                    controller: macluster_protocol::types::ControllerEpoch {
+                        controller_uuid: macluster_protocol::identifiers::ControllerUuid(
+                            macluster_protocol::identifiers::Id128::random(),
+                        ),
+                        epoch: 1,
+                    },
+                },
+                Duration::from_secs(15)
+            ),
+            Duration::from_secs(5),
+            "fence probes are part of bounded node verification"
+        );
+        assert_eq!(
+            operation_timeout(
+                &Operation::SetFanPolicy {
+                    policy: macluster_protocol::types::FanPolicy::Auto,
+                },
+                Duration::from_secs(15)
+            ),
+            Duration::from_secs(5),
+            "fan operations should not wait on a stalled helper indefinitely"
+        );
+        assert_eq!(
+            operation_timeout(&Operation::QueryFanPolicy, Duration::from_secs(15)),
+            Duration::from_secs(5)
         );
     }
 

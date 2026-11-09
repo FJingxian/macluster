@@ -19,7 +19,7 @@ pub use ipc::{
 };
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::{Path, PathBuf},
@@ -123,7 +123,7 @@ impl<T: NodeTransport> ControllerService<T> {
 
     pub(crate) fn node_is_maintenance_scoped(&self, node_id: &str) -> bool {
         match self.maintenance_scope.as_ref() {
-            Some(MaintenanceScope::Cluster) => true,
+            Some(MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_)) => true,
             Some(MaintenanceScope::Nodes(nodes)) => {
                 nodes.iter().any(|node| node.as_str() == node_id)
             }
@@ -142,20 +142,29 @@ impl<T: NodeTransport> ControllerService<T> {
         crate::maintenance::validate_scope_config_change(&self.config, &config, scope)
             .map_err(|error| io::Error::other(format!("unsafe scoped config reload: {error}")))?;
         let affected = |node: Option<&NodeId>| match scope {
-            MaintenanceScope::Cluster => true,
+            MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_) => true,
             MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
         };
+        let deferred_unreachable_nodes = scope
+            .deferred_unreachable_nodes()
+            .iter()
+            .map(NodeId::as_str)
+            .collect::<HashSet<_>>();
         let jobs = self.storage.list_jobs(None)?;
         if jobs.iter().any(|job| {
             let scoped = affected(job.node.as_ref());
+            let output_sync_deferred = job
+                .node
+                .as_ref()
+                .is_some_and(|node| deferred_unreachable_nodes.contains(node.as_str()));
+            let output_sync_pending =
+                (job.snapshot_sync_pending || job.log_sync_pending) && !output_sync_deferred;
             (scoped
                 && matches!(
                     job.state,
                     JobState::Starting | JobState::Running | JobState::Cancelling
                 ))
-                || (scoped && (job.snapshot_sync_pending || job.log_sync_pending))
-                || (matches!(scope, MaintenanceScope::Cluster)
-                    && (job.snapshot_sync_pending || job.log_sync_pending))
+                || ((scoped || scope.is_cluster_wide()) && output_sync_pending)
         }) {
             return Err(io::Error::other(
                 "cannot reload configuration while scoped jobs or output synchronization remain",
@@ -168,7 +177,7 @@ impl<T: NodeTransport> ControllerService<T> {
             .keys()
             .chain(config.nodes.keys())
             .filter(|id| match scope {
-                MaintenanceScope::Cluster => true,
+                MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_) => true,
                 MaintenanceScope::Nodes(nodes) => {
                     nodes.iter().any(|node| node.as_str() == id.as_str())
                 }
@@ -291,6 +300,8 @@ impl<T: NodeTransport> ControllerService<T> {
                             online: false,
                             agent_current: false,
                             storage_ready: false,
+                            configured_shares: self.config.shares.keys().cloned().collect(),
+                            ready_shares: BTreeSet::new(),
                             drain_requested: self.node_is_maintenance_scoped(id),
                             occupied: true,
                             interactive_pty: false,
@@ -339,19 +350,24 @@ impl<T: NodeTransport> ControllerService<T> {
                 health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
             });
             let logical_cpus = health.as_ref().and_then(|health| health.logical_cpus);
-            let node_storage_ready =
-                if !requires_health {
-                    true
-                } else {
-                    let expected_digest = self.config.execution_digest().unwrap_or_default();
-                    health.as_ref().is_some_and(|health| {
-                        health.execution_digest == expected_digest
-                            && health.primary_share_ready
-                            && self.config.shares.keys().all(|share_id| {
-                                health.shares.get(share_id).copied().unwrap_or(false)
-                            })
-                    })
-                };
+            let node_storage_ready = if !requires_health {
+                true
+            } else {
+                let expected_digest = self.config.execution_digest().unwrap_or_default();
+                health.as_ref().is_some_and(|health| {
+                    health.execution_digest == expected_digest && health.primary_share_ready
+                })
+            };
+            let ready_shares: BTreeSet<String> = health
+                .as_ref()
+                .map(|health| {
+                    health
+                        .shares
+                        .iter()
+                        .filter_map(|(share_id, ready)| ready.then(|| share_id.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             if online && !occupied {
                 let idle_since = *self.idle_since.entry(id.clone()).or_insert(now);
                 availability.push(NodeEligibility {
@@ -361,6 +377,8 @@ impl<T: NodeTransport> ControllerService<T> {
                     online,
                     agent_current,
                     storage_ready: storage_ready && node_storage_ready && cleanup_journal_ready,
+                    configured_shares: self.config.shares.keys().cloned().collect(),
+                    ready_shares: ready_shares.clone(),
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
@@ -375,6 +393,8 @@ impl<T: NodeTransport> ControllerService<T> {
                     online,
                     agent_current,
                     storage_ready: storage_ready && cleanup_journal_ready,
+                    configured_shares: self.config.shares.keys().cloned().collect(),
+                    ready_shares,
                     drain_requested: self.node_is_maintenance_scoped(id),
                     occupied,
                     interactive_pty,
@@ -719,10 +739,125 @@ fn namespace_waiting_reason(
     queue: &macluster_core::config::QueueConfig,
     nodes: &[NodeEligibility],
 ) -> Option<String> {
-    (job.spec.storage_namespace.is_some() && !nodes.iter().any(|node| {
-        node.online && node.namespaced_jobs && queue.nodes.iter().any(|id| id == node.id.as_str())
-            && job.spec.node.as_ref().is_none_or(|pinned| pinned == &node.id)
-    })).then(|| "waiting for an online node that advertises namespaced job storage support; this job remains queued while nodes reconnect or are updated".into())
+    if job.spec.storage_namespace.is_none() {
+        return None;
+    }
+    let matching_online = nodes.iter().filter(|node| {
+        node.online
+            && queue.nodes.iter().any(|id| id == node.id.as_str())
+            && job
+                .spec
+                .node
+                .as_ref()
+                .is_none_or(|pinned| pinned == &node.id)
+    });
+    let matching_online = matching_online.collect::<Vec<_>>();
+    if matching_online.iter().any(|node| node.namespaced_jobs) {
+        return None;
+    }
+    let fresh = matching_online
+        .iter()
+        .filter(|node| node.agent_current)
+        .map(|node| node.id.to_string())
+        .collect::<Vec<_>>();
+    if !fresh.is_empty() {
+        return Some(format!(
+            "online node(s) {} do not advertise namespaced job storage; an Agent capability update is required and this job remains queued",
+            fresh.join(", ")
+        ));
+    }
+    if matching_online.is_empty() {
+        let candidates = queue
+            .nodes
+            .iter()
+            .filter(|id| {
+                job.spec
+                    .node
+                    .as_ref()
+                    .is_none_or(|pinned| pinned.as_str() == id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        return Some(format!(
+            "waiting for compute node(s) {} to reconnect; this job remains queued",
+            candidates.join(", ")
+        ));
+    }
+    let candidates = matching_online
+        .iter()
+        .map(|node| node.id.to_string())
+        .collect::<Vec<_>>();
+    Some(format!(
+        "waiting for a fresh capability report from node(s) {}; this job remains queued",
+        candidates.join(", ")
+    ))
+}
+
+pub(crate) fn share_waiting_reason(
+    job: &macluster_protocol::types::JobRecord,
+    queue: &macluster_core::config::QueueConfig,
+    nodes: &[NodeEligibility],
+) -> Option<String> {
+    let matching_nodes = nodes.iter().filter(|node| {
+        queue.nodes.iter().any(|member| member == node.id.as_str())
+            && job
+                .spec
+                .node
+                .as_ref()
+                .is_none_or(|pinned| pinned == &node.id)
+            && node.online
+            && node.agent_current
+            && node.storage_ready
+            && !node.drain_requested
+            && (job.spec.mode != JobMode::Interactive || node.interactive_pty)
+            && (job.spec.storage_namespace.is_none() || node.namespaced_jobs)
+    });
+    let matching_nodes = matching_nodes.collect::<Vec<_>>();
+    let required_shares = job.spec.required_shares.clone().unwrap_or_else(|| {
+        matching_nodes
+            .first()
+            .map(|node| node.configured_shares.iter().cloned().collect())
+            .unwrap_or_default()
+    });
+    if required_shares.is_empty() {
+        return None;
+    }
+    if matching_nodes.is_empty()
+        || matching_nodes.iter().any(|node| {
+            required_shares
+                .iter()
+                .all(|share| node.ready_shares.contains(share))
+        })
+    {
+        return None;
+    }
+
+    let mut missing = job
+        .spec
+        .required_shares
+        .as_ref()
+        .unwrap_or(&required_shares)
+        .iter()
+        .filter(|share| {
+            matching_nodes
+                .iter()
+                .all(|node| !node.ready_shares.contains(*share))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        missing.clone_from(&required_shares);
+    }
+    let nodes = matching_nodes
+        .iter()
+        .map(|node| node.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "waiting for required NFS share(s) {} on {}; automatic mount recovery is retrying",
+        missing.join(", "),
+        nodes
+    ))
 }
 
 pub(crate) fn agent_build_waiting_reason(
@@ -1001,6 +1136,7 @@ mod status_reconciliation_tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: None,
                     name: "log-pending".into(),

@@ -18,7 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use macluster_core::config::{ClusterConfig, NodeConfig};
+use macluster_core::config::{ClusterConfig, NodeConfig, ShareConfig};
 use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, read_frame, sha256_hex, write_frame},
     identifiers::{Id128, StartToken},
@@ -746,11 +746,33 @@ fn fan_helper_command(command: FanHelperCommand) -> Result<FanControlStatus, Pro
     use std::{
         io::{BufRead, BufReader},
         os::unix::net::UnixStream,
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
 
-    let mut stream = UnixStream::connect("/var/run/org.macluster.fan.sock")
-        .map_err(|error| ProtocolError::Failed(format!("fan helper is unavailable: {error}")))?;
+    const SOCKET: &str = "/var/run/org.macluster.fan.sock";
+    const STARTUP_GRACE: Duration = Duration::from_secs(2);
+    const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    let connect_deadline = Instant::now() + STARTUP_GRACE;
+    let mut stream = loop {
+        match UnixStream::connect(SOCKET) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < connect_deadline =>
+            {
+                thread::sleep(RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(ProtocolError::Failed(format!(
+                    "fan helper is unavailable: {error}"
+                )));
+            }
+        }
+    };
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(15))))
@@ -905,19 +927,6 @@ fn node_health_with_mount_provider(
     })
 }
 
-fn verify_named_share(
-    config: &ClusterConfig,
-    local_node_id: &str,
-    share: &macluster_core::config::ShareConfig,
-) -> Result<(), AgentError> {
-    let mount_output = if local_node_id == share.server.as_str() {
-        String::new()
-    } else {
-        current_mount_output()?
-    };
-    verify_named_share_with_mount_output(config, local_node_id, share, &mount_output)
-}
-
 fn verify_named_share_with_mount_output(
     config: &ClusterConfig,
     local_node_id: &str,
@@ -948,18 +957,6 @@ fn verify_named_share_with_mount_output(
     };
     verify_agent_named_share_with_mount_output(local_node_id, &named_share, mount_output)
         .map(|_| ())
-}
-
-fn verify_agent_named_share(
-    local_node_id: &str,
-    share: &AgentNamedShare,
-) -> Result<PathBuf, AgentError> {
-    let mount_output = if local_node_id == share.server_node_id {
-        String::new()
-    } else {
-        current_mount_output()?
-    };
-    verify_agent_named_share_with_mount_output(local_node_id, share, &mount_output)
 }
 
 fn verify_agent_named_share_with_mount_output(
@@ -1001,6 +998,18 @@ fn verify_agent_named_share_with_mount_output(
     }
 }
 
+pub(crate) fn verify_agent_named_share(
+    local_node_id: &str,
+    share: &AgentNamedShare,
+) -> Result<PathBuf, AgentError> {
+    let mount_output = if local_node_id == share.server_node_id {
+        String::new()
+    } else {
+        current_mount_output()?
+    };
+    verify_agent_named_share_with_mount_output(local_node_id, share, &mount_output)
+}
+
 fn start_job(
     controller: ControllerEpoch,
     start_token: StartToken,
@@ -1014,11 +1023,7 @@ fn start_job(
         .nodes
         .get(local_node_id)
         .ok_or(ProtocolError::NotPermitted)?;
-    verify_share(config, local_node_id).map_err(|_| ProtocolError::StorageUnavailable)?;
-    for share in config.shares.values() {
-        verify_named_share(config, local_node_id, share)
-            .map_err(|_| ProtocolError::StorageUnavailable)?;
-    }
+    verify_job_shares(config, local_node_id, spec.required_shares.as_deref())?;
     if spec
         .storage_namespace
         .is_some_and(|namespace| Id128::parse(&config.share_uuid).ok() != Some(namespace))
@@ -1220,6 +1225,24 @@ fn start_job(
         accepted: true,
         runner_pid: record.runner_pid,
     })
+}
+
+fn named_shares_for_job<'a>(
+    config: &'a ClusterConfig,
+    required_shares: Option<&[String]>,
+) -> Result<Vec<&'a ShareConfig>, ProtocolError> {
+    match required_shares {
+        Some(required) => required
+            .iter()
+            .map(|share_id| {
+                config
+                    .shares
+                    .get(share_id)
+                    .ok_or(ProtocolError::InvalidRequest)
+            })
+            .collect(),
+        None => Ok(config.shares.values().collect()),
+    }
 }
 
 fn cancel_job(
@@ -1725,9 +1748,36 @@ fn admit_epoch(store: &mut AgentStore, request: ControllerEpoch) -> Result<(), S
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_share(config: &ClusterConfig, local_node_id: &str) -> Result<(), AgentError> {
     let mount_output = current_mount_output()?;
     verify_share_with_mount_output(config, local_node_id, &mount_output)
+}
+
+fn verify_job_shares(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    required_shares: Option<&[String]>,
+) -> Result<(), ProtocolError> {
+    verify_job_shares_with_mount_provider(config, local_node_id, required_shares, || {
+        current_mount_output().map_err(protocol_failed)
+    })
+}
+
+fn verify_job_shares_with_mount_provider(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    required_shares: Option<&[String]>,
+    mount_provider: impl FnOnce() -> Result<String, ProtocolError>,
+) -> Result<(), ProtocolError> {
+    let mount_output = mount_provider()?;
+    verify_share_with_mount_output(config, local_node_id, &mount_output)
+        .map_err(|_| ProtocolError::StorageUnavailable)?;
+    for share in named_shares_for_job(config, required_shares)? {
+        verify_named_share_with_mount_output(config, local_node_id, share, &mount_output)
+            .map_err(|_| ProtocolError::StorageUnavailable)?;
+    }
+    Ok(())
 }
 
 fn current_mount_output() -> Result<String, AgentError> {
@@ -2246,6 +2296,7 @@ mod tests {
             supported: false,
             active: false,
             average_temperature_deci_celsius: None,
+            actual_rpm: None,
             target_rpm: None,
             message: Some("AppleSMC did not report controllable fans".into()),
         };
@@ -2268,6 +2319,7 @@ mod tests {
             supported: true,
             active: false,
             average_temperature_deci_celsius: None,
+            actual_rpm: None,
             target_rpm: None,
             message: Some("fan controller stayed in system mode".into()),
         };
@@ -2326,6 +2378,25 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
 "#
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn job_share_selection_checks_only_requested_shares_and_preserves_legacy_behavior() {
+        let config = nfs_reconcile_config();
+        let required = vec!["data".to_owned()];
+        let selected = named_shares_for_job(&config, Some(&required)).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|share| share.mount_root.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["/mnt/data"]
+        );
+
+        let legacy = named_shares_for_job(&config, None).unwrap();
+        assert_eq!(legacy.len(), 2, "legacy jobs keep all-share validation");
+
+        assert!(named_shares_for_job(&config, Some(&["removed".into()])).is_err());
     }
 
     #[test]
@@ -2483,6 +2554,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         let token = StartToken(Id128::random());
         let spec = JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("mini01").unwrap(),
             node: None,
             name: "status-recovery".into(),
@@ -3074,6 +3146,53 @@ execution_uid = 501
                 .and_then(|count| u32::try_from(count.get()).ok())
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn job_start_checks_primary_and_required_shares_from_one_mount_snapshot() {
+        let mut config = status_config(Path::new("/mnt/primary"));
+        config.nodes.insert(
+            "worker".into(),
+            NodeConfig {
+                host: "192.0.2.2".into(),
+                transport: macluster_core::config::Transport::Ssh,
+                remote_binary: "macluster".into(),
+                ssh_user: Some("worker".into()),
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
+        config.shares.insert(
+            "data".into(),
+            macluster_core::config::ShareConfig {
+                server: NodeId::new("mini01-a").unwrap(),
+                source_root: PathBuf::from("/srv/data"),
+                mount_root: PathBuf::from("/mnt/data"),
+                share_uuid: "00000000-0000-4000-8000-000000000004".into(),
+                allow_existing_contents: false,
+            },
+        );
+        let mounts = concat!(
+            "127.0.0.1:/mnt/primary on /mnt/primary (nfs, nodev, nosuid)\n",
+            "127.0.0.1:/srv/data on /mnt/data (nfs, nodev, nosuid)\n",
+        );
+        let required = vec!["data".to_owned()];
+        let mount_reads = std::cell::Cell::new(0);
+
+        let result =
+            verify_job_shares_with_mount_provider(&config, "worker", Some(&required), || {
+                mount_reads.set(mount_reads.get() + 1);
+                Ok(mounts.to_owned())
+            });
+
+        assert!(
+            result.is_ok(),
+            "all required NFS mappings should validate: {result:?}"
+        );
+        assert_eq!(mount_reads.get(), 1);
     }
 
     #[test]

@@ -25,6 +25,7 @@ fn temp_dir(label: &str) -> PathBuf {
 fn spec(snapshot: macluster_protocol::types::SnapshotRef) -> JobSpec {
     JobSpec {
         storage_namespace: None,
+        required_shares: Some(Vec::new()),
         queue: QueueName::new("mini01").unwrap(),
         node: Some(NodeId::new("mini01-a").unwrap()),
         name: "analysis".into(),

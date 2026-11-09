@@ -23,6 +23,8 @@ pub enum AdmissionError {
     LoginNode(String),
     #[error("node '{node}' is not a member of queue '{queue}'")]
     NodeNotInQueue { node: String, queue: String },
+    #[error("job requires unknown named NFS share '{0}'")]
+    UnknownRequiredShare(String),
     #[error("job {field} path must be absolute and inside a configured shared path")]
     InvalidSharedPath { field: &'static str },
     #[error("submission storage error: {0}")]
@@ -56,6 +58,12 @@ pub fn admit_submission(
                 node: node.to_string(),
                 queue: spec.queue.to_string(),
             });
+        }
+    }
+
+    for share in spec.required_shares.iter().flatten() {
+        if !config.shares.contains_key(share) {
+            return Err(AdmissionError::UnknownRequiredShare(share.clone()));
         }
     }
 
@@ -127,6 +135,7 @@ mod tests {
                 storage_namespace: Some(
                     Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap(),
                 ),
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new("cpu").unwrap(),
                 node: Some(NodeId::new("compute").unwrap()),
                 name: "test".into(),
@@ -179,6 +188,20 @@ mod tests {
             Err(AdmissionError::InvalidSharedPath {
                 field: "working directory"
             })
+        ));
+    }
+
+    #[test]
+    fn admission_rejects_required_shares_missing_from_the_current_config() {
+        let fixture = Fixture::new();
+        let config = fixture.config();
+        let storage = Storage::open(fixture.0.join("state")).unwrap();
+        let mut spec = fixture.spec();
+        spec.required_shares = Some(vec!["missing".into()]);
+
+        assert!(matches!(
+            admit_submission(&storage, &config, RequestId::random(), spec),
+            Err(AdmissionError::UnknownRequiredShare(share)) if share == "missing"
         ));
     }
 }

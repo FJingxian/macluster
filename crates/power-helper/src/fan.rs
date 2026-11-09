@@ -18,7 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_protocol::types::{FanControlStatus, FanHelperCommand, FanHelperResponse, FanPolicy};
+use macluster_protocol::types::{
+    FanControlStatus, FanHelperCommand, FanHelperResponse, FanPolicy, FanReading,
+};
 
 use crate::PowerCache;
 
@@ -129,6 +131,7 @@ impl FanEngine {
             average_temperature_deci_celsius: self
                 .average_temperature_celsius
                 .map(|temperature| (temperature * 10.0).round() as u16),
+            actual_rpm: None,
             target_rpm: self.target_rpm,
             message: self.message.clone(),
         }
@@ -400,12 +403,15 @@ pub fn start(peer_uid: libc::uid_t, power_cache: Arc<Mutex<PowerCache>>) -> Resu
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("inspect fan socket: {error}")),
     }
+
+    // Do the synchronous AppleSMC probe before publishing the socket. Once the
+    // socket exists, callers assume the fan service is ready to handle requests.
+    let engine = Arc::new(Mutex::new(FanEngine::new()));
     let listener =
         UnixListener::bind(socket_path).map_err(|error| format!("bind fan socket: {error}"))?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))
         .map_err(|error| format!("set fan socket permissions: {error}"))?;
 
-    let engine = Arc::new(Mutex::new(FanEngine::new()));
     let listener_engine = Arc::clone(&engine);
     let listener_cache = Arc::clone(&power_cache);
 
@@ -457,10 +463,18 @@ fn serve(
         let Ok(command) = serde_json::from_str::<FanHelperCommand>(&line) else {
             continue;
         };
-        let temperature = power_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .temperature(Instant::now());
+        let now = Instant::now();
+        let (temperature, actual_rpm) = {
+            let cache = power_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let actual_rpm = cache
+                .response(now)
+                .fan_readings
+                .as_deref()
+                .and_then(average_actual_fan_rpm);
+            (cache.temperature(now), actual_rpm)
+        };
         let mut engine = engine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -473,16 +487,28 @@ fn serve(
                 engine.status()
             }),
         };
-        let (status, error) = match result {
+        let (mut status, error) = match result {
             Ok(status) => (status, None),
             Err(error) => (engine.status(), Some(error)),
         };
+        status.actual_rpm = actual_rpm;
         let reply = FanHelperResponse { status, error };
         if let Ok(mut bytes) = serde_json::to_vec(&reply) {
             bytes.push(b'\n');
             let _ = stream.write_all(&bytes);
         }
     }
+}
+
+fn average_actual_fan_rpm(readings: &[FanReading]) -> Option<u32> {
+    let (total, count) = readings
+        .iter()
+        .map(|fan| fan.rpm)
+        .filter(|rpm| *rpm <= 100_000)
+        .fold((0_u64, 0_u64), |(total, count), rpm| {
+            (total + u64::from(rpm), count + 1)
+        });
+    (count > 0).then(|| ((total + count / 2) / count) as u32)
 }
 
 fn peer_uid_for(stream: &UnixStream) -> std::io::Result<libc::uid_t> {

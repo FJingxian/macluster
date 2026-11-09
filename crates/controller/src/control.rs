@@ -276,7 +276,7 @@ impl ControlApi {
                 manager
                     .begin(operation_id, scope, &journal_digest, &configured_nodes)
                     .map_err(maintenance_manager_error)?;
-                if matches!(manager.scope(), Some(MaintenanceScope::Cluster)) {
+                if manager.scope().is_some_and(|scope| scope.is_cluster_wide()) {
                     // A cluster-wide config/storage change must not leave a
                     // partially uploaded script that can be finalized against
                     // the reloaded controller state.
@@ -690,7 +690,7 @@ impl ControlApi {
         self.require_ready()?;
         if self
             .maintenance_scope()
-            .is_some_and(|scope| matches!(scope, MaintenanceScope::Cluster))
+            .is_some_and(|scope| scope.is_cluster_wide())
         {
             return Err(maintenance_error(
                 "cluster maintenance is draining; retry script upload after it completes",
@@ -708,7 +708,7 @@ impl ControlApi {
             return Ok(());
         };
         let scoped_nodes = match scope {
-            MaintenanceScope::Cluster => {
+            MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_) => {
                 return Err(maintenance_error(
                     "cluster maintenance is draining; retry submission after it completes",
                 ));
@@ -835,6 +835,7 @@ fn admission_error(error: AdmissionError) -> ControlError {
         AdmissionError::StorageNamespace
         | AdmissionError::UnknownQueue(_)
         | AdmissionError::LoginNode(_)
+        | AdmissionError::UnknownRequiredShare(_)
         | AdmissionError::NodeNotInQueue { .. }
         | AdmissionError::InvalidSharedPath { .. } => ControlErrorCode::InvalidRequest,
     };
@@ -967,6 +968,7 @@ mod tests {
         fn job_spec(&self, config: &ClusterConfig, node: Option<NodeId>) -> JobSpec {
             JobSpec {
                 storage_namespace: Some(Id128::parse(&config.share_uuid).unwrap()),
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new("q").unwrap(),
                 node,
                 name: "maintenance admission".into(),
@@ -1327,6 +1329,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: Some(Id128::parse(&config.share_uuid).unwrap()),
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("q").unwrap(),
                     node: None,
                     name: "pending".into(),

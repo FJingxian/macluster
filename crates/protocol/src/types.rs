@@ -99,6 +99,11 @@ pub enum JobMode {
 pub struct JobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_namespace: Option<Id128>,
+    /// Named NFS shares referenced by this job's working directory, command,
+    /// environment, or output paths. A failed unrelated share must not hold
+    /// this job back on an otherwise usable node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_shares: Option<Vec<String>>,
     pub queue: QueueName,
     pub node: Option<NodeId>,
     pub name: String,
@@ -595,6 +600,9 @@ pub struct FanControlStatus {
     pub active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub average_temperature_deci_celsius: Option<u16>,
+    /// Rounded average of the current hardware fan RPM readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_rpm: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_rpm: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

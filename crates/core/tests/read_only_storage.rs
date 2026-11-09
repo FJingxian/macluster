@@ -62,6 +62,7 @@ fn monitor_query_returns_only_pending_and_active_job_records() {
     let node = NodeId::new("mini01-a").unwrap();
     let spec = |snapshot| JobSpec {
         storage_namespace: None,
+        required_shares: Some(Vec::new()),
         queue: QueueName::new("mini01").unwrap(),
         node: Some(node.clone()),
         name: "fixture".into(),

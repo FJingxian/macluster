@@ -42,11 +42,11 @@ pub fn validate_scope_config_change(
                 .into(),
         );
     }
-    if matches!(scope, MaintenanceScope::Cluster) {
+    if scope.is_cluster_wide() {
         return Ok(());
     }
     let MaintenanceScope::Nodes(nodes) = scope else {
-        unreachable!()
+        unreachable!("cluster-wide scopes returned above")
     };
     let covered = nodes.iter().map(NodeId::as_str).collect::<BTreeSet<_>>();
     if old.name != next.name
@@ -529,10 +529,16 @@ fn canonicalize_scope(
     scope: &mut MaintenanceScope,
     configured_nodes: &BTreeSet<NodeId>,
 ) -> Result<(), MaintenanceError> {
-    let MaintenanceScope::Nodes(nodes) = scope else {
-        return Ok(());
+    let nodes = match scope {
+        MaintenanceScope::Cluster => return Ok(()),
+        MaintenanceScope::ClusterExceptUnreachable(nodes) => nodes,
+        MaintenanceScope::Nodes(nodes) => nodes,
     };
     if nodes.is_empty() {
+        if matches!(scope, MaintenanceScope::ClusterExceptUnreachable(_)) {
+            *scope = MaintenanceScope::Cluster;
+            return Ok(());
+        }
         return Err(MaintenanceError::EmptyScope);
     }
     let mut sorted = nodes.clone();
@@ -918,6 +924,14 @@ mod tests {
         assert!(
             validate_scope_config_change(&old, &named_share_change, &MaintenanceScope::Cluster)
                 .is_ok()
+        );
+        assert!(
+            validate_scope_config_change(
+                &old,
+                &named_share_change,
+                &MaintenanceScope::ClusterExceptUnreachable(vec![NodeId::new("arm-b").unwrap()])
+            )
+            .is_ok()
         );
 
         let mut changed_namespace = old.clone();

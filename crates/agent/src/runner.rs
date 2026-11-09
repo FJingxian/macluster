@@ -608,8 +608,11 @@ fn managed_cache_directory(
         })?;
     let mut key = String::new();
     if include_project {
-        let working_directory = Path::new(&record.spec.cwd).canonicalize()?;
-        key.push_str(&working_directory.display().to_string());
+        // The submitter resolves the working directory into the configured
+        // shared namespace before admission. Hash that validated path as-is;
+        // canonicalizing it here can issue an extra metadata request over NFS
+        // for every task, including short Python commands.
+        key.push_str(&record.spec.cwd);
         key.push('\0');
     }
     for (name, value) in &record.spec.env {
@@ -2547,6 +2550,7 @@ mod tests {
         let token = StartToken(Id128::random());
         let spec = JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("mini01").unwrap(),
             node: None,
             name: "test".into(),

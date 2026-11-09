@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-pub const CONTROL_PROTOCOL_VERSION: u16 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_CONTROL_JOB_PAGE: usize = 256;
 pub const MAX_CONTROL_COMPATIBILITY_NODES: usize = 128;
@@ -40,7 +40,25 @@ pub enum ControllerLifecycle {
 #[serde(tag = "scope", content = "nodes", rename_all = "snake_case")]
 pub enum MaintenanceScope {
     Cluster,
+    /// A cluster-wide barrier that keeps dispatch paused everywhere while
+    /// allowing the drain check to defer node-status probes for endpoints
+    /// already confirmed unreachable by the caller. Active jobs and pending
+    /// state-changing operations still block maintenance.
+    ClusterExceptUnreachable(Vec<NodeId>),
     Nodes(Vec<NodeId>),
+}
+
+impl MaintenanceScope {
+    pub fn is_cluster_wide(&self) -> bool {
+        matches!(self, Self::Cluster | Self::ClusterExceptUnreachable(_))
+    }
+
+    pub fn deferred_unreachable_nodes(&self) -> &[NodeId] {
+        match self {
+            Self::ClusterExceptUnreachable(nodes) => nodes,
+            Self::Cluster | Self::Nodes(_) => &[],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -222,10 +240,24 @@ pub enum ControlPayload {
     Job(JobRecord),
     Jobs(JobPage),
     Queues(Vec<QueueSummary>),
-    FanControl(Vec<NodeFanControlResult>),
+    FanControl(FanControlPayload),
     ReconciliationRequested {
         accepted: bool,
     },
+}
+
+/// Fan-control response accepts the older vector-only wire shape while the
+/// controller and CLI are on different builds. New controllers include the
+/// hidden-node count in the detailed shape.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum FanControlPayload {
+    Detailed {
+        nodes: Vec<NodeFanControlResult>,
+        #[serde(default)]
+        hidden_unreachable: usize,
+    },
+    Legacy(Vec<NodeFanControlResult>),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -382,5 +414,26 @@ mod monitor_row_tests {
         .expect("older monitor row should remain readable");
 
         assert_eq!(row.request_latency_ms, None);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_scope_tests {
+    use super::MaintenanceScope;
+    use crate::identifiers::NodeId;
+
+    #[test]
+    fn unreachable_node_exclusions_survive_serialization_as_cluster_scope() {
+        let scope =
+            MaintenanceScope::ClusterExceptUnreachable(vec![NodeId::new("default-003").unwrap()]);
+        let encoded = serde_json::to_vec(&scope).unwrap();
+        let decoded: MaintenanceScope = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded, scope);
+        assert!(decoded.is_cluster_wide());
+        assert_eq!(
+            decoded.deferred_unreachable_nodes(),
+            &[NodeId::new("default-003").unwrap()]
+        );
     }
 }

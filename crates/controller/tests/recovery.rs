@@ -183,6 +183,7 @@ impl NodeTransport for FakeTransport {
                     supported: false,
                     active: false,
                     average_temperature_deci_celsius: None,
+                    actual_rpm: None,
                     target_rpm: None,
                     message: None,
                 },
@@ -193,6 +194,7 @@ impl NodeTransport for FakeTransport {
                     supported: false,
                     active: false,
                     average_temperature_deci_celsius: None,
+                    actual_rpm: None,
                     target_rpm: None,
                     message: None,
                 },
@@ -333,6 +335,7 @@ transport = "ssh"
     let snapshot = storage.stage_snapshot(snapshot_bytes).unwrap();
     let spec = JobSpec {
         storage_namespace: None,
+        required_shares: Some(Vec::new()),
         queue: QueueName::new("mini01").unwrap(),
         node: None,
         name: "test".into(),

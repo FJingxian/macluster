@@ -2150,6 +2150,7 @@ mod schema_migration_tests {
     fn interactive_spec(queue: &str) -> JobSpec {
         JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new(queue).unwrap(),
             node: Some(NodeId::new("mini01-a").unwrap()),
             name: "migration fixture".into(),
@@ -2441,6 +2442,7 @@ mod cancellation_recovery_tests {
     fn job_spec(snapshot: SnapshotRef) -> JobSpec {
         JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("mini01").unwrap(),
             node: Some(NodeId::new("mini01-a").unwrap()),
             name: "snapshot cancellation".into(),

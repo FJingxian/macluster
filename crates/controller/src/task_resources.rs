@@ -250,6 +250,7 @@ mod tests {
             let config=ClusterConfig::parse("[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nshared_root=\"/tmp/shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"worker\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.worker]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n").unwrap();
             let spec = JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: "q".parse().unwrap(),
                 node: None,
                 name: "probe".into(),

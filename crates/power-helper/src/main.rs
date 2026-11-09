@@ -414,7 +414,8 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
         })
         .map_err(|error| format!("start power sampler: {error}"))?;
 
-    start_optional_fan_service(|| fan::start(peer_uid, Arc::clone(&cache)));
+    let fan_cache = Arc::clone(&cache);
+    start_optional_fan_service(move || fan::start(peer_uid, fan_cache));
 
     for incoming in listener.incoming() {
         let mut stream = incoming.map_err(|error| format!("accept socket client: {error}"))?;
@@ -446,10 +447,19 @@ fn serve_power_client(
     Ok(())
 }
 
-fn start_optional_fan_service(start: impl FnOnce() -> Result<(), String>) {
-    if let Err(error) = start() {
+fn start_optional_fan_service(start: impl FnOnce() -> Result<(), String> + Send + 'static) {
+    let result = thread::Builder::new()
+        .name("macluster-fan-startup".into())
+        .spawn(move || {
+            if let Err(error) = start() {
+                eprintln!(
+                    "macluster-power: fan control unavailable: {error}; power/GPU sampling continues"
+                );
+            }
+        });
+    if let Err(error) = result {
         eprintln!(
-            "macluster-power: fan control unavailable: {error}; power/GPU sampling continues"
+            "macluster-power: could not start fan-control service: {error}; power/GPU sampling continues"
         );
     }
 }

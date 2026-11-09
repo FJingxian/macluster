@@ -1,7 +1,7 @@
 //! Bounded asynchronous reconciliation used by the long-running controller.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex,
@@ -42,6 +42,8 @@ use crate::{
 const PROBE_WORKERS: usize = 8;
 const CONTROL_WORKERS: usize = 4;
 const FAN_CONTROL_WORKERS: usize = 2;
+const FAN_CONTROL_NODE_WORKERS: usize = 32;
+const FAN_CONTROL_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
 const NFS_RECONCILE_WORKERS: usize = 2;
@@ -51,6 +53,7 @@ const IDLE_NODE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const NODE_HEALTH_TTL: Duration = Duration::from_secs(60);
 const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const NODE_STALE_AGENT_RETRY: Duration = Duration::from_secs(30);
+const MAINTENANCE_HOST_UNREACHABLE_TTL: Duration = Duration::from_secs(30);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
@@ -215,7 +218,13 @@ struct NodeStatusCache {
 
 struct NodeHealthCache {
     valid: bool,
+    /// True only when the primary share and every configured named share are
+    /// ready; reconciliation uses this to retry partially mounted nodes.
     ready: bool,
+    /// Job metadata uses the primary shared root. Auxiliary named shares are
+    /// checked separately against each job's inferred requirements.
+    job_storage_ready: bool,
+    ready_shares: BTreeSet<String>,
     agent_current: bool,
     interactive_pty: bool,
     namespaced_jobs: bool,
@@ -234,6 +243,7 @@ struct NodeRuntime {
     probe_after_inflight_for_job: Option<u64>,
     probe_failures: u8,
     last_probe_error: Option<String>,
+    last_host_reachable: Option<(bool, Instant)>,
     next_control_at: Instant,
     control_failures: u8,
     nfs_reconcile_attempts: u8,
@@ -253,6 +263,7 @@ impl NodeRuntime {
             probe_after_inflight_for_job: None,
             probe_failures: 0,
             last_probe_error: None,
+            last_host_reachable: None,
             next_control_at: now,
             control_failures: 0,
             nfs_reconcile_attempts: 0,
@@ -285,6 +296,14 @@ impl NodeRuntime {
 
     fn management_unavailable(&self) -> bool {
         self.probe_failures >= crate::liveness::OFFLINE_AFTER_FAILURES
+    }
+
+    fn recently_host_unreachable(&self, now: Instant) -> bool {
+        self.last_host_reachable
+            .is_some_and(|(reachable, sampled_at)| {
+                !reachable
+                    && now.saturating_duration_since(sampled_at) < MAINTENANCE_HOST_UNREACHABLE_TTL
+            })
     }
 }
 
@@ -596,17 +615,25 @@ impl RuntimeState {
         if self.fan_control_pool.pending > 0 {
             blockers.push("a fan-control operation is still in flight".into());
         }
-        let in_scope = |node: Option<&NodeId>| match scope {
-            MaintenanceScope::Cluster => true,
-            MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
+        let deferred_nodes = scope
+            .deferred_unreachable_nodes()
+            .iter()
+            .map(NodeId::as_str)
+            .collect::<HashSet<_>>();
+        let in_scope = |node: Option<&NodeId>| {
+            scope.is_cluster_wide()
+                || matches!(scope, MaintenanceScope::Nodes(nodes) if node.is_some_and(|node| nodes.contains(node)))
         };
         for job in service.storage.list_active_jobs()? {
             let scoped = in_scope(job.node.as_ref());
-            let job_node_unavailable = job
-                .node
-                .as_ref()
-                .and_then(|node_id| self.nodes.get(node_id.as_str()))
-                .is_some_and(NodeRuntime::management_unavailable);
+            let job_node_unavailable = job.node.as_ref().is_some_and(|node_id| {
+                deferred_nodes.contains(node_id.as_str())
+                    || self.nodes.get(node_id.as_str()).is_some_and(|node| {
+                        node.management_unavailable()
+                            || (scope.is_cluster_wide()
+                                && node.recently_host_unreachable(Instant::now()))
+                    })
+            });
             let label = match job.state {
                 JobState::Starting | JobState::Running | JobState::Cancelling if scoped => {
                     Some(format!(
@@ -616,7 +643,7 @@ impl RuntimeState {
                         job.node.as_ref().map_or("unknown", NodeId::as_str)
                     ))
                 }
-                _ if (scoped || matches!(scope, MaintenanceScope::Cluster))
+                _ if (scoped || scope.is_cluster_wide())
                     && (job.snapshot_sync_pending || job.log_sync_pending)
                     && !job_node_unavailable =>
                 {
@@ -633,17 +660,25 @@ impl RuntimeState {
         }
 
         for (node_id, node) in &self.nodes {
-            if !service.node_is_maintenance_scoped(node_id) {
+            if !service.node_is_maintenance_scoped(node_id)
+                || deferred_nodes.contains(node_id.as_str())
+            {
                 continue;
             }
-            let management_unavailable = node.management_unavailable();
+            let management_unavailable = node.management_unavailable()
+                || (scope.is_cluster_wide() && node.recently_host_unreachable(Instant::now()));
+            let offline_for_cluster_maintenance = scope.is_cluster_wide() && management_unavailable;
             let has_mutating_operation = node.in_flight.is_some_and(|operation| {
                 matches!(
                     operation.kind,
                     WorkKind::Start | WorkKind::Cancel | WorkKind::ReconcileNfs
                 )
             });
-            if has_mutating_operation {
+            let deferred_nfs_reconcile = offline_for_cluster_maintenance
+                && node
+                    .in_flight
+                    .is_some_and(|operation| operation.kind == WorkKind::ReconcileNfs);
+            if has_mutating_operation && !deferred_nfs_reconcile {
                 blockers.push(format!(
                     "node {node_id} has a start or cancel operation in flight"
                 ));
@@ -681,7 +716,7 @@ impl RuntimeState {
         scope: &MaintenanceScope,
     ) {
         let mut affected = match scope {
-            MaintenanceScope::Cluster => self
+            MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_) => self
                 .nodes
                 .keys()
                 .cloned()
@@ -701,7 +736,7 @@ impl RuntimeState {
         self.previous_digest = Some(old_digest);
         self.reloaded_affected_nodes = affected;
         self.digest = service.config.execution_digest().unwrap_or_default();
-        if matches!(scope, MaintenanceScope::Cluster) {
+        if scope.is_cluster_wide() {
             self.share_ready = None;
             self.next_share_probe = now;
         }
@@ -975,8 +1010,29 @@ impl RuntimeState {
                         runtime.next_probe_at = now;
                         runtime.status = None;
                         match completion.result {
-                            WorkerResult::Control(Ok(_)) => {
+                            WorkerResult::Control(Ok(response)) => {
                                 runtime.control_failures = 0;
+                                if tag.kind == WorkKind::Start
+                                    && let ResponseBody::Started(start) = response
+                                    && start.accepted
+                                    && let Some(job_id) = tag.job_id
+                                    && let Some(job) = service.storage.get_job(job_id)?
+                                    && job.state == JobState::Starting
+                                    && job.spec.mode == JobMode::Interactive
+                                    && job
+                                        .node
+                                        .as_ref()
+                                        .is_some_and(|node| node.as_str() == node_id)
+                                    && job.start_token.as_ref() == Some(&start.start_token)
+                                {
+                                    // Interactive runners wait for the terminal before
+                                    // launching user code. Treat the accepted Start
+                                    // receipt as allocation readiness so the client can
+                                    // attach; waiting for RuntimePhase::Running here
+                                    // would create a circular wait (the runner only
+                                    // enters Running after it receives the attachment).
+                                    service.storage.mark_running(job_id)?;
+                                }
                             }
                             WorkerResult::Control(Err(_error)) => {
                                 runtime.control_failures =
@@ -1033,6 +1089,9 @@ impl RuntimeState {
         let Some(runtime) = self.nodes.get_mut(node_id) else {
             return Ok(());
         };
+        runtime.last_host_reachable = probe
+            .host_reachable
+            .map(|reachable| (reachable, received_at));
         if let Some(error) = probe.fence_error {
             runtime.last_probe_error = Some(error.chars().take(256).collect());
             service.fenced_nodes.remove(node_id);
@@ -1149,6 +1208,9 @@ impl RuntimeState {
         host_reachable: Option<bool>,
         agent_responding: bool,
     ) {
+        if let Some(runtime) = self.nodes.get_mut(node_id) {
+            runtime.last_host_reachable = host_reachable.map(|reachable| (reachable, received_at));
+        }
         persist_node_liveness(
             service,
             node_id,
@@ -1208,11 +1270,21 @@ impl RuntimeState {
                         .shares
                         .keys()
                         .all(|share_id| health.shares.get(share_id).copied().unwrap_or(false));
+                let job_storage_ready = response_identity_matches
+                    && health.execution_digest == expected_digest
+                    && health.primary_share_ready;
+                let ready_shares = health
+                    .shares
+                    .iter()
+                    .filter_map(|(share_id, ready)| ready.then(|| share_id.clone()))
+                    .collect();
                 let agent_current =
                     health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID);
                 NodeHealthCache {
                     valid: response_identity_matches,
                     ready,
+                    job_storage_ready,
+                    ready_shares,
                     agent_current,
                     namespaced_jobs: health.features.iter().any(|feature| {
                         feature == macluster_protocol::types::NAMESPACED_JOBS_FEATURE
@@ -1230,6 +1302,8 @@ impl RuntimeState {
             _ => NodeHealthCache {
                 valid: false,
                 ready: false,
+                job_storage_ready: false,
+                ready_shares: BTreeSet::new(),
                 agent_current: false,
                 interactive_pty: false,
                 namespaced_jobs: false,
@@ -1626,6 +1700,17 @@ impl RuntimeState {
         service: &ControllerService<T>,
     ) -> Result<(), ControllerError> {
         let now = Instant::now();
+        let deferred_unreachable_nodes = service
+            .maintenance_scope
+            .as_ref()
+            .map(|scope| {
+                scope
+                    .deferred_unreachable_nodes()
+                    .iter()
+                    .map(NodeId::as_str)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         let ids = service.config.nodes.keys().cloned().collect::<Vec<_>>();
         if ids.is_empty() {
             return Ok(());
@@ -1633,6 +1718,9 @@ impl RuntimeState {
         let cursor = self.node_cursor % ids.len();
         for offset in 0..ids.len() {
             let id = &ids[(cursor + offset) % ids.len()];
+            if deferred_unreachable_nodes.contains(id.as_str()) {
+                continue;
+            }
             let Some(config) = service.config.nodes.get(id) else {
                 continue;
             };
@@ -1657,7 +1745,8 @@ impl RuntimeState {
                 continue;
             }
             let already_fenced = runtime.fenced && service.fenced_nodes.contains(id);
-            let check_endpoint_first = runtime.probe_failures > 0;
+            let check_endpoint_first =
+                runtime.probe_failures > 0 || service.node_is_maintenance_scoped(id);
             let generation = runtime.generation;
             let node_id = NodeId::new(id.clone()).expect("validated node ID");
             let expected_execution = service.storage.node_execution_to_reconcile(&node_id)?;
@@ -2119,12 +2208,9 @@ impl RuntimeState {
             let Some(head_index) = pending_heads.get(queue_name).copied() else {
                 continue;
             };
-            let Some(mut head) = jobs.get(head_index).cloned() else {
+            let Some(head) = jobs.get(head_index).cloned() else {
                 continue;
             };
-            if head.snapshot_sync_pending {
-                continue;
-            }
             let waiting_reason = if let Some(pinned) = head
                 .spec
                 .node
@@ -2141,6 +2227,21 @@ impl RuntimeState {
                 Some(reason)
             } else if let Some(reason) =
                 crate::namespace_waiting_reason(&head, &queue_config, &availability)
+            {
+                Some(reason)
+            } else if let Some(removed_share) = head
+                .spec
+                .required_shares
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|share| !service.config.shares.contains_key(*share))
+            {
+                Some(format!(
+                    "required NFS share '{removed_share}' is no longer configured; cancel the job with mkill and resubmit after choosing an active shared path"
+                ))
+            } else if let Some(reason) =
+                crate::share_waiting_reason(&head, &queue_config, &availability)
             {
                 Some(reason)
             } else if head.spec.mode == JobMode::Interactive {
@@ -2165,14 +2266,14 @@ impl RuntimeState {
             let updated = service
                 .storage
                 .set_waiting_reason(head.id, waiting_reason)?;
-            jobs[head_index] = updated.clone();
-            head = updated;
-            let Some(dispatch) = next_dispatch(
-                &queue,
-                &queue_config,
-                std::slice::from_ref(&head),
-                &availability,
-            ) else {
+            jobs[head_index] = updated;
+            let Some(dispatch) = next_dispatch(&queue, &queue_config, &jobs, &availability) else {
+                continue;
+            };
+            let Some(dispatch_index) = jobs
+                .iter()
+                .position(|job| job.id == dispatch.job_id && job.state == JobState::Pending)
+            else {
                 continue;
             };
             let reserved = match service
@@ -2196,7 +2297,7 @@ impl RuntimeState {
                 }
                 Err(error) => return Err(error.into()),
             };
-            jobs[head_index] = reserved.clone();
+            jobs[dispatch_index] = reserved.clone();
             if let Some(node) = availability
                 .iter_mut()
                 .find(|node| node.id == dispatch.node_id)
@@ -2249,8 +2350,8 @@ impl RuntimeState {
                     || !service.config.shares.is_empty();
                 let health = runtime.and_then(|runtime| runtime.health.as_ref());
                 let health_fresh = runtime.is_some_and(|runtime| runtime.health_fresh(now));
-                let node_storage_ready =
-                    !requires_health || (health_fresh && health.is_some_and(|health| health.ready));
+                let node_storage_ready = !requires_health
+                    || (health_fresh && health.is_some_and(|health| health.job_storage_ready));
                 let interactive_pty =
                     health_fresh && health.is_some_and(|health| health.interactive_pty);
                 let namespaced_jobs =
@@ -2270,6 +2371,11 @@ impl RuntimeState {
                     storage_ready: self.share_ready(now)
                         && node_storage_ready
                         && !self.nfs_cleanup_journal_blocked,
+                    ready_shares: health
+                        .filter(|_| health_fresh)
+                        .map(|health| health.ready_shares.clone())
+                        .unwrap_or_default(),
+                    configured_shares: service.config.shares.keys().cloned().collect(),
                     drain_requested: service.node_is_maintenance_scoped(id),
                     occupied: busy,
                     interactive_pty,
@@ -2488,6 +2594,10 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                             } else {
                                 let config = service.config.clone();
                                 let transport = Arc::clone(&service.transport);
+                                let hidden_nodes = hidden_fan_nodes(
+                                    &config,
+                                    service.storage.root(),
+                                );
                                 let responder = request.responder();
                                 if runtime.fan_control_pool.try_spawn(move || {
                                     let result = dispatch_fan_control(
@@ -2495,6 +2605,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                         &transport,
                                         node_id,
                                         policy,
+                                        hidden_nodes,
                                     );
                                     if let Err(error) = responder.respond(result)
                                         && !matches!(
@@ -2690,13 +2801,23 @@ fn dispatch_fan_control<T: NodeTransport>(
     shared_transport: &Arc<T>,
     selected_node: Option<NodeId>,
     policy: Option<macluster_protocol::types::FanPolicy>,
+    hidden_nodes: std::collections::HashSet<String>,
 ) -> Result<macluster_protocol::control::ControlPayload, macluster_protocol::control::ControlError>
 {
     use macluster_protocol::{
-        control::{ControlPayload, NodeFanControlResult},
+        control::{ControlPayload, FanControlPayload, NodeFanControlResult},
         types::{Operation, ResponseBody},
     };
 
+    let explicitly_selected = selected_node.is_some();
+    let hidden_unreachable = if explicitly_selected {
+        0
+    } else {
+        hidden_nodes
+            .iter()
+            .filter(|node_id| !config.is_login_node(node_id))
+            .count()
+    };
     let targets = if let Some(node_id) = selected_node {
         let node = config.nodes.get(node_id.as_str()).ok_or_else(|| {
             crate::control::invalid_request(format!("node '{node_id}' is not in the cluster"))
@@ -2711,24 +2832,28 @@ fn dispatch_fan_control<T: NodeTransport>(
         config
             .nodes
             .iter()
+            .filter(|(id, _)| !hidden_nodes.contains(*id))
             .filter_map(|(id, node)| NodeId::new(id.clone()).ok().map(|id| (id, node)))
             .collect::<Vec<_>>()
     };
     if targets.is_empty() {
-        return Err(crate::control::invalid_request(
-            "cluster has no registered nodes",
-        ));
+        return Ok(ControlPayload::FanControl(FanControlPayload::Detailed {
+            nodes: Vec::new(),
+            hidden_unreachable,
+        }));
     }
 
     let targets = std::sync::Arc::new(targets);
+    let hidden_nodes = std::sync::Arc::new(hidden_nodes);
     let next_target = std::sync::atomic::AtomicUsize::new(0);
     let transport = std::sync::Arc::clone(shared_transport);
     let results = std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::channel();
-        for _ in 0..targets.len().min(8) {
+        for _ in 0..targets.len().min(FAN_CONTROL_NODE_WORKERS) {
             let sender = sender.clone();
             let transport = std::sync::Arc::clone(&transport);
             let targets = std::sync::Arc::clone(&targets);
+            let hidden_nodes = std::sync::Arc::clone(&hidden_nodes);
             let next_target = &next_target;
             scope.spawn(move || {
                 loop {
@@ -2741,7 +2866,19 @@ fn dispatch_fan_control<T: NodeTransport>(
                         Some(policy) => Operation::SetFanPolicy { policy },
                         None => Operation::QueryFanPolicy,
                     };
-                    let result = match transport.call(&node_id, node, operation) {
+                    let operation_result = if hidden_nodes.contains(node_id.as_str()) {
+                        Err(TransportError::Io("node is offline".into()))
+                    } else if node.transport == macluster_core::config::Transport::Ssh
+                        && transport.endpoint_reachable(node, FAN_CONTROL_ENDPOINT_TIMEOUT)
+                            == Some(false)
+                    {
+                        Err(TransportError::Io(
+                            "registered SSH endpoint is not reachable".into(),
+                        ))
+                    } else {
+                        transport.call(&node_id, node, operation)
+                    };
+                    let result = match operation_result {
                         Ok(ResponseBody::FanControl(status)) => NodeFanControlResult {
                             node_id,
                             status: Some(status),
@@ -2769,7 +2906,33 @@ fn dispatch_fan_control<T: NodeTransport>(
     });
     let mut results = results;
     results.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    Ok(ControlPayload::FanControl(results))
+    Ok(ControlPayload::FanControl(FanControlPayload::Detailed {
+        nodes: results,
+        hidden_unreachable,
+    }))
+}
+
+fn hidden_fan_nodes(
+    config: &macluster_core::config::ClusterConfig,
+    state_dir: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let Ok(records) = crate::liveness::read(state_dir, &config.share_uuid) else {
+        return std::collections::HashSet::new();
+    };
+    let now = now_ms();
+    config
+        .nodes
+        .iter()
+        .filter(|(node_id, _)| !config.is_login_node(node_id))
+        .filter_map(|(node_id, node)| {
+            let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            let recently_reachable = records.get(node_id).is_some_and(|record| {
+                record.identity_key.eq_ignore_ascii_case(identity)
+                    && record.was_recently_reachable(identity, now)
+            });
+            (!recently_reachable).then(|| node_id.clone())
+        })
+        .collect()
 }
 
 struct WakeForwarder {
@@ -2956,6 +3119,8 @@ fn should_measure_job_storage(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL,
         NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache,
@@ -2976,7 +3141,8 @@ mod tests {
     use macluster_protocol::{
         control::{
             CONTROL_PROTOCOL_VERSION, ClientHello, ControlCommand, ControlPayload, ControlRequest,
-            ControlResponse, ControllerHello, ControllerLifecycle, HelloResponse,
+            ControlResponse, ControllerHello, ControllerLifecycle, FanControlPayload,
+            HelloResponse,
         },
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
         types::{
@@ -3021,12 +3187,37 @@ mod tests {
                         supported: true,
                         active: false,
                         average_temperature_deci_celsius: Some(390),
+                        actual_rpm: None,
                         target_rpm: None,
                         message: Some("test fan policy armed".into()),
                     }))
                 }
                 _ => Err(crate::transport::TransportError::Timeout),
             }
+        }
+    }
+
+    struct OfflineEndpointFanTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::transport::NodeTransport for OfflineEndpointFanTransport {
+        fn call(
+            &self,
+            _node_id: &NodeId,
+            _node: &macluster_core::config::NodeConfig,
+            _operation: Operation,
+        ) -> Result<ResponseBody, crate::transport::TransportError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Err(crate::transport::TransportError::Timeout)
+        }
+
+        fn endpoint_reachable(
+            &self,
+            _node: &macluster_core::config::NodeConfig,
+            _timeout: Duration,
+        ) -> Option<bool> {
+            Some(false)
         }
     }
 
@@ -3650,6 +3841,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            job_storage_ready: true,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -3755,6 +3948,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: false,
+            job_storage_ready: false,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -3837,6 +4032,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: false,
+            job_storage_ready: false,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -3900,6 +4097,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            job_storage_ready: true,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -3983,6 +4182,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            job_storage_ready: true,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -4015,6 +4216,7 @@ scheduler = "fifo"
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: pinned_node.map(|node| NodeId::new(node).unwrap()),
                     name: "login exclusion".into(),
@@ -4030,6 +4232,33 @@ scheduler = "fifo"
             .unwrap();
         storage.publish_snapshot(job.id, shared_root).unwrap();
         job
+    }
+
+    fn submit_pending_snapshot_test_job(
+        storage: &macluster_core::storage::Storage,
+        shared_root: &std::path::Path,
+        pinned_node: Option<&str>,
+    ) -> JobRecord {
+        let snapshot = storage.stage_snapshot(b"#!/bin/bash\ntrue\n").unwrap();
+        storage
+            .submit_once(
+                RequestId(Id128::random()),
+                JobSpec {
+                    storage_namespace: None,
+                    required_shares: Some(Vec::new()),
+                    queue: QueueName::new("mini01").unwrap(),
+                    node: pinned_node.map(|node| NodeId::new(node).unwrap()),
+                    name: "pending interactive snapshot test".into(),
+                    cwd: shared_root.display().to_string(),
+                    stdout_path: shared_root.join("jobs/%j/out").display().to_string(),
+                    stderr_path: shared_root.join("jobs/%j/err").display().to_string(),
+                    walltime_secs: None,
+                    env: Default::default(),
+                    mode: JobMode::Interactive,
+                    snapshot: Some(snapshot),
+                },
+            )
+            .unwrap()
     }
 
     #[test]
@@ -4065,6 +4294,8 @@ scheduler = "fifo"
         worker.health = Some(NodeHealthCache {
             valid: true,
             ready: true,
+            job_storage_ready: true,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: true,
             namespaced_jobs: true,
@@ -4107,6 +4338,69 @@ scheduler = "fifo"
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_dispatch_skips_an_unavailable_pinned_head_for_another_idle_node() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::{fs, sync::atomic::Ordering};
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-pinned-head-backfill-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 2);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut service =
+            ControllerService::new(config, storage, StartCountingTransport(Arc::clone(&starts)))
+                .unwrap();
+        let pinned =
+            submit_pending_snapshot_test_job(&service.storage, &shared_root, Some("node-000"));
+        let available = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let now = Instant::now();
+        runtime.share_ready = Some((true, now));
+        for (id, state) in &mut runtime.nodes {
+            state.fenced = true;
+            state.status = Some(NodeStatusCache {
+                online: id == "node-001",
+                occupied: false,
+                sampled_at: now,
+            });
+            state.health = Some(NodeHealthCache {
+                valid: true,
+                ready: true,
+                job_storage_ready: true,
+                ready_shares: BTreeSet::new(),
+                agent_current: true,
+                interactive_pty: true,
+                namespaced_jobs: true,
+                logical_cpus: Some(8),
+                sampled_at: now,
+                retry_at: now + NODE_HEALTH_TTL,
+            });
+        }
+
+        let jobs = service.storage.list_reconcile_jobs().unwrap();
+        runtime
+            .dispatch(&mut service, jobs, &["mini01".into()])
+            .unwrap();
+
+        let pinned = service.storage.get_job(pinned.id).unwrap().unwrap();
+        let available = service.storage.get_job(available.id).unwrap().unwrap();
+        assert_eq!(pinned.state, JobState::Pending);
+        assert_eq!(available.state, JobState::Starting);
+        assert_eq!(available.node.unwrap().as_str(), "node-001");
+        assert_eq!(starts.load(Ordering::Acquire), 1);
 
         drop(runtime);
         drop(service);
@@ -4274,6 +4568,8 @@ scheduler = "fifo"
             state.health = Some(NodeHealthCache {
                 valid: true,
                 ready: true,
+                job_storage_ready: true,
+                ready_shares: BTreeSet::new(),
                 agent_current: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
@@ -4366,6 +4662,95 @@ scheduler = "fifo"
     }
 
     #[test]
+    fn interactive_start_ack_marks_job_running_for_terminal_attachment() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use macluster_protocol::types::StartResult;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-interactive-start-ack-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let submitted = service
+            .storage
+            .submit_once(
+                RequestId(Id128::random()),
+                JobSpec {
+                    storage_namespace: None,
+                    required_shares: Some(Vec::new()),
+                    queue: QueueName::new("mini01").unwrap(),
+                    node: None,
+                    name: "interactive attach gate".into(),
+                    cwd: shared_root.display().to_string(),
+                    stdout_path: shared_root.join("jobs/%j/out").display().to_string(),
+                    stderr_path: shared_root.join("jobs/%j/err").display().to_string(),
+                    walltime_secs: None,
+                    env: Default::default(),
+                    mode: JobMode::Interactive,
+                    snapshot: None,
+                },
+            )
+            .unwrap();
+        let reserved = service
+            .storage
+            .reserve_job(submitted.id, NodeId::new("worker").unwrap())
+            .unwrap();
+        let start_token = reserved.start_token.clone().unwrap();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let operation_id = 41;
+        let generation = 7;
+        let now = Instant::now();
+        let node = runtime.nodes.get_mut("worker").unwrap();
+        node.fenced = true;
+        node.generation = generation;
+        node.in_flight = Some(InFlightNodeOperation {
+            id: operation_id,
+            kind: WorkKind::Start,
+        });
+        let completion = WorkerCompletion {
+            tag: WorkTag {
+                epoch: service.epoch,
+                config_digest: runtime.digest.clone(),
+                node_id: Some("worker".into()),
+                generation,
+                operation_id,
+                kind: WorkKind::Start,
+                job_id: Some(reserved.id),
+                started_at: now,
+            },
+            received_at: now,
+            result: WorkerResult::Control(Ok(ResponseBody::Started(StartResult {
+                start_token,
+                accepted: true,
+                runner_pid: Some(7),
+            }))),
+        };
+
+        runtime.handle_completion(&mut service, completion).unwrap();
+
+        assert_eq!(
+            service
+                .storage
+                .get_job(submitted.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Running,
+            "an accepted interactive Start must unblock terminal attachment"
+        );
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn one_shot_dispatch_explains_legacy_jobs_pinned_to_login() {
         use crate::ControllerService;
         use macluster_core::storage::Storage;
@@ -4440,6 +4825,8 @@ scheduler = "fifo"
                 state.health = Some(NodeHealthCache {
                     valid: true,
                     ready: true,
+                    job_storage_ready: true,
+                    ready_shares: BTreeSet::new(),
                     agent_current: true,
                     interactive_pty: true,
                     namespaced_jobs: true,
@@ -4629,6 +5016,165 @@ scheduler = "fifo"
     }
 
     #[test]
+    fn fan_control_skips_agent_transport_for_unreachable_ssh_endpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-offline-fan-control-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(OfflineEndpointFanTransport {
+            calls: Arc::clone(&calls),
+        });
+
+        let response = super::dispatch_fan_control(
+            &config,
+            &transport,
+            None,
+            Some(FanPolicy::Power),
+            std::collections::HashSet::new(),
+        )
+        .unwrap();
+        let ControlPayload::FanControl(FanControlPayload::Detailed {
+            nodes: results,
+            hidden_unreachable,
+        }) = response
+        else {
+            panic!("unexpected fan-control response")
+        };
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(hidden_unreachable, 0);
+        assert!(results.iter().all(|result| {
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("SSH endpoint is not reachable"))
+        }));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_control_omits_confirmed_offline_nodes_and_reports_explicit_offline_targets() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-fan-control-hotplug-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 3);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(OfflineEndpointFanTransport {
+            calls: Arc::clone(&calls),
+        });
+        let offline = std::collections::HashSet::from(["node-000".to_owned()]);
+
+        let response = super::dispatch_fan_control(
+            &config,
+            &transport,
+            None,
+            Some(FanPolicy::Power),
+            offline.clone(),
+        )
+        .unwrap();
+        let ControlPayload::FanControl(FanControlPayload::Detailed {
+            nodes: results,
+            hidden_unreachable,
+        }) = response
+        else {
+            panic!("unexpected fan-control response")
+        };
+        assert_eq!(hidden_unreachable, 1);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["node-001", "node-002"]
+        );
+
+        let selected = super::dispatch_fan_control(
+            &config,
+            &transport,
+            Some(NodeId::new("node-000").unwrap()),
+            Some(FanPolicy::Power),
+            offline.clone(),
+        )
+        .unwrap();
+        let ControlPayload::FanControl(FanControlPayload::Detailed {
+            nodes: selected_results,
+            hidden_unreachable,
+        }) = selected
+        else {
+            panic!("unexpected selected fan-control response")
+        };
+        assert_eq!(hidden_unreachable, 0);
+        assert_eq!(selected_results.len(), 1);
+        assert_eq!(
+            selected_results[0].error.as_deref(),
+            Some("node transport error: node is offline")
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let all_offline = config.nodes.keys().cloned().collect();
+        let all_hidden =
+            super::dispatch_fan_control(&config, &transport, None, None, all_offline).unwrap();
+        assert!(matches!(
+            all_hidden,
+            ControlPayload::FanControl(FanControlPayload::Detailed {
+                nodes,
+                hidden_unreachable: 3
+            }) if nodes.is_empty()
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fan_control_uses_and_releases_the_shared_confirmed_offline_state() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-fan-liveness-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 1);
+        let observation = |reachable| crate::liveness::NodeObservation {
+            node_id: "node-000".into(),
+            identity_key: "192.0.2.1".into(),
+            reachable,
+            agent_responding: Some(reachable == Some(true)),
+        };
+        let observed_at = super::now_ms();
+        for sampled_at in [observed_at, observed_at + 3_000, observed_at + 6_000] {
+            crate::liveness::observe_many(
+                &root,
+                &config.share_uuid,
+                &[observation(Some(false))],
+                sampled_at,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            super::hidden_fan_nodes(&config, &root),
+            std::collections::HashSet::from(["node-000".to_owned()])
+        );
+
+        crate::liveness::observe_many(
+            &root,
+            &config.share_uuid,
+            &[observation(Some(true))],
+            observed_at + 7_000,
+        )
+        .unwrap();
+        assert!(super::hidden_fan_nodes(&config, &root).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn an_external_wake_datagram_signals_the_runtime_waiter() {
         use crate::wake::{ControllerWake, notify_controller};
 
@@ -4663,6 +5209,8 @@ scheduler = "fifo"
             node.health = Some(NodeHealthCache {
                 valid: true,
                 ready: true,
+                job_storage_ready: true,
+                ready_shares: BTreeSet::new(),
                 agent_current: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
@@ -4700,6 +5248,7 @@ scheduler = "fifo"
             id: 7,
             spec: JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new("mini01").unwrap(),
                 node: Some(node.clone()),
                 name: "reset test".into(),
@@ -4848,6 +5397,124 @@ scheduler = "fifo"
     }
 
     #[test]
+    fn cluster_maintenance_defers_confirmed_offline_node_probes_but_keeps_job_blockers() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-maintenance-offline-node-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 2);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        for node in runtime.nodes.values_mut() {
+            node.status = Some(NodeStatusCache {
+                online: true,
+                occupied: false,
+                sampled_at: now,
+            });
+        }
+        runtime.nodes.get_mut("node-000").unwrap().status = None;
+        runtime.nodes.get_mut("node-000").unwrap().in_flight = Some(InFlightNodeOperation {
+            id: 1,
+            kind: WorkKind::Probe,
+        });
+        let scope =
+            MaintenanceScope::ClusterExceptUnreachable(vec![NodeId::new("node-000").unwrap()]);
+        service.set_maintenance_scope(Some(scope.clone()));
+
+        assert!(
+            runtime
+                .maintenance_blockers(&service, &scope)
+                .unwrap()
+                .is_empty()
+        );
+
+        let submitted = submit_dispatch_test_job(&service.storage, &shared_root, Some("node-000"));
+        service
+            .storage
+            .reserve_job(submitted.id, NodeId::new("node-000").unwrap())
+            .unwrap();
+        service.storage.mark_running(submitted.id).unwrap();
+        let blockers = runtime.maintenance_blockers(&service, &scope).unwrap();
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("job 1 is Running on node-000"))
+        );
+
+        service
+            .storage
+            .finish_job(submitted.id, JobState::Completed, Some(0), None)
+            .unwrap();
+        service
+            .storage
+            .set_log_sync_pending(submitted.id, true)
+            .unwrap();
+        assert!(
+            runtime
+                .maintenance_blockers(&service, &scope)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .reload_quiescent_config(service.config.clone(), &scope)
+                .is_ok()
+        );
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cluster_maintenance_does_not_wait_for_a_recently_confirmed_offline_probe() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-maintenance-confirmed-offline-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 1);
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let node = runtime.nodes.get_mut("node-000").unwrap();
+        node.status = None;
+        node.probe_failures = 1;
+        node.last_host_reachable = Some((false, now));
+        node.in_flight = Some(InFlightNodeOperation {
+            id: 1,
+            kind: WorkKind::Probe,
+        });
+        service.set_maintenance_scope(Some(MaintenanceScope::Cluster));
+
+        assert!(
+            runtime
+                .maintenance_blockers(&service, &MaintenanceScope::Cluster)
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn scoped_maintenance_blocks_only_affected_nodes_from_dispatch() {
         use crate::ControllerService;
         use macluster_core::storage::Storage;
@@ -4876,6 +5543,8 @@ scheduler = "fifo"
             node.health = Some(NodeHealthCache {
                 valid: true,
                 ready: true,
+                job_storage_ready: true,
+                ready_shares: BTreeSet::new(),
                 agent_current: true,
                 interactive_pty: true,
                 namespaced_jobs: true,
@@ -5144,6 +5813,7 @@ scheduler = "fifo"
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: None,
                     name: "queued during reset".into(),
@@ -5230,6 +5900,8 @@ scheduler = "fifo"
         node.health = Some(NodeHealthCache {
             valid: true,
             ready: false,
+            job_storage_ready: false,
+            ready_shares: BTreeSet::new(),
             agent_current: true,
             interactive_pty: false,
             namespaced_jobs: false,
@@ -5395,6 +6067,7 @@ transport = "ssh"
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: None,
                     name: "interactive-shell".into(),

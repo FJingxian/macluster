@@ -460,6 +460,15 @@ fn run_authorized_with_attach_timeout(
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
+    // Prepare the inherited task environment while the login node is opening
+    // the interactive SSH attachment. Environment setup can involve SDK and
+    // shared toolchain metadata checks; overlapping it with the handshake
+    // keeps the delay out of the user's prompt without starting the task early.
+    let task_command = build_interactive_command(state_dir, job_id, &record)?;
+    let gate_path = local_dir.join(format!(".task-gate-{}", Id128::random()));
+    let mut command = super::gated_task_command(task_command, &gate_path);
+    super::configure_task_environment(&mut command, job_id, &record)?;
+
     // Do not start user code before the authorized terminal has attached. This
     // prevents short commands from exiting before msub receives their output.
     let (mut attachment, initial_window) =
@@ -481,10 +490,6 @@ fn run_authorized_with_attach_timeout(
     attachment.set_nonblocking(true)?;
 
     let (mut master, slave) = create_pty_with_size(initial_window.0, initial_window.1)?;
-    let task_command = build_interactive_command(state_dir, job_id, &record)?;
-    let gate_path = local_dir.join(format!(".task-gate-{}", Id128::random()));
-    let mut command = super::gated_task_command(task_command, &gate_path);
-    super::configure_task_environment(&mut command, job_id, &record)?;
     command
         .current_dir(&record.spec.cwd)
         .stdin(Stdio::from(slave.try_clone()?))
@@ -1330,6 +1335,7 @@ mod tests {
         let token = StartToken(Id128::random());
         let spec = JobSpec {
             storage_namespace: None,
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("mini01").unwrap(),
             node: None,
             name: "interactive-test".into(),

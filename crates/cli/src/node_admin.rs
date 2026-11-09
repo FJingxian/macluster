@@ -10583,35 +10583,6 @@ fn save_deferred_share_cleanup(
     state.save_to_dir(state_dir).map_err(io_error)
 }
 
-fn remember_deferred_share_marker_cleanup(
-    state_dir: &Path,
-    share_id: &str,
-    server_id: &str,
-    server: &NodeConfig,
-    share: &ShareConfig,
-    state: &AdminState,
-    alias_target: Option<String>,
-) -> AppResult<()> {
-    let mut pending = read_deferred_share_cleanup(state_dir)?;
-    pending.version = 1;
-    let machine_uuid = server
-        .machine_uuid
-        .clone()
-        .or_else(|| state.machine_uuids.get(server_id).cloned());
-    pending.marker_entries.insert(
-        marker_cleanup_key(share_id, server_id, &share.share_uuid),
-        DeferredShareMarkerCleanup {
-            share_id: share_id.to_owned(),
-            node_id: server_id.to_owned(),
-            source_root: share.source_root.to_string_lossy().into_owned(),
-            share_uuid: share.share_uuid.clone(),
-            machine_uuid,
-            alias_target,
-        },
-    );
-    save_deferred_share_cleanup(state_dir, &pending)
-}
-
 fn remember_deferred_share_server_cleanup(
     state_dir: &Path,
     share_id: &str,
@@ -11850,29 +11821,37 @@ fn remove_registered_share(
         save_admin_state(&journal_path, &state)?;
 
         let mut still_authorized = Vec::new();
+        let mut server_cleanup_error = None;
         if !export_requests.is_empty() && !server_offline {
-            let statuses = remove_managed_nfs_exports(server, &export_requests, &operation.id)
-                .map_err(|error| {
-                    (
-                        1,
-                        format!("cannot remove managed NFS exports for share {share_id}: {error}"),
-                    )
-                })?;
-            for ((_, node), (_, authorized)) in config
-                .nodes
-                .iter()
-                .filter(|(node_id, _)| node_id.as_str() != server_id)
-                .zip(statuses)
-            {
-                if authorized {
-                    still_authorized.push(node.host.to_string());
+            match remove_managed_nfs_exports(server, &export_requests, &operation.id) {
+                Ok(statuses) => {
+                    for ((_, node), (_, authorized)) in config
+                        .nodes
+                        .iter()
+                        .filter(|(node_id, _)| node_id.as_str() != server_id)
+                        .zip(statuses)
+                    {
+                        if authorized {
+                            still_authorized.push(node.host.to_string());
+                        }
+                    }
+                }
+                Err(error) => {
+                    server_cleanup_error =
+                        Some(format!("managed NFS export cleanup will retry: {error}"));
                 }
             }
         }
-        if !server_offline && share.source_root != share.mount_root {
-            remove_pending_share_alias(server, &share.mount_root, &share.source_root, share_id)?;
+        if !server_offline
+            && server_cleanup_error.is_none()
+            && share.source_root != share.mount_root
+            && let Err(error) =
+                remove_pending_share_alias(server, &share.mount_root, &share.source_root, share_id)
+        {
+            server_cleanup_error =
+                Some(format!("managed NFS alias cleanup will retry: {}", error.1));
         }
-        if !server_offline {
+        if !server_offline && server_cleanup_error.is_none() {
             match remove_pending_share_marker(server, &share.source_root, share_uuid, share_id) {
                 Ok(()) => forget_deferred_share_marker_cleanup(
                     state_dir,
@@ -11888,18 +11867,23 @@ fn remove_registered_share(
                     // exports registered forever. The operation journal records
                     // the UUID, and this sidecar retries exact marker cleanup once
                     // the source responds again.
-                    remember_deferred_share_marker_cleanup(
-                        state_dir, share_id, &server_id, server, &share, &state, None,
-                    )?;
+                    server_cleanup_error =
+                        Some(format!("source marker cleanup will retry: {error}"));
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    server_cleanup_error =
+                        Some(format!("source marker cleanup will retry: {}", error.1));
+                }
             }
         }
+        let server_cleanup_deferred = server_offline || server_cleanup_error.is_some();
 
         operation.phase = "REMOVAL_COMMITTING".into();
         operation.detail = Some(if server_offline {
             "NFS server is offline; exact server cleanup will be reconciled after reconnecting"
                 .into()
+        } else if let Some(error) = &server_cleanup_error {
+            format!("client mounts are removed; {error}")
         } else {
             "NFS resources are removed; committing share config change".into()
         });
@@ -11910,7 +11894,7 @@ fn remove_registered_share(
         backup_config(&config_path, &operation.id)?;
         atomic_write(&config_path, candidate.as_bytes())?;
 
-        if server_offline {
+        if server_cleanup_deferred {
             remember_deferred_share_server_cleanup(
                 state_dir,
                 share_id,

@@ -310,13 +310,14 @@ impl NodeRuntime {
     }
 
     fn should_log_nfs_reconcile(&mut self, error: &str, now: Instant) -> bool {
+        let current = error.chars().take(512).collect::<String>();
         if let Some((previous, logged_at)) = &self.last_nfs_reconcile_log
-            && previous == error
+            && previous == &current
             && now.saturating_duration_since(*logged_at) < NFS_RECONCILE_LOG_INTERVAL
         {
             return false;
         }
-        self.last_nfs_reconcile_log = Some((error.chars().take(512).collect(), now));
+        self.last_nfs_reconcile_log = Some((current, now));
         true
     }
 
@@ -5297,6 +5298,16 @@ scheduler = "fifo"
         assert!(runtime.should_log_nfs_reconcile(
             "different error",
             now + NFS_RECONCILE_LOG_INTERVAL + Duration::from_secs(2)
+        ));
+        runtime.clear_nfs_reconcile_log();
+        let long_error = "x".repeat(600);
+        assert!(runtime.should_log_nfs_reconcile(
+            &long_error,
+            now + NFS_RECONCILE_LOG_INTERVAL + Duration::from_secs(3)
+        ));
+        assert!(!runtime.should_log_nfs_reconcile(
+            &long_error,
+            now + NFS_RECONCILE_LOG_INTERVAL + Duration::from_secs(4)
         ));
     }
 

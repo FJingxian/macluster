@@ -359,7 +359,14 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let disk = aggregate_disk(&scope_rows);
     let network = aggregate_network(&scope_rows);
     let power = aggregate_power(&scope_rows);
-    let online = state
+    let known = state
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.identity.compute_member && matches!(node.metrics, MetricView::Available { .. })
+        })
+        .count();
+    let fresh = state
         .nodes
         .iter()
         .filter(|node| {
@@ -395,6 +402,21 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let timestamp = state
         .updated_at
         .map_or_else(|| "waiting".into(), |instant| format_age(instant.elapsed()));
+    let sample_age = state
+        .nodes
+        .iter()
+        .filter(|node| node.identity.compute_member)
+        .filter_map(|node| match &node.metrics {
+            MetricView::Available { age, .. } => Some(*age),
+            MetricView::Loading | MetricView::Unavailable { .. } => None,
+        })
+        .max()
+        .unwrap_or_default();
+    let sample_status = if known > 0 && fresh < known {
+        format!("Stale {}", format_age(sample_age))
+    } else {
+        format!("Updated {timestamp}")
+    };
     let title_style = if state.no_color {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -404,8 +426,8 @@ fn render_summary(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
     let summary = vec![Line::from(Span::styled(
         format!(
-            " {}  ·  {}/{} compute nodes online   {}   Updated {}",
-            state.queue_name, online, compute_nodes, job_summary, timestamp
+            " {}  ·  {}/{} compute nodes known   {}   {}",
+            state.queue_name, known, compute_nodes, job_summary, sample_status
         ),
         title_style,
     ))];

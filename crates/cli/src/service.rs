@@ -1,7 +1,7 @@
 //! User-session LaunchAgent lifecycle and its stable, versioned executable.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     env,
     fs::{self, File, OpenOptions},
     io,
@@ -643,6 +643,11 @@ impl<L: ServiceLauncher> ServiceManager<L> {
         ensure_private_directory(&service_dir, self.binding.uid())?;
         let versions_dir = service_dir.join("versions");
         ensure_private_directory(&versions_dir, self.binding.uid())?;
+        let previous_digest = read_active_version(&service_dir.join("active-version"));
+        let installed_digest = read_plist_version(&self.plist_path());
+        let mut retained_versions = BTreeSet::new();
+        retained_versions.extend(previous_digest);
+        retained_versions.extend(installed_digest);
         let version_dir = versions_dir.join(&digest);
         ensure_private_directory(&version_dir, self.binding.uid())?;
         let destination = version_dir.join("macluster");
@@ -726,6 +731,12 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             digest.as_bytes(),
             self.binding.uid(),
         )?;
+        prune_old_service_versions(
+            &versions_dir,
+            self.binding.uid(),
+            &digest,
+            &retained_versions,
+        );
         Ok(destination)
     }
 
@@ -903,6 +914,66 @@ fn cached_file_digest(path: &Path) -> Result<String, ServiceLifecycleError> {
     cache.retain(|key, _| key.path != canonical);
     cache.insert(identity, digest.clone());
     Ok(digest)
+}
+
+fn valid_service_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_active_version(manifest: &Path) -> Option<String> {
+    fs::read_to_string(manifest)
+        .ok()
+        .map(|contents| contents.trim().to_owned())
+        .filter(|digest| valid_service_digest(digest))
+}
+
+fn read_plist_version(plist: &Path) -> Option<String> {
+    let contents = fs::read_to_string(plist).ok()?;
+    let marker = "/service/versions/";
+    let digest = contents.split_once(marker)?.1;
+    let digest = digest.split('/').next()?;
+    valid_service_digest(digest).then(|| digest.to_owned())
+}
+
+fn prune_old_service_versions(
+    versions_dir: &Path,
+    uid: u32,
+    current: &str,
+    retained: &BTreeSet<String>,
+) {
+    let entries = match fs::read_dir(versions_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "macluster: could not inspect old controller service versions at {}: {error}",
+                versions_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !valid_service_digest(name) || name == current || retained.contains(name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&path) {
+            eprintln!(
+                "macluster: could not remove obsolete controller version {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Returns the content hash used in controller handshakes for the running executable.
@@ -1205,5 +1276,64 @@ impl ServiceLauncher for LaunchdServiceLauncher {
             }
             Err(error) => Err(HelloProbeError::Unavailable(error.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, fs, os::unix::fs::symlink};
+
+    use macluster_protocol::identifiers::Id128;
+
+    use super::{prune_old_service_versions, read_plist_version};
+
+    #[test]
+    fn service_version_pruning_keeps_current_and_previous_versions() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-service-prune-{}", Id128::random()));
+        let versions = root.join("versions");
+        fs::create_dir_all(&versions).unwrap();
+        let digest = |character: char| character.to_string().repeat(64);
+        let current = digest('a');
+        let previous = digest('b');
+        let obsolete = digest('c');
+        for name in [&current, &previous, &obsolete] {
+            fs::create_dir(versions.join(name)).unwrap();
+        }
+        fs::create_dir(versions.join("not-a-service-digest")).unwrap();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, versions.join(digest('d'))).unwrap();
+
+        let retained = BTreeSet::from([previous.clone()]);
+        prune_old_service_versions(&versions, unsafe { libc::geteuid() }, &current, &retained);
+
+        assert!(versions.join(current).is_dir());
+        assert!(versions.join(previous).is_dir());
+        assert!(!versions.join(obsolete).exists());
+        assert!(versions.join("not-a-service-digest").is_dir());
+        assert!(outside.is_dir(), "pruning must not follow symlinks");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn service_version_is_read_from_the_installed_launch_agent_target() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-service-plist-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let plist = root.join("controller.plist");
+        let digest = "a".repeat(64);
+        fs::write(
+            &plist,
+            format!(
+                "<array><string>/tmp/state/service/versions/{digest}/macluster</string></array>"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(read_plist_version(&plist), Some(digest));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

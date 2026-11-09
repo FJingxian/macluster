@@ -54,6 +54,7 @@ const NODE_HEALTH_TTL: Duration = Duration::from_secs(60);
 const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const NODE_STALE_AGENT_RETRY: Duration = Duration::from_secs(30);
 const MAINTENANCE_HOST_UNREACHABLE_TTL: Duration = Duration::from_secs(30);
+const NFS_RECONCILE_LOG_INTERVAL: Duration = Duration::from_secs(300);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
@@ -248,6 +249,7 @@ struct NodeRuntime {
     control_failures: u8,
     nfs_reconcile_attempts: u8,
     next_nfs_reconcile_at: Instant,
+    last_nfs_reconcile_log: Option<(String, Instant)>,
     pending_start: Option<JobRecord>,
 }
 
@@ -268,6 +270,7 @@ impl NodeRuntime {
             control_failures: 0,
             nfs_reconcile_attempts: 0,
             next_nfs_reconcile_at: now,
+            last_nfs_reconcile_log: None,
             pending_start: None,
         }
     }
@@ -304,6 +307,21 @@ impl NodeRuntime {
                 !reachable
                     && now.saturating_duration_since(sampled_at) < MAINTENANCE_HOST_UNREACHABLE_TTL
             })
+    }
+
+    fn should_log_nfs_reconcile(&mut self, error: &str, now: Instant) -> bool {
+        if let Some((previous, logged_at)) = &self.last_nfs_reconcile_log
+            && previous == error
+            && now.saturating_duration_since(*logged_at) < NFS_RECONCILE_LOG_INTERVAL
+        {
+            return false;
+        }
+        self.last_nfs_reconcile_log = Some((error.chars().take(512).collect(), now));
+        true
+    }
+
+    fn clear_nfs_reconcile_log(&mut self) {
+        self.last_nfs_reconcile_log = None;
     }
 }
 
@@ -924,6 +942,7 @@ impl RuntimeState {
                         runtime.health = None;
                         runtime.next_probe_at = now;
                         runtime.last_probe_error = None;
+                        runtime.clear_nfs_reconcile_log();
                     }
                     Err(error) => {
                         runtime.nfs_reconcile_attempts =
@@ -940,7 +959,11 @@ impl RuntimeState {
                                 .take(256)
                                 .collect(),
                         );
-                        eprintln!("macluster: NFS reconciliation on {node_id} will retry: {error}");
+                        if runtime.should_log_nfs_reconcile(&error, now) {
+                            eprintln!(
+                                "macluster: NFS reconciliation on {node_id} will retry: {error}"
+                            );
+                        }
                     }
                 }
             }
@@ -1593,7 +1616,9 @@ impl RuntimeState {
                 .take(256)
                 .collect(),
         );
-        eprintln!("macluster: NFS reconciliation for {node_id} deferred: {error}");
+        if runtime.should_log_nfs_reconcile(&error, now) {
+            eprintln!("macluster: NFS reconciliation for {node_id} deferred: {error}");
+        }
     }
 
     fn schedule_share_probe<T: NodeTransport>(&mut self, service: &ControllerService<T>) {
@@ -3122,12 +3147,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NODE_HEALTH_RETRY, NODE_HEALTH_TTL,
-        NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL, NodeHealthCache, NodeRuntime, NodeStatusCache,
-        RuntimeState, WakeForwarder, WorkKind, WorkTag, WorkerCompletion, WorkerPool, WorkerResult,
-        health_retry_delay, maintenance_drain_complete, node_probe_retry_delay,
-        node_result_is_current, now_ms, pending_queue_heads, probe_delay, reset_drain_complete,
-        retry_delay, run_forever, should_measure_job_storage,
+        IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NFS_RECONCILE_LOG_INTERVAL,
+        NODE_HEALTH_RETRY, NODE_HEALTH_TTL, NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL,
+        NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState, WakeForwarder, WorkKind,
+        WorkTag, WorkerCompletion, WorkerPool, WorkerResult, health_retry_delay,
+        maintenance_drain_complete, node_probe_retry_delay, node_result_is_current, now_ms,
+        pending_queue_heads, probe_delay, reset_drain_complete, retry_delay, run_forever,
+        should_measure_job_storage,
     };
     use crate::events::RuntimeSignal;
     use macluster_core::maintenance::ResetBarrierPolicy;
@@ -4353,7 +4379,7 @@ scheduler = "fifo"
         let root = std::env::temp_dir().join(format!(
             "macluster-pinned-head-backfill-{}-{}",
             std::process::id(),
-            now_ms()
+            Id128::random()
         ));
         fs::create_dir_all(&root).unwrap();
         let config = simulated_fleet_config(&root, 2);
@@ -4400,6 +4426,12 @@ scheduler = "fifo"
         assert_eq!(pinned.state, JobState::Pending);
         assert_eq!(available.state, JobState::Starting);
         assert_eq!(available.node.unwrap().as_str(), "node-001");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while starts.load(Ordering::Acquire) == 0 {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(Instant::now() < deadline, "Start RPC was not sent promptly");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(starts.load(Ordering::Acquire), 1);
 
         drop(runtime);
@@ -4953,7 +4985,7 @@ scheduler = "fifo"
                         node_id: None,
                         policy: Some(FanPolicy::Power),
                     },
-                    Duration::from_secs(3),
+                    Duration::from_secs(10),
                 )
             });
             let status_binding = binding.clone();
@@ -5010,7 +5042,11 @@ scheduler = "fifo"
             "status IPC waited for the slow fan operation: {:?}",
             status_elapsed
         );
-        assert!(matches!(result.1, Ok(ControlPayload::FanControl(_))));
+        assert!(
+            matches!(result.1, Ok(ControlPayload::FanControl(_))),
+            "fan-control IPC failed while another test was running: {:?}",
+            result.1
+        );
         assert!(result.2.is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5240,6 +5276,28 @@ scheduler = "fifo"
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(20), Duration::from_secs(30));
         assert_eq!(node_probe_retry_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn repeated_nfs_errors_are_logged_only_when_they_change_or_the_interval_elapses() {
+        let now = Instant::now();
+        let mut runtime = NodeRuntime::new(now);
+        assert!(runtime.should_log_nfs_reconcile("permission denied", now));
+        assert!(
+            !runtime.should_log_nfs_reconcile("permission denied", now + Duration::from_secs(299))
+        );
+        assert!(
+            runtime.should_log_nfs_reconcile("permission denied", now + NFS_RECONCILE_LOG_INTERVAL)
+        );
+        assert!(runtime.should_log_nfs_reconcile(
+            "different error",
+            now + NFS_RECONCILE_LOG_INTERVAL + Duration::from_secs(1)
+        ));
+        runtime.clear_nfs_reconcile_log();
+        assert!(runtime.should_log_nfs_reconcile(
+            "different error",
+            now + NFS_RECONCILE_LOG_INTERVAL + Duration::from_secs(2)
+        ));
     }
 
     fn reset_test_job(state: JobState, snapshot_sync_pending: bool) -> JobRecord {

@@ -45,6 +45,8 @@ type AppResult<T> = Result<T, (i32, String)>;
 const INTERACTIVE_FAST_POLL_WINDOW: Duration = Duration::from_secs(1);
 const INTERACTIVE_FAST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INTERACTIVE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_SUBMISSION_CACHE_ENTRIES: usize = 1024;
+const MAX_SUBMISSION_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HelpMode {
@@ -7549,7 +7551,69 @@ fn save_submission_cache(
     let metadata = serde_json::to_vec(&CachedSubmission { spec: spec.clone() })
         .map_err(|error| (1, error.to_string()))?;
     atomic_write(&dir.join(format!("{request_id}.script")), script)?;
-    atomic_write(&dir.join(format!("{request_id}.json")), &metadata)
+    atomic_write(&dir.join(format!("{request_id}.json")), &metadata)?;
+    if let Err(error) = prune_submission_cache(
+        &dir,
+        MAX_SUBMISSION_CACHE_ENTRIES,
+        MAX_SUBMISSION_CACHE_BYTES,
+    ) {
+        eprintln!("macluster: could not prune old submission cache entries: {error}");
+    }
+    Ok(())
+}
+
+fn prune_submission_cache(dir: &Path, retain: usize, max_bytes: u64) -> io::Result<()> {
+    let mut entries = BTreeMap::<String, (SystemTime, u64)>::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !matches!(extension, "json" | "script") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if Id128::parse(stem).is_err() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        entries
+            .entry(stem.to_owned())
+            .and_modify(|(current_modified, current_bytes)| {
+                *current_modified = (*current_modified).max(modified);
+                *current_bytes = current_bytes.saturating_add(metadata.len());
+            })
+            .or_insert((modified, metadata.len()));
+    }
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.1.0.cmp(&left.1.0).then_with(|| right.0.cmp(&left.0)));
+    let mut kept = 0_usize;
+    let mut kept_bytes = 0_u64;
+    for (request_id, (_, bytes)) in entries {
+        let within_limits =
+            kept < retain && (kept_bytes == 0 || kept_bytes.saturating_add(bytes) <= max_bytes);
+        if within_limits {
+            kept += 1;
+            kept_bytes = kept_bytes.saturating_add(bytes);
+            continue;
+        }
+        for extension in ["json", "script"] {
+            let path = dir.join(format!("{request_id}.{extension}"));
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -7723,7 +7787,7 @@ mod tests {
         explain_legacy_power_agent, format_fan_control_table, format_job_details,
         format_jobs_table, format_power, interactive_job_ready_to_attach, is_macluster_binary_path,
         maybe_run_agent_update, metric_row, metric_table_header, prepare_task_environment,
-        promote_inline_command, required_named_shares,
+        promote_inline_command, prune_submission_cache, required_named_shares,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
         submission_must_wait_for_agent_update,
@@ -7753,6 +7817,60 @@ mod tests {
             deferred_nodes_summary(100),
             "\n100 unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
         );
+    }
+
+    #[test]
+    fn submission_cache_keeps_only_the_newest_request_pairs() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-submission-cache-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = Id128::random().to_string();
+            fs::write(root.join(format!("{id}.json")), b"{}").unwrap();
+            fs::write(root.join(format!("{id}.script")), b"true\n").unwrap();
+            ids.push(id);
+            thread::sleep(Duration::from_millis(20));
+        }
+        fs::write(root.join("unrelated.txt"), b"preserve").unwrap();
+
+        prune_submission_cache(&root, 2, 1024).unwrap();
+
+        for id in &ids[..3] {
+            assert!(!root.join(format!("{id}.json")).exists());
+            assert!(!root.join(format!("{id}.script")).exists());
+        }
+        for id in &ids[3..] {
+            assert!(root.join(format!("{id}.json")).is_file());
+            assert!(root.join(format!("{id}.script")).is_file());
+        }
+        assert!(root.join("unrelated.txt").is_file());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn submission_cache_uses_the_total_size_limit() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-submission-size-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let id = Id128::random().to_string();
+            fs::write(root.join(format!("{id}.json")), vec![b'j'; 10]).unwrap();
+            fs::write(root.join(format!("{id}.script")), vec![b's'; 20]).unwrap();
+            ids.push(id);
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        prune_submission_cache(&root, 10, 70).unwrap();
+
+        assert!(!root.join(format!("{}.json", ids[0])).exists());
+        assert!(!root.join(format!("{}.json", ids[1])).exists());
+        assert!(root.join(format!("{}.json", ids[2])).is_file());
+        assert!(root.join(format!("{}.json", ids[3])).is_file());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::{
 
 use macluster_core::config::{NodeConfig, Transport};
 
-const PREVIEW_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm= | /usr/bin/sort -k2,2nr | /usr/bin/head -n 32";
+const PREVIEW_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_SAMPLE_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
@@ -555,8 +555,7 @@ fn collect_child(
             detail
         });
     }
-    String::from_utf8(output)
-        .map_err(|error| format!("{description} returned invalid UTF-8: {error}"))
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 fn read_bounded(reader: impl Read) -> io::Result<Vec<u8>> {
@@ -706,8 +705,8 @@ fn parse_process_names(input: &str) -> BTreeMap<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROCESS_COMMAND, ProcessCache, ProcessInfo, ProcessSort, ProcessView, parse_top_processes,
-        sort_processes,
+        PREVIEW_COMMAND, PROCESS_COMMAND, ProcessCache, ProcessInfo, ProcessSort, ProcessView,
+        parse_preview_processes, parse_top_processes, sort_processes,
     };
     use std::time::{Duration, Instant};
 
@@ -715,10 +714,9 @@ mod tests {
 
     #[test]
     fn preview_parses_rss_units_and_does_not_replace_interval_samples() {
-        let rows = super::parse_preview_processes(
-            "12 83.2 4096 1:23.45 Worker Helper\n13 NaN 4 0:01 invalid\n",
-        )
-        .unwrap();
+        let rows =
+            parse_preview_processes("12 83.2 4096 1:23.45 Worker Helper\n13 NaN 4 0:01 invalid\n")
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].memory, "4096K");
         assert_eq!(rows[0].command, "Worker Helper");
@@ -741,6 +739,15 @@ mod tests {
         assert!(
             matches!(cache.view_at(now), ProcessView::Available {rows, warning: None, ..} if rows.is_empty())
         );
+    }
+
+    #[test]
+    fn preview_sorts_in_process_and_tolerates_non_utf8_names() {
+        assert!(!PREVIEW_COMMAND.contains("/usr/bin/sort"));
+        let output = String::from_utf8_lossy(b"12 2.0 4096 0:01.00 bad\xffname\n");
+        let rows = parse_preview_processes(&output).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].command.contains('\u{fffd}'));
     }
 
     #[test]

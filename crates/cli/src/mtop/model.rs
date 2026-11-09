@@ -277,8 +277,9 @@ pub fn aggregate_cpu_temperature(rows: &[ResourceValues]) -> CpuTemperatureAggre
         total_nodes: rows.len(),
         ..CpuTemperatureAggregate::default()
     };
+    let include_stale = all_rows_stale(rows);
     for row in rows {
-        if !row.fresh {
+        if !row.fresh && !include_stale {
             continue;
         }
         let Some(value) = row
@@ -389,10 +390,11 @@ pub fn aggregate_cpu(rows: &[ResourceValues]) -> CpuAggregate {
         total_nodes: rows.len(),
         ..CpuAggregate::default()
     };
+    let include_stale = all_rows_stale(rows);
     let mut cpu = 0.0;
     let mut maximum = 0.0;
     for row in rows {
-        if !row.fresh {
+        if !row.fresh && !include_stale {
             continue;
         }
         if let Some((value, limit)) = row
@@ -425,10 +427,11 @@ pub fn aggregate_memory(rows: &[ResourceValues]) -> MemoryAggregate {
         total_nodes: rows.len(),
         ..MemoryAggregate::default()
     };
+    let include_stale = all_rows_stale(rows);
     let mut used = 0_u64;
     let mut total = 0_u64;
     for row in rows {
-        if !row.fresh {
+        if !row.fresh && !include_stale {
             continue;
         }
         if let Some((row_used, row_total)) = row.memory_used_bytes.zip(row.memory_total_bytes) {
@@ -490,11 +493,12 @@ fn aggregate_io(
     rows: &[ResourceValues],
     values: impl Fn(&ResourceValues) -> Option<(f64, f64)>,
 ) -> (Option<f64>, Option<f64>, usize) {
+    let include_stale = all_rows_stale(rows);
     let mut valid_nodes = 0;
     let mut first = 0.0;
     let mut second = 0.0;
     for row in rows {
-        if !row.fresh {
+        if !row.fresh && !include_stale {
             continue;
         }
         if let Some((a, b)) = values(row).filter(|(a, b)| a.is_finite() && b.is_finite()) {
@@ -508,6 +512,10 @@ fn aggregate_io(
     } else {
         (None, None, valid_nodes)
     }
+}
+
+fn all_rows_stale(rows: &[ResourceValues]) -> bool {
+    !rows.is_empty() && rows.iter().all(|row| !row.fresh)
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

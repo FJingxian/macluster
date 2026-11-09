@@ -141,6 +141,50 @@ fn disconnected_selected_node_remains_in_details_and_is_labeled_offline() {
 }
 
 #[test]
+fn stale_monitor_samples_keep_known_nodes_and_last_totals_visible() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.cpu_percent = Some(200.0);
+    snapshot.cpu_max_percent = Some(800.0);
+
+    let node = |id: &str| UiNode {
+        identity: DisplayNodeIdentity {
+            id: id.into(),
+            host: format!("{id}.local"),
+            role: NodeRole::Compute,
+            queues: vec!["default".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot: snapshot.clone(),
+            age: std::time::Duration::from_secs(90),
+            stale: true,
+        },
+        jobs: Vec::new(),
+        cpu_history: Vec::new(),
+        last_error: None,
+        processes: ProcessView::Loading,
+    };
+
+    let mut state = AppState::empty("default");
+    state.nodes = vec![node("default-001"), node("default-002")];
+    state.selected_id = Some("default-001".into());
+
+    let screen = rendered_lines(160, 40, &state).join("\n");
+    assert!(
+        screen.contains("2/2 compute nodes known"),
+        "stale samples must not look like offline nodes: {screen}"
+    );
+    assert!(
+        screen.contains("CPU% 400/1600"),
+        "the last complete totals should remain visible: {screen}"
+    );
+    assert!(
+        screen.contains("Stale 90s"),
+        "the summary must identify stale data explicitly: {screen}"
+    );
+}
+
+#[test]
 fn expanded_resource_panel_fits_a_100_column_terminal() {
     let mut snapshot = macluster_metrics::unavailable(1, "fixture");
     snapshot.cpu_percent = Some(125.0);

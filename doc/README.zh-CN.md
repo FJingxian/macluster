@@ -160,7 +160,7 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 | `macluster node --failed` | 查看未完成的节点或共享操作及错误原因 |
 | `macluster node -rm NODE_ID` | 移除空闲计算节点；托管共享的节点需先迁移存储 |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | 使用新地址连接并核实原机器身份后移除 |
-| `macluster node -rm share:SHARE_ID` | 取消未完成的共享配置 |
+| `macluster node -rm share:SHARE_ID [--force]` | 移除已配置共享或取消未完成配置；`--force` 用于处理仍被进程占用的挂载 |
 | `macluster fans --status [--node ID]` | 查看风扇策略与支持情况 |
 | `macluster fans --auto [--node ID]` | 按 40–80°C 线性调速 |
 | `macluster fans --power [--node ID]` | 按 40–80°C 对数曲线调速 |

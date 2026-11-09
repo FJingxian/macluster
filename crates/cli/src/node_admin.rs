@@ -102,6 +102,7 @@ const INTERACTIVE_SSH_OPTIONS: &[&str] = &[
 const ADMIN_COMMAND_LIMIT: Duration = Duration::from_secs(300);
 const LOCAL_ADMIN_SCRIPT_LIMIT: Duration = Duration::from_secs(60);
 const ADMIN_TIMEOUT: &str = "administrator command timed out";
+const MOUNT_HOLDER_LIMIT: usize = 12;
 
 const MAINTENANCE_WAIT_LIMIT: Duration = Duration::from_secs(300);
 
@@ -1874,6 +1875,7 @@ enum Action {
     Remove {
         target: String,
         connect: Option<NodeEndpoint>,
+        force: bool,
     },
 }
 
@@ -1996,9 +1998,13 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         }
         Action::Failures => list_failed_operations(&config_path, &state_dir),
         Action::Add(options) => add_node(&config_path, &state_dir, options),
-        Action::Remove { target, connect } => {
+        Action::Remove {
+            target,
+            connect,
+            force,
+        } => {
             if let Some(share_id) = target.strip_prefix("share:") {
-                remove_share(&config_path, &state_dir, share_id)
+                remove_share(&config_path, &state_dir, share_id, force)
             } else {
                 remove_node(&config_path, &state_dir, &target, connect.as_ref())
             }
@@ -3721,41 +3727,81 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
             }))
         }
         "-rm" | "--remove" => {
-            if inline.is_some() || !matches!(args.len(), 2 | 4) {
+            if inline.is_some() || args.len() < 2 {
                 return Err((
                     2,
                     format!(
-                        "{key} requires a node ID or pending share ID, optionally followed by --connect USER@IPv4[:PORT]"
+                        "{key} requires a node ID or pending share ID, optionally followed by --connect USER@IPv4[:PORT] or --force for a named share"
                     ),
                 ));
             }
             let value = args[1].clone();
             let identifier = value.strip_prefix("share:").unwrap_or(&value);
             NodeId::new(identifier.to_owned()).map_err(|error| (2, error.to_string()))?;
-            let connect = if args.len() == 4 {
-                if args[2] != "--connect" {
-                    return Err((2, format!("unknown mnode remove option '{}'", args[2])));
+            let is_share = value.starts_with("share:");
+            let mut connect = None;
+            let mut force = false;
+            let mut index = 2;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--force" if is_share => {
+                        if force {
+                            return Err((2, "--force may only be specified once".into()));
+                        }
+                        force = true;
+                        index += 1;
+                    }
+                    "--force" => {
+                        return Err((
+                            2,
+                            "--force is only supported when removing a named share".into(),
+                        ));
+                    }
+                    "--connect" => {
+                        if connect.is_some() {
+                            return Err((2, "--connect may only be specified once".into()));
+                        }
+                        if is_share {
+                            return Err((
+                                2,
+                                "--connect is only supported when removing a configured node"
+                                    .into(),
+                            ));
+                        }
+                        let endpoint = args
+                            .get(index + 1)
+                            .ok_or_else(|| (2, "--connect requires USER@IPv4[:PORT]".into()))?;
+                        let endpoint = NodeEndpoint::parse(endpoint).map_err(|error| (2, error))?;
+                        if endpoint.source_path.is_some() {
+                            return Err((
+                                2,
+                                "--connect accepts USER@IPv4[:PORT], without a source path".into(),
+                            ));
+                        }
+                        connect = Some(endpoint);
+                        index += 2;
+                    }
+                    option => {
+                        return Err((2, format!("unknown mnode remove option '{option}'")));
+                    }
                 }
-                if value.starts_with("share:") {
-                    return Err((
-                        2,
-                        "--connect is only supported when removing a configured node".into(),
-                    ));
-                }
-                let endpoint = NodeEndpoint::parse(&args[3]).map_err(|error| (2, error))?;
-                if endpoint.source_path.is_some() {
-                    return Err((
-                        2,
-                        "--connect accepts USER@IPv4[:PORT], without a source path".into(),
-                    ));
-                }
-                Some(endpoint)
-            } else {
-                None
-            };
+            }
+            if !is_share && force {
+                return Err((
+                    2,
+                    "--force is only supported when removing a named share".into(),
+                ));
+            }
+            if is_share && connect.is_some() {
+                return Err((
+                    2,
+                    "--connect is only supported when removing a configured node".into(),
+                ));
+            }
             Ok(Action::Remove {
                 target: value,
                 connect,
+                force,
             })
         }
         _ => Err((2, format!("unknown mnode option '{key}'"))),
@@ -3775,7 +3821,7 @@ fn node_help(full: bool) -> &'static str {
   mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
-  mnode -rm share:SHARE_ID
+  mnode -rm share:SHARE_ID [--force]
 
 OPTIONS
   --queue QUEUE       Choose a compute queue.
@@ -3783,6 +3829,7 @@ OPTIONS
   --share-id ID       Name an additional NFS share.
   --mount-root PATH   Choose its client mount path.
   --overlay-existing  Keep client files under the NFS mount.
+  --force             Force-detach a named share whose NFS mount is in use.
 
 EXAMPLES
   mnode -a user@192.0.2.10
@@ -3801,7 +3848,7 @@ Use --help for share, SSH, and removal details."#;
   mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
-  mnode -rm share:SHARE_ID
+  mnode -rm share:SHARE_ID [--force]
 
 OPTIONS
   --queue QUEUE       Choose a compute queue.
@@ -3810,6 +3857,7 @@ OPTIONS
   --mount-root PATH   Choose its client mount path.
   --overlay-existing  Keep client files underneath the NFS mount.
   --connect USER@IP   Reach a moved node at its current address.
+  --force             Force-detach a named share whose client mount is in use.
 
 EXAMPLES
   mnode -a user@192.0.2.10
@@ -3850,7 +3898,10 @@ REMOVE NODES
   its machine UUID, and preserves the previous address for NFS export cleanup.
   The connection is saved for interrupted-removal retries. Host-key
   verification stays enabled. `mnode -rm share:SHARE_ID` removes a configured
-  named share or cancels incomplete setup. Source directories and files remain.
+  named share or cancels incomplete setup. If a client mount is in use, mnode
+  lists the holding processes and asks before a forced detach; non-interactive
+  callers can explicitly use --force. Forced unmount may make those processes
+  fail with I/O errors. Source directories and files remain.
 
 SCAN NETWORK
   `mnode --scan` searches only the subnet attached to the configured login
@@ -9997,7 +10048,12 @@ fn abort_pending_enrollment(
     Ok(true)
 }
 
-fn remove_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
+fn remove_share(
+    config_path: &Path,
+    state_dir: &Path,
+    share_id: &str,
+    force: bool,
+) -> AppResult<()> {
     let config_path = config_path.canonicalize().map_err(io_error)?;
     let config = read_config(&config_path)?;
     let journal_path = state_dir.join("node-admin.json");
@@ -10021,7 +10077,7 @@ fn remove_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResu
         ));
     }
     if share_remove_uses_registered_path(config.shares.contains_key(share_id), &state, share_id) {
-        remove_registered_share(&config_path, state_dir, share_id)
+        remove_registered_share(&config_path, state_dir, share_id, force)
     } else {
         remove_pending_share(&config_path, state_dir, share_id)
     }
@@ -10380,6 +10436,121 @@ struct ShareRemovalClientPlan {
     node: NodeConfig,
     mounts: Vec<NfsMount>,
     aliases: Vec<NfsAlias>,
+}
+
+fn parse_mount_holder_lines(output: &str) -> Vec<String> {
+    let mut pids = BTreeSet::new();
+    let mut holders = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_command) = fields.next() else {
+            continue;
+        };
+        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !pids.insert(pid) {
+            continue;
+        }
+        holders.push(line.chars().take(256).collect());
+        if holders.len() >= MOUNT_HOLDER_LIMIT {
+            break;
+        }
+    }
+    holders
+}
+
+fn inspect_mount_holders(node: &NodeConfig, target: &Path) -> Result<Vec<String>, String> {
+    let script = format!(
+        "/usr/sbin/lsof -nP {} 2>&1",
+        shell_quote(&target.to_string_lossy())
+    );
+    let output = ssh_output_with_timeout(node, &script, None, Duration::from_secs(3))
+        .map_err(|(_, error)| error)?;
+    match output.status.code() {
+        Some(0 | 1) => Ok(parse_mount_holder_lines(&String::from_utf8_lossy(
+            &output.stdout,
+        ))),
+        _ => Err(command_error(
+            "cannot inspect processes using mount",
+            &output,
+        )),
+    }
+}
+
+fn busy_named_share_mount_error(
+    share_id: &str,
+    node_id: &str,
+    target: &Path,
+    holders: &[String],
+) -> String {
+    let holder_text = holders
+        .iter()
+        .map(|holder| format!("  {holder}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "named share {share_id} cannot be removed because {} on {node_id} is in use:\n{holder_text}\nStop the listed processes and rerun `mnode -rm share:{share_id}`, or force-detach the mount with `mnode -rm share:{share_id} --force`. Forced unmount may cause those processes to fail with I/O errors.",
+        target.display()
+    )
+}
+
+fn confirm_busy_named_share_removal(
+    share_id: &str,
+    clients: &[ShareRemovalClientPlan],
+) -> AppResult<bool> {
+    let mut busy = Vec::new();
+    for client in clients {
+        for mount in &client.mounts {
+            let target = Path::new(&mount.target);
+            let holders = inspect_mount_holders(&client.node, target).map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "cannot inspect processes using {} on {} before removing share {share_id}: {error}",
+                        target.display(),
+                        client.node_id
+                    ),
+                )
+            })?;
+            if !holders.is_empty() {
+                busy.push((client.node_id.clone(), target.to_path_buf(), holders));
+            }
+        }
+    }
+    if busy.is_empty() {
+        return Ok(false);
+    }
+    for (node_id, target, holders) in &busy {
+        eprintln!(
+            "{}",
+            busy_named_share_mount_error(share_id, node_id, target, holders)
+        );
+    }
+    if !io::stdin().is_terminal() {
+        return Err((
+            1,
+            format!(
+                "named share {share_id} is still in use; rerun with `mnode -rm share:{share_id} --force` after reviewing the listed processes"
+            ),
+        ));
+    }
+    eprint!(
+        "Force-detach the listed NFS mount(s)? Processes using them may fail with I/O errors. [y/N]: "
+    );
+    io::stdout().flush().map_err(io_error)?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).map_err(io_error)?;
+    if !shutdown_confirmation_accepted(&response) {
+        return Err((
+            1,
+            format!(
+                "named share {share_id} removal cancelled; stop the listed processes and rerun without --force"
+            ),
+        ));
+    }
+    eprintln!("Forcing NFS unmount for named share {share_id}.");
+    Ok(true)
 }
 
 fn share_marker_read_can_be_deferred(error: &str, source_root: &Path) -> bool {
@@ -10981,7 +11152,12 @@ fn retry_deferred_share_export_cleanup(
     Ok(deferred)
 }
 
-fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
+fn remove_registered_share(
+    config_path: &Path,
+    state_dir: &Path,
+    share_id: &str,
+    mut force: bool,
+) -> AppResult<()> {
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
         state_dir,
@@ -11612,6 +11788,9 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 aliases,
             });
         }
+        if !force && confirm_busy_named_share_removal(share_id, &clients)? {
+            force = true;
+        }
 
         let candidate = remove_share_sections(&source_text, &BTreeSet::from([share_id.to_owned()]));
         let candidate_config =
@@ -11623,7 +11802,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
         }
         operation.old_config_sha256 = Some(current_digest.clone());
         operation.phase = "REMOVAL_PENDING".into();
-        operation.detail = Some("removing exact NFS mounts, exports, aliases and marker".into());
+        operation.detail = Some("detaching managed client NFS mounts".into());
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
@@ -11637,22 +11816,38 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &client.node,
                 &client.mounts,
                 &client.aliases,
-                false,
+                force,
                 &format!(
                     "remove exact NFS share {share_id} mount on {}",
                     client.node_id
                 ),
             )
             .map_err(|error| {
+                let force_hint = if !force
+                    && (error.to_ascii_lowercase().contains("busy")
+                        || error.contains("Unmount failed"))
+                {
+                    format!(
+                        "\nStop processes using the mount or rerun `mnode -rm share:{share_id} --force` to force-detach it."
+                    )
+                } else {
+                    String::new()
+                };
                 (
                     1,
                     format!(
-                        "cannot remove share {share_id} mount from {}: {error}",
+                        "cannot remove share {share_id} mount from {}: {error}{force_hint}",
                         client.node_id
                     ),
                 )
             })?;
         }
+
+        operation.detail = Some("removing managed NFS exports, aliases, and source marker".into());
+        state
+            .operations
+            .insert(operation_key.clone(), operation.clone());
+        save_admin_state(&journal_path, &state)?;
 
         let mut still_authorized = Vec::new();
         if !export_requests.is_empty() && !server_offline {
@@ -20456,8 +20651,90 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let args = ["-rm", "share:volumes_data"].map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::Remove { target, connect: None }) if target == "share:volumes_data"
+            Ok(Action::Remove {
+                target,
+                connect: None,
+                force: false
+            }) if target == "share:volumes_data"
         ));
+    }
+
+    #[test]
+    fn share_removal_accepts_force_but_node_removal_does_not() {
+        let args = ["-rm", "share:homebrew", "--force"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Remove {
+                target,
+                connect: None,
+                force: true
+            }) if target == "share:homebrew"
+        ));
+
+        let args = ["-rm", "default-a", "--force"].map(str::to_owned);
+        let error = parse_action(&args).expect_err("node removal must reject force");
+        assert_eq!(error.0, 2);
+        assert!(error.1.contains("--force"), "{error:?}");
+
+        let args = ["-rm", "share:homebrew", "--force", "--force"].map(str::to_owned);
+        assert!(parse_action(&args).is_err());
+    }
+
+    #[test]
+    fn lsof_output_reports_processes_holding_a_managed_mount() {
+        let output = concat!(
+            "COMMAND     PID     USER  FD   TYPE DEVICE SIZE/OFF NODE NAME\n",
+            "cc-switch 48719 operator txt REG 26,15 19204832 1 /opt/homebrew/bin/cc-switch\n",
+            "worker     9001 operator cwd DIR 26,15       96 2 /opt/homebrew\n"
+        );
+        let holders = super::parse_mount_holder_lines(output);
+        assert_eq!(holders.len(), 2);
+        assert!(holders[0].contains("cc-switch"));
+        assert!(holders[1].contains("/opt/homebrew"));
+    }
+
+    #[test]
+    fn unavailable_lsof_output_has_no_mount_holders() {
+        assert!(super::parse_mount_holder_lines("").is_empty());
+        assert!(super::parse_mount_holder_lines("lsof: WARNING: can't stat()\n").is_empty());
+    }
+
+    #[test]
+    fn busy_mount_error_lists_holders_and_force_command() {
+        let message = super::busy_named_share_mount_error(
+            "homebrew",
+            "default-001",
+            Path::new("/opt/homebrew"),
+            &["cc-switch 48719 operator txt REG 26,15 1 /opt/homebrew/bin/cc-switch".into()],
+        );
+        assert!(message.contains("default-001"));
+        assert!(message.contains("cc-switch"));
+        assert!(message.contains("mnode -rm share:homebrew --force"));
+        assert!(message.contains("in use"));
+    }
+
+    #[test]
+    fn removal_accepts_an_explicit_connection_for_a_moved_node() {
+        let args = ["-rm", "default-a", "--connect", "operator@192.0.2.10"].map(str::to_owned);
+        assert!(
+            parse_action(&args).is_ok(),
+            "removal must allow the registered Mac to be reached at its current address"
+        );
+    }
+
+    #[test]
+    fn removal_rejects_connection_paths_and_share_overrides() {
+        for args in [
+            [
+                "-rm",
+                "default-a",
+                "--connect",
+                "operator@192.0.2.10:/tmp/share",
+            ],
+            ["-rm", "share:tools", "--connect", "operator@192.0.2.10"],
+        ] {
+            assert!(parse_action(&args.map(str::to_owned)).is_err());
+        }
     }
 
     #[test]
@@ -20486,30 +20763,6 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             parse_action(&args),
             Ok(Action::List { all: false })
         ));
-    }
-
-    #[test]
-    fn removal_accepts_an_explicit_connection_for_a_moved_node() {
-        let args = ["-rm", "default-a", "--connect", "operator@192.0.2.10"].map(str::to_owned);
-        assert!(
-            parse_action(&args).is_ok(),
-            "removal must allow the registered Mac to be reached at its current address"
-        );
-    }
-
-    #[test]
-    fn removal_rejects_connection_paths_and_share_overrides() {
-        for args in [
-            [
-                "-rm",
-                "default-a",
-                "--connect",
-                "operator@192.0.2.10:/tmp/share",
-            ],
-            ["-rm", "share:tools", "--connect", "operator@192.0.2.10"],
-        ] {
-            assert!(parse_action(&args.map(str::to_owned)).is_err());
-        }
     }
 
     #[test]
@@ -20924,7 +21177,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         );
         super::save_admin_state(&state_dir.join("node-admin.json"), &state).unwrap();
 
-        super::remove_share(&config_path, &state_dir, "tools").unwrap();
+        super::remove_share(&config_path, &state_dir, "tools", false).unwrap();
 
         let remaining_config = fs::read_to_string(&config_path).unwrap();
         let parsed = ClusterConfig::parse(&remaining_config).unwrap();
@@ -20954,7 +21207,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let config_path = config_path.canonicalize().unwrap();
         let state_dir = state_dir.canonicalize().unwrap();
 
-        let error = super::remove_share(&config_path, &state_dir, "primary").unwrap_err();
+        let error = super::remove_share(&config_path, &state_dir, "primary", false).unwrap_err();
 
         assert!(error.1.contains("primary storage is not a named share"));
         assert!(error.1.contains("macluster --init"));

@@ -158,7 +158,7 @@ The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an 
 | `macluster node --failed` | Unfinished enrollment/share/removal errors |
 | `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
-| `macluster node -rm share:SHARE_ID` | Cancel incomplete named-share setup |
+| `macluster node -rm share:SHARE_ID [--force]` | Remove a configured share or cancel incomplete setup; `--force` handles a mounted share still in use |
 | `macluster fans --status [--node ID]` | Fan policy and support |
 | `macluster fans --auto [--node ID]` | Linear 40–80°C temperature curve |
 | `macluster fans --power [--node ID]` | Logarithmic 40–80°C temperature curve |

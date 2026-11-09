@@ -298,7 +298,7 @@ fn failed_request_keeps_last_sample_and_marks_it_stale_by_age() {
 }
 
 #[test]
-fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
+fn mtop_keeps_failed_nodes_through_the_offline_grace_period() {
     let sampled_at = Instant::now();
     let identities = vec![
         DisplayNodeIdentity {
@@ -394,7 +394,11 @@ fn mtop_keeps_transiently_failing_nodes_until_repeated_failures() {
         .get_mut("worker-a")
         .unwrap()
         .apply_error("SSH timeout".into());
-    let expired_at = initial_failure_at + Duration::from_millis(3);
+    let expired_at = Instant::now() + Duration::from_secs(31);
+    caches
+        .get_mut("worker-b")
+        .unwrap()
+        .apply_success(metric(Some(25.0), Some(800.0), None), expired_at);
     update_visible_nodes(
         &mut state,
         &identities,

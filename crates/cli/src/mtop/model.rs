@@ -7,6 +7,8 @@ use std::{
 use macluster_protocol::types::MetricSnapshot;
 
 const METRICS_STALE_AFTER: Duration = Duration::from_secs(6);
+const CONTROLLER_LIVENESS_FRESH_FOR: Duration = Duration::from_secs(6);
+const OFFLINE_HIDE_AFTER: Duration = Duration::from_secs(30);
 const CPU_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +121,7 @@ pub struct NodeMetricCache {
     controller_liveness_managed: bool,
     confirmed_offline: bool,
     controller_liveness_at: Option<Instant>,
+    confirmed_offline_at: Option<Instant>,
 }
 
 impl NodeMetricCache {
@@ -181,23 +184,41 @@ impl NodeMetricCache {
     pub fn set_controller_liveness(&mut self, confirmed_offline: bool, observed_at: Instant) {
         self.controller_liveness_managed = true;
         self.confirmed_offline = confirmed_offline;
+        if confirmed_offline {
+            self.confirmed_offline_at.get_or_insert(observed_at);
+        } else {
+            self.confirmed_offline_at = None;
+        }
         self.controller_liveness_at = Some(observed_at);
     }
 
     pub fn set_confirmed_offline(&mut self, confirmed_offline: bool) {
         self.confirmed_offline = confirmed_offline;
+        if confirmed_offline {
+            self.confirmed_offline_at.get_or_insert_with(Instant::now);
+        } else {
+            self.confirmed_offline_at = None;
+        }
     }
 
     pub fn should_display(&self, now: Instant) -> bool {
-        if self.confirmed_offline {
-            return false;
-        }
         if self.controller_liveness_managed {
             // A stalled monitor feed is not evidence that the host is offline.
             // Keep its last sample visible (view_at marks it STALE), and also
             // keep a Loading/Unavailable row if the controller has observed
             // the node but its first metric sample has not arrived yet. Only
             // a confirmed host outage should remove a controller-managed node.
+            let controller_liveness_fresh = self.controller_liveness_at.is_some_and(|observed| {
+                now.saturating_duration_since(observed) < CONTROLLER_LIVENESS_FRESH_FOR
+            });
+            if self.confirmed_offline
+                && controller_liveness_fresh
+                && self.confirmed_offline_at.is_some_and(|observed| {
+                    now.saturating_duration_since(observed) >= OFFLINE_HIDE_AFTER
+                })
+            {
+                return false;
+            }
             return self.last_success.is_some() || self.controller_liveness_at.is_some();
         }
         let Some((_, sampled_at)) = self.last_success.as_ref() else {
@@ -205,7 +226,9 @@ impl NodeMetricCache {
         };
         let failures = macluster_controller::liveness::OFFLINE_AFTER_FAILURES;
         if self.consecutive_failures >= failures {
-            return false;
+            return self.last_error_at.is_some_and(|failed_at| {
+                now.saturating_duration_since(failed_at) < OFFLINE_HIDE_AFTER
+            });
         }
         self.consecutive_failures > 0
             || now.saturating_duration_since(*sampled_at) < METRICS_STALE_AFTER
@@ -586,5 +609,53 @@ impl CpuHistory {
 
     pub fn points(&self) -> &VecDeque<CpuPoint> {
         &self.points
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NodeMetricCache, OFFLINE_HIDE_AFTER};
+    use std::time::{Duration, Instant};
+
+    fn cached_sample(now: Instant) -> NodeMetricCache {
+        let mut cache = NodeMetricCache::default();
+        cache.apply_success(macluster_metrics::unavailable(0, "test sample"), now);
+        cache
+    }
+
+    #[test]
+    fn stalled_controller_feed_keeps_last_confirmed_offline_node_visible() {
+        let started = Instant::now();
+        let mut cache = cached_sample(started);
+        cache.set_controller_liveness(true, started);
+
+        assert!(cache.should_display(started + Duration::from_secs(10)));
+        assert!(
+            cache.should_display(started + Duration::from_secs(120)),
+            "an absent controller feed must not turn its last offline marker into a hidden node"
+        );
+    }
+
+    #[test]
+    fn fresh_controller_feed_hides_offline_node_after_grace_period() {
+        let started = Instant::now();
+        let mut cache = cached_sample(started);
+        cache.set_controller_liveness(true, started);
+        cache.set_controller_liveness(true, started + Duration::from_secs(29));
+        assert!(cache.should_display(started + Duration::from_secs(29)));
+
+        cache.set_controller_liveness(true, started + OFFLINE_HIDE_AFTER);
+        assert!(!cache.should_display(started + OFFLINE_HIDE_AFTER));
+    }
+
+    #[test]
+    fn direct_monitor_fallback_keeps_failed_node_visible_for_the_same_grace_period() {
+        let started = Instant::now();
+        let mut cache = cached_sample(started);
+        cache.apply_error("temporary timeout".into());
+        cache.set_consecutive_failures(macluster_controller::liveness::OFFLINE_AFTER_FAILURES);
+
+        assert!(cache.should_display(started + Duration::from_secs(29)));
+        assert!(!cache.should_display(started + OFFLINE_HIDE_AFTER + Duration::from_secs(1)));
     }
 }

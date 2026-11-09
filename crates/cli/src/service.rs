@@ -30,7 +30,7 @@ use crate::control_client::{ControlClient, ControlClientError};
 /// launchd is replacing the service and the controller is rebuilding state.
 pub const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_READY_WAIT: Duration = CONTROLLER_READY_TIMEOUT;
-const LAUNCH_AGENT_PROCESS_TYPE: &str = "Adaptive";
+const LAUNCH_AGENT_PROCESS_TYPE: &str = "Interactive";
 const START_LOCK_POLL: Duration = Duration::from_millis(10);
 const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn controller_launch_agent_is_not_declared_as_background_throttled() {
-        assert_eq!(LAUNCH_AGENT_PROCESS_TYPE, "Adaptive");
+        assert_eq!(LAUNCH_AGENT_PROCESS_TYPE, "Interactive");
     }
 
     #[test]

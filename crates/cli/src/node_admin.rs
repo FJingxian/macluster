@@ -4081,6 +4081,71 @@ fn backup_config(path: &Path, operation_id: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn read_config_backup_for_digest(
+    config_path: &Path,
+    expected_digest: &str,
+) -> AppResult<Option<ClusterConfig>> {
+    if expected_digest.len() != 64 || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err((
+            1,
+            "pending share journal contains an invalid previous config digest".into(),
+        ));
+    }
+    let parent = config_path.parent().ok_or_else(|| {
+        (
+            1,
+            format!(
+                "cannot locate previous config snapshot beside {}",
+                config_path.display()
+            ),
+        )
+    })?;
+    let file_name = config_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let prefix = format!("{file_name}.macluster-");
+    let entries = fs::read_dir(parent).map_err(io_error)?;
+    for entry in entries {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".bak") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > 4 * 1024 * 1024
+        {
+            continue;
+        }
+        let bytes = fs::read(entry.path()).map_err(io_error)?;
+        if sha256_hex(&bytes).map_err(|error| (1, error.to_string()))? != expected_digest {
+            continue;
+        }
+        let source = std::str::from_utf8(&bytes).map_err(|error| {
+            (
+                1,
+                format!("previous config snapshot is not valid UTF-8: {error}"),
+            )
+        })?;
+        let snapshot = ClusterConfig::parse(source)
+            .map_err(|error| (1, format!("previous config snapshot is invalid: {error}")))?;
+        return Ok(Some(snapshot));
+    }
+    Ok(None)
+}
+
+fn same_pending_share_topology(current: &ClusterConfig, previous: &ClusterConfig) -> bool {
+    current.login_node == previous.login_node
+        && current.storage_server == previous.storage_server
+        && current.nodes == previous.nodes
+}
+
 fn remote_node_check(node: &NodeConfig, node_id: &str) -> AppResult<NodeCheck> {
     let mut args = vec![node.remote_binary.as_str()];
     if let Some(config_path) = node.remote_config.as_deref() {
@@ -9876,11 +9941,34 @@ fn remove_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResu
             "primary storage is not a named share; use `macluster --init` to reset or reconfigure the cluster (shared directory files are preserved)".into(),
         ));
     }
-    if config.shares.contains_key(share_id) || removal_pending {
+    if share_remove_uses_registered_path(config.shares.contains_key(share_id), &state, share_id) {
         remove_registered_share(&config_path, state_dir, share_id)
     } else {
         remove_pending_share(&config_path, state_dir, share_id)
     }
+}
+
+fn share_remove_uses_registered_path(
+    configured_share: bool,
+    state: &AdminState,
+    share_id: &str,
+) -> bool {
+    if configured_share || share_removal_in_progress(state, share_id).is_some() {
+        return true;
+    }
+    let pending_setup = state
+        .operations
+        .get(&format!("share:{share_id}"))
+        .is_some_and(|operation| {
+            operation.action == "share" && !matches!(operation.phase.as_str(), "READY" | "ABORTED")
+        });
+    let completed_removal = state
+        .operations
+        .get(&format!("share-remove:{share_id}"))
+        .is_some_and(|operation| {
+            operation.action == "share-remove" && operation.phase == "REMOVED"
+        });
+    completed_removal && !pending_setup
 }
 
 fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) -> AppResult<()> {
@@ -9937,12 +10025,33 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
         let digest =
             sha256_hex(config_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
         if operation.old_config_sha256.as_deref() != Some(digest.as_str()) {
-            return Err((
-                1,
-                format!(
-                    "cluster config changed during setup of share {share_id}; inspect node-admin.json before cancelling"
-                ),
-            ));
+            let previous_digest = operation.old_config_sha256.as_deref().ok_or_else(|| {
+                (
+                    1,
+                    format!(
+                        "pending share {share_id} has no recorded previous config digest; inspect node-admin.json before cancelling"
+                    ),
+                )
+            })?;
+            let previous = read_config_backup_for_digest(&config_path, previous_digest)?
+                .ok_or_else(|| {
+                    (
+                        1,
+                        format!(
+                            "cluster config changed during setup of share {share_id}, and its exact previous config snapshot is unavailable; restore that snapshot or use `macluster --init` to reset safely"
+                        ),
+                    )
+                })?;
+            if previous.shares.contains_key(share_id)
+                || !same_pending_share_topology(&config, &previous)
+            {
+                return Err((
+                    1,
+                    format!(
+                        "cluster node topology changed during setup of share {share_id}; refusing cleanup against a different node identity or topology"
+                    ),
+                ));
+            }
         }
         let (endpoint_share_id, server_id, source_root, mount_root, allow_existing_contents) =
             parse_pending_named_share_endpoint(&operation.endpoint)?;
@@ -17828,22 +17937,56 @@ exec "$@"
             client_setup_attempted: Some(true),
             detail: None,
         };
+        let pending_add = NodeOperation {
+            id: "pending-share-test".into(),
+            action: "share".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
+            node_id: "default-001".into(),
+            endpoint: "share:tools:default-001:/opt/tools:/opt/tools".into(),
+            machine_uuid: Some("00000000-0000-4000-8000-000000000003".into()),
+            phase: "SETUP_PENDING".into(),
+            old_config_sha256: Some("before".into()),
+            candidate_config_sha256: Some("candidate".into()),
+            managed_export: true,
+            managed_shares: BTreeSet::new(),
+            client_setup_attempted: Some(false),
+            detail: None,
+        };
         let mut state = AdminState {
             version: 1,
             config_path: "/tmp/config.toml".into(),
             state_dir: "/tmp/state".into(),
             reserved_node_ids: BTreeSet::new(),
             machine_uuids: BTreeMap::new(),
-            operations: BTreeMap::from([("share-remove:tools".into(), operation.clone())]),
+            operations: BTreeMap::from([
+                ("share-remove:tools".into(), operation.clone()),
+                ("share:tools".into(), pending_add),
+            ]),
         };
 
         assert!(super::share_removal_in_progress(&state, "tools").is_some());
+        assert!(super::share_remove_uses_registered_path(
+            false, &state, "tools"
+        ));
         state
             .operations
             .get_mut("share-remove:tools")
             .unwrap()
             .phase = "REMOVED".into();
         assert!(super::share_removal_in_progress(&state, "tools").is_none());
+        assert!(
+            !super::share_remove_uses_registered_path(false, &state, "tools"),
+            "a completed removal record must not shadow cancellation of the pending setup"
+        );
+        assert!(super::share_remove_uses_registered_path(
+            true, &state, "tools"
+        ));
+        state.operations.remove("share:tools");
+        assert!(
+            super::share_remove_uses_registered_path(false, &state, "tools"),
+            "completed removals still need the registered cleanup path for deferred resources"
+        );
     }
 
     #[test]

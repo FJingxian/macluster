@@ -63,6 +63,7 @@ impl Fixture {
     fn spec(&self, config: &ClusterConfig) -> JobSpec {
         JobSpec {
             storage_namespace: Some(Id128::parse(&config.share_uuid).unwrap()),
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("q").unwrap(),
             node: None,
             name: "lost acknowledgement recovery".into(),

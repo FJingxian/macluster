@@ -26,7 +26,10 @@ use thiserror::Error;
 
 use crate::control_client::{ControlClient, ControlClientError};
 
-const MAX_READY_WAIT: Duration = Duration::from_secs(15);
+/// Normal controller startup can take longer after Agent maintenance, when
+/// launchd is replacing the service and the controller is rebuilding state.
+pub const CONTROLLER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_READY_WAIT: Duration = CONTROLLER_READY_TIMEOUT;
 const START_LOCK_POLL: Duration = Duration::from_millis(10);
 const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
@@ -84,14 +87,6 @@ pub enum ServiceLifecycleError {
     UnloadTimeout(Duration),
     #[error("controller hello belongs to a different service binding: {0}")]
     WrongHello(String),
-    #[error(
-        "controller build {running} differs from this binary {current}, and {active_jobs} jobs are active; let them finish, then retry"
-    )]
-    ActiveJobsPreventUpdate {
-        running: String,
-        current: String,
-        active_jobs: usize,
-    },
     #[error(
         "controller could not be verified while {active_jobs} jobs are active; it was left untouched"
     )]
@@ -409,11 +404,12 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             }
             let active_jobs = self.active_job_count()?;
             if active_jobs > 0 {
-                return Err(ServiceLifecycleError::ActiveJobsPreventUpdate {
-                    running: hello.build_id,
-                    current: expected_build,
-                    active_jobs,
-                });
+                // `probe_once` already verified the controller identity and
+                // control protocol. Keep using that compatible resident
+                // controller while jobs drain; replacing it here would
+                // interrupt scheduling, and rejecting it would block routine
+                // commands such as mjob, mqueue, and mfans.
+                return Ok(hello);
             }
             self.install_stable_binary()?;
             let plist = self.install_plist()?;
@@ -432,7 +428,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             let active_jobs = self.active_job_count()?;
             if active_jobs > 0 {
                 if launch_state == LaunchState::Running {
-                    return self.wait_for_existing_hello(deadline, &expected_build, active_jobs);
+                    return self.wait_for_existing_hello(deadline, active_jobs);
                 }
                 if self.plist_targets_build(&expected_build)? {
                     self.launcher
@@ -440,7 +436,7 @@ impl<L: ServiceLauncher> ServiceManager<L> {
                         .map_err(map_launchd_error)?;
                     return self.wait_for_hello(deadline, timeout, &expected_build);
                 }
-                return self.wait_for_existing_hello(deadline, &expected_build, active_jobs);
+                return self.wait_for_existing_hello(deadline, active_jobs);
             }
         }
         self.install_stable_binary()?;
@@ -522,7 +518,6 @@ impl<L: ServiceLauncher> ServiceManager<L> {
     fn wait_for_existing_hello(
         &self,
         deadline: Instant,
-        expected_build: &str,
         active_jobs: usize,
     ) -> Result<ControllerHello, ServiceLifecycleError> {
         loop {
@@ -533,13 +528,8 @@ impl<L: ServiceLauncher> ServiceManager<L> {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if let Some(hello) = self.probe_once(remaining.min(Duration::from_millis(200)))? {
-                if hello.build_id != expected_build {
-                    return Err(ServiceLifecycleError::ActiveJobsPreventUpdate {
-                        running: hello.build_id,
-                        current: expected_build.to_owned(),
-                        active_jobs,
-                    });
-                }
+                // As above, a verified existing controller with a compatible
+                // protocol remains usable while active tasks prevent refresh.
                 return Ok(hello);
             }
             thread::sleep(remaining.min(Duration::from_millis(25)));

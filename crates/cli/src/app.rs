@@ -20,7 +20,7 @@ use macluster_core::{
 use macluster_protocol::{
     control::{
         AgentCompatibilityRecord, AgentCompatibilityState, AgentCompatibilityUpdate,
-        ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle,
+        ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle, FanControlPayload,
         MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, NodeFanControlResult,
     },
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
@@ -232,11 +232,12 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             );
         }
     }
+    let mut hidden_node_notice_printed = false;
     if should_preflight_agent_update(&command, &args)
         && !address_migration_deferred
         && is_macluster_executable()
     {
-        preflight_agent_update(&command, &args, &global)?;
+        hidden_node_notice_printed = preflight_agent_update(&command, &args, &global)?;
     }
 
     match command.as_str() {
@@ -262,7 +263,9 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             let disabled_for_test = env::var_os("MACLUSTER_DISABLE_SERVICE_AUTOSTART").is_some();
             if !help && !disabled_for_test && is_macluster_executable() && config_path.is_file() {
                 match controller_service_manager(&global, &state_dir).and_then(|manager| {
-                    manager.start(Duration::from_secs(5)).map_err(service_error)
+                    manager
+                        .start(crate::service::CONTROLLER_READY_TIMEOUT)
+                        .map_err(service_error)
                 }) {
                     Ok(hello) => println!(
                         "Controller service ready ({:?}, epoch {}).",
@@ -276,7 +279,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             Ok(initialized)
         }
         "node" => node_admin(global, &args),
-        "fans" => fans(global, &args),
+        "fans" => fans(global, &args, hidden_node_notice_printed),
         "internal" => internal(global, &args),
         "agent" => Err((1, format!("`{command}` is not implemented yet"))),
         _ => unreachable!(),
@@ -557,7 +560,10 @@ fn defer_update_without_terminal(
     if interactive || !requires_privileged_authorization {
         return Ok(false);
     }
-    if can_defer_agent_update_for_work(command, args) {
+    // A running workload may defer maintenance while a new submission uses
+    // already-current nodes. Without a TTY, however, a submission must still
+    // fail closed when its required Agent/helper update needs authorization.
+    if command != "submit" && can_defer_agent_update_for_work(command, args) {
         return Ok(true);
     }
     // Mutations may proceed using sudo -n; missing authorization fails without prompting.
@@ -565,16 +571,17 @@ fn defer_update_without_terminal(
 }
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
-    matches!(command, "job" | "queue" | "kill" | "top")
+    matches!(command, "submit" | "job" | "queue" | "kill" | "top")
         || controller_web_monitor_requested(command, args)
         || command == "fans"
-            && args
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "--status" | "-l"))
         || command == "node"
             && args
                 .first()
                 .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
+}
+
+fn submission_must_wait_for_agent_update(command: &str) -> bool {
+    command == "submit"
 }
 
 fn controller_web_monitor_requested(command: &str, args: &[String]) -> bool {
@@ -600,7 +607,11 @@ fn is_macluster_binary_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn preflight_agent_update(command: &str, args: &[String], global: &GlobalOptions) -> AppResult<()> {
+fn preflight_agent_update(
+    command: &str,
+    args: &[String],
+    global: &GlobalOptions,
+) -> AppResult<bool> {
     preflight_agent_update_with_compatibility(command, args, global, None)
 }
 
@@ -609,7 +620,7 @@ fn preflight_agent_update_with_compatibility(
     args: &[String],
     global: &GlobalOptions,
     checked_compatibility: Option<crate::node_admin::AgentBuildCompatibility>,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let config_path = resolved_config_path(global.config.as_deref());
     let config_exists = match fs::symlink_metadata(&config_path) {
         Ok(_) => true,
@@ -629,7 +640,7 @@ fn preflight_agent_update_with_compatibility(
         Err(_) if command == "init" || !config_exists => {
             // A missing config is a valid bootstrap case. `init` also needs
             // to remain available to repair or reset an invalid old config.
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => {
             return Err((
@@ -680,16 +691,16 @@ fn preflight_agent_update_with_compatibility(
             &state_dir.join("mtop-cache"),
         )?
     {
-        return Ok(());
+        return Ok(false);
     }
     if command == "top" && node_recovery_pending {
         eprintln!(
             "Node setup or removal is incomplete; resume its original `mnode` command. Monitoring remains available."
         );
-        return Ok(());
+        return Ok(false);
     }
     if should_defer_agent_update_for_node_recovery(command, node_recovery_pending) {
-        return Ok(());
+        return Ok(false);
     }
     if node_recovery_pending {
         eprintln!(
@@ -778,7 +789,7 @@ fn preflight_agent_update_with_compatibility(
     if recovery_pending {
         probe_candidates.extend(config.nodes.keys().cloned());
     }
-    let reachable_nodes =
+    let mut reachable_nodes =
         crate::node_admin::reachable_configured_node_ids(&config, &probe_candidates);
     let agent_mismatch = agent_update_candidates
         .iter()
@@ -791,35 +802,8 @@ fn preflight_agent_update_with_compatibility(
     // controller when every stale compute node is currently offline, so that
     // it fences those nodes immediately when they reconnect.
     let controller_mismatch = controller_build_mismatch(global, &state_dir);
-    if controller_mismatch {
-        eprintln!(
-            "Controller build mismatch detected; it will be restarted after Agent maintenance."
-        );
-    }
     let update_required =
         recovery_pending || agent_mismatch || helper_refresh_pending || controller_mismatch;
-    let deferred_nodes = probe_candidates
-        .difference(&reachable_nodes)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !deferred_nodes.is_empty() {
-        eprintln!(
-            "Agent/helper update deferred for unreachable node(s): {}. They remain unavailable for new jobs until refreshed.",
-            deferred_nodes.join(", ")
-        );
-    }
-    let missing_online_features = local_validation
-        .missing_required_features
-        .iter()
-        .filter(|node| reachable_nodes.contains(*node))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing_online_features.is_empty() {
-        eprintln!(
-            "Agent capability mismatch detected on {}; updating the cluster before `{command}`.",
-            missing_online_features.join(", ")
-        );
-    }
     if update_required
         && can_defer_agent_update_for_work(command, args)
         && crate::node_admin::agent_update_blocked_by_work(&state_dir).map_err(|error| {
@@ -829,11 +813,18 @@ fn preflight_agent_update_with_compatibility(
             )
         })?
     {
+        if submission_must_wait_for_agent_update(command) {
+            return Err((
+                1,
+                "active jobs or output sync remain before Agent update; no job was submitted. Retry `msub` after the work drains.".into(),
+            ));
+        }
+        let hidden_count = hidden_fan_node_count(&config, &state_dir);
+        let deferred = deferred_nodes_summary(hidden_count);
         eprintln!(
-            "Agent update is deferred while active tasks or output synchronization remain; continuing with `{}`. Retry after the work drains to resume the automatic update.",
-            command
+            "Agent update is deferred while active tasks or output synchronization remain; continuing with `{command}`. Retry after the work drains to resume the automatic update.{deferred}"
         );
-        return Ok(());
+        return Ok(hidden_count > 0);
     }
     if update_required
         && defer_update_without_terminal(
@@ -843,10 +834,12 @@ fn preflight_agent_update_with_compatibility(
             helper_refresh_pending && !agent_mismatch && !recovery_pending,
         )?
     {
+        let hidden_count = hidden_fan_node_count(&config, &state_dir);
+        let deferred = deferred_nodes_summary(hidden_count);
         eprintln!(
-            "Agent update needs an interactive Terminal; continuing with `{command}` without updating."
+            "Agent update needs an interactive Terminal; continuing with `{command}` without updating.{deferred}"
         );
-        return Ok(());
+        return Ok(hidden_count > 0);
     }
     if should_block_agent_update_for_pending_node_recovery(
         command,
@@ -858,21 +851,53 @@ fn preflight_agent_update_with_compatibility(
             "Agent update is blocked by an unfinished node administration operation; finish or resolve it with `mnode`, then retry the requested command.".into(),
         ));
     }
+    let reachable_nodes_for_update = if update_required {
+        let all_nodes = config
+            .nodes
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let unprobed_nodes = all_nodes
+            .difference(&probe_candidates)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        reachable_nodes.extend(crate::node_admin::reachable_configured_node_ids(
+            &config,
+            &unprobed_nodes,
+        ));
+        Some(reachable_nodes.clone())
+    } else {
+        None
+    };
     if command == "top" && top_will_use_tui(args) && update_required && agent_mismatch {
         println!("Agent build mismatch detected; entering the cluster update workflow.");
     }
     let update_result = maybe_run_agent_update(update_required, || {
-        crate::node_admin::update_all_agents_for_preflight(&config_path, &state_dir)
+        crate::node_admin::update_all_agents_for_preflight(
+            &config_path,
+            &state_dir,
+            reachable_nodes_for_update.expect("reachable nodes collected for an update"),
+        )
     })?;
     if update_result.is_some() {
         crate::node_admin::invalidate_agent_validation_cache(&state_dir.join("mtop-cache"));
         publish_unknown_controller_agent_compatibility(&config_path, &state_dir, &config);
     }
+    let hidden_count = if update_result.is_some() {
+        hidden_fan_node_count(&config, &state_dir)
+    } else {
+        0
+    };
+    if hidden_count > 0
+        && let Some(notice) = crate::node_admin::hidden_node_notice(hidden_count)
+    {
+        eprintln!("{notice}");
+    }
     if update_result.is_some_and(|controller_was_running| {
         controller_should_resume_after_agent_update(command, args, controller_was_running)
     }) {
         controller_service_manager(global, &state_dir)?
-            .ensure_running(Duration::from_secs(5))
+            .ensure_running(crate::service::CONTROLLER_READY_TIMEOUT)
             .map_err(|error| {
                 (
                     1,
@@ -883,7 +908,12 @@ fn preflight_agent_update_with_compatibility(
             })?;
         eprintln!("Controller restarted after Agent update.");
     }
-    Ok(())
+    Ok(hidden_count > 0)
+}
+
+fn deferred_nodes_summary(count: usize) -> String {
+    crate::node_admin::hidden_node_notice(count)
+        .map_or_else(String::new, |notice| format!("\n{notice}"))
 }
 
 fn query_controller_agent_compatibility(
@@ -1635,6 +1665,10 @@ fn format_interactive_timing(
     )
 }
 
+fn interactive_job_ready_to_attach(state: JobState, has_node: bool, has_start_token: bool) -> bool {
+    state == JobState::Running && has_node && has_start_token
+}
+
 fn run_interactive_submission(
     storage: &Storage,
     initial: JobRecord,
@@ -1654,7 +1688,7 @@ fn run_interactive_submission(
         if job.state.is_terminal() {
             return interactive_job_result(&job);
         }
-        if job.state != JobState::Cancelling
+        if interactive_job_ready_to_attach(job.state, job.node.is_some(), job.start_token.is_some())
             && let (Some(node_id), Some(start_token)) =
                 (job.node.as_ref(), job.start_token.as_ref())
         {
@@ -2072,8 +2106,11 @@ fn build_submission(
             config.shared_root.to_string_lossy().into_owned(),
         );
     }
+    let required_shares =
+        required_named_shares(config, &cwd, &script, &task_env, &stdout_path, &stderr_path);
     let spec = JobSpec {
         storage_namespace: Some(storage_namespace),
+        required_shares: Some(required_shares),
         queue,
         node: merged.node,
         name,
@@ -3870,6 +3907,33 @@ fn shared_working_directory(config: &ClusterConfig, cwd: &Path) -> Option<PathBu
     remap_shared_path(config, cwd)
 }
 
+fn required_named_shares(
+    config: &ClusterConfig,
+    cwd: &Path,
+    script: &[u8],
+    env: &BTreeMap<String, String>,
+    stdout_path: &str,
+    stderr_path: &str,
+) -> Vec<String> {
+    let script = String::from_utf8_lossy(script);
+    config
+        .shares
+        .iter()
+        .filter_map(|(share_id, share)| {
+            let roots = [&share.mount_root, &share.source_root];
+            let referenced = roots.iter().any(|root| {
+                let text = root.to_string_lossy();
+                cwd.starts_with(root.as_path())
+                    || Path::new(stdout_path).starts_with(root.as_path())
+                    || Path::new(stderr_path).starts_with(root.as_path())
+                    || script.contains(text.as_ref())
+                    || env.values().any(|value| value.contains(text.as_ref()))
+            });
+            referenced.then(|| share_id.clone())
+        })
+        .collect()
+}
+
 fn validate_shared_output_path(
     path: &Path,
     submitter_cwd: &Path,
@@ -4662,7 +4726,7 @@ STORAGE
     }
 }
 
-fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
+fn fans(global: GlobalOptions, args: &[String], hidden_node_notice_printed: bool) -> AppResult<()> {
     use macluster_protocol::{
         control::{ControlCommand, ControlPayload},
         types::FanPolicy,
@@ -4739,6 +4803,7 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
 
     let config_path = resolved_config_path(global.config.as_deref());
     let state_dir = state_root(global.state_dir.as_deref())?;
+    let config = load_config(global.config.as_deref()).map_err(config_error)?;
     let mut controller = online_controller(&config_path, &state_dir, false)?
         .ok_or_else(|| (1, "fan control requires the running controller".into()))?;
     controller
@@ -4749,12 +4814,29 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         &mut controller.client,
         ControlCommand::FanControl { node_id, policy },
     )?;
-    let ControlPayload::FanControl(results) = payload else {
+    let ControlPayload::FanControl(response) = payload else {
         return Err((
             1,
             "controller returned an invalid fan-control response".into(),
         ));
     };
+    let (results, response_hidden_unreachable) = match response {
+        FanControlPayload::Detailed {
+            nodes,
+            hidden_unreachable,
+        } => (nodes, Some(hidden_unreachable)),
+        FanControlPayload::Legacy(nodes) => (nodes, None),
+    };
+    let hidden_unreachable =
+        response_hidden_unreachable.unwrap_or_else(|| hidden_fan_node_count(&config, &state_dir));
+    if !hidden_node_notice_printed && hidden_unreachable > 0 {
+        if let Some(notice) = crate::node_admin::hidden_node_notice(hidden_unreachable) {
+            eprintln!("{notice}");
+        }
+    }
+    if results.is_empty() {
+        return Err((1, "no online nodes are available for fan control".into()));
+    }
     if json {
         println!(
             "{}",
@@ -4766,6 +4848,13 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     let failed = results
         .iter()
         .filter(|result| {
+            if result
+                .status
+                .as_ref()
+                .is_some_and(|status| !status.supported)
+            {
+                return false;
+            }
             result.error.is_some()
                 || (policy.is_some()
                     && result
@@ -4775,6 +4864,45 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         })
         .count();
     if failed > 0 {
+        let mut shown_details = 0usize;
+        for result in &results {
+            if result
+                .status
+                .as_ref()
+                .is_some_and(|status| !status.supported)
+            {
+                continue;
+            }
+            let detail = if let Some(error) = &result.error {
+                Some(sanitize_cell(error))
+            } else if let Some(policy) = policy {
+                match result.status.as_ref() {
+                    Some(status) if status.policy != policy => Some(format!(
+                        "node reports {:?} policy; requested {:?}{}",
+                        status.policy,
+                        policy,
+                        status
+                            .message
+                            .as_deref()
+                            .map(|message| format!(" ({})", sanitize_cell(message)))
+                            .unwrap_or_default()
+                    )),
+                    None => Some("node returned no fan status".into()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(detail) = detail {
+                if shown_details < 8 {
+                    eprintln!("  {}: {detail}", result.node_id);
+                }
+                shown_details += 1;
+            }
+        }
+        if shown_details > 8 {
+            eprintln!("  … and {} more node error(s)", shown_details - 8);
+        }
         return Err((
             1,
             format!(
@@ -4786,14 +4914,32 @@ fn fans(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     Ok(())
 }
 
+fn hidden_fan_node_count(config: &ClusterConfig, state_dir: &Path) -> usize {
+    let Ok(records) = macluster_controller::liveness::read(state_dir, &config.share_uuid) else {
+        return 0;
+    };
+    let sampled_at = now_unix_ms();
+    config
+        .nodes
+        .iter()
+        .filter(|(node_id, _)| !config.is_login_node(node_id))
+        .filter(|(node_id, node)| {
+            let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+            !records
+                .get(*node_id)
+                .is_some_and(|record| record.was_recently_reachable(identity, sampled_at))
+        })
+        .count()
+}
+
 fn format_fan_control_table(results: &[NodeFanControlResult]) -> String {
-    const HEADERS: [&str; 6] = ["NODE", "POLICY", "STATE", "TEMP", "TARGET RPM", "STATUS"];
+    const HEADERS: [&str; 4] = ["NODE", "STATE", "TEMP", "RPM"];
 
     let rows = results
         .iter()
         .map(fan_control_table_cells)
         .collect::<Vec<_>>();
-    let widths = std::array::from_fn::<_, 6, _>(|column| {
+    let widths = std::array::from_fn::<_, 4, _>(|column| {
         rows.iter()
             .map(|row| display_width(&row[column]))
             .max()
@@ -4826,70 +4972,49 @@ fn format_fan_control_table(results: &[NodeFanControlResult]) -> String {
     output
 }
 
-fn fan_control_table_cells(result: &NodeFanControlResult) -> [String; 6] {
+fn fan_control_table_cells(result: &NodeFanControlResult) -> [String; 4] {
     let node = sanitize_cell(&result.node_id.to_string());
-    if let Some(error) = &result.error {
-        return [
-            node,
-            "ERROR".into(),
-            "-".into(),
-            "-".into(),
-            "-".into(),
-            sanitize_cell(error),
-        ];
+    if result
+        .status
+        .as_ref()
+        .is_some_and(|status| !status.supported)
+    {
+        return [node, "N/A".into(), "N/A".into(), "N/A".into()];
+    }
+    if result.error.is_some() {
+        return [node, "ERROR".into(), "-".into(), "-".into()];
     }
 
     let Some(status) = &result.status else {
-        return [
-            node,
-            "ERROR".into(),
-            "-".into(),
-            "-".into(),
-            "-".into(),
-            "no fan status returned".into(),
-        ];
+        return [node, "ERROR".into(), "-".into(), "-".into()];
     };
-
-    if !status.supported {
-        return [
-            node,
-            "UNAVAILABLE".into(),
-            "-".into(),
-            "-".into(),
-            "-".into(),
-            sanitize_cell(
-                status
-                    .message
-                    .as_deref()
-                    .unwrap_or("fan control is unsupported"),
-            ),
-        ];
-    }
 
     let policy = match status.policy {
         FanPolicy::System => "SYSTEM",
         FanPolicy::Auto => "AUTO",
         FanPolicy::Power => "POWER",
     };
+
     let detail = status.message.as_deref().unwrap_or("");
     let below_release_threshold = !status.active && detail.starts_with("below 38°C");
-    let state = if status.policy == FanPolicy::System || below_release_threshold {
-        "DEFAULT"
+    let state = if status.policy == FanPolicy::System {
+        "DEFAULT".to_owned()
+    } else if below_release_threshold {
+        format!("{policy} DEFAULT")
     } else if status.active {
-        "ACTIVE"
+        format!("{policy} ACTIVE")
     } else if status.average_temperature_deci_celsius.is_none() {
-        "WAIT TEMP"
+        format!("{policy} WAIT TEMP")
     } else {
-        "ARMED"
+        format!("{policy} ARMED")
     };
     let temperature = status
         .average_temperature_deci_celsius
         .map(|value| format!("{:.1}°C", f32::from(value) / 10.0))
         .unwrap_or_else(|| "N/A".into());
-    let target_rpm = status
-        .target_rpm
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| if status.active { "N/A" } else { "SYSTEM" }.into());
+    let actual_rpm = status
+        .actual_rpm
+        .map_or_else(|| "N/A".into(), |value| value.to_string());
     let standard_messages = [
         "macOS controls fan speed",
         "waiting for a fresh CPU temperature sample; macOS controls fans until activation",
@@ -4901,26 +5026,13 @@ fn fan_control_table_cells(result: &NodeFanControlResult) -> [String; 6] {
     let is_standard_message = detail.is_empty()
         || standard_messages.contains(&detail)
         || detail.ends_with(" curve active");
-    let summary = if !is_standard_message {
-        sanitize_cell(detail)
-    } else if status.policy == FanPolicy::System || below_release_threshold {
-        "macOS default".into()
-    } else if status.active {
-        "Curve active".into()
-    } else if status.average_temperature_deci_celsius.is_none() {
-        "Waiting for temperature".into()
+    let state = if !is_standard_message {
+        format!("{state}: {}", sanitize_cell(detail))
     } else {
-        "Waiting for 40°C".into()
+        state
     };
 
-    [
-        node,
-        policy.into(),
-        state.into(),
-        temperature,
-        target_rpm,
-        summary,
-    ]
+    [node, state, temperature, actual_rpm]
 }
 
 fn fans_help(mode: HelpMode) -> &'static str {
@@ -5362,10 +5474,11 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
                         &global,
                         Some(compatibility),
                     )
+                    .map(|_| ())
                 }
                 #[cfg(test)]
                 crate::mtop::MtopPostAction::RecoverMaintenance => {
-                    preflight_agent_update("top", args, &global)
+                    preflight_agent_update("top", args, &global).map(|_| ())
                 }
                 crate::mtop::MtopPostAction::SetupLocalPower => {
                     power_setup_attempted.set(true);
@@ -5554,7 +5667,7 @@ fn controller(
         }
         "start" => {
             let hello = controller_service_manager(&global, &state_dir)?
-                .start(Duration::from_secs(5))
+                .start(crate::service::CONTROLLER_READY_TIMEOUT)
                 .map_err(service_error)?;
             println!(
                 "Controller ready ({:?}, epoch {}).",
@@ -5573,7 +5686,7 @@ fn controller(
         }
         "restart" => {
             let hello = controller_service_manager(&global, &state_dir)?
-                .restart(Duration::from_secs(5))
+                .restart(crate::service::CONTROLLER_READY_TIMEOUT)
                 .map_err(service_error)?;
             println!(
                 "Controller restarted ({:?}, epoch {}).",
@@ -5644,7 +5757,7 @@ fn controller(
                     eprintln!("Updating and restarting the controller for the browser monitor…");
                     crate::service::ServiceManager::current(binding.clone())
                         .map_err(service_error)?
-                        .ensure_running(Duration::from_secs(10))
+                        .ensure_running(crate::service::CONTROLLER_READY_TIMEOUT)
                         .map_err(service_error)?;
                     client = crate::control_client::ControlClient::connect(
                         &binding,
@@ -5939,7 +6052,11 @@ fn controller(
                         || requested.load(std::sync::atomic::Ordering::SeqCst),
                         |service| {
                             drop(maintenance_lock.take());
-                            let result = crate::node_admin::refresh_node_addresses(&config_file, &state_dir, true);
+                            // This is a background retry, not an explicit
+                            // operator-forced migration. Preserve the inventory
+                            // scan cooldown so an offline node cannot trigger
+                            // repeated full-subnet sweeps every maintenance pass.
+                            let result = crate::node_admin::refresh_node_addresses(&config_file, &state_dir, false);
                             maintenance_lock = Some(MaintenanceLock::shared(&config_file)?);
                             match result {
                                 Ok(_) => {
@@ -6048,7 +6165,7 @@ fn online_controller(
         ServiceIntent::Stopped => {
             eprintln!("Controller is stopped; starting it for the interactive submission.");
             manager
-                .start(Duration::from_secs(5))
+                .start(crate::service::CONTROLLER_READY_TIMEOUT)
                 .map_err(service_error)?;
         }
         ServiceIntent::Resetting => {
@@ -6058,13 +6175,15 @@ fn online_controller(
                     .into(),
             ));
         }
-        ServiceIntent::Auto => match manager.ensure_running(Duration::from_secs(5)) {
-            Ok(_) => {}
-            Err(crate::service::ServiceLifecycleError::NoGuiSession(_)) if allow_offline => {
-                return Ok(None);
+        ServiceIntent::Auto => {
+            match manager.ensure_running(crate::service::CONTROLLER_READY_TIMEOUT) {
+                Ok(_) => {}
+                Err(crate::service::ServiceLifecycleError::NoGuiSession(_)) if allow_offline => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(service_error(error)),
             }
-            Err(error) => return Err(service_error(error)),
-        },
+        }
     }
     let client = crate::control_client::ControlClient::connect(&binding, Duration::from_secs(5))
         .map_err(|error| (1, error.to_string()))?;
@@ -7600,12 +7719,14 @@ mod tests {
         ACTIVE_ENV_PREFIX_ENV, CARGO_HOME_SEED_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV,
         NodeMetricRow, aggregate_metrics, build_submission, cached_monitor_samples,
         can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
-        controller_startup_policy, display_width, explain_legacy_power_agent,
-        format_fan_control_table, format_job_details, format_jobs_table, format_power,
-        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
-        prepare_task_environment, promote_inline_command,
+        controller_startup_policy, deferred_nodes_summary, display_width,
+        explain_legacy_power_agent, format_fan_control_table, format_job_details,
+        format_jobs_table, format_power, interactive_job_ready_to_attach, is_macluster_binary_path,
+        maybe_run_agent_update, metric_row, metric_table_header, prepare_task_environment,
+        promote_inline_command, required_named_shares,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
+        submission_must_wait_for_agent_update,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -7620,6 +7741,89 @@ mod tests {
             MetricSnapshot,
         },
     };
+
+    #[test]
+    fn deferred_node_notice_uses_the_shared_hotplug_message() {
+        assert_eq!(deferred_nodes_summary(0), "");
+        assert_eq!(
+            deferred_nodes_summary(1),
+            "\n1 unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
+        );
+        assert_eq!(
+            deferred_nodes_summary(100),
+            "\n100 unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
+        );
+    }
+
+    #[test]
+    fn submission_requires_only_shares_referenced_by_the_job() {
+        let config = ClusterConfig::parse(
+            r#"
+[cluster]
+name = "test"
+default_queue = "default"
+login_node = "login"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "login"
+protocol_version = 1
+
+[queues.default]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.1"
+transport = "local"
+machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+execution_uid = 501
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+
+[shares.project]
+server = "login"
+source_root = "/Users/operator/project"
+mount_root = "/Users/operator/project"
+share_uuid = "00000000-0000-4000-8000-000000000002"
+
+[shares.env]
+server = "login"
+source_root = "/Users/operator/env"
+mount_root = "/Users/operator/env"
+share_uuid = "00000000-0000-4000-8000-000000000003"
+
+[shares.data]
+server = "login"
+source_root = "/Volumes/data"
+mount_root = "/Volumes/data"
+share_uuid = "00000000-0000-4000-8000-000000000004"
+
+[shares.legacy]
+server = "login"
+source_root = "/Users/operator/legacy-project"
+mount_root = "/Users/operator/legacy-project"
+share_uuid = "00000000-0000-4000-8000-000000000005"
+"#,
+        )
+        .unwrap();
+        let task_env = BTreeMap::from([(
+            "PATH".into(),
+            "/Users/operator/env/bin:/usr/bin:/bin".into(),
+        )]);
+
+        let required = required_named_shares(
+            &config,
+            Path::new("/Users/operator/project"),
+            b"analyze --input /Volumes/data/inputs/data.pgen",
+            &task_env,
+            "/Users/Shared/macluster/jobs/1/stdout.log",
+            "/Users/Shared/macluster/jobs/1/stderr.log",
+        );
+
+        assert_eq!(required, ["data", "env", "project"]);
+    }
 
     #[test]
     fn pending_peer_config_sync_does_not_pause_healthy_cluster_dispatch() {
@@ -7884,15 +8088,14 @@ mod tests {
     }
 
     #[test]
-    fn only_status_and_cancel_commands_can_defer_an_agent_update_for_active_work() {
-        for command in ["job", "queue", "kill", "top"] {
+    fn operational_commands_can_defer_agent_updates_for_active_work() {
+        for command in ["submit", "job", "queue", "kill", "top", "fans"] {
             assert!(can_defer_agent_update_for_work(command, &[]), "{command}");
         }
         for args in [vec!["-l".into()], vec!["--list".into()]] {
             assert!(can_defer_agent_update_for_work("node", &args));
         }
         for (command, args) in [
-            ("submit", vec![]),
             ("node", vec!["-a".into(), "user@192.0.2.1".into()]),
             ("node", vec!["-rm".into(), "worker".into()]),
             ("init", vec![]),
@@ -7903,6 +8106,41 @@ mod tests {
                 "{command} {args:?} must stay blocked"
             );
         }
+    }
+
+    #[test]
+    fn submission_waits_when_active_work_prevents_a_stale_controller_restart() {
+        assert!(submission_must_wait_for_agent_update("submit"));
+        assert!(!submission_must_wait_for_agent_update("job"));
+    }
+
+    #[test]
+    fn interactive_attach_waits_for_controller_to_confirm_running_state() {
+        assert!(!interactive_job_ready_to_attach(
+            JobState::Starting,
+            true,
+            true
+        ));
+        assert!(interactive_job_ready_to_attach(
+            JobState::Running,
+            true,
+            true
+        ));
+        assert!(!interactive_job_ready_to_attach(
+            JobState::Running,
+            false,
+            true
+        ));
+        assert!(!interactive_job_ready_to_attach(
+            JobState::Running,
+            true,
+            false
+        ));
+        assert!(!interactive_job_ready_to_attach(
+            JobState::Cancelled,
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -8153,6 +8391,7 @@ mod tests {
             id,
             spec: JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new(queue).unwrap(),
                 node: None,
                 name: name.into(),
@@ -8214,7 +8453,7 @@ mod tests {
     }
 
     #[test]
-    fn fan_control_table_aligns_variable_width_rows_and_summarizes_normal_status() {
+    fn fan_control_table_aligns_columns_and_keeps_diagnostics_in_state() {
         let rows = vec![
             NodeFanControlResult {
                 node_id: NodeId::new("default-001").unwrap(),
@@ -8223,6 +8462,7 @@ mod tests {
                     supported: true,
                     active: true,
                     average_temperature_deci_celsius: Some(759),
+                    actual_rpm: Some(5021),
                     target_rpm: Some(4737),
                     message: Some("power curve active".into()),
                 }),
@@ -8235,6 +8475,7 @@ mod tests {
                     supported: true,
                     active: false,
                     average_temperature_deci_celsius: None,
+                    actual_rpm: None,
                     target_rpm: None,
                     message: Some("waiting for a fresh CPU temperature sample".into()),
                 }),
@@ -8247,6 +8488,7 @@ mod tests {
                     supported: false,
                     active: false,
                     average_temperature_deci_celsius: None,
+                    actual_rpm: None,
                     target_rpm: None,
                     message: Some("this Mac does not expose controllable fans".into()),
                 }),
@@ -8262,41 +8504,16 @@ mod tests {
         let rendered = format_fan_control_table(&rows);
         let lines: Vec<_> = rendered.lines().collect();
         let header = lines[0];
+        assert!(!header.contains("STATUS"), "{header}");
+        assert!(!header.contains("POLICY"), "{header}");
+        assert!(!rendered.contains("ERROR:"), "{rendered}");
         let expected_rows = [
-            [
-                "default-001",
-                "POWER",
-                "ACTIVE",
-                "75.9°C",
-                "4737",
-                "Curve active",
-            ],
-            [
-                "arm-a",
-                "AUTO",
-                "WAIT TEMP",
-                "N/A",
-                "SYSTEM",
-                "Waiting for temperature",
-            ],
-            [
-                "worker-with-long-name",
-                "UNAVAILABLE",
-                "-",
-                "-",
-                "-",
-                "this Mac does not expose controllable fans",
-            ],
-            [
-                "login-01",
-                "ERROR",
-                "-",
-                "-",
-                "-",
-                "node transport timed out\\nretry",
-            ],
+            ["default-001", "POWER ACTIVE", "75.9°C", "5021"],
+            ["arm-a", "AUTO WAIT TEMP", "N/A", "N/A"],
+            ["worker-with-long-name", "N/A", "N/A", "N/A"],
+            ["login-01", "ERROR", "-", "-"],
         ];
-        let header_cells = ["NODE", "POLICY", "STATE", "TEMP", "TARGET RPM", "STATUS"];
+        let header_cells = ["NODE", "STATE", "TEMP", "RPM"];
         for (line, expected) in lines.iter().skip(1).zip(expected_rows) {
             let (mut header_cursor, mut row_cursor) = (0, 0);
             for (column, (header_cell, expected_cell)) in
@@ -8469,6 +8686,7 @@ mod tests {
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
         let spec = JobSpec {
             storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+            required_shares: Some(Vec::new()),
             queue: QueueName::new("compute").unwrap(),
             node: Some(NodeId::new("worker").unwrap()),
             name: "login-environment".into(),

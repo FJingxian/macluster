@@ -1701,6 +1701,7 @@ fn mjob_details_display_controller_waiting_reason() {
             ),
             macluster_protocol::types::JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: macluster_protocol::identifiers::QueueName::new("mini01").unwrap(),
                 node: None,
                 name: "waiting".into(),

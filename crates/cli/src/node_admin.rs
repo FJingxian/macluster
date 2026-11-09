@@ -2,7 +2,10 @@
 
 mod addresses;
 mod primary_reuse;
+mod progress;
 mod scan;
+
+use progress::MaintenanceProgress;
 
 pub(crate) use addresses::{
     address_migration_has_active_jobs, address_migration_pending, prepare_node_address_migration,
@@ -433,9 +436,20 @@ fn try_acquire_live_maintenance(
     let current_build =
         crate::service::current_executable_build_id().map_err(|error| (1, error.to_string()))?;
     if client.hello().build_id != current_build {
-        eprintln!(
-            "Controller build mismatch detected; refreshing the idle controller before {operation}."
-        );
+        if agent_update_blocked_by_work(state_dir).map_err(|error| {
+            (
+                1,
+                format!("cannot determine whether controller restart is safe: {error}"),
+            )
+        })? {
+            return Err((
+                1,
+                format!(
+                    "controller update for {operation} is deferred while active tasks or output synchronization remain; the running controller and jobs were left untouched. Retry after the work drains."
+                ),
+            ));
+        }
+        eprintln!("Restarting the idle controller with the current build for {operation}.");
         crate::service::ServiceManager::current(binding.clone())
             .map_err(|error| (1, error.to_string()))?
             .ensure_running(Duration::from_secs(15))
@@ -735,7 +749,8 @@ fn wait_for_live_maintenance(
     journal_path: &Path,
 ) -> AppResult<bool> {
     let started = Instant::now();
-    let mut last_message = Instant::now();
+    let mut progress =
+        MaintenanceProgress::new(operation, scope.deferred_unreachable_nodes().len());
     let mut next_epoch_check = Instant::now();
     let mut epoch_recovered = false;
     let state_dir = journal_path
@@ -777,12 +792,7 @@ fn wait_for_live_maintenance(
                         ),
                     ));
                 }
-                if last_message.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "Controller maintenance status is temporarily unavailable; retrying {operation}."
-                    );
-                    last_message = Instant::now();
-                }
+                progress.update("controller", &[]);
                 thread::sleep(Duration::from_millis(250));
                 continue;
             }
@@ -816,6 +826,8 @@ fn wait_for_live_maintenance(
                             )? {
                                 return Ok(true);
                             }
+                        } else {
+                            progress.update("draining", &status.blockers);
                         }
                     }
                     MaintenancePhase::Applying => {
@@ -828,18 +840,12 @@ fn wait_for_live_maintenance(
                             )? {
                                 return Ok(true);
                             }
+                        } else {
+                            progress.update("applying", &status.blockers);
                         }
                     }
                     MaintenancePhase::Draining => {
-                        if last_message.elapsed() >= Duration::from_secs(5) {
-                            let reason = status
-                                .blockers
-                                .first()
-                                .map(String::as_str)
-                                .unwrap_or("waiting for scoped nodes to become idle");
-                            eprintln!("Waiting for controller maintenance {operation}: {reason}");
-                            last_message = Instant::now();
-                        }
+                        progress.update("draining", &status.blockers);
                     }
                 }
             }
@@ -999,7 +1005,7 @@ fn retry_maintenance_completion(
     mut attempt: impl FnMut() -> AppResult<bool>,
 ) -> AppResult<()> {
     let started = Instant::now();
-    let mut last_message = Instant::now();
+    let mut progress = MaintenanceProgress::new(operation, 0);
     loop {
         if attempt()? {
             return Ok(());
@@ -1012,12 +1018,7 @@ fn retry_maintenance_completion(
                 ),
             ));
         }
-        if last_message.elapsed() >= Duration::from_secs(5) {
-            eprintln!(
-                "Waiting for controller maintenance {operation} to become quiescent before finalizing…"
-            );
-            last_message = Instant::now();
-        }
+        progress.update("finalizing", &[]);
         thread::sleep(Duration::from_millis(250));
     }
 }
@@ -1116,7 +1117,7 @@ fn read_maintenance_client_state(path: &Path) -> AppResult<Option<MaintenanceCli
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o077 != 0
-        || metadata.len() > 4096
+        || metadata.len() > 65_536
     {
         return Err((
             1,
@@ -3111,50 +3112,104 @@ fn verify_registered_node_identities(
 pub(crate) fn update_all_agents_for_preflight(
     config_path: &Path,
     state_dir: &Path,
+    reachable_nodes: BTreeSet<String>,
 ) -> AppResult<bool> {
-    update_all_agents_impl(config_path, state_dir)
+    update_all_agents_impl(config_path, state_dir, reachable_nodes)
 }
 
-fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<bool> {
+fn agent_update_maintenance_scope(
+    deferred_nodes: &BTreeSet<String>,
+) -> AppResult<MaintenanceScope> {
+    if deferred_nodes.is_empty() {
+        return Ok(MaintenanceScope::Cluster);
+    }
+    let nodes = deferred_nodes
+        .iter()
+        .map(|node| {
+            NodeId::new(node.clone()).map_err(|error| {
+                (
+                    2,
+                    format!("invalid configured node ID '{node}' for update scope: {error}"),
+                )
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(MaintenanceScope::ClusterExceptUnreachable(nodes))
+}
+
+pub(crate) fn hidden_node_notice(hidden: usize) -> Option<String> {
+    (hidden > 0).then(|| {
+        format!(
+            "{hidden} unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
+        )
+    })
+}
+
+fn agent_update_completion_summary(prefix: &str, reachable: usize) -> String {
+    let reachable_label = if reachable == 1 { "node" } else { "nodes" };
+    format!("{prefix}: {reachable} reachable {reachable_label}.")
+}
+
+fn update_all_agents_impl(
+    config_path: &Path,
+    state_dir: &Path,
+    preflight_reachable_nodes: BTreeSet<String>,
+) -> AppResult<bool> {
     if unsafe { libc::geteuid() } == 0 {
         return Err((
             1,
             "run the Agent update as your normal cluster account, without sudo".into(),
         ));
     }
+    let config_path = config_path.canonicalize().map_err(io_error)?;
+    let initial_source = fs::read_to_string(&config_path).map_err(io_error)?;
+    let initial_config =
+        ClusterConfig::parse(&initial_source).map_err(|error| (2, error.to_string()))?;
+    let initial_config_digest =
+        sha256_hex(initial_source.as_bytes()).map_err(|error| (1, error.to_string()))?;
+    let all_nodes = initial_config
+        .nodes
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let reachable_nodes = all_nodes
+        .intersection(&preflight_reachable_nodes)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let deferred_nodes = all_nodes
+        .difference(&reachable_nodes)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let maintenance_scope = agent_update_maintenance_scope(&deferred_nodes)?;
     let maintenance = acquire_node_maintenance_scoped(
-        config_path,
+        &config_path,
         state_dir,
         "Agent update",
-        MaintenanceScope::Cluster,
+        maintenance_scope,
     )?;
     if maintenance.recovered {
         return Ok(false);
     }
     let mut helper_refresh_deferred = None;
     let result = (|| -> AppResult<bool> {
-        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+        MaintenanceLock::bind_state_dir(&config_path, state_dir).map_err(|error| {
             (
                 1,
                 format!("cluster config/state directory binding failed: {error}"),
             )
         })?;
         fs::create_dir_all(state_dir).map_err(io_error)?;
-        let config_path = config_path.canonicalize().map_err(io_error)?;
         let source = fs::read_to_string(&config_path).map_err(io_error)?;
-        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
-        let all_nodes = config.nodes.keys().cloned().collect::<BTreeSet<_>>();
-        let reachable_nodes = reachable_configured_node_ids(&config, &all_nodes);
-        let deferred_nodes = all_nodes
-            .difference(&reachable_nodes)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !deferred_nodes.is_empty() {
-            eprintln!(
-                "Agent update deferred for unreachable node(s): {}. They will stay out of the dispatch pool; the next Agent-dependent command after they reconnect will retry the update.",
-                deferred_nodes.join(", ")
-            );
+        if sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?
+            != initial_config_digest
+        {
+            return Err((
+                1,
+                "cluster config changed while checking node reachability; retry the Agent update"
+                    .into(),
+            ));
         }
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
         let old_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
         let journal_path = state_dir.join("node-admin.json");
         let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
@@ -3215,8 +3270,11 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
                 state_dir,
             )?;
             println!(
-                "Recovered Agent update sync for {} reachable node(s).",
-                reachable_nodes.len()
+                "{}",
+                agent_update_completion_summary(
+                    "Recovered Agent update sync",
+                    reachable_nodes.len(),
+                )
             );
             return Ok(maintenance.controller_was_running);
         }
@@ -3374,8 +3432,8 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
                 state_dir,
             )?;
             println!(
-                "All {} reachable node(s) already use the current Agent.",
-                reachable_nodes.len()
+                "{}",
+                agent_update_completion_summary("Current Agent verified", reachable_nodes.len(),)
             );
             return Ok(maintenance.controller_was_running);
         }
@@ -3404,8 +3462,8 @@ fn update_all_agents_impl(config_path: &Path, state_dir: &Path) -> AppResult<boo
             state_dir,
         )?;
         println!(
-            "Updated Agent on {} reachable node(s).",
-            reachable_nodes.len()
+            "{}",
+            agent_update_completion_summary("Agent update complete", reachable_nodes.len(),)
         );
         Ok(maintenance.controller_was_running)
     })();
@@ -9511,6 +9569,27 @@ fn plan_remove_nfs_exports(
     Ok((candidate, statuses, changed_any))
 }
 
+fn managed_exports_prove_missing_share_source(
+    exports: &str,
+    requests: &[NfsExportRequest],
+) -> bool {
+    // Config alone must not authorize cleanup after the source disappears.
+    // An exact UUID-tagged export proves that macluster owned this endpoint;
+    // `plan_remove_nfs_exports` separately rejects a changed tagged line before
+    // any mount, export, or config mutation is performed.
+    !requests.is_empty()
+        && requests.iter().any(|request| {
+            let marker = format!(
+                "# macluster-managed {} {}",
+                request.share_uuid, request.node_id
+            );
+            matches!(
+                exports_authorize(exports, &request.root, &request.client_ip, Some(&marker)),
+                ExportAccess::Managed
+            )
+        })
+}
+
 pub(crate) fn mount_candidate_with_power(
     node: &NodeConfig,
     storage_node: &NodeConfig,
@@ -10303,11 +10382,14 @@ struct ShareRemovalClientPlan {
     aliases: Vec<NfsAlias>,
 }
 
-fn share_marker_read_timeout(error: &str, source_root: &Path) -> bool {
+fn share_marker_read_can_be_deferred(error: &str, source_root: &Path) -> bool {
     let marker = source_root.join(".macluster-share-id");
     let lower = error.to_ascii_lowercase();
     error.contains(&marker.to_string_lossy().to_string())
-        && (lower.contains("timed out") || lower.contains("timeout"))
+        && (lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("stale nfs file handle")
+            || lower.contains("stale file handle"))
 }
 
 fn read_deferred_share_cleanup(state_dir: &Path) -> AppResult<DeferredShareCleanupState> {
@@ -11335,6 +11417,35 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
             check_remote_idle(node, node_id, &config_path)?;
         }
 
+        let export_requests = config
+            .nodes
+            .iter()
+            .filter(|(node_id, _)| node_id.as_str() != server_id)
+            .map(|(node_id, node)| NfsExportRequest {
+                root: share.source_root.to_string_lossy().into_owned(),
+                client_ip: node.host.to_string(),
+                share_uuid: share_uuid.to_owned(),
+                node_id: node_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        let missing_source_cleanup_proven = if !export_requests.is_empty() && !server_offline {
+            let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
+                (
+                    1,
+                    format!("cannot inspect NFS exports before removing share {share_id}: {error}"),
+                )
+            })?;
+            plan_remove_nfs_exports(&exports, &export_requests).map_err(|error| {
+                (
+                    1,
+                    format!("cannot safely remove NFS exports for share {share_id}: {error}"),
+                )
+            })?;
+            managed_exports_prove_missing_share_source(&exports, &export_requests)
+        } else {
+            false
+        };
+
         let existing_removal = resumed_removal;
         if server_offline {
             eprintln!(
@@ -11348,11 +11459,11 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &format!("verify source marker for share {share_id} removal"),
             ) {
                 // REMOVAL_PENDING is written only after the source marker has
-                // already been matched against this UUID. On resume, a timed
-                // out marker read can therefore be deferred; the exact marker
+                // already been matched against this UUID. On resume, an
+                // unavailable marker read can therefore be deferred; the marker
                 // is checked again before any cleanup or is left in place if
                 // the source volume remains unresponsive.
-                if !share_marker_read_timeout(&error, &share.source_root) {
+                if !share_marker_read_can_be_deferred(&error, &share.source_root) {
                     return Err((1, error));
                 }
                 eprintln!(
@@ -11360,7 +11471,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 );
             }
         } else {
-            let marker_missing = verify_named_share_mount_for_removal(
+            let marker_missing = match verify_named_share_mount_for_removal(
                 server,
                 &server_id,
                 &server_id,
@@ -11368,10 +11479,23 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 &share.source_root,
                 &share.mount_root,
                 share_uuid,
-            )?;
+                missing_source_cleanup_proven,
+            ) {
+                Ok(missing) => missing,
+                Err((_, error))
+                    if missing_source_cleanup_proven
+                        && share_marker_read_can_be_deferred(&error, &share.source_root) =>
+                {
+                    eprintln!(
+                        "Warning: source marker on {server_id} has a stale NFS handle; exact managed exports were verified, so mount/export cleanup will proceed and marker cleanup will be retried later."
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            };
             if marker_missing {
                 eprintln!(
-                    "Warning: share marker on NFS server {server_id} is missing; continuing with the configured source path and preserving its files."
+                    "Warning: share marker on NFS server {server_id} is missing; continuing only after checking the configured export identity. Source files are preserved."
                 );
             }
         }
@@ -11432,6 +11556,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                             &share.source_root,
                             &share.mount_root,
                             share_uuid,
+                            missing_source_cleanup_proven,
                         )
                     {
                         // The mount table above already proved the exact
@@ -11439,7 +11564,7 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                         // prevent its exact managed mount from being removed;
                         // the privileged unmount helper still checks its
                         // recorded UUID before detaching it.
-                        if !share_marker_read_timeout(&error, &share.mount_root) {
+                        if !share_marker_read_can_be_deferred(&error, &share.mount_root) {
                             return Err((code, error));
                         }
                         eprintln!(
@@ -11486,32 +11611,6 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                 mounts: client_mounts,
                 aliases,
             });
-        }
-
-        let export_requests = config
-            .nodes
-            .iter()
-            .filter(|(node_id, _)| node_id.as_str() != server_id)
-            .map(|(node_id, node)| NfsExportRequest {
-                root: share.source_root.to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: share_uuid.to_owned(),
-                node_id: node_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        if !export_requests.is_empty() && !server_offline {
-            let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
-                (
-                    1,
-                    format!("cannot inspect NFS exports before removing share {share_id}: {error}"),
-                )
-            })?;
-            plan_remove_nfs_exports(&exports, &export_requests).map_err(|error| {
-                (
-                    1,
-                    format!("cannot safely remove NFS exports for share {share_id}: {error}"),
-                )
-            })?;
         }
 
         let candidate = remove_share_sections(&source_text, &BTreeSet::from([share_id.to_owned()]));
@@ -11587,7 +11686,9 @@ fn remove_registered_share(config_path: &Path, state_dir: &Path, share_id: &str)
                     &share.source_root,
                     share_uuid,
                 )?,
-                Err((_, error)) if share_marker_read_timeout(&error, &share.source_root) => {
+                Err((_, error))
+                    if share_marker_read_can_be_deferred(&error, &share.source_root) =>
+                {
                     // A stalled removable volume must not keep client mounts and
                     // exports registered forever. The operation journal records
                     // the UUID, and this sidecar retries exact marker cleanup once
@@ -12896,13 +12997,13 @@ fn cached_node_list_state(
     if !login_node && confirmed_offline {
         return show_all.then_some("OFFLINE");
     }
+    if !login_node && consecutive_failures > 0 {
+        return Some("RECONNECTING");
+    }
     if !login_node && !known_online {
         return show_all.then_some("UNKNOWN");
     }
     if !login_node && probe_inconclusive {
-        return Some("RECONNECTING");
-    }
-    if !login_node && consecutive_failures > 0 {
         return Some("RECONNECTING");
     }
     if !login_node && agent_responding == Some(false) {
@@ -13101,9 +13202,9 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
         );
     }
     if hidden_unreachable > 0 {
-        eprintln!(
-            "{hidden_unreachable} unverified or unreachable compute node(s) hidden; use `mnode -l --all` to inspect them"
-        );
+        if let Some(notice) = hidden_node_notice(hidden_unreachable) {
+            eprintln!("{notice}");
+        }
     }
     print!("{}", format_node_list(&rows));
     Ok(())
@@ -14222,8 +14323,8 @@ fn pending_named_share_operation_for_request(
         return Err((
             1,
             format!(
-                "share {share_id} has an incomplete operation for a different server, source path, or mount path; inspect node-admin journal {}",
-                existing.id
+                "share {share_id} already has an incomplete setup on server {} with endpoint {}; cancel that recorded attempt with `mnode -rm share:{share_id}` before adding a different source or server (journal {})",
+                existing.node_id, existing.endpoint, existing.id
             ),
         ));
     }
@@ -15520,6 +15621,7 @@ fn verify_named_share_mount(
         mount,
         uuid,
         false,
+        false,
     )
     .map(|_| ())
 }
@@ -15532,6 +15634,7 @@ fn verify_named_share_mount_for_removal(
     source: &Path,
     mount: &Path,
     uuid: &str,
+    allow_missing_source: bool,
 ) -> AppResult<bool> {
     verify_named_share_mount_with_missing_marker(
         node,
@@ -15542,6 +15645,7 @@ fn verify_named_share_mount_for_removal(
         mount,
         uuid,
         true,
+        allow_missing_source,
     )
 }
 
@@ -15554,6 +15658,7 @@ fn verify_named_share_mount_with_missing_marker(
     mount: &Path,
     uuid: &str,
     allow_missing_marker: bool,
+    allow_missing_source: bool,
 ) -> AppResult<bool> {
     let is_server = node_id == server_id;
     let marker_root = if is_server { source } else { mount };
@@ -15618,7 +15723,7 @@ fn verify_named_share_mount_with_missing_marker(
                 ),
             )
         })?;
-        if !source_directory.status.success() {
+        if !source_directory.status.success() && !allow_missing_source {
             return Err((
                 1,
                 format!(
@@ -17166,6 +17271,7 @@ mod tests {
         ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds,
         acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
         acquire_node_maintenance_with_confirmation_using, admin_shell_command,
+        agent_update_completion_summary, agent_update_maintenance_scope,
         agent_update_recovery_pending, cached_node_list_state, candidate_admin_script,
         classify_configured_agents, cleanup_node_from_endpoint, client_mount_admin_request,
         client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
@@ -17347,6 +17453,37 @@ mod tests {
 
         assert!(reachable);
         assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn agent_update_summary_is_compact_and_scales_by_node_count() {
+        assert_eq!(
+            agent_update_completion_summary("Agent update complete", 2),
+            "Agent update complete: 2 reachable nodes."
+        );
+        assert_eq!(
+            agent_update_completion_summary("Agent update complete", 3),
+            "Agent update complete: 3 reachable nodes."
+        );
+    }
+
+    #[test]
+    fn agent_update_maintenance_scope_defers_only_confirmed_unreachable_nodes() {
+        assert_eq!(
+            agent_update_maintenance_scope(&BTreeSet::new()).unwrap(),
+            macluster_protocol::control::MaintenanceScope::Cluster
+        );
+        assert_eq!(
+            agent_update_maintenance_scope(&BTreeSet::from([
+                "node-003".to_owned(),
+                "node-001".to_owned(),
+            ]))
+            .unwrap(),
+            macluster_protocol::control::MaintenanceScope::ClusterExceptUnreachable(vec![
+                NodeId::new("node-001").unwrap(),
+                NodeId::new("node-003").unwrap(),
+            ])
+        );
     }
 
     fn wait_for_exclusive_maintenance_lock(config: &Path) -> std::io::Result<MaintenanceLock> {
@@ -17892,6 +18029,42 @@ exec "$@"
 
         assert!(error.contains("did not match"), "{error}");
         assert!(original.contains("/Users/Shared/other 192.0.2.10"));
+    }
+
+    #[test]
+    fn missing_share_source_cleanup_requires_an_exact_managed_export_marker() {
+        let request = super::NfsExportRequest {
+            root: "/Users/operator/legacy-project".into(),
+            client_ip: "192.0.2.10".into(),
+            share_uuid: "share-legacy".into(),
+            node_id: "worker-a".into(),
+        };
+        let exact = concat!(
+            "# operator note\n",
+            "# macluster-managed share-legacy worker-a\n",
+            "/Users/operator/legacy-project 192.0.2.10\n",
+        );
+        let wrong_uuid = concat!(
+            "# macluster-managed another-share worker-a\n",
+            "/Users/operator/legacy-project 192.0.2.10\n",
+        );
+
+        assert!(super::managed_exports_prove_missing_share_source(
+            exact,
+            &[request.clone()]
+        ));
+        assert!(!super::managed_exports_prove_missing_share_source(
+            wrong_uuid,
+            &[request.clone()]
+        ));
+        assert!(!super::managed_exports_prove_missing_share_source(
+            "",
+            &[request]
+        ));
+        assert!(!super::managed_exports_prove_missing_share_source(
+            exact,
+            &[]
+        ));
     }
 
     #[test]
@@ -19577,6 +19750,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 macluster_protocol::identifiers::RequestId::random(),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("q").unwrap(),
                     node: None,
                     name: "active".into(),
@@ -19992,7 +20166,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 "192.0.2.2",
                 &root,
                 &root,
-                uuid
+                uuid,
+                false,
             )
             .expect("a missing marker on an existing configured directory is recoverable")
         );
@@ -20006,6 +20181,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             &root,
             &root,
             uuid,
+            false,
         )
         .unwrap_err();
         assert!(error.1.contains("different UUID"), "{error:?}");
@@ -20015,6 +20191,58 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             "a different share marker must be preserved"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn share_removal_can_accept_a_missing_source_after_export_ownership_is_proven() {
+        let root = test_exports_path();
+        let node = local_share_test_node();
+
+        let allowed = super::verify_named_share_mount_for_removal(
+            &node,
+            "storage",
+            "storage",
+            "192.0.2.2",
+            &root,
+            &root,
+            "00000000-0000-4000-8000-000000000001",
+            true,
+        )
+        .expect("exact managed exports permit cleanup of a missing source path");
+
+        assert!(allowed, "a missing marker/source is reported to the caller");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_nfs_marker_reads_are_deferred_only_for_the_recorded_marker_path() {
+        let source = Path::new("/Users/operator/legacy-project");
+        let stale = format!(
+            "cannot read share marker {}: cat: {}: Stale NFS file handle",
+            source.join(".macluster-share-id").display(),
+            source.join(".macluster-share-id").display()
+        );
+        let other_path = "cat: /Users/elsewhere/.macluster-share-id: Stale NFS file handle";
+        let permission = format!(
+            "cannot read share marker {}: Permission denied",
+            source.join(".macluster-share-id").display()
+        );
+
+        assert!(super::share_marker_read_can_be_deferred(&stale, source));
+        assert!(super::share_marker_read_can_be_deferred(
+            &format!(
+                "cannot read share marker {}: node transport timed out",
+                source.join(".macluster-share-id").display()
+            ),
+            source
+        ));
+        assert!(!super::share_marker_read_can_be_deferred(
+            other_path, source
+        ));
+        assert!(!super::share_marker_read_can_be_deferred(
+            &permission,
+            source
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -21729,11 +21957,26 @@ ssh_port = 22
             true,
         )
         .unwrap_err();
+        assert!(error.1.contains("different source or server"), "{error:?}");
+        assert!(error.1.contains("login-01"), "{error:?}");
+        assert!(error.1.contains("mnode -rm share:cargo"), "{error:?}");
+
+        let server_error = super::pending_named_share_operation_for_request(
+            Some(&operation),
+            "cargo",
+            "login-02",
+            &source,
+            &mount,
+            true,
+        )
+        .unwrap_err();
         assert!(
-            error
-                .1
-                .contains("different server, source path, or mount path"),
-            "{error:?}"
+            server_error.1.contains("server login-01"),
+            "{server_error:?}"
+        );
+        assert!(
+            server_error.1.contains("mnode -rm share:cargo"),
+            "{server_error:?}"
         );
     }
 
@@ -21787,11 +22030,7 @@ ssh_port = 22
             false,
         )
         .unwrap_err();
-        assert!(
-            error
-                .1
-                .contains("different server, source path, or mount path")
-        );
+        assert!(error.1.contains("different source or server"));
 
         operation.endpoint =
             named_share_operation_endpoint("cargo", "login-01", &new_source, &new_mount, false);

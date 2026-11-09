@@ -480,7 +480,7 @@ fn an_idle_controller_with_an_old_binary_is_replaced_by_the_current_build() {
 }
 
 #[test]
-fn a_build_update_waits_for_active_jobs_and_does_not_stop_the_old_controller() {
+fn a_build_update_is_deferred_while_active_jobs_keep_the_old_controller_running() {
     use macluster_core::storage::Storage;
 
     let fixture = Fixture::new();
@@ -493,6 +493,7 @@ fn a_build_update_waits_for_active_jobs_and_does_not_stop_the_old_controller() {
             RequestId::random(),
             JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new("q").unwrap(),
                 node: None,
                 name: "active".into(),
@@ -515,9 +516,9 @@ fn a_build_update_waits_for_active_jobs_and_does_not_stop_the_old_controller() {
     let launcher = Arc::new(FakeLauncher::active());
     launcher.stale_build.store(true, Ordering::SeqCst);
     let service = manager(&fixture, Arc::clone(&launcher), source);
-    let error = service.ensure_running(Duration::from_secs(1)).unwrap_err();
+    let hello = service.ensure_running(Duration::from_secs(1)).unwrap();
 
-    assert!(error.to_string().contains("1 jobs are active"));
+    assert_eq!(hello.build_id, "previous-build");
     assert_eq!(launcher.bootouts.load(Ordering::SeqCst), 0);
     assert_eq!(launcher.bootstraps.load(Ordering::SeqCst), 0);
 }
@@ -540,6 +541,7 @@ fn a_stopped_same_build_controller_restarts_to_reconcile_active_jobs() {
             RequestId::random(),
             JobSpec {
                 storage_namespace: None,
+                required_shares: Some(Vec::new()),
                 queue: QueueName::new("q").unwrap(),
                 node: None,
                 name: "active".into(),

@@ -7,7 +7,6 @@ use std::{
 use macluster_protocol::types::MetricSnapshot;
 
 const METRICS_STALE_AFTER: Duration = Duration::from_secs(6);
-const MONITOR_LIVENESS_STALE_AFTER: Duration = Duration::from_secs(20);
 const CPU_HISTORY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,14 +192,17 @@ impl NodeMetricCache {
         if self.confirmed_offline {
             return false;
         }
+        if self.controller_liveness_managed {
+            // A stalled monitor feed is not evidence that the host is offline.
+            // Keep its last sample visible (view_at marks it STALE), and also
+            // keep a Loading/Unavailable row if the controller has observed
+            // the node but its first metric sample has not arrived yet. Only
+            // a confirmed host outage should remove a controller-managed node.
+            return self.last_success.is_some() || self.controller_liveness_at.is_some();
+        }
         let Some((_, sampled_at)) = self.last_success.as_ref() else {
             return false;
         };
-        if self.controller_liveness_managed {
-            return self.controller_liveness_at.is_some_and(|observed_at| {
-                now.saturating_duration_since(observed_at) < MONITOR_LIVENESS_STALE_AFTER
-            });
-        }
         let failures = macluster_controller::liveness::OFFLINE_AFTER_FAILURES;
         if self.consecutive_failures >= failures {
             return false;

@@ -81,6 +81,7 @@ fn job_spec(binding: &ServiceBinding, name: &str) -> JobSpec {
     let shared = config.shared_root;
     JobSpec {
         storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+        required_shares: Some(Vec::new()),
         queue: QueueName::new("cpu").unwrap(),
         node: Some(NodeId::new("compute").unwrap()),
         name: name.into(),

@@ -3598,6 +3598,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: Some(NodeId::new("mini01-a").unwrap()),
                     name: "terminal pending logs".into(),
@@ -3619,6 +3620,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: Some(NodeId::new("mini01-b").unwrap()),
                     name: "queued pending snapshot".into(),
@@ -3667,6 +3669,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: Some(NodeId::new("mini01-a").unwrap()),
                     name: "cancelled output sync".into(),
@@ -3711,6 +3714,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: Some(NodeId::new("mini01-a").unwrap()),
                     name: "terminal pending logs".into(),
@@ -3732,6 +3736,7 @@ mod tests {
                 RequestId(Id128::random()),
                 JobSpec {
                     storage_namespace: None,
+                    required_shares: Some(Vec::new()),
                     queue: QueueName::new("mini01").unwrap(),
                     node: Some(NodeId::new("mini01-a").unwrap()),
                     name: "pending task".into(),

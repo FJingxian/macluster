@@ -4,6 +4,7 @@ mod app;
 pub mod arguments;
 pub mod client_profile;
 mod control_client;
+pub mod discovery;
 mod embedded_power;
 mod init;
 mod job_resources;

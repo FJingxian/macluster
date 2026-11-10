@@ -434,34 +434,40 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
     {
-        let discovered =
-            crate::discovery::discover_clusters(Duration::from_secs(1)).unwrap_or_default();
-        if discovered.len() == 1 {
-            let candidate = &discovered[0];
-            if let (Some(address), Some(port)) = (&candidate.resolved_address, candidate.ssh_port) {
-                let user = env::var("USER").unwrap_or_else(|_| "mac".into());
-                eprint!(
-                    "Found cluster '{}' at {} ({}). Join as {}@{}:{}? [y/N] ",
-                    candidate.cluster_name,
-                    address,
-                    candidate.ssh_host_fingerprint,
-                    user,
-                    address,
-                    port
-                );
-                io::stderr().flush().ok();
-                let mut answer = String::new();
-                io::stdin()
-                    .read_line(&mut answer)
-                    .map_err(|error| (1, error.to_string()))?;
-                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    let profile = crate::client_join::join_cluster(
-                        &format!("{user}@{address}:{port}"),
-                        false,
-                    )
-                    .map_err(|error| (1, error))?;
-                    return remote_command(profile, &command, &args);
-                }
+        let current_user = current_account_name().unwrap_or_else(|| "mac".into());
+        let candidates = automatic_join_candidates(&current_user).unwrap_or_default();
+        if let [candidate] = candidates.as_slice() {
+            let fingerprint = candidate
+                .ssh_host_fingerprint
+                .as_deref()
+                .map(|value| format!(", {value}"))
+                .unwrap_or_default();
+            eprint!(
+                "Detected existing cluster '{}' ({}) at {}@{}:{}{}. Join as a login client? [y/N] ",
+                candidate.cluster_name,
+                candidate.cluster_uuid,
+                candidate.ssh_user,
+                candidate.address,
+                candidate.ssh_port,
+                fingerprint
+            );
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| (1, error.to_string()))?;
+            if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                let control_only = !remote_command_requires_client_storage(&command, &args);
+                let profile = crate::client_join::join_cluster_expected(
+                    &format!(
+                        "{}@{}:{}",
+                        candidate.ssh_user, candidate.address, candidate.ssh_port
+                    ),
+                    control_only,
+                    Some(&candidate.cluster_uuid),
+                )
+                .map_err(|error| (1, error))?;
+                return remote_command(profile, &command, &args);
             }
         }
     }
@@ -625,6 +631,117 @@ fn persist_leave_phase(
 ) -> io::Result<()> {
     profile.leave_phase = Some(phase);
     store.save(profile)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomaticJoinCandidate {
+    cluster_uuid: String,
+    cluster_name: String,
+    ssh_user: String,
+    address: String,
+    ssh_port: u16,
+    ssh_host_fingerprint: Option<String>,
+}
+
+fn automatic_join_candidates(current_user: &str) -> Result<Vec<AutomaticJoinCandidate>, String> {
+    let discovered =
+        crate::discovery::discover_clusters(Duration::from_secs(1)).unwrap_or_default();
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())?;
+    let local_addresses = crate::node_admin::local_ipv4_addresses()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mount_table = process::Command::new("/sbin/mount")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let local = crate::discovery::discover_local_cluster_candidates(
+        &home,
+        &mount_table,
+        &local_addresses,
+        current_user,
+    )
+    .unwrap_or_default();
+    let local = local
+        .into_iter()
+        .map(|candidate| AutomaticJoinCandidate {
+            cluster_uuid: candidate.cluster_uuid,
+            cluster_name: candidate.cluster_name,
+            ssh_user: candidate.ssh_user,
+            address: candidate.host,
+            ssh_port: candidate.ssh_port,
+            ssh_host_fingerprint: None,
+        })
+        .collect::<Vec<_>>();
+    Ok(select_automatic_join_candidates(
+        discovered,
+        local,
+        current_user,
+    ))
+}
+
+fn select_automatic_join_candidates(
+    discovered: Vec<crate::discovery::DiscoveryRecord>,
+    local: Vec<AutomaticJoinCandidate>,
+    current_user: &str,
+) -> Vec<AutomaticJoinCandidate> {
+    if !discovered.is_empty() {
+        let candidates = discovered
+            .into_iter()
+            .filter_map(|record| {
+                let matching_local = local
+                    .iter()
+                    .find(|candidate| candidate.cluster_uuid == record.cluster_uuid);
+                Some(AutomaticJoinCandidate {
+                    cluster_uuid: record.cluster_uuid,
+                    cluster_name: record.cluster_name,
+                    ssh_user: record
+                        .ssh_user
+                        .filter(|user| valid_account_component(user))
+                        .or_else(|| matching_local.map(|candidate| candidate.ssh_user.clone()))
+                        .unwrap_or_else(|| current_user.to_owned()),
+                    address: record
+                        .resolved_address
+                        .or_else(|| matching_local.map(|candidate| candidate.address.clone()))?,
+                    ssh_port: record
+                        .ssh_port
+                        .or_else(|| matching_local.map(|candidate| candidate.ssh_port))?,
+                    ssh_host_fingerprint: Some(record.ssh_host_fingerprint),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+    local
+}
+
+fn current_account_name() -> Option<String> {
+    env::var("USER")
+        .ok()
+        .filter(|user| valid_account_component(user))
+        .or_else(|| {
+            env::var_os("HOME")
+                .and_then(|home| PathBuf::from(home).file_name()?.to_str().map(str::to_owned))
+                .filter(|user| valid_account_component(user))
+        })
+}
+
+fn valid_account_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+            }
+        })
 }
 
 fn remove_file_if_exists(path: &Path) -> io::Result<()> {
@@ -7109,6 +7226,7 @@ fn start_cluster_advertisement(
         controller_build: hello.build_id.clone(),
         ssh_host_fingerprint: fingerprint,
         transport: "ssh".into(),
+        ssh_user: current_account_name(),
         resolved_address: None,
         ssh_port: None,
     };
@@ -8062,7 +8180,16 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
         Some("nfs-admin") => internal_nfs_admin(&args[1..]),
         Some("control-proxy") => {
-            let proxy = crate::remote_transport::validate_proxy_args(&args[1..])
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let mut proxy_args = vec![
+                "--config".into(),
+                config_path.to_string_lossy().into_owned(),
+                "--state-dir".into(),
+                state_dir.to_string_lossy().into_owned(),
+            ];
+            proxy_args.extend(args[1..].iter().cloned());
+            let proxy = crate::remote_transport::validate_proxy_args(&proxy_args)
                 .map_err(|error| (1, error))?;
             if let Some((client_id, recorded_ip)) = proxy.client_storage.as_ref() {
                 let config =
@@ -8091,12 +8218,38 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 .map_err(|error| (1, error.to_string()))?;
             let mut output = socket.try_clone().map_err(|error| (1, error.to_string()))?;
             std::thread::scope(|scope| {
-                let input = scope.spawn(|| {
-                    io::copy(&mut io::stdin(), &mut socket).map_err(|error| error.to_string())
+                let input = scope.spawn(|| -> Result<(), String> {
+                    let stdin = io::stdin();
+                    let mut stdin = stdin.lock();
+                    let mut buffer = [0_u8; 16 * 1024];
+                    loop {
+                        let count = stdin.read(&mut buffer).map_err(|error| error.to_string())?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        socket
+                            .write_all(&buffer[..count])
+                            .map_err(|error| error.to_string())?;
+                        socket.flush().map_err(|error| error.to_string())?;
+                    }
                 });
-                let result = io::copy(&mut output, &mut io::stdout())
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
+                let result = (|| -> Result<(), String> {
+                    let stdout = io::stdout();
+                    let mut stdout = stdout.lock();
+                    let mut buffer = [0_u8; 16 * 1024];
+                    loop {
+                        let count = output
+                            .read(&mut buffer)
+                            .map_err(|error| error.to_string())?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        stdout
+                            .write_all(&buffer[..count])
+                            .map_err(|error| error.to_string())?;
+                        stdout.flush().map_err(|error| error.to_string())?;
+                    }
+                })();
                 let _ = input.join();
                 result
             })
@@ -11872,8 +12025,9 @@ mod update_terminal_regressions {
 #[cfg(test)]
 mod remote_client_regressions {
     use super::{
-        Id128, InteractiveRequestFile, job_uses_remote_cli, queue_uses_remote_cli,
-        remote_command_requires_client_storage,
+        AutomaticJoinCandidate, Id128, InteractiveRequestFile, job_uses_remote_cli,
+        queue_uses_remote_cli, remote_command_requires_client_storage,
+        select_automatic_join_candidates,
     };
 
     #[test]
@@ -11926,5 +12080,32 @@ mod remote_client_regressions {
             assert!(path.exists());
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn bonjour_candidate_uses_the_ssh_account_derived_from_local_agent_state() {
+        let record = crate::discovery::DiscoveryRecord {
+            instance: "macluster".into(),
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "macluster".into(),
+            protocol_version: 1,
+            controller_build: "macluster/0.2.0".into(),
+            ssh_host_fingerprint: "SHA256:test".into(),
+            transport: "ssh".into(),
+            ssh_user: None,
+            resolved_address: Some("192.0.2.1".into()),
+            ssh_port: Some(22),
+        };
+        let local = vec![AutomaticJoinCandidate {
+            cluster_uuid: record.cluster_uuid.clone(),
+            cluster_name: "macluster".into(),
+            ssh_user: "loginuser".into(),
+            address: "192.0.2.1".into(),
+            ssh_port: 22,
+            ssh_host_fingerprint: None,
+        }];
+        let selected = select_automatic_join_candidates(vec![record], local, "worker");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].ssh_user, "loginuser");
     }
 }

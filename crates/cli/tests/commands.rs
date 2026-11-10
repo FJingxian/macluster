@@ -92,6 +92,86 @@ fn read_queries_do_not_wait_for_controller_or_remote_agents() {
 }
 
 #[test]
+fn internal_control_proxy_accepts_cli_global_config_and_state_dir() {
+    let (root, _shared, config) = fixture();
+    let state = root.join("controller");
+    let output = macluster_command()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "internal",
+            "control-proxy",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("control-proxy requires"), "{stderr}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn internal_control_proxy_forwards_input_before_stdin_reaches_eof() {
+    use macluster_core::service::ServiceBinding;
+    use std::os::unix::net::UnixListener;
+
+    let (root, _shared, config) = fixture();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    let binding = ServiceBinding::load(&config, &state).unwrap();
+    binding.prepare_endpoint_dir().unwrap();
+    let listener = UnixListener::bind(binding.endpoint_path()).unwrap();
+    let mut child = macluster_command()
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "internal",
+            "control-proxy",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stdin.write_all(b"hello").unwrap();
+    stdin.flush().unwrap();
+    let mut received = [0_u8; 5];
+    server.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"hello");
+    server.write_all(b"world").unwrap();
+    server.flush().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut reply = [0_u8; 5];
+        let result = stdout.read_exact(&mut reply).map(|_| reply);
+        let _ = sender.send(result);
+    });
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(),
+        *b"world"
+    );
+    drop(stdin);
+    drop(server);
+    reader.join().unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn job_listing_before_first_job_does_not_create_controller_state() {
     let (root, _, config) = fixture();
     let state = root.join("controller");

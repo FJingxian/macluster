@@ -172,6 +172,14 @@ pub fn profile_from_bootstrap(
 }
 
 pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile, String> {
+    join_cluster_expected(endpoint, control_only, None)
+}
+
+pub fn join_cluster_expected(
+    endpoint: &str,
+    control_only: bool,
+    expected_cluster_uuid: Option<&str>,
+) -> Result<ClientProfile, String> {
     let endpoint = JoinEndpoint::parse(endpoint)?;
     let mut node = endpoint.node();
     let access = ssh_bootstrap::ensure_ssh_access_with_receipt(
@@ -180,7 +188,7 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
     )?;
     let identity = node
         .ssh_identity_file
-        .as_deref()
+        .clone()
         .ok_or_else(|| "SSH bootstrap did not retain a client identity".to_owned())?;
     let public_key = access
         .public_key
@@ -193,8 +201,11 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
     let mut profile_persisted = false;
     let mut known_hosts_cleanup = None;
     let result = (|| {
+        let remote_binary = resolve_remote_macluster(&node)?;
+        node.remote_binary = remote_binary.clone();
         let bootstrap_command = format!(
-            "macluster internal client-bootstrap --json --client-key-digest {client_key_digest}"
+            "{} internal client-bootstrap --json --client-key-digest {client_key_digest}",
+            node_admin::shell_quote(&remote_binary)
         );
         let output =
             node_admin::ssh_output(&node, &bootstrap_command, None).map_err(|(_, error)| error)?;
@@ -206,8 +217,9 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
         }
         let bootstrap: BootstrapResponse = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("Controller bootstrap returned invalid JSON: {error}"))?;
+        verify_expected_cluster_uuid(&bootstrap.descriptor.cluster_uuid, expected_cluster_uuid)?;
         let host_fingerprint = bootstrap.host_fingerprint.clone();
-        let mut profile = profile_from_bootstrap(&endpoint, bootstrap, PathBuf::from(identity))?;
+        let mut profile = profile_from_bootstrap(&endpoint, bootstrap, PathBuf::from(&identity))?;
         let known_hosts_path = PathBuf::from(&profile.known_hosts_path);
         if !known_hosts_path.exists() {
             known_hosts_cleanup = Some(known_hosts_path.clone());
@@ -351,7 +363,7 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
                 let public_key = String::from_utf8_lossy(&public_key);
                 match ssh_bootstrap::revoke_public_key(&node, &public_key) {
                     Ok(()) => {
-                        let _ = fs::remove_file(identity);
+                        let _ = fs::remove_file(&identity);
                         let _ = fs::remove_file(format!("{identity}.pub"));
                     }
                     Err(cleanup_error) => {
@@ -376,6 +388,55 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
 
 fn join_key_cleanup_required(profile_persisted: bool, key_installed: bool) -> bool {
     key_installed && !profile_persisted
+}
+
+fn resolve_remote_macluster(node: &NodeConfig) -> Result<String, String> {
+    let script = r#"set -eu
+for candidate in /opt/homebrew/bin/macluster /usr/local/bin/macluster "$HOME/.local/bin/macluster" "$HOME/.macluster/bin/macluster"; do
+  if [ -x "$candidate" ]; then /usr/bin/printf '%s\n' "$candidate"; exit 0; fi
+done
+candidate=$(command -v macluster 2>/dev/null || true)
+[ -n "$candidate" ] || { echo 'macluster is not installed on this login node' >&2; exit 127; }
+/usr/bin/printf '%s\n' "$candidate"
+"#;
+    let output = node_admin::ssh_output(node, script, None).map_err(|(_, error)| error)?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot locate macluster on the login node: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_remote_macluster_path(&output.stdout)
+}
+
+fn parse_remote_macluster_path(output: &[u8]) -> Result<String, String> {
+    let path = String::from_utf8(output.to_vec())
+        .map_err(|_| "login-node macluster path is not valid UTF-8".to_owned())?;
+    let path = path.trim();
+    let parsed = std::path::Path::new(path);
+    if path.is_empty()
+        || !parsed.is_absolute()
+        || path.chars().any(char::is_control)
+        || parsed
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("login-node macluster path is invalid".into());
+    }
+    Ok(path.to_owned())
+}
+
+fn verify_expected_cluster_uuid(actual: &str, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the discovered endpoint belongs to cluster {actual}, not the expected cluster {expected}"
+        ))
+    }
 }
 
 fn join_local_cleanup_required(profile_persisted: bool) -> bool {
@@ -515,7 +576,8 @@ fn retired_transport_profile(
 mod tests {
     use super::{
         BootstrapResponse, JoinEndpoint, existing_mounts_are_active, join_key_cleanup_required,
-        join_local_cleanup_required, profile_from_bootstrap,
+        join_local_cleanup_required, parse_remote_macluster_path, profile_from_bootstrap,
+        verify_expected_cluster_uuid,
     };
 
     fn descriptor() -> macluster_protocol::control::ClientDescriptor {
@@ -636,6 +698,35 @@ mod tests {
         assert!(existing_mounts_are_active(&profile));
         profile.leave_phase = Some(crate::client_profile::ClientLeavePhase::MountsDetached);
         assert!(!existing_mounts_are_active(&profile));
+    }
+
+    #[test]
+    fn automatic_join_rejects_a_controller_from_another_cluster() {
+        assert!(
+            verify_expected_cluster_uuid(
+                "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+                Some("f779bcf5-ea85-5caa-9579-74b395f3cce5")
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_expected_cluster_uuid(
+                "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+                Some("82d02835-f6ab-52b4-aaab-f90cafde9981")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn login_node_binary_path_must_be_a_safe_absolute_path() {
+        assert_eq!(
+            parse_remote_macluster_path(b"/opt/homebrew/bin/macluster\n").unwrap(),
+            "/opt/homebrew/bin/macluster"
+        );
+        assert!(parse_remote_macluster_path(b"macluster\n").is_err());
+        assert!(parse_remote_macluster_path(b"/tmp/../macluster\n").is_err());
+        assert!(parse_remote_macluster_path(b"/tmp/macluster\nmalicious\n").is_err());
     }
 
     #[test]

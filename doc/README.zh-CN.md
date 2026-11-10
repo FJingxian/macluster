@@ -26,6 +26,15 @@
 
 要求：macOS 12 或更新版本；计算节点开启“远程登录”，登录 Mac 可以通过 SSH 连接。源码编译需要 Rust 1.90 或更新版本。
 
+Apple silicon 用户可以直接安装经过签名和公证的最新版本：
+
+```sh
+brew install FJingxian/macluster/macluster
+brew upgrade macluster
+```
+
+每次 GitHub Release 发布后，Homebrew tap 会自动更新。Intel Mac 和源码安装使用下列命令。
+
 在准备作为登录节点的 Mac 上进入仓库执行：
 
 ```sh
@@ -39,6 +48,8 @@ export PATH="$HOME/.local/bin:$PATH"
 只复制二进制时可以运行 `macluster 子命令`；`mtop` 这类短命令是安装脚本创建的软链接。使用下载的二进制时，运行 `packaging/scripts/install-user.sh /path/to/macluster "$HOME/.local/bin"`，然后将该目录加入 PATH。
 
 下文使用完整命令；安装脚本也提供 `msub`、`mjob`、`mqueue`、`mkill`、`mtop`、`mnode`、`mfans` 别名。controller 服务命令仍可用于手动维护，但不再显示在主帮助中。
+
+签名、notarization 和 Homebrew tap 的维护流程见[发布说明](releasing.md)。
 
 ## 创建集群
 

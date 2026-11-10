@@ -9,3 +9,5 @@
 rust-toolchain.toml
 /macos/
 .DS_Store
+*.p12
+*.p12.base64

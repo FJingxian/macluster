@@ -1,0 +1,243 @@
+name: Release macOS binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: aarch64-apple-darwin
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.90
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --target "$TARGET"
+          rustup default 1.90.0
+
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts/release/tests -v
+
+      - name: Verify tag matches workspace version
+        run: |
+          python3 - "$GITHUB_REF_NAME" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          tag = sys.argv[1]
+          version = re.search(
+              r'(?ms)^\[workspace\.package\]\s*.*?^version = "([^"]+)"',
+              pathlib.Path("Cargo.toml").read_text(),
+          ).group(1)
+          if tag != f"v{version}":
+              raise SystemExit(f"tag {tag} does not match workspace version v{version}")
+          print(f"release version: {version}")
+          PY
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets -- --test-threads=1
+
+      - name: Build arm64 release binary
+        run: cargo build --release --locked -p macluster-cli --target "$TARGET"
+
+      - name: Verify release binary
+        run: |
+          BIN="target/$TARGET/release/macluster"
+          test -x "$BIN"
+          file "$BIN"
+          file "$BIN" | grep -q "Mach-O 64-bit executable arm64"
+          "$BIN" --version | grep -F "macluster ${GITHUB_REF_NAME#v}"
+
+      - name: Validate signing credentials
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12_BASE64" || { echo "::error::APPLE_CERTIFICATE_P12_BASE64 is not configured"; exit 1; }
+          test -n "$APPLE_CERTIFICATE_PASSWORD" || { echo "::error::APPLE_CERTIFICATE_PASSWORD is not configured"; exit 1; }
+          test -n "$APPLE_ID" || { echo "::error::APPLE_ID is not configured"; exit 1; }
+          test -n "$APPLE_TEAM_ID" || { echo "::error::APPLE_TEAM_ID is not configured"; exit 1; }
+          test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "::error::APPLE_APP_SPECIFIC_PASSWORD is not configured"; exit 1; }
+          test -n "$HOMEBREW_TAP_SSH_KEY" || { echo "::error::HOMEBREW_TAP_SSH_KEY is not configured"; exit 1; }
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN="$RUNNER_TEMP/macluster-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERTIFICATE" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -t cert -f pkcs12 -T /usr/bin/codesign -k "$KEYCHAIN"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s \
+            "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" |
+            awk -F '"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY" || {
+            echo "::error::the imported certificate is not a Developer ID Application identity"
+            exit 1
+          }
+          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "MACOS_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Sign release binary
+        run: |
+          BIN="target/$TARGET/release/macluster"
+          codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=4 "$BIN"
+          codesign -dv --verbose=4 "$BIN"
+
+      - name: Notarize signed binary
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          BIN="target/$TARGET/release/macluster"
+          ARCHIVE="$RUNNER_TEMP/macluster-notarization.zip"
+          /usr/bin/ditto -c -k --keepParent "$BIN" "$ARCHIVE"
+          xcrun notarytool submit "$ARCHIVE" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait \
+            --output-format json > "$RUNNER_TEMP/notarization.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          result = json.loads(
+              pathlib.Path(os.environ["RUNNER_TEMP"], "notarization.json").read_text()
+          )
+          if result.get("status") != "Accepted":
+              raise SystemExit(f"notarization failed: {result}")
+          print(f"notarization submission: {result.get('id')}")
+          PY
+
+      - name: Package signed release
+        run: |
+          python3 scripts/release/package_macos.py \
+            --binary "target/$TARGET/release/macluster" \
+            --version "${GITHUB_REF_NAME#v}" \
+            --output-dir dist
+          cd dist
+          shasum -a 256 -c SHA256SUMS
+          tar -tzvf ./*.tar.gz
+
+      - name: Generate Homebrew formula
+        run: |
+          SHA256="$(awk '{print $1}' dist/SHA256SUMS)"
+          python3 scripts/release/homebrew_formula.py \
+            --version "${GITHUB_REF_NAME#v}" \
+            --sha256 "$SHA256" \
+            --output dist/macluster.rb
+          ruby -c dist/macluster.rb
+
+      - name: Create GitHub Release
+        run: |
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## English
+
+          macluster $GITHUB_REF_NAME is a signed and notarized Apple silicon build.
+
+          Homebrew (after the tap is published):
+
+          \`\`\`sh
+          brew install FJingxian/macluster/macluster
+          \`\`\`
+
+          See the commit history for the complete change list.
+
+          ## 简体中文
+
+          macluster $GITHUB_REF_NAME 是经过签名和 Apple notarization 的 Apple silicon 版本。
+
+          Homebrew 安装（tap 发布后）：
+
+          \`\`\`sh
+          brew install FJingxian/macluster/macluster
+          \`\`\`
+
+          完整改动请查看 commit 记录。
+          EOF
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              dist/macluster-v*-macos-arm64.tar.gz \
+              dist/SHA256SUMS \
+              dist/macluster.rb \
+              --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              dist/macluster-v*-macos-arm64.tar.gz \
+              dist/SHA256SUMS \
+              dist/macluster.rb \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          TAP_REPOSITORY="${TAP_REPOSITORY:-FJingxian/homebrew-macluster}"
+          TAP_DIR="$RUNNER_TEMP/homebrew-macluster"
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$HOMEBREW_TAP_SSH_KEY" > "$HOME/.ssh/macluster-homebrew-deploy-key"
+          chmod 600 "$HOME/.ssh/macluster-homebrew-deploy-key"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/macluster-homebrew-deploy-key -o IdentitiesOnly=yes"
+          git clone "git@github.com:${TAP_REPOSITORY}.git" "$TAP_DIR"
+          mkdir -p "$TAP_DIR/Formula"
+          cp dist/macluster.rb "$TAP_DIR/Formula/macluster.rb"
+          git -C "$TAP_DIR" config user.name "github-actions[bot]"
+          git -C "$TAP_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$TAP_DIR" add Formula/macluster.rb
+          if git -C "$TAP_DIR" diff --cached --quiet; then
+            echo "Homebrew formula is already current."
+            exit 0
+          fi
+          git -C "$TAP_DIR" commit -m "macluster ${GITHUB_REF_NAME#v}"
+          git -C "$TAP_DIR" push origin HEAD:main
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if test -n "${MACOS_KEYCHAIN:-}" && test -e "$MACOS_KEYCHAIN"; then
+            security delete-keychain "$MACOS_KEYCHAIN"
+          fi

@@ -26,6 +26,15 @@ This is an early-stage project for personal and lab clusters. It uses macOS acco
 
 Requirements: macOS 12+, Remote Login enabled on compute Macs, and SSH access from the login Mac. Building requires Rust 1.90+.
 
+On Apple silicon, install the latest signed release with Homebrew:
+
+```sh
+brew install FJingxian/macluster/macluster
+brew upgrade macluster
+```
+
+The tap formula is updated automatically after a GitHub release. Intel Macs and source installs can use the commands below.
+
 Build and install on the Mac you want to use as the login node:
 
 ```sh
@@ -39,6 +48,8 @@ Add the PATH line to your shell configuration. To distribute the app, copy only 
 Copying the binary alone provides `macluster SUBCOMMAND`. Short commands such as `mtop` are symlinks created by the installer. For a downloaded binary, run `packaging/scripts/install-user.sh /path/to/macluster "$HOME/.local/bin"`, then add that directory to `PATH`.
 
 Examples use the full command. The installer also provides `msub`, `mjob`, `mqueue`, `mkill`, `mtop`, `mnode`, and `mfans` command aliases. Controller commands remain available for manual service maintenance but are omitted from the main help.
+
+Release signing, notarization, and the Homebrew tap are documented in [releasing.md](doc/releasing.md).
 
 ## Start a cluster
 

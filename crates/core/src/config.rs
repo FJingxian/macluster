@@ -110,7 +110,7 @@ fn add_trusted_node_ssh_args(
     alias: &str,
     registered_host: &str,
 ) {
-    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return;
     };
     let private_parent = path

@@ -1,4 +1,8 @@
-use std::{io, os::unix::net::UnixStream, time::Duration};
+use std::{
+    io::{self, Read, Write},
+    os::unix::net::UnixStream,
+    time::Duration,
+};
 
 use macluster_core::service::{ServiceBinding, ServiceError, peer_uid};
 use macluster_protocol::{
@@ -10,6 +14,8 @@ use macluster_protocol::{
     identifiers::{Id128, RequestId},
 };
 use thiserror::Error;
+
+use crate::{client_profile::ClientProfile, remote_transport::RemoteControlStream};
 
 #[derive(Debug, Error)]
 pub enum ControlClientError {
@@ -31,8 +37,38 @@ pub enum ControlClientError {
 }
 
 pub struct ControlClient {
-    stream: UnixStream,
+    stream: ControlStream,
     hello: ControllerHello,
+}
+
+enum ControlStream {
+    Local(UnixStream),
+    Remote(RemoteControlStream),
+}
+
+impl Read for ControlStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Local(stream) => stream.read(buffer),
+            Self::Remote(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for ControlStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Local(stream) => stream.write(buffer),
+            Self::Remote(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Local(stream) => stream.flush(),
+            Self::Remote(stream) => stream.flush(),
+        }
+    }
 }
 
 impl ControlClient {
@@ -90,7 +126,49 @@ impl ControlClient {
         {
             return Err(ControlClientError::WrongCluster);
         }
-        Ok(Self { stream, hello })
+        Ok(Self {
+            stream: ControlStream::Local(stream),
+            hello,
+        })
+    }
+
+    pub fn connect_remote(
+        profile: &ClientProfile,
+        timeout: Duration,
+        ensure_client_storage: bool,
+    ) -> Result<Self, ControlClientError> {
+        let stream = RemoteControlStream::connect(profile, ensure_client_storage, timeout)?;
+        Self::handshake(
+            ControlStream::Remote(stream),
+            timeout,
+            |stream| {
+                write_frame(
+                    stream,
+                    &ClientHello {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        binding_digest: profile.binding_digest.clone(),
+                        namespace: profile.namespace.clone(),
+                        uid: profile.remote_uid,
+                        build_id: concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
+                            .into(),
+                        capabilities: vec![
+                            "status.v1".into(),
+                            "jobs.v1".into(),
+                            "snapshot.upload.v1".into(),
+                            "agent.compatibility.v1".into(),
+                            "monitor.v1".into(),
+                            macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
+                            "maintenance.v1".into(),
+                            "fan-control.v1".into(),
+                        ],
+                    },
+                )?;
+                Ok(())
+            },
+            &profile.binding_digest,
+            &profile.namespace,
+            profile.remote_uid,
+        )
     }
 
     pub fn hello(&self) -> &ControllerHello {
@@ -98,13 +176,24 @@ impl ControlClient {
     }
 
     pub fn set_timeouts(&self, timeout: Duration) -> Result<(), ControlClientError> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        self.stream.set_write_timeout(Some(timeout))?;
+        match &self.stream {
+            ControlStream::Local(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+            }
+            ControlStream::Remote(stream) => stream.set_timeout(timeout),
+        }
         Ok(())
     }
 
     pub fn shutdown_handle(&self) -> io::Result<UnixStream> {
-        self.stream.try_clone()
+        match &self.stream {
+            ControlStream::Local(stream) => stream.try_clone(),
+            ControlStream::Remote(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote control shutdown handles are not available",
+            )),
+        }
     }
 
     pub fn call(&mut self, request: ControlRequest) -> Result<ControlResponse, ControlClientError> {
@@ -135,6 +224,44 @@ impl ControlClient {
             code: error.code,
             message: error.message,
         })
+    }
+
+    fn handshake(
+        mut stream: ControlStream,
+        timeout: Duration,
+        write_hello: impl FnOnce(&mut ControlStream) -> Result<(), ControlClientError>,
+        binding_digest: &str,
+        namespace: &str,
+        uid: u32,
+    ) -> Result<Self, ControlClientError> {
+        if let ControlStream::Local(stream) = &stream {
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+        }
+        write_hello(&mut stream)?;
+        let response: HelloResponse = read_frame(&mut stream)?.ok_or_else(|| {
+            ControlClientError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "controller closed during hello",
+            ))
+        })?;
+        let hello = match response {
+            HelloResponse::Accepted(hello) => hello,
+            HelloResponse::Rejected(error) => {
+                return Err(ControlClientError::Remote {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+        };
+        if hello.protocol_version != CONTROL_PROTOCOL_VERSION
+            || hello.binding_digest != binding_digest
+            || hello.namespace != namespace
+            || hello.uid != uid
+        {
+            return Err(ControlClientError::WrongCluster);
+        }
+        Ok(Self { stream, hello })
     }
 }
 
@@ -168,7 +295,7 @@ mod tests {
             fs::write(
                 root.join("config.toml"),
                 format!(
-                    "[cluster]\nname=\"cli-control\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n",
+                    "[cluster]\nname=\"cli-control\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n",
                     root.display()
                 ),
             )

@@ -1357,7 +1357,7 @@ mod tests {
 
     fn node(transport: Transport, binary: &str) -> NodeConfig {
         NodeConfig {
-            host: "192.168.2.3".into(),
+            host: "192.0.2.3".into(),
             transport,
             remote_binary: binary.into(),
             ssh_user: Some("operator".into()),
@@ -1710,7 +1710,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-oServerAliveCountMax=4"));
         assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
         assert!(args.windows(2).any(|pair| pair == ["-l", "operator"]));
-        let host_index = args.iter().position(|arg| arg == "192.168.2.3").unwrap();
+        let host_index = args.iter().position(|arg| arg == "192.0.2.3").unwrap();
         assert_eq!(args[host_index + 1], "/usr/local/bin/macluster");
         assert!(
             args.windows(2).any(|pair| {

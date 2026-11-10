@@ -431,7 +431,7 @@ mod tests {
 
     fn config_text(shared: &PathBuf) -> String {
         format!(
-            "[cluster]\nname=\"service-test\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n",
+            "[cluster]\nname=\"service-test\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n",
             shared.display()
         )
     }

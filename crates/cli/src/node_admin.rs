@@ -10646,6 +10646,28 @@ fn remember_deferred_share_server_cleanup(
             cleanup,
         );
     }
+    for request in crate::client_access::registered_client_share_requests(state_dir, share)
+        .map_err(|error| (1, error))?
+    {
+        let cleanup = DeferredShareExportCleanup {
+            share_id: share_id.to_owned(),
+            node_id: server_id.to_owned(),
+            source_root: request.root,
+            client_ip: request.client_ip,
+            client_node_id: request.node_id,
+            share_uuid: share.share_uuid.clone(),
+            machine_uuid: Some(machine_uuid.clone()),
+        };
+        pending.exports.insert(
+            export_cleanup_key(
+                share_id,
+                server_id,
+                &cleanup.client_node_id,
+                &share.share_uuid,
+            ),
+            cleanup,
+        );
+    }
     save_deferred_share_cleanup(state_dir, &pending)
 }
 
@@ -11564,7 +11586,7 @@ fn remove_registered_share(
             check_remote_idle(node, node_id, &config_path)?;
         }
 
-        let export_requests = config
+        let mut export_requests = config
             .nodes
             .iter()
             .filter(|(node_id, _)| node_id.as_str() != server_id)
@@ -11575,6 +11597,17 @@ fn remove_registered_share(
                 node_id: node_id.clone(),
             })
             .collect::<Vec<_>>();
+        export_requests.extend(
+            crate::client_access::registered_client_share_requests(state_dir, &share)
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot inspect login-client export cleanup for share {share_id}: {error}"
+                        ),
+                    )
+                })?,
+        );
         let missing_source_cleanup_proven = if !export_requests.is_empty() && !server_offline {
             let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
                 (
@@ -19683,30 +19716,30 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     #[test]
     fn local_address_policy_reuses_registered_interface_with_multiple_addresses() {
         let mut config = parse_build_test_config();
-        config.nodes.get_mut("login").unwrap().host = "192.168.2.2".into();
+        config.nodes.get_mut("login").unwrap().host = "192.0.2.2".into();
         let addresses =
-            ["198.18.0.1", "192.168.3.5", "192.168.2.2"].map(|address| address.parse().unwrap());
+            ["198.18.0.1", "198.51.100.5", "192.0.2.2"].map(|address| address.parse().unwrap());
         assert_eq!(
             preferred_local_host(&config, None, &addresses).unwrap(),
-            Some("192.168.2.2".parse().unwrap())
+            Some("192.0.2.2".parse().unwrap())
         );
     }
 
     #[test]
     fn local_address_policy_requires_explicit_change_for_inactive_registration() {
         let mut config = parse_build_test_config();
-        config.nodes.get_mut("login").unwrap().host = "192.168.2.2".into();
-        let replacement = "192.168.3.5".parse().unwrap();
+        config.nodes.get_mut("login").unwrap().host = "192.0.2.2".into();
+        let replacement = "198.51.100.5".parse().unwrap();
         let addresses = [replacement];
         let error = preferred_local_host(&config, None, &addresses).unwrap_err();
-        assert!(error.1.contains("192.168.2.2"), "{error:?}");
+        assert!(error.1.contains("192.0.2.2"), "{error:?}");
         assert!(error.1.contains("--host"), "{error:?}");
         assert_eq!(
             preferred_local_host(&config, Some(replacement), &addresses).unwrap(),
             Some(replacement)
         );
         assert!(
-            preferred_local_host(&config, Some("192.168.9.9".parse().unwrap()), &addresses)
+            preferred_local_host(&config, Some("198.18.2.9".parse().unwrap()), &addresses)
                 .is_err()
         );
         config.nodes.remove("login");
@@ -21648,7 +21681,7 @@ nodes = ["storage"]
 scheduler = "fifo"
 
 [nodes.storage]
-host = "192.168.2.1"
+host = "192.0.2.1"
 transport = "ssh"
 remote_binary = "/usr/local/bin/macluster"
 ssh_user = "operator"
@@ -21656,7 +21689,7 @@ ssh_port = 22
 "#;
         let config = ClusterConfig::parse(source).expect("parse cluster config");
         let local_node = NodeConfig {
-            host: "192.168.2.2".into(),
+            host: "192.0.2.2".into(),
             transport: Transport::Local,
             remote_binary: "/usr/local/bin/macluster".into(),
             ssh_user: None,
@@ -21695,7 +21728,7 @@ ssh_port = 22
     #[test]
     fn primary_mount_source_uses_server_path_not_client_mount_path() {
         let storage = NodeConfig {
-            host: "192.168.2.1".into(),
+            host: "192.0.2.1".into(),
             transport: Transport::Ssh,
             remote_binary: "/usr/local/bin/macluster".into(),
             ssh_user: Some("operator".into()),
@@ -21708,7 +21741,7 @@ ssh_port = 22
 
         assert_eq!(
             nfs_mount_source(&storage, std::path::Path::new("/Volumes/Storage/macluster")),
-            "192.168.2.1:/Volumes/Storage/macluster"
+            "192.0.2.1:/Volumes/Storage/macluster"
         );
     }
 
@@ -22300,15 +22333,15 @@ ssh_port = 22
     #[test]
     fn named_share_mount_status_rejects_another_source_at_the_requested_path() {
         let output =
-            "192.168.2.9:/other on /Users/operator/mamba/envs/analysis (nfs, nodev, nosuid)\n";
+            "192.0.2.9:/other on /Users/operator/mamba/envs/analysis (nfs, nodev, nosuid)\n";
 
         assert_eq!(
             named_share_mount_status(
                 output,
-                "192.168.2.2:/Users/operator/mamba/envs/analysis",
+                "192.0.2.2:/Users/operator/mamba/envs/analysis",
                 "/Users/operator/mamba/envs/analysis",
             ),
-            NamedShareMountStatus::MountedElsewhere("192.168.2.9:/other".into())
+            NamedShareMountStatus::MountedElsewhere("192.0.2.9:/other".into())
         );
 
         let local_volume =
@@ -22316,7 +22349,7 @@ ssh_port = 22
         assert_eq!(
             named_share_mount_status(
                 local_volume,
-                "192.168.2.2:/Users/operator/mamba/envs/analysis",
+                "192.0.2.2:/Users/operator/mamba/envs/analysis",
                 "/Users/operator/mamba/envs/analysis",
             ),
             NamedShareMountStatus::MountedElsewhere("/dev/disk3s5".into())
@@ -22325,7 +22358,7 @@ ssh_port = 22
 
     #[test]
     fn named_share_mount_status_accepts_only_the_exact_expected_source_and_path() {
-        let expected_source = "192.168.2.2:/Users/operator/mamba/envs/analysis";
+        let expected_source = "192.0.2.2:/Users/operator/mamba/envs/analysis";
         let expected_path = "/Users/operator/mamba/envs/analysis";
         let expected = format!("{expected_source} on {expected_path} (nfs, nodev, nosuid)\n");
         let other_path = format!("{expected_source} on {expected_path}-other (nfs, nodev)\n");
@@ -22722,7 +22755,7 @@ ssh_port = 22
         let admin = client_mount_admin_request(&[ClientMountRequest {
             source: "192.0.2.1:/Users/Shared/data".into(),
             mount_root: PathBuf::from("/Users/Shared/data"),
-            share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+            share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
             source_alias: None,
             needs_privileged_mkdir: true,
             needs_mount: true,
@@ -22731,7 +22764,7 @@ ssh_port = 22
         let NfsAdminOperation::Mount { mounts } = admin.operation else {
             panic!("mount request expected");
         };
-        assert_eq!(mounts[0].share_uuid, "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41");
+        assert_eq!(mounts[0].share_uuid, "79b24deb-6e78-5720-aaee-1ff0fb8d35f4");
         assert_eq!(mounts[0].target, "/Users/Shared/data");
     }
 
@@ -22923,7 +22956,7 @@ nodes = ["login"]
 scheduler = "fifo"
 
 [nodes.login]
-host = "192.168.2.2"
+host = "192.0.2.2"
 transport = "local"
 remote_binary = "/Users/operator/script/macluster/target/release/macluster"
 machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
@@ -22946,7 +22979,7 @@ execution_uid = 501
             client_setup_attempted: Some(false),
             detail: None,
         };
-        let host = "192.168.2.2".parse().unwrap();
+        let host = "192.0.2.2".parse().unwrap();
 
         assert_ne!(
             std::env::current_exe().unwrap().to_string_lossy().as_ref(),
@@ -22990,7 +23023,7 @@ nodes = ["login"]
 scheduler = "fifo"
 
 [nodes.login]
-host = "192.168.2.2"
+host = "192.0.2.2"
 transport = "local"
 machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
 execution_uid = 501
@@ -23017,7 +23050,7 @@ execution_uid = 501
         let error = pending_local_share_retry_node(
             &config,
             Some(&operation),
-            &"192.168.2.2".parse().unwrap(),
+            &"192.0.2.2".parse().unwrap(),
             "fedcba98-7654-3210-fedc-ba9876543210",
             501,
         )
@@ -23640,14 +23673,14 @@ share_uuid="00000000-0000-4000-8000-000000000002"
 
     #[test]
     fn omitted_ssh_port_matches_default_port_22() {
-        let endpoint = NodeEndpoint::parse("operator@192.168.2.1").unwrap();
+        let endpoint = NodeEndpoint::parse("operator@192.0.2.1").unwrap();
         let mut configured = endpoint.node_config("/usr/local/bin/macluster".into(), None);
         configured.ssh_port = None;
 
         assert!(existing_ssh_endpoint_matches(&configured, &endpoint));
-        let different_port = NodeEndpoint::parse("operator@192.168.2.1:2222").unwrap();
+        let different_port = NodeEndpoint::parse("operator@192.0.2.1:2222").unwrap();
         assert!(!existing_ssh_endpoint_matches(&configured, &different_port));
-        let different_user = NodeEndpoint::parse("other@192.168.2.1").unwrap();
+        let different_user = NodeEndpoint::parse("other@192.0.2.1").unwrap();
         assert!(!existing_ssh_endpoint_matches(&configured, &different_user));
     }
 
@@ -23802,15 +23835,15 @@ share_uuid="00000000-0000-4000-8000-000000000002"
     #[test]
     fn reset_endpoint_reconstruction_keeps_the_recorded_transport_identity() {
         let uuid = "01234567-89ab-cdef-0123-456789abcdef".to_owned();
-        let ssh = reset_node_from_endpoint("operator@192.168.2.3:2222", Some(uuid.clone()))
+        let ssh = reset_node_from_endpoint("operator@192.0.2.3:2222", Some(uuid.clone()))
             .expect("reconstruct pending SSH node");
         assert_eq!(ssh.transport, Transport::Ssh);
-        assert_eq!(ssh.host, "192.168.2.3");
+        assert_eq!(ssh.host, "192.0.2.3");
         assert_eq!(ssh.ssh_user.as_deref(), Some("operator"));
         assert_eq!(ssh.ssh_port, Some(2222));
         assert_eq!(ssh.machine_uuid.as_deref(), Some(uuid.as_str()));
 
-        let local = reset_node_from_endpoint("local@192.168.2.2:22", Some(uuid))
+        let local = reset_node_from_endpoint("local@192.0.2.2:22", Some(uuid))
             .expect("reconstruct pending local node");
         assert_eq!(local.transport, Transport::Local);
         assert_eq!(local.ssh_user, None);
@@ -23830,7 +23863,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
     #[test]
     fn existing_exports_file_contents_are_preserved() {
         let path = test_exports_path();
-        let contents = b"/Users/Shared/macluster 192.168.2.2\n";
+        let contents = b"/Users/Shared/macluster 192.0.2.2\n";
         fs::write(&path, contents).expect("create exports test file");
 
         let output = read_exports(&path);
@@ -24814,7 +24847,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         }
 
         let script = nfs_exports_update_script(
-            "/Users/Shared/macluster 192.168.2.2\n",
+            "/Users/Shared/macluster 192.0.2.2\n",
             &exports.to_string_lossy(),
             &temporary.to_string_lossy(),
             &backup.to_string_lossy(),
@@ -24834,7 +24867,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         );
         assert_eq!(
             fs::read_to_string(&exports).expect("read generated exports"),
-            "/Users/Shared/macluster 192.168.2.2\n"
+            "/Users/Shared/macluster 192.0.2.2\n"
         );
         assert_eq!(
             fs::read_to_string(&log).expect("read nfsd invocation log"),
@@ -24924,7 +24957,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         let log = root.join("nfsd.log");
         let sudo = bin.join("sudo");
         let nfsd = bin.join("nfsd");
-        let original = "/Users/Shared/existing 192.168.2.9\n";
+        let original = "/Users/Shared/existing 192.0.2.9\n";
         fs::write(&exports, original).expect("write existing exports");
         fs::write(&sudo, "#!/bin/sh\nexec \"$@\"\n").expect("write fake sudo");
         fs::write(
@@ -24941,7 +24974,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         }
 
         let script = nfs_exports_update_script(
-            "/Users/Shared/macluster 192.168.2.2\n",
+            "/Users/Shared/macluster 192.0.2.2\n",
             &exports.to_string_lossy(),
             &temporary.to_string_lossy(),
             &backup.to_string_lossy(),
@@ -24996,7 +25029,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         }
 
         let script = nfs_exports_update_script(
-            "/Users/Shared/macluster 192.168.2.2\n",
+            "/Users/Shared/macluster 192.0.2.2\n",
             &exports.to_string_lossy(),
             &temporary.to_string_lossy(),
             &backup.to_string_lossy(),

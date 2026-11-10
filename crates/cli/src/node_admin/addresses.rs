@@ -1682,7 +1682,7 @@ mod tests {
         let interfaces = [
             InterfaceAddress {
                 interface: "en0".into(),
-                address: "192.168.3.5".parse().unwrap(),
+                address: "198.51.100.5".parse().unwrap(),
                 mask: u32::from("255.255.255.0".parse::<Ipv4Addr>().unwrap()),
                 mac: None,
             },
@@ -1693,13 +1693,13 @@ mod tests {
                 mac: None,
             },
         ];
-        let selected = select_explicit_interface(Some("192.168.3.5".parse().unwrap()), &interfaces)
+        let selected = select_explicit_interface(Some("198.51.100.5".parse().unwrap()), &interfaces)
             .unwrap()
             .unwrap();
         assert_eq!(selected.interface, "en0");
-        assert_eq!(selected.address, "192.168.3.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(selected.address, "198.51.100.5".parse::<Ipv4Addr>().unwrap());
         assert!(
-            select_explicit_interface(Some("192.168.2.2".parse().unwrap()), &interfaces)
+            select_explicit_interface(Some("192.0.2.2".parse().unwrap()), &interfaces)
                 .unwrap_err()
                 .1
                 .contains("not assigned")
@@ -1837,14 +1837,14 @@ mod tests {
     fn nfs_address_migration_is_idempotent_and_keeps_operator_exports() {
         let old = NfsExportRequest {
             root: "/Users/Shared/macluster".into(),
-            client_ip: "192.168.2.1".into(),
+            client_ip: "192.0.2.1".into(),
             share_uuid: "share".into(),
             node_id: "worker".into(),
         };
         let mut new = old.clone();
-        new.client_ip = "192.168.2.3".into();
-        let original = "# operator\n/Volumes/Other 192.168.2.9\n# macluster-managed share worker\n/Users/Shared/macluster 192.168.2.1\n";
-        let expected = "# operator\n/Volumes/Other 192.168.2.9\n# macluster-managed share worker\n/Users/Shared/macluster 192.168.2.3\n";
+        new.client_ip = "192.0.2.3".into();
+        let original = "# operator\n/Volumes/Other 192.0.2.9\n# macluster-managed share worker\n/Users/Shared/macluster 192.0.2.1\n";
+        let expected = "# operator\n/Volumes/Other 192.0.2.9\n# macluster-managed share worker\n/Users/Shared/macluster 192.0.2.3\n";
         assert_eq!(
             migrated_exports(
                 original,
@@ -1865,7 +1865,7 @@ mod tests {
         );
         assert!(
             migrated_exports(
-                &original.replace("macluster 192.168.2.1", "macluster 192.168.2.8"),
+                &original.replace("macluster 192.0.2.1", "macluster 192.0.2.8"),
                 &[old],
                 &[new]
             )
@@ -1908,12 +1908,12 @@ mod tests {
         assert!(normalize_mac("ff:ff:ff:ff:ff:ff").is_none());
         assert!(normalize_mac("02:00:00:00:00:00").is_none());
         let entries = parse_neighbors(
-            "? (192.168.2.3) at 36:52:b2:4:bb:80 on bridge0 ifscope [bridge]\n? (192.168.2.4) at (incomplete) on bridge0\n",
+            "? (192.0.2.3) at 36:52:b2:4:bb:80 on bridge0 ifscope [bridge]\n? (192.0.2.4) at (incomplete) on bridge0\n",
         );
         assert_eq!(
             entries,
             vec![(
-                "192.168.2.3".parse::<Ipv4Addr>().unwrap(),
+                "192.0.2.3".parse::<Ipv4Addr>().unwrap(),
                 "36:52:b2:04:bb:80".into()
             )]
         );
@@ -1922,23 +1922,23 @@ mod tests {
     #[test]
     fn interface_selection_uses_real_netmask_and_refuses_ambiguous_matches() {
         let interfaces = parse_interfaces(
-            "bridge0: flags=8863<UP,BROADCAST,RUNNING>\n\tether 36:3d:96:0:52:80\n\tinet 192.168.2.1 netmask 0xffffff80 broadcast 192.168.2.127\nen0: flags=8863<UP,RUNNING>\n\tether 32:08:ef:e3:41:8e\n\tinet 192.168.6.235 netmask 0xffffff00\n",
+            "bridge0: flags=8863<UP,BROADCAST,RUNNING>\n\tether 36:3d:96:0:52:80\n\tinet 192.0.2.1 netmask 0xffffff80 broadcast 192.0.2.127\nen0: flags=8863<UP,RUNNING>\n\tether 32:08:ef:e3:41:8e\n\tinet 203.0.113.235 netmask 0xffffff00\n",
         );
         let interface =
-            matching_interface("192.168.2.2".parse().unwrap(), &interfaces, None).unwrap();
+            matching_interface("192.0.2.2".parse().unwrap(), &interfaces, None).unwrap();
         assert_eq!(interface.interface, "bridge0");
-        assert!(!interface.contains("192.168.2.200".parse().unwrap()));
+        assert!(!interface.contains("192.0.2.200".parse().unwrap()));
         let mut ambiguous = interfaces.clone();
         ambiguous.push(InterfaceAddress {
             interface: "en9".into(),
-            address: "192.168.2.5".parse().unwrap(),
+            address: "192.0.2.5".parse().unwrap(),
             mask: 0xffffff80,
             mac: None,
         });
-        assert!(matching_interface("192.168.2.2".parse().unwrap(), &ambiguous, None).is_none());
+        assert!(matching_interface("192.0.2.2".parse().unwrap(), &ambiguous, None).is_none());
         assert_eq!(
             matching_interface(
-                "192.168.2.2".parse().unwrap(),
+                "192.0.2.2".parse().unwrap(),
                 &ambiguous,
                 Some("36:3d:96:00:52:80")
             )
@@ -1952,13 +1952,13 @@ mod tests {
     fn subnet_scan_prioritizes_recorded_mac_and_excludes_other_networks_and_this_mac() {
         let interface = InterfaceAddress {
             interface: "bridge0".into(),
-            address: "192.168.2.1".parse().unwrap(),
+            address: "192.0.2.1".parse().unwrap(),
             mask: 0xffffff00,
             mac: None,
         };
         let entries = vec![
-            ("192.168.2.3".parse().unwrap(), "36:52:b2:04:bb:80".into()),
-            ("192.168.6.3".parse().unwrap(), "36:52:b2:04:bb:80".into()),
+            ("192.0.2.3".parse().unwrap(), "36:52:b2:04:bb:80".into()),
+            ("203.0.113.3".parse().unwrap(), "36:52:b2:04:bb:80".into()),
         ];
         let (preferred, rest) = subnet_candidates(
             &interface,
@@ -1966,10 +1966,10 @@ mod tests {
             &entries,
             Some("36:52:b2:04:bb:80"),
         );
-        assert_eq!(preferred, vec!["192.168.2.3".parse::<Ipv4Addr>().unwrap()]);
+        assert_eq!(preferred, vec!["192.0.2.3".parse::<Ipv4Addr>().unwrap()]);
         assert_eq!(rest.len(), 252);
         assert!(!rest.contains(&interface.address));
-        assert!(!rest.contains(&"192.168.2.255".parse().unwrap()));
+        assert!(!rest.contains(&"192.0.2.255".parse().unwrap()));
         assert!(rest.iter().all(|address| interface.contains(*address)));
     }
 

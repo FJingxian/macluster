@@ -1,4 +1,9 @@
-use std::process::Command;
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn help(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
@@ -8,6 +13,11 @@ fn help(args: &[&str]) -> String {
     assert!(
         output.status.success(),
         "help command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "help command wrote stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("help is UTF-8")
@@ -83,6 +93,12 @@ fn main_help_is_a_compact_module_index() {
         "{output}"
     );
     assert!(output.contains("macluster --init"), "{output}");
+    assert!(output.contains("macluster --join"), "{output}");
+    assert!(output.contains("macluster --clusters"), "{output}");
+    assert!(
+        output.contains("macluster [--cluster NAME|UUID] --leave"),
+        "{output}"
+    );
     assert!(output.contains("macluster --web [IP[:PORT]]"), "{output}");
     assert!(!output.contains("macluster controller"), "{output}");
 }
@@ -90,6 +106,9 @@ fn main_help_is_a_compact_module_index() {
 #[test]
 fn top_level_init_and_web_shortcuts_have_help() {
     assert!(help(&["--init", "--help"]).contains("FIRST SETUP"));
+    assert!(help(&["--join", "--help"]).contains("multi-entry cluster"));
+    assert!(help(&["--clusters", "--help"]).contains("Lists each"));
+    assert!(help(&["--leave", "--help"]).contains("--cluster NAME|UUID"));
     let web = help(&["--web", "--help"]);
     assert!(web.contains("127.0.0.1[:PORT]"), "{web}");
     assert!(web.contains("local-only"), "{web}");
@@ -120,4 +139,60 @@ fn detailed_help_has_clear_examples_and_section_headings() {
             );
         }
     }
+}
+
+#[test]
+fn clusters_lists_joined_login_client_profiles() {
+    let home = std::env::temp_dir().join(format!(
+        "macluster-client-list-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let profiles = home.join("Library/Application Support/macluster/clients");
+    fs::create_dir_all(&profiles).unwrap();
+    let profile = profiles.join("f779bcf5-ea85-5caa-9579-74b395f3cce5.json");
+    fs::write(
+        &profile,
+        r#"{
+  "version": 1,
+  "cluster_uuid": "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+  "cluster_name": "home-cluster",
+  "binding_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "namespace": "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+  "descriptor_generation": 1,
+  "controller_host": "192.0.2.1",
+  "controller_user": "cluster",
+  "controller_port": 22,
+  "known_hosts_path": "/tmp/known_hosts",
+  "identity_file": "/tmp/id_ed25519",
+  "remote_uid": 501,
+  "remote_binary": "/opt/homebrew/bin/macluster",
+  "remote_config": "/tmp/config.toml",
+  "remote_state_dir": "/tmp/state",
+  "mounts_enabled": false,
+  "nfs_client_id": "client-test",
+  "nfs_client_ip": "192.0.2.10",
+  "last_used_unix_ms": 1,
+  "descriptor": null
+}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .arg("--clusters")
+        .env("HOME", &home)
+        .output()
+        .expect("list joined clusters");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("home-cluster"), "{stdout}");
+    assert!(stdout.contains("cluster@192.0.2.1:22"), "{stdout}");
+    fs::remove_dir_all(home).unwrap();
 }

@@ -425,18 +425,18 @@ mod tests {
     fn retirement_accepts_only_exact_owned_pairs() {
         let root = Path::new("/Users/Shared/macluster");
         let managed = format!(
-            "# unrelated\n# macluster-managed {OLD} node1\n{} 10.0.0.2\n/other 10.0.0.3\n",
+            "# unrelated\n# macluster-managed {OLD} node1\n{} 198.18.1.2\n/other 198.18.1.3\n",
             root.display()
         );
         assert_eq!(
             retire_exports(&managed, root, Some(OLD)).unwrap(),
-            "# unrelated\n/other 10.0.0.3\n"
+            "# unrelated\n/other 198.18.1.3\n"
         );
         assert!(retire_exports(&managed, root, Some(UUID)).is_err());
         for entry in [
-            "/Users/Shared/macluster -alldirs 10.0.0.2",
-            "/Users/Shared 10.0.0.2",
-            "/Users/Shared/macluster/child 10.0.0.2",
+            "/Users/Shared/macluster -alldirs 198.18.1.2",
+            "/Users/Shared 198.18.1.2",
+            "/Users/Shared/macluster/child 198.18.1.2",
         ] {
             assert!(retire_exports(&format!("{entry}\n"), root, Some(OLD)).is_err());
         }

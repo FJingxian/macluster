@@ -328,6 +328,15 @@ pub(crate) fn run(
                 ));
             }
         };
+        if let Err(error) = crate::client_access::revoke_all_registered_clients(&old, &state_dir) {
+            cancel_temporary_drain(&path);
+            return Err((
+                1,
+                format!(
+                    "reset was cancelled before cleanup because login-client NFS access could not be revoked: {error}. Restart the controller with `macluster controller run` after resolving the issue."
+                ),
+            ));
+        }
         begin_controller_reset(&config_path, &state_dir)?;
         journal.phase = "CLEANING".into();
         save_journal(&path, &journal, false)?;
@@ -349,6 +358,12 @@ pub(crate) fn run(
             journal.discard_terminal_sync,
             &journal.abandoned_sync_jobs,
         )?;
+        crate::client_access::revoke_all_registered_clients(&old, &state_dir).map_err(|error| {
+            (
+                1,
+                format!("reset cleanup cannot revoke login-client NFS access: {error}"),
+            )
+        })?;
         cleanup_resources(&mut journal, &plan, &path)?;
         journal.phase = "REMOTE_CONFIGS".into();
         save_journal(&path, &journal, false)?;
@@ -3899,39 +3914,39 @@ mod tests {
 
     #[test]
     fn reset_unmount_match_requires_exact_server_source_mount_and_nfs_type() {
-        let output = "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
+        let output = "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
         assert!(mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Users/Shared/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!mount_matches(
-            "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (apfs, local)\n",
-            "192.168.2.1",
+            "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (apfs, local)\n",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!mount_matches(
-            "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs4, nodev)\n",
-            "192.168.2.1",
+            "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs4, nodev)\n",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
 
         let stacked = concat!(
-            "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev)\n",
-            "192.168.2.9:/unrelated on /Users/Shared/macluster (nfs, nodev)\n",
+            "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev)\n",
+            "192.0.2.9:/unrelated on /Users/Shared/macluster (nfs, nodev)\n",
         );
         let expected = mount_matches(
             stacked,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         );
@@ -3939,7 +3954,7 @@ mod tests {
         assert!(
             mount_conflict(
                 stacked,
-                "192.168.2.1",
+                "192.0.2.1",
                 Path::new("/Volumes/Storage/macluster"),
                 Path::new("/Users/Shared/macluster"),
             ),
@@ -3948,7 +3963,7 @@ mod tests {
         assert!(
             !mount_conflict(
                 "/dev/disk5s1 on /Volumes/Data (apfs, local, journaled)\n",
-                "192.168.2.1",
+                "192.0.2.1",
                 Path::new("/Volumes/Data"),
                 Path::new("/Volumes/Data"),
             ),
@@ -3956,8 +3971,8 @@ mod tests {
         );
         assert!(
             !mount_conflict(
-                "192.168.2.9:/other on /Volumes/Data (nfs, nodev)\n",
-                "192.168.2.1",
+                "192.0.2.9:/other on /Volumes/Data (nfs, nodev)\n",
+                "192.0.2.1",
                 Path::new("/Volumes/Data"),
                 Path::new("/Volumes/Data"),
             ),
@@ -3965,7 +3980,7 @@ mod tests {
         );
 
         let unmount_step = super::reset_mount_unmount_step(
-            "192.168.2.1:/Volumes/Storage/macluster",
+            "192.0.2.1:/Volumes/Storage/macluster",
             Path::new("/Users/Shared/macluster"),
         );
         assert!(unmount_step.contains("/usr/bin/awk"));
@@ -4039,11 +4054,11 @@ mod tests {
     fn reset_removes_only_exact_adjacent_managed_export_pairs() {
         let exports = concat!(
             "# operator-managed cluster export\n",
-            "/Users/Shared/macluster -network 192.168.2.0 -mask 255.255.255.0\n",
+            "/Users/Shared/macluster -network 192.0.2.0 -mask 255.255.255.0\n",
             "# macluster-managed share-uuid node-a\n",
-            "/Volumes/Storage/macluster 192.168.2.2\n",
+            "/Volumes/Storage/macluster 192.0.2.2\n",
             "# keep this other managed resource\n",
-            "/Users/Shared/tools 192.168.2.2\n",
+            "/Users/Shared/tools 192.0.2.2\n",
         );
         let (updated, removed) = remove_managed_exports(
             exports,
@@ -4051,7 +4066,7 @@ mod tests {
                 "share-uuid",
                 "node-a",
                 "/Volumes/Storage/macluster",
-                "192.168.2.2",
+                "192.0.2.2",
             )],
         )
         .expect("filter exact managed export pair");
@@ -4066,12 +4081,12 @@ mod tests {
     #[test]
     fn reset_export_cleanup_accepts_duplicate_identical_share_records() {
         let exports =
-            "# macluster-managed share-uuid node-a\n/Volumes/Storage/macluster 192.168.2.2\n";
+            "# macluster-managed share-uuid node-a\n/Volumes/Storage/macluster 192.0.2.2\n";
         let spec = export(
             "share-uuid",
             "node-a",
             "/Volumes/Storage/macluster",
-            "192.168.2.2",
+            "192.0.2.2",
         );
         let (updated, removed) =
             remove_managed_exports(exports, &[spec.clone(), spec]).expect("dedupe exact resource");
@@ -4083,7 +4098,7 @@ mod tests {
     fn reset_refuses_a_managed_marker_whose_adjacent_rule_changed() {
         let exports = concat!(
             "# macluster-managed share-uuid node-a\n",
-            "/Volumes/Other 192.168.2.2\n",
+            "/Volumes/Other 192.0.2.2\n",
         );
         assert!(
             remove_managed_exports(
@@ -4092,7 +4107,7 @@ mod tests {
                     "share-uuid",
                     "node-a",
                     "/Volumes/Storage/macluster",
-                    "192.168.2.2",
+                    "192.0.2.2",
                 )],
             )
             .is_err()
@@ -4128,7 +4143,7 @@ mod tests {
         config.shared_root = primary.clone();
         let server = config.nodes["login-01"].clone();
         let mut client = server.clone();
-        client.host = "192.168.2.1".into();
+        client.host = "192.0.2.1".into();
         config.nodes.insert("arm-a".into(), client);
         let mut plan = ResetPlan {
             nodes: config.nodes.clone(),
@@ -4176,14 +4191,14 @@ mod tests {
         plan.preflight_aliases()
             .expect("failed alias creation must not block resetting its NFS rules");
         let exports = format!(
-            "# operator-managed\n/Volumes/Other 192.168.2.9\n# macluster-managed {primary_uuid} arm-a\n{} 192.168.2.1\n# macluster-managed {pending_uuid} arm-a\n{} 192.168.2.1\n",
+            "# operator-managed\n/Volumes/Other 192.0.2.9\n# macluster-managed {primary_uuid} arm-a\n{} 192.0.2.1\n# macluster-managed {pending_uuid} arm-a\n{} 192.0.2.1\n",
             primary.display(),
             source.display()
         );
         let (cleaned, removed) =
             remove_managed_exports(&exports, &plan.exports["login-01"].specs).unwrap();
         assert!(removed);
-        assert_eq!(cleaned, "# operator-managed\n/Volumes/Other 192.168.2.9\n");
+        assert_eq!(cleaned, "# operator-managed\n/Volumes/Other 192.0.2.9\n");
         for alias in &plan.aliases {
             super::remove_alias(alias).unwrap();
         }
@@ -4715,7 +4730,7 @@ mod tests {
             connection_endpoint: None,
             remote_config_path: None,
             node_id: "mini01-a".into(),
-            endpoint: "operator@192.168.2.1:22".into(),
+            endpoint: "operator@192.0.2.1:22".into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
             phase: "SETUP_PENDING".into(),
             old_config_sha256: Some("old-digest".into()),
@@ -5200,7 +5215,7 @@ mod tests {
 
     fn test_config_source(name: &str, uuid: &str) -> String {
         format!(
-            "[cluster]\nname = \"{name}\"\nlogin_node = \"login-01\"\ndefault_queue = \"default\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"{uuid}\"\nstorage_server = \"login-01\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"login-01\"]\nscheduler = \"fifo\"\n\n[nodes.login-01]\nhost = \"192.168.2.2\"\ntransport = \"local\"\nremote_binary = \"/usr/local/bin/macluster\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n"
+            "[cluster]\nname = \"{name}\"\nlogin_node = \"login-01\"\ndefault_queue = \"default\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"{uuid}\"\nstorage_server = \"login-01\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"login-01\"]\nscheduler = \"fifo\"\n\n[nodes.login-01]\nhost = \"192.0.2.2\"\ntransport = \"local\"\nremote_binary = \"/usr/local/bin/macluster\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n"
         )
     }
 }

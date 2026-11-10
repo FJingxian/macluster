@@ -5,7 +5,10 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, IsTerminal, Read, Write},
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     process, thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -58,6 +61,7 @@ enum HelpMode {
 struct GlobalOptions {
     config: Option<PathBuf>,
     state_dir: Option<PathBuf>,
+    cluster: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,10 +104,271 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         if command_arg == "--init" {
             command = Some("init".into());
             args.remove(command_index);
+        } else if command_arg == "--clusters" {
+            if let Some(mode) = help_mode(&args[command_index + 1..]) {
+                println!("{}", client_clusters_help(mode));
+                return Ok(());
+            }
+            if command_index + 1 != args.len() {
+                return Err((2, "--clusters does not accept arguments".into()));
+            }
+            let store = crate::client_profile::ClientProfileStore::current()
+                .map_err(|error| (1, error.to_string()))?;
+            let profiles = store.load_all().map_err(|error| (1, error.to_string()))?;
+            if profiles.is_empty() {
+                println!("No client cluster profiles.");
+            } else {
+                println!("CLUSTER UUID                             NAME             CONTROLLER");
+                for profile in profiles {
+                    println!(
+                        "{:<40} {:<16} {}@{}:{}",
+                        profile.cluster_uuid,
+                        profile.cluster_name,
+                        profile.controller_user,
+                        profile.controller_host,
+                        profile.controller_port
+                    );
+                }
+            }
+            return Ok(());
+        } else if command_arg == "--leave" {
+            if let Some(mode) = help_mode(&args[command_index + 1..]) {
+                println!("{}", client_leave_help(mode));
+                return Ok(());
+            }
+            if command_index + 1 != args.len() {
+                return Err((2, "--leave does not accept arguments".into()));
+            }
+            let (leading, _) = take_global_options(args[..command_index].to_vec(), false)?;
+            if leading.cluster.is_some()
+                && (leading.config.is_some() || leading.state_dir.is_some())
+            {
+                return Err((
+                    2,
+                    "--cluster cannot be combined with --config or --state-dir".into(),
+                ));
+            }
+            let store = crate::client_profile::ClientProfileStore::current()
+                .map_err(|error| (1, error.to_string()))?;
+            let mut profile = match store
+                .select(leading.cluster.as_deref())
+                .map_err(|error| (1, error.to_string()))?
+            {
+                crate::client_profile::ClientSelection::Explicit(profile)
+                | crate::client_profile::ClientSelection::LastUsed(profile)
+                | crate::client_profile::ClientSelection::Sole(profile) => profile,
+                crate::client_profile::ClientSelection::None => {
+                    return Err((1, "no client cluster profile exists".into()));
+                }
+            };
+            let resuming_leave = profile.leave_phase.is_some();
+            if !resuming_leave && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                eprint!(
+                    "Leave cluster '{}', detach its mounts, and revoke its access? [y/N]: ",
+                    profile.cluster_name
+                );
+                io::stderr()
+                    .flush()
+                    .map_err(|error| (1, error.to_string()))?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| (1, error.to_string()))?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Leave cancelled.");
+                    return Ok(());
+                }
+            }
+            if !resuming_leave {
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::Requested,
+                )
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot start leaving cluster '{}': {error}",
+                            profile.cluster_name
+                        ),
+                    )
+                })?;
+            }
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::MountsDetached)
+            {
+                for descriptor in mount_cleanup_layouts(&profile) {
+                    if let Err(error) = crate::client_storage::remove_client_mounts(
+                        &profile.cluster_uuid,
+                        &descriptor,
+                        &profile.nfs_client_ip,
+                    ) {
+                        return Err((
+                            1,
+                            format!(
+                                "cannot leave cluster '{}' while client mounts are still active: {error}; rerun --leave to resume",
+                                profile.cluster_name
+                            ),
+                        ));
+                    }
+                }
+                profile.mounted_descriptor = None;
+                profile.transition_mount_descriptors.clear();
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::MountsDetached,
+                )
+                .map_err(|error| (1, error.to_string()))?;
+            }
+            crate::client_join::resume_retired_access(&store, &mut profile, true).map_err(
+                |error| {
+                    (
+                        1,
+                        format!(
+                            "cannot leave cluster '{}' until previous credential cleanup finishes: {error}",
+                            profile.cluster_name
+                        ),
+                    )
+                },
+            )?;
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::NfsRevoked) {
+                let has_client_nfs_identity = !profile.nfs_client_id.is_empty()
+                    && profile.nfs_client_ip.parse::<std::net::Ipv4Addr>().is_ok();
+                if has_client_nfs_identity
+                    && let Err(error) = crate::remote_admin::revoke_client_nfs_access(&profile)
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "client mounts are detached, but NFS access revocation failed: {error}; rerun --leave to finish"
+                        ),
+                    ));
+                }
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::NfsRevoked,
+                )
+                .map_err(|error| (1, error.to_string()))?;
+            }
+            let identity_shared = store
+                .load_all()
+                .map_err(|error| (1, error.to_string()))?
+                .iter()
+                .any(|other| {
+                    other.cluster_uuid != profile.cluster_uuid
+                        && other.identity_file == profile.identity_file
+                });
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::KeyRevoked) {
+                if !identity_shared
+                    && let Err(error) = crate::remote_admin::revoke_client_key(&profile)
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "NFS access is detached, but the Controller client key could not be revoked: {error}; rerun --leave to finish"
+                        ),
+                    ));
+                }
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::KeyRevoked,
+                )
+                .map_err(|error| (1, error.to_string()))?;
+            }
+            if let Err(error) = crate::remote_admin::close_control_master(&profile) {
+                return Err((
+                    1,
+                    format!(
+                        "client access was revoked, but its reusable SSH control connection could not be closed: {error}; rerun --leave to finish"
+                    ),
+                ));
+            }
+            if !profile.leave_has_completed(
+                crate::client_profile::ClientLeavePhase::LocalCredentialsRemoved,
+            ) {
+                if !identity_shared {
+                    remove_file_if_exists(Path::new(&profile.identity_file))
+                        .map_err(|error| (1, error.to_string()))?;
+                    remove_file_if_exists(Path::new(&format!("{}.pub", profile.identity_file)))
+                        .map_err(|error| (1, error.to_string()))?;
+                }
+                remove_file_if_exists(Path::new(&profile.known_hosts_path))
+                    .map_err(|error| (1, error.to_string()))?;
+                if let Some(parent) = Path::new(&profile.known_hosts_path).parent() {
+                    match fs::remove_dir(parent) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                            ) => {}
+                        Err(error) => return Err((1, error.to_string())),
+                    }
+                }
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::LocalCredentialsRemoved,
+                )
+                .map_err(|error| (1, error.to_string()))?;
+            }
+            store
+                .remove(&profile.cluster_uuid)
+                .map_err(|error| (1, error.to_string()))?;
+            println!("Left cluster '{}'.", profile.cluster_name);
+            return Ok(());
+        } else if command_arg == "--join" {
+            if help_mode(&args[command_index + 1..]).is_some() {
+                println!(
+                    "Usage\n  macluster --join [--control-only] USER@HOST[:PORT]\n\nJoins an existing multi-entry cluster as a login client."
+                );
+                return Ok(());
+            }
+            let (endpoint, control_only) = parse_join_shortcut(&args[command_index + 1..])?;
+            let profile = crate::client_join::join_cluster(&endpoint, control_only)
+                .map_err(|error| (1, error))?;
+            println!(
+                "Joined cluster '{}' at {}@{}:{} (compute=false{}).",
+                profile.cluster_name,
+                profile.controller_user,
+                profile.controller_host,
+                profile.controller_port,
+                if control_only { ", control-only" } else { "" }
+            );
+            return Ok(());
         } else if command_arg == "--web" {
             if let Some(mode) = help_mode(&args[command_index + 1..]) {
                 println!("{}", web_shortcut_help(mode));
                 return Ok(());
+            }
+            let (leading, _) = take_global_options(args[..command_index].to_vec(), false)?;
+            if leading.cluster.is_some()
+                && (leading.config.is_some() || leading.state_dir.is_some())
+            {
+                return Err((
+                    2,
+                    "--cluster cannot be combined with --config or --state-dir".into(),
+                ));
+            }
+            if leading.cluster.is_some()
+                || !resolved_config_path(None).exists()
+                    && !args[..command_index]
+                        .iter()
+                        .any(|argument| argument == "--config" || argument.starts_with("--config="))
+            {
+                let store = crate::client_profile::ClientProfileStore::current()
+                    .map_err(|error| (1, error.to_string()))?;
+                if let crate::client_profile::ClientSelection::Explicit(profile)
+                | crate::client_profile::ClientSelection::LastUsed(profile)
+                | crate::client_profile::ClientSelection::Sole(profile) = store
+                    .select(leading.cluster.as_deref())
+                    .map_err(|error| (1, error.to_string()))?
+                {
+                    return remote_web(profile, &args[command_index + 1..]);
+                }
             }
             let controller_args = parse_web_shortcut_args(&args[command_index + 1..])?;
             args.truncate(command_index);
@@ -129,11 +394,83 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let command = command.expect("argv0 alias or parsed subcommand is present");
 
     let (global, args) = take_global_options(args, command == "submit")?;
+    if global.cluster.is_some() && (global.config.is_some() || global.state_dir.is_some()) {
+        return Err((
+            2,
+            "--cluster cannot be combined with --config or --state-dir".into(),
+        ));
+    }
+    if global.cluster.is_some() && !crate::client_context::remote_command_supported(&command) {
+        return Err((
+            2,
+            format!(
+                "--cluster selects a joined login-client profile and cannot be used with `{command}`"
+            ),
+        ));
+    }
+    let caller_has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     if command == "submit"
         && parse_submit_args(&args).is_ok_and(|options| options.interactive)
-        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+        && !caller_has_tty
     {
         return Err((2, "msub -Is requires terminal stdin and stdout".into()));
+    }
+    if let Some(profile) = crate::client_context::select_remote_profile(
+        &resolved_config_path(global.config.as_deref()),
+        &command,
+        &args,
+        global.cluster.as_deref(),
+        global.config.is_some(),
+    )
+    .map_err(|error| (1, error))?
+    {
+        return remote_command(profile, &command, &args);
+    }
+    if global.config.is_none()
+        && !resolved_config_path(None).exists()
+        && crate::client_context::remote_command_supported(&command)
+        && !args
+            .iter()
+            .any(|argument| argument == "-h" || argument == "--help")
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        let current_user = current_account_name().unwrap_or_else(|| "mac".into());
+        let candidates = automatic_join_candidates(&current_user).unwrap_or_default();
+        if let [candidate] = candidates.as_slice() {
+            let fingerprint = candidate
+                .ssh_host_fingerprint
+                .as_deref()
+                .map(|value| format!(", {value}"))
+                .unwrap_or_default();
+            eprint!(
+                "Detected existing cluster '{}' ({}) at {}@{}:{}{}. Join as a login client? [y/N] ",
+                candidate.cluster_name,
+                candidate.cluster_uuid,
+                candidate.ssh_user,
+                candidate.address,
+                candidate.ssh_port,
+                fingerprint
+            );
+            io::stderr().flush().ok();
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|error| (1, error.to_string()))?;
+            if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                let control_only = !remote_command_requires_client_storage(&command, &args);
+                let profile = crate::client_join::join_cluster_expected(
+                    &format!(
+                        "{}@{}:{}",
+                        candidate.ssh_user, candidate.address, candidate.ssh_port
+                    ),
+                    control_only,
+                    Some(&candidate.cluster_uuid),
+                )
+                .map_err(|error| (1, error))?;
+                return remote_command(profile, &command, &args);
+            }
+        }
     }
     let mut address_migration_deferred = false;
     let mut address_migration_deferred_error = None;
@@ -286,6 +623,779 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "agent" => Err((1, format!("`{command}` is not implemented yet"))),
         _ => unreachable!(),
     }
+}
+
+fn persist_leave_phase(
+    store: &crate::client_profile::ClientProfileStore,
+    profile: &mut crate::client_profile::ClientProfile,
+    phase: crate::client_profile::ClientLeavePhase,
+) -> io::Result<()> {
+    profile.leave_phase = Some(phase);
+    store.save(profile)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomaticJoinCandidate {
+    cluster_uuid: String,
+    cluster_name: String,
+    ssh_user: String,
+    address: String,
+    ssh_port: u16,
+    ssh_host_fingerprint: Option<String>,
+}
+
+fn automatic_join_candidates(current_user: &str) -> Result<Vec<AutomaticJoinCandidate>, String> {
+    let discovered =
+        crate::discovery::discover_clusters(Duration::from_secs(1)).unwrap_or_default();
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_owned())?;
+    let local_addresses = crate::node_admin::local_ipv4_addresses()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mount_table = process::Command::new("/sbin/mount")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let local = crate::discovery::discover_local_cluster_candidates(
+        &home,
+        &mount_table,
+        &local_addresses,
+        current_user,
+    )
+    .unwrap_or_default();
+    let local = local
+        .into_iter()
+        .map(|candidate| AutomaticJoinCandidate {
+            cluster_uuid: candidate.cluster_uuid,
+            cluster_name: candidate.cluster_name,
+            ssh_user: candidate.ssh_user,
+            address: candidate.host,
+            ssh_port: candidate.ssh_port,
+            ssh_host_fingerprint: None,
+        })
+        .collect::<Vec<_>>();
+    Ok(select_automatic_join_candidates(
+        discovered,
+        local,
+        current_user,
+    ))
+}
+
+fn select_automatic_join_candidates(
+    discovered: Vec<crate::discovery::DiscoveryRecord>,
+    local: Vec<AutomaticJoinCandidate>,
+    current_user: &str,
+) -> Vec<AutomaticJoinCandidate> {
+    if !discovered.is_empty() {
+        let candidates = discovered
+            .into_iter()
+            .filter_map(|record| {
+                let matching_local = local
+                    .iter()
+                    .find(|candidate| candidate.cluster_uuid == record.cluster_uuid);
+                Some(AutomaticJoinCandidate {
+                    cluster_uuid: record.cluster_uuid,
+                    cluster_name: record.cluster_name,
+                    ssh_user: record
+                        .ssh_user
+                        .filter(|user| valid_account_component(user))
+                        .or_else(|| matching_local.map(|candidate| candidate.ssh_user.clone()))
+                        .unwrap_or_else(|| current_user.to_owned()),
+                    address: record
+                        .resolved_address
+                        .or_else(|| matching_local.map(|candidate| candidate.address.clone()))?,
+                    ssh_port: record
+                        .ssh_port
+                        .or_else(|| matching_local.map(|candidate| candidate.ssh_port))?,
+                    ssh_host_fingerprint: Some(record.ssh_host_fingerprint),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return candidates;
+        }
+    }
+    local
+}
+
+fn current_account_name() -> Option<String> {
+    env::var("USER")
+        .ok()
+        .filter(|user| valid_account_component(user))
+        .or_else(|| {
+            env::var_os("HOME")
+                .and_then(|home| PathBuf::from(home).file_name()?.to_str().map(str::to_owned))
+                .filter(|user| valid_account_component(user))
+        })
+}
+
+fn valid_account_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+            }
+        })
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn mount_cleanup_layouts(
+    profile: &crate::client_profile::ClientProfile,
+) -> Vec<macluster_protocol::control::ClientDescriptor> {
+    crate::client_storage::distinct_mount_layouts(
+        profile.mount_cleanup_descriptors(),
+        &profile.nfs_client_ip,
+    )
+}
+
+struct InteractiveRequestFile {
+    path: PathBuf,
+}
+
+impl InteractiveRequestFile {
+    fn from_existing_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InteractiveRequestFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn remote_web(profile: crate::client_profile::ClientProfile, args: &[String]) -> AppResult<()> {
+    let normalized = parse_web_shortcut_args(args)?;
+    let no_open = normalized.iter().any(|value| value == "--no-open");
+    let requested_local_port = normalized
+        .windows(2)
+        .find(|pair| pair[0] == "--web-port")
+        .and_then(|pair| pair[1].parse::<u16>().ok());
+    let local_port = requested_local_port
+        .filter(|port| *port != 0)
+        .unwrap_or_else(|| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .map(|address| address.port())
+                .unwrap_or(52_521)
+        });
+    let mut remote = crate::client_context::RemoteContext::connect(profile, false)
+        .map_err(|error| (1, error))?;
+    let ControlPayload::WebStarted { port, token, .. } = remote
+        .client
+        .request(ControlCommand::StartWeb { port: None })
+        .map_err(|error| (1, error.to_string()))?
+    else {
+        return Err((1, "Controller returned an invalid web response".into()));
+    };
+    let mut forward = crate::remote_admin::start_forward(&remote.profile, local_port, port)
+        .map_err(|error| (1, error.to_string()))?;
+    let base = format!("http://127.0.0.1:{local_port}/#{token}");
+    if no_open {
+        println!("Remote web monitor: {base}");
+    } else {
+        println!("Opened the remote web monitor at http://127.0.0.1:{local_port}/");
+        let _ = process::Command::new("/usr/bin/open").arg(&base).status();
+    }
+    let status = forward.wait().map_err(|error| (1, error.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err((1, "remote web forward closed".into()))
+    }
+}
+
+fn remote_command(
+    profile: crate::client_profile::ClientProfile,
+    command: &str,
+    args: &[String],
+) -> AppResult<()> {
+    let profile = ensure_remote_command_storage_with(
+        profile,
+        command,
+        args,
+        |endpoint, control_only, expected_cluster_uuid| {
+            crate::client_join::join_cluster_expected(endpoint, control_only, expected_cluster_uuid)
+        },
+    )?;
+    if command == "submit" {
+        run_remote_submit_preflight(&profile)?;
+    }
+    let ensure_client_storage = remote_command_requires_client_storage(command, args);
+    let mut remote = crate::client_context::RemoteContext::connect(profile, ensure_client_storage)
+        .map_err(|error| (1, error))?;
+    match command {
+        "submit" => remote_submit(&mut remote, args),
+        "queue" if queue_uses_remote_cli(args) => {
+            run_remote_cli(&remote.profile, "queue", args, false, "remote mqueue")
+        }
+        "queue" => remote_queue(&mut remote, args),
+        "job" if job_uses_remote_cli(args) => {
+            run_remote_cli(&remote.profile, "job", args, false, "remote mjob")
+        }
+        "job" => remote_job(&mut remote, args),
+        "kill" => remote_kill(&mut remote, args),
+        "fans" => remote_fans(&mut remote, args),
+        "top" => run_remote_cli(
+            &remote.profile,
+            "top",
+            args,
+            io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && !args.iter().any(|argument| argument == "--once"),
+            "remote mtop",
+        ),
+        "node" => run_remote_cli(
+            &remote.profile,
+            "node",
+            args,
+            io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && !args.iter().any(|argument| {
+                    matches!(argument.as_str(), "-l" | "--list" | "--failed" | "--scan")
+                }),
+            "remote mnode",
+        ),
+        _ => Err((
+            1,
+            format!("command '{command}' is not yet available through the login-client transport"),
+        )),
+    }
+}
+
+fn ensure_remote_command_storage_with<F>(
+    profile: crate::client_profile::ClientProfile,
+    command: &str,
+    args: &[String],
+    mut enable_storage: F,
+) -> AppResult<crate::client_profile::ClientProfile>
+where
+    F: FnMut(&str, bool, Option<&str>) -> Result<crate::client_profile::ClientProfile, String>,
+{
+    if profile.mounts_enabled || !remote_command_requires_client_storage(command, args) {
+        return Ok(profile);
+    }
+    let endpoint = format!(
+        "{}@{}:{}",
+        profile.controller_user, profile.controller_host, profile.controller_port
+    );
+    eprintln!(
+        "Cluster '{}' is currently a control-only login client; enabling shared storage and submissions.",
+        profile.cluster_name
+    );
+    let upgraded =
+        enable_storage(&endpoint, false, Some(profile.cluster_uuid.as_str())).map_err(|error| {
+            (
+                1,
+                format!(
+                    "could not enable shared storage for cluster '{}': {error}",
+                    profile.cluster_name
+                ),
+            )
+        })?;
+    if !upgraded.mounts_enabled {
+        return Err((
+            1,
+            format!(
+                "cluster '{}' remained a control-only login client after storage setup",
+                profile.cluster_name
+            ),
+        ));
+    }
+    Ok(upgraded)
+}
+
+fn run_remote_submit_preflight(profile: &crate::client_profile::ClientProfile) -> AppResult<()> {
+    if !profile.mounts_enabled {
+        return Err((
+            1,
+            format!(
+                "cluster '{}' is configured as a control-only login client; rerun `macluster --join {}@{}:{}` without --control-only to enable storage and submissions",
+                profile.cluster_name,
+                profile.controller_user,
+                profile.controller_host,
+                profile.controller_port
+            ),
+        ));
+    }
+    if profile.leave_phase.is_some() {
+        return Err((
+            1,
+            "cluster leave is incomplete; rerun `--leave` to finish it or `--join` to reactivate storage"
+                .into(),
+        ));
+    }
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let code = crate::remote_admin::run(
+        profile,
+        &["internal".into(), "submit-preflight".into()],
+        tty,
+    )
+    .map_err(|error| (1, error.to_string()))?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err((code, "remote submission preflight failed".into()))
+    }
+}
+
+fn run_remote_cli(
+    profile: &crate::client_profile::ClientProfile,
+    command: &str,
+    args: &[String],
+    tty: bool,
+    failure_context: &'static str,
+) -> AppResult<()> {
+    let remote_args = std::iter::once(command.to_owned())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    let code = crate::remote_admin::run(profile, &remote_args, tty)
+        .map_err(|error| (1, error.to_string()))?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err((code, failure_context.into()))
+    }
+}
+
+fn job_uses_remote_cli(args: &[String]) -> bool {
+    args.iter()
+        .any(|argument| matches!(argument.as_str(), "--log" | "--metrics"))
+}
+
+fn queue_uses_remote_cli(args: &[String]) -> bool {
+    args.iter()
+        .any(|argument| matches!(argument.as_str(), "--jobs" | "--watch"))
+}
+
+fn remote_command_requires_client_storage(command: &str, _args: &[String]) -> bool {
+    command == "submit"
+}
+
+fn remote_interactive_submission_args(args: &[String]) -> Vec<String> {
+    std::iter::once("submit".to_owned())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
+fn remote_submit(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    if !remote.profile.mounts_enabled {
+        return Err((
+            1,
+            format!(
+                "cluster '{}' is configured as a control-only login client; rerun `macluster --join {}@{}:{}` without --control-only to enable storage and submissions",
+                remote.profile.cluster_name,
+                remote.profile.controller_user,
+                remote.profile.controller_host,
+                remote.profile.controller_port
+            ),
+        ));
+    }
+    let options = promote_inline_command(parse_submit_args(args).map_err(cli_error)?);
+    if options.interactive {
+        let config = remote.submission_config();
+        let (spec, _) = build_submission(&config, &options)?;
+        crate::client_storage::verify_client_mounts(
+            &remote.descriptor,
+            spec.required_shares.as_deref(),
+            &remote.profile.nfs_client_ip,
+        )
+        .map_err(|error| (1, error))?;
+        let cwd = PathBuf::from(&spec.cwd);
+        let request_dir = config.shared_root.join(".macluster-client-requests");
+        fs::create_dir_all(&request_dir).map_err(|error| (1, error.to_string()))?;
+        fs::set_permissions(&request_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| (1, error.to_string()))?;
+        let request_path = request_dir.join(format!("{}.json", Id128::random()));
+        let request = crate::remote_admin::InteractiveRequest {
+            args: remote_interactive_submission_args(args),
+            cwd: cwd.to_string_lossy().into_owned(),
+            environment: env::vars().collect(),
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&request_path)
+            .map_err(|error| (1, error.to_string()))?;
+        let request_file = InteractiveRequestFile::from_existing_path(request_path);
+        serde_json::to_writer(&mut file, &request).map_err(|error| (1, error.to_string()))?;
+        file.sync_all().map_err(|error| (1, error.to_string()))?;
+        drop(file);
+        let code = crate::remote_admin::run(
+            &remote.profile,
+            &[
+                "internal".into(),
+                "remote-interactive".into(),
+                "--request-file".into(),
+                request_file.path().to_string_lossy().into_owned(),
+            ],
+            true,
+        )
+        .map_err(|error| (1, error.to_string()))?;
+        return if code == 0 {
+            Ok(())
+        } else {
+            Err((code, "remote interactive job failed".into()))
+        };
+    }
+    let config = remote.submission_config();
+    let (mut spec, script) = build_submission(&config, &options)?;
+    crate::client_storage::verify_client_mounts(
+        &remote.descriptor,
+        spec.required_shares.as_deref(),
+        &remote.profile.nfs_client_ip,
+    )
+    .map_err(|error| (1, error))?;
+    let request_id = options
+        .request_id
+        .unwrap_or_else(|| RequestId(Id128::random()));
+    if !script.is_empty() {
+        let expected = snapshot_reference(&script)?;
+        spec.snapshot = Some(expected.clone());
+        let upload_id = Id128::random();
+        match remote
+            .client
+            .request(ControlCommand::BeginSnapshot {
+                upload_id,
+                size_bytes: expected.size_bytes,
+                sha256: expected.sha256.clone(),
+            })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::SnapshotProgress { offset: 0 } => {}
+            _ => return Err((1, "Controller returned an invalid snapshot response".into())),
+        }
+        let mut offset = 0_u64;
+        for bytes in script.chunks(MAX_CONTROL_SNAPSHOT_CHUNK_BYTES) {
+            let payload = remote
+                .client
+                .request(ControlCommand::PutSnapshotChunk {
+                    upload_id,
+                    offset,
+                    bytes: bytes.to_vec(),
+                })
+                .map_err(|error| (1, error.to_string()))?;
+            offset += bytes.len() as u64;
+            if payload != (ControlPayload::SnapshotProgress { offset }) {
+                return Err((1, "Controller returned an invalid snapshot offset".into()));
+            }
+        }
+        if remote
+            .client
+            .request(ControlCommand::FinishSnapshot { upload_id })
+            .map_err(|error| (1, error.to_string()))?
+            != ControlPayload::SnapshotFinished(expected)
+        {
+            return Err((1, "Controller staged a different script snapshot".into()));
+        }
+    }
+    let record = match remote
+        .client
+        .request(ControlCommand::Submit { request_id, spec })
+        .map_err(|error| (1, error.to_string()))?
+    {
+        ControlPayload::Submission(record) => record,
+        _ => {
+            return Err((
+                1,
+                "Controller returned an invalid submission response".into(),
+            ));
+        }
+    };
+    println!("Submitted job {} ({})", record.id, record.spec.name);
+    println!("Request ID: {request_id}");
+    if record.snapshot_sync_pending {
+        println!("shared snapshot pending");
+    }
+    Ok(())
+}
+
+fn remote_queue(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let mut json = false;
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "-q" | "--queue" => {
+                index += 1;
+                selected = Some(
+                    args.get(index)
+                        .ok_or_else(|| (2, "missing queue name".into()))?
+                        .clone(),
+                );
+            }
+            "--jobs" => {}
+            "--watch" => {
+                index += 1;
+                let _ = args
+                    .get(index)
+                    .ok_or_else(|| (2, "missing --watch interval".into()))?;
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mqueue option '{value}'")));
+            }
+            value => return Err((2, format!("unexpected mqueue argument '{value}'"))),
+        }
+        index += 1;
+    }
+    let ControlPayload::Queues(mut queues) = remote
+        .client
+        .request(ControlCommand::QueryQueues)
+        .map_err(|error| (1, error.to_string()))?
+    else {
+        return Err((1, "Controller returned an invalid queue response".into()));
+    };
+    if let Some(selected) = selected {
+        queues.retain(|queue| queue.name == selected);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&queues).map_err(|error| (1, error.to_string()))?
+        );
+        return Ok(());
+    }
+    println!("QUEUE    NODES    PENDING  RUNNING  COMPLETED  FAILED");
+    for queue in queues {
+        println!(
+            "{:<8} {:<8} {:>7}  {:>7}  {:>9}  {:>6}",
+            queue.name,
+            queue.nodes.join(","),
+            queue.pending,
+            queue.running,
+            queue.completed,
+            queue.failed
+        );
+    }
+    Ok(())
+}
+
+fn remote_job(remote: &mut crate::client_context::RemoteContext, args: &[String]) -> AppResult<()> {
+    let mut json = false;
+    let mut all = false;
+    let mut state = None;
+    let mut positional = None;
+    let mut request_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--all" => all = true,
+            "--request-id" => {
+                index += 1;
+                request_id = Some(RequestId(
+                    Id128::parse(
+                        args.get(index)
+                            .ok_or_else(|| (2, "--request-id requires a UUID".into()))?,
+                    )
+                    .map_err(|_| (2, "--request-id must be a UUID".into()))?,
+                ));
+            }
+            "--state" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| (2, "--state requires a value".into()))?;
+                state = Some(
+                    parse_state(value).ok_or_else(|| (2, format!("unknown state '{value}'")))?,
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mjob option '{value}'")));
+            }
+            value if positional.is_none() => positional = Some(parse_job_id(value)?),
+            value => return Err((2, format!("unexpected mjob argument '{value}'"))),
+        }
+        index += 1;
+    }
+    let jobs = if let Some(id) = positional {
+        match remote
+            .client
+            .request(ControlCommand::LookupJob { job_id: id })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::Job(job) => vec![job],
+            _ => return Err((1, "Controller returned an invalid job response".into())),
+        }
+    } else if let Some(request_id) = request_id {
+        match remote
+            .client
+            .request(ControlCommand::LookupRequest { request_id })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::Lookup(Some(job)) => vec![job],
+            ControlPayload::Lookup(None) => Vec::new(),
+            _ => return Err((1, "Controller returned an invalid request lookup".into())),
+        }
+    } else {
+        let mut jobs = Vec::new();
+        let mut offset = 0;
+        loop {
+            let payload = remote
+                .client
+                .request(ControlCommand::QueryJobs {
+                    offset,
+                    limit: macluster_protocol::control::MAX_CONTROL_JOB_PAGE,
+                    state,
+                    active_only: !all && state.is_none(),
+                })
+                .map_err(|error| (1, error.to_string()))?;
+            let ControlPayload::Jobs(page) = payload else {
+                return Err((1, "Controller returned an invalid job list".into()));
+            };
+            jobs.extend(page.jobs);
+            match page.next_offset {
+                Some(next) if next > offset => offset = next,
+                Some(_) => {
+                    return Err((1, "Controller returned a non-advancing job page".into()));
+                }
+                None => break,
+            }
+        }
+        jobs
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&jobs).map_err(|error| (1, error.to_string()))?
+        );
+    } else if jobs.len() == 1 {
+        print!("{}", format_job_details(&jobs[0]));
+    } else {
+        print!("{}", format_jobs_table(&jobs, all));
+    }
+    Ok(())
+}
+
+fn remote_kill(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let mut force = false;
+    let mut ids = Vec::new();
+    for arg in args {
+        if arg == "--force" {
+            force = true;
+        } else if arg.starts_with('-') {
+            return Err((2, format!("unknown mkill option '{arg}'")));
+        } else {
+            ids.push(parse_job_id(arg)?);
+        }
+    }
+    if ids.is_empty() {
+        return Err((2, "mkill requires one or more job IDs".into()));
+    }
+    let mut failures = 0;
+    for id in ids {
+        match remote
+            .client
+            .request(ControlCommand::CancelJob { job_id: id, force })
+        {
+            Ok(ControlPayload::Job(job)) => println!("Job {}: {:?}", id, job.state),
+            Ok(_) => {
+                eprintln!("Job {id}: invalid cancellation response");
+                failures += 1;
+            }
+            Err(error) => {
+                eprintln!("Job {id}: {error}");
+                failures += 1;
+            }
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err((1, format!("failed to cancel {failures} job(s)")))
+    }
+}
+
+fn remote_fans(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let mut policy = None;
+    let mut node_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let requested = match args[index].as_str() {
+            "--json" | "--status" | "-l" => None,
+            "--reset" => Some(FanPolicy::System),
+            "--auto" => Some(FanPolicy::Auto),
+            "--power" => Some(FanPolicy::Power),
+            "--node" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| (2, "--node requires a node ID".into()))?;
+                node_id = Some(
+                    value
+                        .parse::<NodeId>()
+                        .map_err(|_| (2, format!("invalid node ID '{value}'")))?,
+                );
+                None
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mfans option '{value}'")));
+            }
+            value => return Err((2, format!("unexpected mfans argument '{value}'"))),
+        };
+        if let Some(requested) = requested
+            && policy.replace(requested).is_some()
+        {
+            return Err((2, "choose only one of --reset, --auto, or --power".into()));
+        }
+        index += 1;
+    }
+    remote
+        .client
+        .set_timeouts(Duration::from_secs(65))
+        .map_err(|error| (1, error.to_string()))?;
+    let payload = remote
+        .client
+        .request(ControlCommand::FanControl { node_id, policy })
+        .map_err(|error| (1, error.to_string()))?;
+    let ControlPayload::FanControl(response) = payload else {
+        return Err((1, "Controller returned an invalid fan response".into()));
+    };
+    let results = match response {
+        FanControlPayload::Detailed { nodes, .. } => nodes,
+        FanControlPayload::Legacy(nodes) => nodes,
+    };
+    if args.iter().any(|arg| arg == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string(&results).map_err(|error| (1, error.to_string()))?
+        );
+    } else {
+        print!("{}", format_fan_control_table(&results));
+    }
+    Ok(())
 }
 
 // The controller runs the address watcher continuously. When it is healthy,
@@ -1071,7 +2181,7 @@ fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
             .map_or((args[index].as_str(), None), |(key, value)| {
                 (key, Some(value))
             });
-        if key == "--config" || key == "--state-dir" {
+        if key == "--config" || key == "--state-dir" || key == "--cluster" {
             if inline.is_none() {
                 if index + 1 >= args.len() {
                     return Err((2, format!("missing value for {key}")));
@@ -1158,6 +2268,43 @@ SECURITY
     }
 }
 
+fn client_clusters_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  macluster --clusters
+
+List clusters joined by this Mac."#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  macluster --clusters
+
+Lists each joined cluster's UUID, name, controller account and endpoint.
+The most recently used profile is selected when a command omits --cluster."#
+        }
+    }
+}
+
+fn client_leave_help(mode: HelpMode) -> &'static str {
+    match mode {
+        HelpMode::Short => {
+            r#"Usage
+  macluster [--cluster NAME|UUID] --leave
+
+Remove a joined cluster and its local client configuration."#
+        }
+        HelpMode::Long => {
+            r#"Usage
+  macluster [--cluster NAME|UUID] --leave
+
+Unmounts the profile's NFS shares, revokes its NFS-client export entries when
+possible, revokes the dedicated SSH key and removes the local profile. Shared
+files remain on the Controller."#
+        }
+    }
+}
+
 fn alias_to_command(name: &str) -> Option<&'static str> {
     Some(match name {
         "submit" | "msub" => "submit",
@@ -1190,7 +2337,7 @@ fn take_global_options(
         let (key, inline) = argument
             .split_once('=')
             .map_or((argument.as_str(), None), |(key, value)| (key, Some(value)));
-        if key == "--config" || key == "--state-dir" {
+        if key == "--config" || key == "--state-dir" || key == "--cluster" {
             let value = if let Some(value) = inline {
                 value.to_owned()
             } else {
@@ -1204,8 +2351,10 @@ fn take_global_options(
             }
             if key == "--config" {
                 options.config = Some(PathBuf::from(value));
-            } else {
+            } else if key == "--state-dir" {
                 options.state_dir = Some(PathBuf::from(value));
+            } else {
+                options.cluster = Some(value);
             }
         } else {
             remaining.push(argument.clone());
@@ -1222,6 +2371,29 @@ fn take_global_options(
         index += 1;
     }
     Ok((options, remaining))
+}
+
+fn parse_join_shortcut(args: &[String]) -> AppResult<(String, bool)> {
+    let mut endpoint = None;
+    let mut control_only = false;
+    for value in args {
+        match value.as_str() {
+            "--control-only" if !control_only => control_only = true,
+            "--control-only" => {
+                return Err((2, "--control-only may only be specified once".into()));
+            }
+            "-h" | "--help" => return Err((0, String::new())),
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown join option '{value}'")));
+            }
+            value if endpoint.is_none() => endpoint = Some(value.to_owned()),
+            value => return Err((2, format!("unexpected join argument '{value}'"))),
+        }
+    }
+    Ok((
+        endpoint.ok_or_else(|| (2, "--join requires USER@HOST[:PORT]".into()))?,
+        control_only,
+    ))
 }
 
 fn submit_option_takes_value(key: &str) -> bool {
@@ -5983,6 +7155,7 @@ fn controller(
                         macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
                         "maintenance.v1".into(),
                         "web.v1".into(),
+                        macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE.into(),
                     ],
                     controller_epoch: service.epoch(),
                     config_generation: maintenance.generation(),
@@ -6007,6 +7180,17 @@ fn controller(
                 );
                 Ok(())
             } else {
+                let _cluster_advertisement = control_hello
+                    .as_ref()
+                    .and_then(|hello| match start_cluster_advertisement(&config, hello) {
+                        Ok(advertisement) => Some(advertisement),
+                        Err(error) => {
+                            eprintln!(
+                                "macluster: cluster discovery advertisement is unavailable: {error}. Manual `macluster --join` remains available."
+                            );
+                            None
+                        }
+                    });
                 let watcher = crate::node_admin::watch_node_addresses(
                     config_file.clone(),
                     state_dir.clone(),
@@ -6083,6 +7267,37 @@ fn controller(
         }
         value => Err((2, format!("unknown controller command '{value}'"))),
     }
+}
+
+fn start_cluster_advertisement(
+    config: &macluster_core::config::ClusterConfig,
+    hello: &ControllerHello,
+) -> Result<crate::discovery::AdvertisementGuard, String> {
+    let login = config
+        .nodes
+        .iter()
+        .find(|(id, node)| config.is_login_node(id) && node.transport == Transport::Local)
+        .map(|(_, node)| node)
+        .ok_or_else(|| "configured local login node is missing".to_owned())?;
+    let fingerprint = crate::ssh_bootstrap::host_key_fingerprint(login)?;
+    let record = crate::discovery::DiscoveryRecord {
+        instance: config.name.clone(),
+        cluster_uuid: config.share_uuid.to_ascii_lowercase(),
+        cluster_name: config.name.clone(),
+        protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+        controller_build: hello.build_id.clone(),
+        ssh_host_fingerprint: fingerprint,
+        transport: "ssh".into(),
+        ssh_user: current_account_name(),
+        resolved_address: None,
+        ssh_port: None,
+    };
+    crate::discovery::advertise_cluster(
+        &record,
+        &login.host,
+        &login.host,
+        login.ssh_port.unwrap_or(22),
+    )
 }
 
 fn controller_help(mode: HelpMode) -> &'static str {
@@ -7026,11 +8241,272 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
         Some("nfs-admin") => internal_nfs_admin(&args[1..]),
+        Some("control-proxy") => {
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let mut proxy_args = vec![
+                "--config".into(),
+                config_path.to_string_lossy().into_owned(),
+                "--state-dir".into(),
+                state_dir.to_string_lossy().into_owned(),
+            ];
+            proxy_args.extend(args[1..].iter().cloned());
+            let proxy = crate::remote_transport::validate_proxy_args(&proxy_args)
+                .map_err(|error| (1, error))?;
+            if let Some((client_id, recorded_ip)) = proxy.client_storage.as_ref() {
+                let config =
+                    load_config(Some(Path::new(&proxy.config_path))).map_err(config_error)?;
+                if crate::init::reset::journal_path(Path::new(&proxy.config_path)).exists() {
+                    return Err((
+                        1,
+                        "cluster reset is in progress; login-client NFS access will resume after reset completes".into(),
+                    ));
+                }
+                let current_ip =
+                    crate::client_access::current_ssh_client_ipv4().map_err(|error| (1, error))?;
+                crate::client_access::replace_registered_client_address(
+                    &config,
+                    Path::new(&proxy.state_dir),
+                    client_id,
+                    recorded_ip,
+                    &current_ip,
+                )
+                .map_err(|error| (1, error))?;
+            }
+            let binding =
+                ServiceBinding::load(Path::new(&proxy.config_path), Path::new(&proxy.state_dir))
+                    .map_err(|error| (1, error.to_string()))?;
+            let mut socket = std::os::unix::net::UnixStream::connect(binding.endpoint_path())
+                .map_err(|error| (1, error.to_string()))?;
+            let mut output = socket.try_clone().map_err(|error| (1, error.to_string()))?;
+            std::thread::scope(|scope| {
+                let input = scope.spawn(|| -> Result<(), String> {
+                    let stdin = io::stdin();
+                    let mut stdin = stdin.lock();
+                    let mut buffer = [0_u8; 16 * 1024];
+                    loop {
+                        let count = stdin.read(&mut buffer).map_err(|error| error.to_string())?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        socket
+                            .write_all(&buffer[..count])
+                            .map_err(|error| error.to_string())?;
+                        socket.flush().map_err(|error| error.to_string())?;
+                    }
+                });
+                let result = (|| -> Result<(), String> {
+                    let stdout = io::stdout();
+                    let mut stdout = stdout.lock();
+                    let mut buffer = [0_u8; 16 * 1024];
+                    loop {
+                        let count = output
+                            .read(&mut buffer)
+                            .map_err(|error| error.to_string())?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        stdout
+                            .write_all(&buffer[..count])
+                            .map_err(|error| error.to_string())?;
+                        stdout.flush().map_err(|error| error.to_string())?;
+                    }
+                })();
+                let _ = input.join();
+                result
+            })
+            .map_err(|error| (1, error))
+        }
+        Some("remote-interactive") => {
+            let request_path = option_value(&args[1..], "--request-file")?
+                .ok_or_else(|| (2, "remote-interactive requires --request-file PATH".into()))?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            let request_path = PathBuf::from(request_path);
+            crate::remote_admin::validate_interactive_request_path(
+                &request_path,
+                &config.shared_root,
+            )
+            .map_err(|error| (2, error))?;
+            let request: crate::remote_admin::InteractiveRequest = serde_json::from_slice(
+                &fs::read(&request_path).map_err(|error| (1, error.to_string()))?,
+            )
+            .map_err(|error| (2, format!("invalid interactive request: {error}")))?;
+            fs::remove_file(&request_path).map_err(|error| (1, error.to_string()))?;
+            let executable = env::current_exe().map_err(|error| (1, error.to_string()))?;
+            let mut command = process::Command::new(executable);
+            command
+                .arg("--config")
+                .arg(config_path)
+                .arg("--state-dir")
+                .arg(state_dir)
+                .args(request.args)
+                .current_dir(request.cwd)
+                .env_clear()
+                .envs(request.environment);
+            let status = command.status().map_err(|error| (1, error.to_string()))?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err((
+                    status.code().unwrap_or(1),
+                    "local interactive submission failed".into(),
+                ))
+            }
+        }
+        Some("submit-preflight") => {
+            if args.len() != 1 {
+                return Err((2, "internal submit-preflight takes no arguments".into()));
+            }
+            preflight_agent_update("submit", &[], &global)?;
+            Ok(())
+        }
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
             }
             controller(global, &["run".into()], true, false, None)
+        }
+        Some("client-bootstrap") => {
+            let options = &args[1..];
+            let client_key_digest =
+                option_value(options, "--client-key-digest")?.ok_or_else(|| {
+                    (
+                        2,
+                        "internal client-bootstrap requires --client-key-digest".into(),
+                    )
+                })?;
+            if !options.iter().any(|argument| argument == "--json")
+                || !options
+                    .iter()
+                    .any(|argument| argument == "--client-key-digest")
+                || options.iter().enumerate().any(|(index, argument)| {
+                    argument != "--json"
+                        && argument != "--client-key-digest"
+                        && !(index > 0
+                            && options
+                                .get(index - 1)
+                                .is_some_and(|value| value == "--client-key-digest"))
+                })
+                || client_key_digest.len() != 64
+                || !client_key_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err((
+                    2,
+                    "internal client-bootstrap requires --json --client-key-digest HEX".into(),
+                ));
+            }
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            if crate::init::reset::journal_path(&config_path).exists() {
+                return Err((
+                    1,
+                    "cluster reset is in progress; retry login-client enrollment after reset completes"
+                        .into(),
+                ));
+            }
+            let client_ip =
+                crate::client_access::current_ssh_client_ipv4().map_err(|error| (1, error))?;
+            let client_id = format!("client-{}", &client_key_digest[..56].to_ascii_lowercase());
+            let mut controller = online_controller(&config_path, &state_dir, false)?
+                .ok_or_else(|| (1, "Controller is unavailable".into()))?;
+            let payload = controller
+                .client
+                .request(ControlCommand::ClientDescriptor)
+                .map_err(|error| (1, error.to_string()))?;
+            let ControlPayload::ClientDescriptor(descriptor) = payload else {
+                return Err((
+                    1,
+                    "Controller returned an unexpected bootstrap response".into(),
+                ));
+            };
+            let login = config
+                .nodes
+                .iter()
+                .find(|(id, node)| config.is_login_node(id) && node.transport == Transport::Local)
+                .map(|(_, node)| node)
+                .ok_or_else(|| (1, "configured local login node is missing".into()))?;
+            let host_fingerprint =
+                crate::ssh_bootstrap::host_key_fingerprint(login).map_err(|error| (1, error))?;
+            let binary = env::current_exe().map_err(|error| (1, error.to_string()))?;
+            let response = crate::client_join::BootstrapResponse {
+                descriptor,
+                binding_digest: controller.binding.binding_digest().to_owned(),
+                remote_uid: unsafe { libc::geteuid() },
+                remote_binary: binary.to_string_lossy().into_owned(),
+                remote_config: config_path.to_string_lossy().into_owned(),
+                remote_state_dir: state_dir.to_string_lossy().into_owned(),
+                host_fingerprint,
+                nfs_client_id: client_id,
+                nfs_client_ip: client_ip,
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&response).map_err(|error| (1, error.to_string()))?
+            );
+            Ok(())
+        }
+        Some("client-authorize") => {
+            if !args.iter().skip(1).any(|argument| argument == "--json") {
+                return Err((2, "internal client-authorize requires --json".into()));
+            }
+            let client_id = option_value(&args[1..], "--client-id")?
+                .ok_or_else(|| (2, "internal client-authorize requires --client-id".into()))?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            if crate::init::reset::journal_path(&config_path).exists() {
+                return Err((
+                    1,
+                    "cluster reset is in progress; retry login-client authorization after reset completes"
+                        .into(),
+                ));
+            }
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            let client_ip =
+                crate::client_access::current_ssh_client_ipv4().map_err(|error| (1, error))?;
+            crate::client_access::authorize_registered_client(
+                &config, &state_dir, &client_id, &client_ip,
+            )
+            .map_err(|error| (1, error))?;
+            Ok(())
+        }
+        Some("client-revoke") => {
+            if !args.iter().skip(1).any(|argument| argument == "--json") {
+                return Err((2, "internal client-revoke requires --json".into()));
+            }
+            let client_id = option_value(&args[1..], "--client-id")?
+                .ok_or_else(|| (2, "internal client-revoke requires --client-id".into()))?;
+            let client_ip = option_value(&args[1..], "--client-ip")?
+                .ok_or_else(|| (2, "internal client-revoke requires --client-ip".into()))?;
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            if !config_path.exists() {
+                crate::client_access::forget_registered_client(&state_dir, &client_id)
+                    .map_err(|error| (1, error))?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revoked": false,
+                        "client_id": client_id,
+                        "detail": "active cluster config is absent; local registry entry removed"
+                    })
+                );
+                return Ok(());
+            }
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            crate::client_access::revoke_client_at_current_address(
+                &config, &state_dir, &client_id, &client_ip,
+            )
+            .map_err(|error| (1, error))?;
+            println!(
+                "{}",
+                serde_json::json!({ "revoked": true, "client_id": client_id })
+            );
+            Ok(())
         }
         Some("claim-agent") => {
             let node_id = option_value(args, "--node")?
@@ -8146,7 +9622,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             &["-a".into(), "operator@192.0.2.20".into()]
         ));
         assert!(
-            should_preflight_agent_update("node", &["-rm".into(), "share:wdisk".into()],),
+            should_preflight_agent_update("node", &["-rm".into(), "share:external-disk".into()],),
             "named-share removal needs the current privileged NFS protocol"
         );
     }
@@ -8753,7 +10229,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             &config_path,
             format!(
-                "[cluster]\nname=\"online-env\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n[shares.mamba]\nserver=\"login\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"340edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\n",
+                "[cluster]\nname=\"online-env\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n[shares.mamba]\nserver=\"login\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"82d02835-f6ab-52b4-aaab-f90cafde9981\"\n",
                 shared_root.display(),
                 unsafe { libc::geteuid() },
                 software_root.display(),
@@ -8803,7 +10279,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         ]);
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
         let spec = JobSpec {
-            storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+            storage_namespace: Some(Id128::parse("f779bcf5-ea85-5caa-9579-74b395f3cce5").unwrap()),
             required_shares: Some(Vec::new()),
             queue: QueueName::new("compute").unwrap(),
             node: Some(NodeId::new("worker").unwrap()),
@@ -10153,14 +11629,14 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         let nodes = vec![
             NodeMetricRow {
                 id: "mini01-a".into(),
-                host: "192.168.2.1".into(),
+                host: "192.0.2.1".into(),
                 reachable: true,
                 metrics: Some(first),
                 error: None,
             },
             NodeMetricRow {
                 id: "mini01-b".into(),
-                host: "192.168.2.2".into(),
+                host: "192.0.2.2".into(),
                 reachable: true,
                 metrics: Some(second),
                 error: None,
@@ -10221,7 +11697,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             &config_path,
             format!(
-                "[cluster]\nname=\"monitor-cache\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                "[cluster]\nname=\"monitor-cache\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
                 root.join("shared").display(),
                 unsafe { libc::geteuid() }
             ),
@@ -10350,7 +11826,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             root.join("config.toml"),
             format!(
-                "[cluster]\nname=\"preflight\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                "[cluster]\nname=\"preflight\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
                 root.display(),
                 unsafe { libc::geteuid() }
             ),
@@ -10464,11 +11940,16 @@ Usage
 
 Modes
   macluster --init [OPTIONS]              Create or reset a cluster.
+  macluster --join [OPTIONS] USER@HOST[:PORT]
+                                          Join an existing cluster.
+  macluster --clusters                    List joined clusters.
+  macluster [--cluster NAME|UUID] --leave Leave a joined cluster.
   macluster --web [IP[:PORT]] [OPTIONS]   Open the read-only web monitor.
 
 Options
   -h, --help           Show this help message.
   -V, --version        Show version and protocol information.
+  --cluster NAME|UUID  Select a joined cluster profile.
   --config PATH        Use a cluster config file.
   --state-dir PATH     Use a service state directory.
 
@@ -10600,5 +12081,173 @@ mod update_terminal_regressions {
             defer_update_without_terminal("submit", &[], true, true),
             Ok(false)
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_client_regressions {
+    use super::{
+        AutomaticJoinCandidate, Id128, InteractiveRequestFile, ensure_remote_command_storage_with,
+        job_uses_remote_cli, queue_uses_remote_cli, remote_command_requires_client_storage,
+        remote_interactive_submission_args, select_automatic_join_candidates,
+    };
+
+    fn control_only_profile() -> crate::client_profile::ClientProfile {
+        crate::client_profile::ClientProfile {
+            version: crate::client_profile::CLIENT_PROFILE_VERSION,
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            binding_digest: "b".repeat(64),
+            namespace: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            descriptor_generation: 1,
+            controller_host: "192.0.2.1".into(),
+            controller_user: "login".into(),
+            controller_port: 2222,
+            known_hosts_path: "/tmp/known_hosts".into(),
+            identity_file: "/tmp/id_ed25519".into(),
+            remote_uid: 501,
+            remote_binary: "/opt/homebrew/bin/macluster".into(),
+            remote_config: "/tmp/config.toml".into(),
+            remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: false,
+            nfs_client_id: "client-test".into(),
+            nfs_client_ip: "192.0.2.10".into(),
+            last_used_unix_ms: 1,
+            descriptor: None,
+            mounted_descriptor: None,
+            transition_mount_descriptors: vec![],
+            retired_access: vec![],
+            leave_phase: None,
+        }
+    }
+
+    #[test]
+    fn storage_command_upgrades_a_control_only_profile_for_the_same_cluster() {
+        let profile = control_only_profile();
+        let expected_uuid = profile.cluster_uuid.clone();
+        let mut join_request = None;
+        let upgraded = ensure_remote_command_storage_with(
+            profile,
+            "submit",
+            &[],
+            |endpoint, control_only, expected_cluster_uuid| {
+                join_request = Some((
+                    endpoint.to_owned(),
+                    control_only,
+                    expected_cluster_uuid.map(str::to_owned),
+                ));
+                let mut upgraded = control_only_profile();
+                upgraded.mounts_enabled = true;
+                Ok(upgraded)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            join_request,
+            Some(("login@192.0.2.1:2222".into(), false, Some(expected_uuid)))
+        );
+        assert!(upgraded.mounts_enabled);
+    }
+
+    #[test]
+    fn remote_interactive_submission_keeps_the_submit_module() {
+        assert_eq!(
+            remote_interactive_submission_args(&["-Is".into(), "pwd".into()]),
+            vec!["submit", "-Is", "pwd"]
+        );
+    }
+
+    #[test]
+    fn monitoring_does_not_upgrade_a_control_only_profile() {
+        let profile = ensure_remote_command_storage_with(
+            control_only_profile(),
+            "top",
+            &[],
+            |_, _, _| -> Result<crate::client_profile::ClientProfile, String> {
+                panic!("monitoring must not enable client storage")
+            },
+        )
+        .unwrap();
+        assert!(!profile.mounts_enabled);
+    }
+
+    #[test]
+    fn remote_job_logs_and_resource_streams_use_the_full_controller_cli() {
+        assert!(job_uses_remote_cli(&["--log".into(), "12".into()]));
+        assert!(job_uses_remote_cli(&[
+            "--metrics".into(),
+            "12".into(),
+            "--follow".into()
+        ]));
+        assert!(job_uses_remote_cli(&[
+            "--log".into(),
+            "12".into(),
+            "--follow".into()
+        ]));
+        assert!(!job_uses_remote_cli(&["--all".into(), "--json".into()]));
+        assert!(!job_uses_remote_cli(&["--state".into(), "running".into()]));
+    }
+
+    #[test]
+    fn remote_queue_combined_jobs_and_watch_use_the_full_controller_cli() {
+        assert!(queue_uses_remote_cli(&["--jobs".into()]));
+        assert!(queue_uses_remote_cli(&["--watch".into(), "5".into()]));
+        assert!(!queue_uses_remote_cli(&["--json".into()]));
+        assert!(!queue_uses_remote_cli(&[
+            "--queue".into(),
+            "default".into()
+        ]));
+    }
+
+    #[test]
+    fn only_storage_dependent_remote_commands_refresh_client_nfs_access() {
+        assert!(remote_command_requires_client_storage("submit", &[]));
+        assert!(!remote_command_requires_client_storage(
+            "job",
+            &["--log".into(), "12".into()]
+        ));
+        assert!(!remote_command_requires_client_storage("job", &[]));
+        assert!(!remote_command_requires_client_storage("queue", &[]));
+        assert!(!remote_command_requires_client_storage("top", &[]));
+    }
+
+    #[test]
+    fn interactive_request_file_is_removed_when_remote_launch_fails() {
+        let path =
+            std::env::temp_dir().join(format!("macluster-interactive-request-{}", Id128::random()));
+        std::fs::write(&path, b"{}").unwrap();
+        {
+            let _request = InteractiveRequestFile::from_existing_path(path.clone());
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bonjour_candidate_uses_the_ssh_account_derived_from_local_agent_state() {
+        let record = crate::discovery::DiscoveryRecord {
+            instance: "macluster".into(),
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "macluster".into(),
+            protocol_version: 1,
+            controller_build: "macluster/0.2.0".into(),
+            ssh_host_fingerprint: "SHA256:test".into(),
+            transport: "ssh".into(),
+            ssh_user: None,
+            resolved_address: Some("192.0.2.1".into()),
+            ssh_port: Some(22),
+        };
+        let local = vec![AutomaticJoinCandidate {
+            cluster_uuid: record.cluster_uuid.clone(),
+            cluster_name: "macluster".into(),
+            ssh_user: "loginuser".into(),
+            address: "192.0.2.1".into(),
+            ssh_port: 22,
+            ssh_host_fingerprint: None,
+        }];
+        let selected = select_automatic_join_candidates(vec![record], local, "worker");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].ssh_user, "loginuser");
     }
 }

@@ -734,6 +734,7 @@ mod macos {
         }
     }
 
+    #[allow(clippy::items_after_test_module)]
     #[cfg(test)]
     mod power_tests {
         use super::{
@@ -1158,9 +1159,7 @@ mod macos {
         let mut interfaces = 0_u64;
         for line in input.lines() {
             let fields: Vec<_> = line.split_whitespace().collect();
-            if fields.iter().any(|field| *field == "Ibytes")
-                && fields.iter().any(|field| *field == "Obytes")
-            {
+            if fields.contains(&"Ibytes") && fields.contains(&"Obytes") {
                 headers = Some(fields);
                 continue;
             }

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    identifiers::{Id128, NodeId, RequestId},
+    identifiers::{Id128, NodeId, QueueName, RequestId},
     types::{
         ControllerEpoch, FanControlStatus, FanPolicy, JobRecord, JobSpec, JobState, MetricSnapshot,
         SnapshotRef,
@@ -17,6 +17,39 @@ pub const MAX_CONTROL_COMPATIBILITY_NODES: usize = 128;
 pub const MAX_CONTROL_MONITOR_NODES: usize = 128;
 pub const MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES: usize = 4096;
 pub const MAX_MONITOR_PROCESS_ROWS: usize = 32;
+pub const MULTI_ENTRY_CLIENT_FEATURE: &str = "multi-entry-client.v1";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientDescriptor {
+    pub cluster_uuid: String,
+    pub cluster_name: String,
+    pub default_queue: QueueName,
+    pub config_generation: u64,
+    pub controller_build_id: String,
+    pub controller_uid: u32,
+    pub capabilities: Vec<String>,
+    pub primary_mount_root: String,
+    pub primary_source_root: String,
+    pub primary_source_host: String,
+    pub shares: Vec<ClientShareDescriptor>,
+    pub queues: Vec<ClientQueueDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientShareDescriptor {
+    pub id: String,
+    pub server: NodeId,
+    pub source_root: String,
+    pub server_host: String,
+    pub mount_root: String,
+    pub share_uuid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientQueueDescriptor {
+    pub name: QueueName,
+    pub nodes: Vec<NodeId>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClientHello {
@@ -136,6 +169,7 @@ pub enum ControlCommand {
     },
     UnsubscribeJobResources,
     Status,
+    ClientDescriptor,
     BeginMaintenance {
         operation_id: Id128,
         scope: MaintenanceScope,
@@ -221,6 +255,7 @@ pub enum ControlPayload {
     JobResourcesSubscribed,
     JobResourceSnapshot(crate::resources::JobResourceSnapshot),
     Status(ControllerHello),
+    ClientDescriptor(ClientDescriptor),
     Maintenance(Option<MaintenanceStatus>),
     AgentCompatibility(Vec<AgentCompatibilityRecord>),
     MonitorSnapshot(MonitorSnapshot),
@@ -434,6 +469,55 @@ mod maintenance_scope_tests {
         assert_eq!(
             decoded.deferred_unreachable_nodes(),
             &[NodeId::new("default-003").unwrap()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_descriptor_tests {
+    use super::{ClientDescriptor, ControlPayload};
+
+    #[test]
+    fn legacy_control_payloads_deserialize_without_client_descriptor() {
+        let payload: ControlPayload =
+            serde_json::from_value(serde_json::json!({"payload": "monitor_acknowledged"})).unwrap();
+        assert_eq!(payload, ControlPayload::MonitorAcknowledged);
+    }
+
+    #[test]
+    fn client_descriptor_reports_generation_queues_and_share_paths() {
+        let descriptor = ClientDescriptor {
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "multi-entry".into(),
+            default_queue: "compute".parse().unwrap(),
+            config_generation: 17,
+            controller_build_id: "macluster/test".into(),
+            controller_uid: 501,
+            capabilities: vec![super::MULTI_ENTRY_CLIENT_FEATURE.into()],
+            primary_mount_root: "/Users/Shared/macluster".into(),
+            primary_source_root: "/Users/Shared/macluster".into(),
+            primary_source_host: "192.0.2.1".into(),
+            shares: vec![super::ClientShareDescriptor {
+                id: "tools".into(),
+                server: "login".parse().unwrap(),
+                source_root: "/opt/homebrew".into(),
+                server_host: "192.0.2.1".into(),
+                mount_root: "/opt/homebrew".into(),
+                share_uuid: "82d02835-f6ab-52b4-aaab-f90cafde9981".into(),
+            }],
+            queues: vec![super::ClientQueueDescriptor {
+                name: "compute".parse().unwrap(),
+                nodes: vec!["worker-a".parse().unwrap()],
+            }],
+        };
+
+        let encoded = serde_json::to_value(&descriptor).unwrap();
+        assert_eq!(encoded["config_generation"], 17);
+        assert_eq!(encoded["queues"][0]["nodes"][0], "worker-a");
+        assert_eq!(encoded["shares"][0]["mount_root"], "/opt/homebrew");
+        assert_eq!(
+            encoded["capabilities"][0],
+            super::MULTI_ENTRY_CLIENT_FEATURE
         );
     }
 }

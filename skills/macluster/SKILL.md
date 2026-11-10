@@ -11,11 +11,27 @@ Use the installed `macluster` CLI on the configured login Mac. Prefer full subco
 
 - Locate the executable with `command -v macluster`; in a source checkout, `target/release/macluster` may be available. Do not assume a checkout binary is the installed build.
 - Inspect `macluster --help` and relevant subcommand help when needed. Installed behavior takes precedence over examples in this skill.
-- Read `macluster controller status`, `macluster node -l`, `macluster queue`, and, when relevant, `macluster job --all`. Respect explicit `--config PATH` / `--state-dir PATH`; put global options before the subcommand.
+- Read `macluster controller status`, `macluster node -l`, `macluster queue`, and, when relevant, `macluster job --all`. If the local config is absent, run `macluster --clusters` before assuming initialization is required. Respect explicit `--cluster NAME|UUID`, `--config PATH`, and `--state-dir PATH`; put global options before the subcommand. An explicit `--cluster` selects a joined login-client profile even when a local controller config also exists.
 - Read-only job/queue queries use saved state and do not prove the controller is running or the nodes are currently reachable. Known Agent mismatches can trigger an update workflow even from inspection commands; do not answer maintenance prompts blindly.
 - If configuration is missing, report that discovery result. Use `init` only for requested initialization/reset, since an existing configuration turns it into a reset workflow.
 
 The login Mac runs the controller and normally hosts primary NFS storage; it does not accept compute jobs. Each compute Mac runs one job at a time with no core/memory quota. There is no standalone `mupdate`: normal operations trigger Agent updates when needed.
+
+## Join and select a login client
+
+Another Mac can consume an existing cluster without becoming a compute node:
+
+```sh
+macluster --join USER@CONTROLLER[:PORT]
+macluster --join --control-only USER@CONTROLLER[:PORT]
+macluster --clusters
+macluster --cluster NAME_OR_UUID queue
+macluster --cluster NAME_OR_UUID --leave
+```
+
+Normal join installs a dedicated SSH identity and host pin, authorizes the client's current IPv4 address for managed NFS shares, mounts the shares, and installs a client remount service. `--control-only` skips NFS authorization and local mounts and is limited to inspection/monitoring; do not promise that form for submissions. A controller connection for `submit` or `job --log/--metrics` refreshes the recorded NFS client address when the client IP changes.
+
+If one compatible cluster is discoverable, a normal cluster command may prompt to join it. macOS Local Network permission can be required for discovery; denial does not prevent explicit `--join`. Do not invent a controller account: use the account supplied by the user or shown by discovery. Host-key verification remains mandatory. `--leave` removes mounts and revokes the client SSH/NFS access; retry it if cleanup reports an error rather than deleting profile files manually.
 
 ## Submit the intended workload
 

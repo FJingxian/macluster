@@ -27,3 +27,4 @@ ed25519-dalek.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
+mdns-sd.workspace = true

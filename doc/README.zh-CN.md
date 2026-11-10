@@ -13,12 +13,12 @@
 ## 工作方式
 
 ```text
-登录 Mac                         计算 Mac
-命令行 + 后台 controller  ───►   每台同时执行一个任务
-默认提供 NFS 存储         ◄──►   共享项目和软件
+登录客户端                        登录 Mac / Controller             计算 Mac
+通过固定 SSH 身份运行命令  ───►   命令行 + 后台服务           ───►   每台同时执行一个任务
+可选 NFS 挂载             ◄──►   默认提供 NFS 存储           ◄──►   共享项目和软件
 ```
 
-登录 Mac 不加入计算队列。每个任务独占一台计算节点，不限制 CPU 核数或内存。初始化时也可以指定另一台 Mac 提供存储。
+运行 controller 的 Mac 不加入计算队列。另一台 Mac 可以作为登录客户端加入同一集群，提交和查看任务，但不会变成计算节点。每个任务独占一台计算节点，不限制 CPU 核数或内存。初始化时也可以指定另一台 Mac 提供存储。
 
 项目仍处于早期阶段，面向个人和实验室集群，以 macOS 账户及共享目录作为信任边界。
 
@@ -75,6 +75,30 @@ macluster controller stop
 ```
 
 `controller run` 用于前台排查。仅需启动服务时不要执行 `macluster --init`：已有配置时，它会询问是否重置集群。
+
+## 将另一台 Mac 作为登录客户端
+
+在另一台 Mac 上运行同一个二进制，加入已有 controller：
+
+```sh
+macluster --join cluster-user@192.0.2.1
+macluster --clusters
+macluster queue
+macluster submit hostname
+```
+
+加入流程会安装专用 SSH 密钥和只属于该集群的 SSH 主机密钥 pin，并默认挂载主共享和命名 NFS 共享。程序还会安装 root LaunchDaemon，在网络恢复后自动重挂。如果挂载会遮住本机已有文件，macluster 会列出路径并要求输入 `y` 确认。只需要查看队列、任务、节点和监控信息、不希望挂载共享空间时，使用 `--join --control-only`。
+
+局域网内只发现一个兼容集群时，直接运行 `mtop` 等命令会询问是否自动加入。macOS 第一次发现设备时可能请求“本地网络”权限；拒绝只会关闭自动发现，手动 `--join` 仍可使用。
+
+```sh
+macluster --cluster home mtop
+macluster --cluster home --leave
+```
+
+`--cluster` 接受配置名或完整 UUID，并在该命令中覆盖本机 controller 配置。`--leave` 会停止客户端挂载服务、卸载对应共享、撤销该客户端的 NFS 导出和 SSH 密钥，再删除本地 profile。清理失败时 profile 会保留，可重试同一命令。
+
+controller 会记录 SSH 对端 IPv4 地址，只把这个地址加入托管的 NFS 导出。首次加入或地址变化时，controller 或其 NFS 服务器可能请求一次管理员授权。同一个客户端密钥重复加入时会复用原身份。
 
 ## 提交任务
 
@@ -203,6 +227,8 @@ macluster --init --name home --queue default \
 | 找不到 Python/编译器 | 登录终端激活了正确环境，软件安装目录已共享 |
 | 工作目录不对 | `node -l` 的映射；在共享目录中提交或用 `--cwd` |
 | NFS 拒绝导出 | 存储 Mac 的文件系统、目录权限及 nfsd 隐私授权 |
+| 登录客户端找不到集群 | 允许“本地网络”访问，或显式运行 `--join USER@HOST[:PORT]` |
+| 客户端 IP 变化后共享空间未恢复 | 运行一次依赖存储的命令（例如 `submit`），下一次 controller 连接会更新 NFS 客户端地址 |
 | controller 无法启动 | `controller status`，服务日志位于 `~/Library/Logs/macluster/` |
 
 用 `macluster --help`、`macluster submit --help` 查看选项。保留 SSH 主机密钥校验；指纹变化时先核实机器身份，再更新信任记录。

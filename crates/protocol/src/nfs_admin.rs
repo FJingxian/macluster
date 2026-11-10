@@ -390,7 +390,7 @@ mod tests {
     fn deferred_export_cleanup_round_trips_and_rejects_unscoped_requests() {
         let valid = NfsAdminRequest {
             operation: NfsAdminOperation::RemoveExports {
-                operation_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                operation_id: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                 exports: vec![NfsExportCleanup {
                     root: "/Volumes/archive".into(),
                     client_ip: "192.0.2.8".into(),
@@ -429,7 +429,7 @@ mod tests {
         ] {
             let request = NfsAdminRequest {
                 operation: NfsAdminOperation::RemoveExports {
-                    operation_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    operation_id: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                     exports: vec![export],
                 },
             };
@@ -441,7 +441,7 @@ mod tests {
     fn forget_cluster_update_trust_is_bound_to_a_canonical_cluster_id() {
         let valid = NfsAdminRequest {
             operation: NfsAdminOperation::ForgetClusterUpdater {
-                cluster_id: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                cluster_id: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
             },
         };
         valid.validate(501).unwrap();
@@ -451,7 +451,7 @@ mod tests {
             valid
         );
 
-        for cluster_id in ["not-a-uuid", "D7ADD7D9-272F-4DC0-93CD-C62C4Cdd0F41"] {
+        for cluster_id in ["not-a-uuid", "79b24deb-6e78-5720-aaee-1ff0fb8d35f4"] {
             let request = NfsAdminRequest {
                 operation: NfsAdminOperation::ForgetClusterUpdater {
                     cluster_id: cluster_id.into(),
@@ -469,7 +469,7 @@ mod tests {
                 mounts: vec![NfsMount {
                     source: "192.0.2.1:/Users/Shared/macluster".into(),
                     target: "/Users/Shared/macluster".into(),
-                    share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                     alias: None,
                     allow_existing_contents: false,
                 }],
@@ -487,12 +487,12 @@ mod tests {
         for (target, uuid) in [
             (
                 "/Users/Shared/../private",
-                "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41",
+                "79b24deb-6e78-5720-aaee-1ff0fb8d35f4",
             ),
             ("/Users/Shared/data", "not-a-uuid"),
             (
                 "/Users/Shared/data/",
-                "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41",
+                "79b24deb-6e78-5720-aaee-1ff0fb8d35f4",
             ),
         ] {
             let request = NfsAdminRequest {
@@ -517,7 +517,7 @@ mod tests {
                 mounts: vec![NfsMount {
                     source: source.into(),
                     target: target.into(),
-                    share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                     alias: None,
                     allow_existing_contents: true,
                 }],
@@ -541,7 +541,7 @@ mod tests {
         let original = "/Users/Shared/other -maproot 501:20\n";
         let candidate = concat!(
             "/Users/Shared/other -maproot 501:20\n",
-            "# macluster-managed d7add7d9-272f-4dc0-93cd-c62c4cdd0f41 node-001\n",
+            "# macluster-managed 79b24deb-6e78-5720-aaee-1ff0fb8d35f4 node-001\n",
             "/Users/Shared/macluster 192.0.2.3\n",
         );
 
@@ -618,7 +618,7 @@ mod tests {
         let valid = NfsAdminRequest {
             operation: NfsAdminOperation::RemoveMarker {
                 source_root: "/Users/Shared/macluster".into(),
-                share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
             },
         };
         valid.validate(501).unwrap();
@@ -627,7 +627,7 @@ mod tests {
             let request = NfsAdminRequest {
                 operation: NfsAdminOperation::RemoveMarker {
                     source_root: source_root.into(),
-                    share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                 },
             };
             assert!(request.validate(501).is_err());
@@ -657,7 +657,7 @@ mod tests {
                 mounts: vec![NfsMount {
                     source: "192.0.2.1:/Users/Shared/macluster".into(),
                     target: "/Users/Shared/macluster".into(),
-                    share_uuid: "d7add7d9-272f-4dc0-93cd-c62c4cdd0f41".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
                     alias: None,
                     allow_existing_contents: false,
                 }],

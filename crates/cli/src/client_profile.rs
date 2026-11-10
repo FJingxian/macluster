@@ -14,6 +14,8 @@ pub struct ClientProfile {
     pub version: u32,
     pub cluster_uuid: String,
     pub cluster_name: String,
+    pub binding_digest: String,
+    pub namespace: String,
     pub descriptor_generation: u64,
     pub controller_host: String,
     pub controller_user: String,
@@ -211,6 +213,8 @@ fn validate_profile(profile: &ClientProfile) -> io::Result<()> {
     if profile.version != 1
         || Id128::parse(&profile.cluster_uuid).is_err()
         || profile.cluster_name.trim().is_empty()
+        || profile.binding_digest.len() != 64
+        || profile.namespace.is_empty()
         || profile.controller_host.trim().is_empty()
         || profile.controller_user.trim().is_empty()
         || profile.controller_port == 0
@@ -241,6 +245,8 @@ mod tests {
             version: 1,
             cluster_uuid: uuid.into(),
             cluster_name: "home".into(),
+            binding_digest: "b".repeat(64),
+            namespace: uuid.into(),
             descriptor_generation: 7,
             controller_host: "192.0.2.1".into(),
             controller_user: "mac".into(),

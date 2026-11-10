@@ -75,6 +75,7 @@ impl JoinEndpoint {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BootstrapResponse {
     pub descriptor: ClientDescriptor,
+    pub binding_digest: String,
     pub remote_uid: u32,
     pub remote_binary: String,
     pub remote_config: String,
@@ -102,6 +103,8 @@ pub fn profile_from_bootstrap(
         version: 1,
         cluster_uuid: bootstrap.descriptor.cluster_uuid.to_ascii_lowercase(),
         cluster_name: bootstrap.descriptor.cluster_name,
+        binding_digest: bootstrap.binding_digest,
+        namespace: bootstrap.descriptor.cluster_uuid.clone(),
         descriptor_generation: bootstrap.descriptor.config_generation,
         controller_host: endpoint.host.clone(),
         controller_user: endpoint.user.clone(),
@@ -183,6 +186,7 @@ mod tests {
         descriptor.capabilities.clear();
         let bootstrap = BootstrapResponse {
             descriptor,
+            binding_digest: "b".repeat(64),
             remote_uid: 501,
             remote_binary: "/opt/homebrew/bin/macluster".into(),
             remote_config: "/tmp/config".into(),
@@ -198,6 +202,7 @@ mod tests {
         let endpoint = JoinEndpoint::parse("mac@192.0.2.1").unwrap();
         let bootstrap = BootstrapResponse {
             descriptor: descriptor(),
+            binding_digest: "b".repeat(64),
             remote_uid: 501,
             remote_binary: "/opt/homebrew/bin/macluster".into(),
             remote_config: "/tmp/config".into(),

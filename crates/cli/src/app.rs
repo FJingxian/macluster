@@ -7107,6 +7107,26 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
         Some("nfs-admin") => internal_nfs_admin(&args[1..]),
+        Some("control-proxy") => {
+            let (config_path, state_dir) = crate::remote_transport::validate_proxy_args(&args[1..])
+                .map_err(|error| (1, error))?;
+            let binding = ServiceBinding::load(Path::new(&config_path), Path::new(&state_dir))
+                .map_err(|error| (1, error.to_string()))?;
+            let mut socket = std::os::unix::net::UnixStream::connect(binding.endpoint_path())
+                .map_err(|error| (1, error.to_string()))?;
+            let mut output = socket.try_clone().map_err(|error| (1, error.to_string()))?;
+            std::thread::scope(|scope| {
+                let input = scope.spawn(|| {
+                    io::copy(&mut io::stdin(), &mut socket).map_err(|error| error.to_string())
+                });
+                let result = io::copy(&mut output, &mut io::stdout())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = input.join();
+                result
+            })
+            .map_err(|error| (1, error))
+        }
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -7146,6 +7166,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             let binary = env::current_exe().map_err(|error| (1, error.to_string()))?;
             let response = crate::client_join::BootstrapResponse {
                 descriptor,
+                binding_digest: controller.binding.binding_digest().to_owned(),
                 remote_uid: unsafe { libc::geteuid() },
                 remote_binary: binary.to_string_lossy().into_owned(),
                 remote_config: config_path.to_string_lossy().into_owned(),

@@ -12,6 +12,7 @@ mod job_resources;
 mod mtop;
 mod nfs_recovery;
 mod node_admin;
+mod remote_transport;
 pub mod service;
 mod ssh_bootstrap;
 mod terminal;

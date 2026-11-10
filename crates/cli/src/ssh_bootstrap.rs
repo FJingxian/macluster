@@ -511,6 +511,10 @@ fn scan_host_key(node: &NodeConfig) -> Result<ScannedHostKey, String> {
     )
 }
 
+pub(crate) fn host_key_fingerprint(node: &NodeConfig) -> Result<String, String> {
+    scan_host_key(node).map(|key| key.fingerprint)
+}
+
 fn prompt_for_host_key(node: &NodeConfig, key: &ScannedHostKey) -> Result<bool, String> {
     let account = node.ssh_user.as_deref().unwrap_or("current account");
     eprintln!(

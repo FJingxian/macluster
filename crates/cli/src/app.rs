@@ -6008,6 +6008,17 @@ fn controller(
                 );
                 Ok(())
             } else {
+                let _cluster_advertisement = control_hello
+                    .as_ref()
+                    .and_then(|hello| match start_cluster_advertisement(&config, hello) {
+                        Ok(advertisement) => Some(advertisement),
+                        Err(error) => {
+                            eprintln!(
+                                "macluster: cluster discovery advertisement is unavailable: {error}. Manual `macluster --join` remains available."
+                            );
+                            None
+                        }
+                    });
                 let watcher = crate::node_admin::watch_node_addresses(
                     config_file.clone(),
                     state_dir.clone(),
@@ -6084,6 +6095,34 @@ fn controller(
         }
         value => Err((2, format!("unknown controller command '{value}'"))),
     }
+}
+
+fn start_cluster_advertisement(
+    config: &macluster_core::config::ClusterConfig,
+    hello: &ControllerHello,
+) -> Result<crate::discovery::AdvertisementGuard, String> {
+    let login = config
+        .nodes
+        .iter()
+        .find(|(id, node)| config.is_login_node(id) && node.transport == Transport::Local)
+        .map(|(_, node)| node)
+        .ok_or_else(|| "configured local login node is missing".to_owned())?;
+    let fingerprint = crate::ssh_bootstrap::host_key_fingerprint(login)?;
+    let record = crate::discovery::DiscoveryRecord {
+        instance: config.name.clone(),
+        cluster_uuid: config.share_uuid.to_ascii_lowercase(),
+        cluster_name: config.name.clone(),
+        protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+        controller_build: hello.build_id.clone(),
+        ssh_host_fingerprint: fingerprint,
+        transport: "ssh".into(),
+    };
+    crate::discovery::advertise_cluster(
+        &record,
+        &login.host,
+        &login.host,
+        login.ssh_port.unwrap_or(22),
+    )
 }
 
 fn controller_help(mode: HelpMode) -> &'static str {

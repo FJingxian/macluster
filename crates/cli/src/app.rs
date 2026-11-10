@@ -150,7 +150,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             }
             let store = crate::client_profile::ClientProfileStore::current()
                 .map_err(|error| (1, error.to_string()))?;
-            let profile = match store
+            let mut profile = match store
                 .select(leading.cluster.as_deref())
                 .map_err(|error| (1, error.to_string()))?
             {
@@ -161,28 +161,95 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                     return Err((1, "no client cluster profile exists".into()));
                 }
             };
-            if profile.mounts_enabled
-                && let Some(descriptor) = profile.descriptor.as_ref()
-                && let Err(error) =
-                    crate::client_storage::remove_client_mounts(&profile.cluster_uuid, descriptor)
-            {
-                return Err((
-                    1,
-                    format!(
-                        "cannot leave cluster '{}' while client mounts are still active: {error}",
-                        profile.cluster_name
-                    ),
-                ));
+            let resuming_leave = profile.leave_phase.is_some();
+            if !resuming_leave && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                eprint!(
+                    "Leave cluster '{}', detach its mounts, and revoke its access? [y/N]: ",
+                    profile.cluster_name
+                );
+                io::stderr()
+                    .flush()
+                    .map_err(|error| (1, error.to_string()))?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| (1, error.to_string()))?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Leave cancelled.");
+                    return Ok(());
+                }
             }
-            if profile.mounts_enabled
-                && let Err(error) = crate::remote_admin::revoke_client_nfs_access(&profile)
+            if !resuming_leave {
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::Requested,
+                )
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot start leaving cluster '{}': {error}",
+                            profile.cluster_name
+                        ),
+                    )
+                })?;
+            }
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::MountsDetached)
             {
-                return Err((
-                    1,
-                    format!(
-                        "client mounts are detached, but NFS access revocation failed: {error}; rerun --leave to finish"
-                    ),
-                ));
+                for descriptor in mount_cleanup_layouts(&profile) {
+                    if let Err(error) = crate::client_storage::remove_client_mounts(
+                        &profile.cluster_uuid,
+                        &descriptor,
+                    ) {
+                        return Err((
+                            1,
+                            format!(
+                                "cannot leave cluster '{}' while client mounts are still active: {error}; rerun --leave to resume",
+                                profile.cluster_name
+                            ),
+                        ));
+                    }
+                }
+                profile.mounted_descriptor = None;
+                profile.transition_mount_descriptors.clear();
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::MountsDetached,
+                )
+                .map_err(|error| (1, error.to_string()))?;
+            }
+            crate::client_join::resume_retired_access(&store, &mut profile, true).map_err(
+                |error| {
+                    (
+                        1,
+                        format!(
+                            "cannot leave cluster '{}' until previous credential cleanup finishes: {error}",
+                            profile.cluster_name
+                        ),
+                    )
+                },
+            )?;
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::NfsRevoked) {
+                let has_client_nfs_identity = !profile.nfs_client_id.is_empty()
+                    && profile.nfs_client_ip.parse::<std::net::Ipv4Addr>().is_ok();
+                if has_client_nfs_identity
+                    && let Err(error) = crate::remote_admin::revoke_client_nfs_access(&profile)
+                {
+                    return Err((
+                        1,
+                        format!(
+                            "client mounts are detached, but NFS access revocation failed: {error}; rerun --leave to finish"
+                        ),
+                    ));
+                }
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::NfsRevoked,
+                )
+                .map_err(|error| (1, error.to_string()))?;
             }
             let identity_shared = store
                 .load_all()
@@ -192,8 +259,10 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                     other.cluster_uuid != profile.cluster_uuid
                         && other.identity_file == profile.identity_file
                 });
-            if !identity_shared {
-                if let Err(error) = crate::remote_admin::revoke_client_key(&profile) {
+            if !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::KeyRevoked) {
+                if !identity_shared
+                    && let Err(error) = crate::remote_admin::revoke_client_key(&profile)
+                {
                     return Err((
                         1,
                         format!(
@@ -201,12 +270,49 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                         ),
                     ));
                 }
-                let _ = fs::remove_file(&profile.identity_file);
-                let _ = fs::remove_file(format!("{}.pub", profile.identity_file));
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::KeyRevoked,
+                )
+                .map_err(|error| (1, error.to_string()))?;
             }
-            let _ = fs::remove_file(&profile.known_hosts_path);
-            if let Some(parent) = Path::new(&profile.known_hosts_path).parent() {
-                let _ = fs::remove_dir(parent);
+            if let Err(error) = crate::remote_admin::close_control_master(&profile) {
+                return Err((
+                    1,
+                    format!(
+                        "client access was revoked, but its reusable SSH control connection could not be closed: {error}; rerun --leave to finish"
+                    ),
+                ));
+            }
+            if !profile.leave_has_completed(
+                crate::client_profile::ClientLeavePhase::LocalCredentialsRemoved,
+            ) {
+                if !identity_shared {
+                    remove_file_if_exists(Path::new(&profile.identity_file))
+                        .map_err(|error| (1, error.to_string()))?;
+                    remove_file_if_exists(Path::new(&format!("{}.pub", profile.identity_file)))
+                        .map_err(|error| (1, error.to_string()))?;
+                }
+                remove_file_if_exists(Path::new(&profile.known_hosts_path))
+                    .map_err(|error| (1, error.to_string()))?;
+                if let Some(parent) = Path::new(&profile.known_hosts_path).parent() {
+                    match fs::remove_dir(parent) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                            ) => {}
+                        Err(error) => return Err((1, error.to_string())),
+                    }
+                }
+                persist_leave_phase(
+                    &store,
+                    &mut profile,
+                    crate::client_profile::ClientLeavePhase::LocalCredentialsRemoved,
+                )
+                .map_err(|error| (1, error.to_string()))?;
             }
             store
                 .remove(&profile.cluster_uuid)
@@ -301,6 +407,13 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             ),
         ));
     }
+    let caller_has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if command == "submit"
+        && parse_submit_args(&args).is_ok_and(|options| options.interactive)
+        && !caller_has_tty
+    {
+        return Err((2, "msub -Is requires terminal stdin and stdout".into()));
+    }
     if let Some(profile) = crate::client_context::select_remote_profile(
         &resolved_config_path(global.config.as_deref()),
         &command,
@@ -351,12 +464,6 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 }
             }
         }
-    }
-    if command == "submit"
-        && parse_submit_args(&args).is_ok_and(|options| options.interactive)
-        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
-    {
-        return Err((2, "msub -Is requires terminal stdin and stdout".into()));
     }
     let mut address_migration_deferred = false;
     let mut address_migration_deferred_error = None;
@@ -511,6 +618,49 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     }
 }
 
+fn persist_leave_phase(
+    store: &crate::client_profile::ClientProfileStore,
+    profile: &mut crate::client_profile::ClientProfile,
+    phase: crate::client_profile::ClientLeavePhase,
+) -> io::Result<()> {
+    profile.leave_phase = Some(phase);
+    store.save(profile)
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn mount_cleanup_layouts(
+    profile: &crate::client_profile::ClientProfile,
+) -> Vec<macluster_protocol::control::ClientDescriptor> {
+    crate::client_storage::distinct_mount_layouts(profile.mount_cleanup_descriptors())
+}
+
+struct InteractiveRequestFile {
+    path: PathBuf,
+}
+
+impl InteractiveRequestFile {
+    fn from_existing_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for InteractiveRequestFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn remote_web(profile: crate::client_profile::ClientProfile, args: &[String]) -> AppResult<()> {
     let normalized = parse_web_shortcut_args(args)?;
     let no_open = normalized.iter().any(|value| value == "--no-open");
@@ -557,6 +707,9 @@ fn remote_command(
     command: &str,
     args: &[String],
 ) -> AppResult<()> {
+    if command == "submit" {
+        run_remote_submit_preflight(&profile)?;
+    }
     let ensure_client_storage = remote_command_requires_client_storage(command, args);
     let mut remote = crate::client_context::RemoteContext::connect(profile, ensure_client_storage)
         .map_err(|error| (1, error))?;
@@ -576,22 +729,60 @@ fn remote_command(
             &remote.profile,
             "top",
             args,
-            !args.iter().any(|argument| argument == "--once"),
+            io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && !args.iter().any(|argument| argument == "--once"),
             "remote mtop",
         ),
         "node" => run_remote_cli(
             &remote.profile,
             "node",
             args,
-            !args.iter().any(|argument| {
-                matches!(argument.as_str(), "-l" | "--list" | "--failed" | "--scan")
-            }),
+            io::stdin().is_terminal()
+                && io::stdout().is_terminal()
+                && !args.iter().any(|argument| {
+                    matches!(argument.as_str(), "-l" | "--list" | "--failed" | "--scan")
+                }),
             "remote mnode",
         ),
         _ => Err((
             1,
             format!("command '{command}' is not yet available through the login-client transport"),
         )),
+    }
+}
+
+fn run_remote_submit_preflight(profile: &crate::client_profile::ClientProfile) -> AppResult<()> {
+    if !profile.mounts_enabled {
+        return Err((
+            1,
+            format!(
+                "cluster '{}' is configured as a control-only login client; rerun `macluster --join {}@{}:{}` without --control-only to enable storage and submissions",
+                profile.cluster_name,
+                profile.controller_user,
+                profile.controller_host,
+                profile.controller_port
+            ),
+        ));
+    }
+    if profile.leave_phase.is_some() {
+        return Err((
+            1,
+            "cluster leave is incomplete; rerun `--leave` to finish it or `--join` to reactivate storage"
+                .into(),
+        ));
+    }
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let code = crate::remote_admin::run(
+        profile,
+        &["internal".into(), "submit-preflight".into()],
+        tty,
+    )
+    .map_err(|error| (1, error.to_string()))?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err((code, "remote submission preflight failed".into()))
     }
 }
 
@@ -624,8 +815,8 @@ fn queue_uses_remote_cli(args: &[String]) -> bool {
         .any(|argument| matches!(argument.as_str(), "--jobs" | "--watch"))
 }
 
-fn remote_command_requires_client_storage(command: &str, args: &[String]) -> bool {
-    command == "submit" || command == "job" && job_uses_remote_cli(args)
+fn remote_command_requires_client_storage(command: &str, _args: &[String]) -> bool {
+    command == "submit"
 }
 
 fn remote_submit(
@@ -670,20 +861,21 @@ fn remote_submit(
             .mode(0o600)
             .open(&request_path)
             .map_err(|error| (1, error.to_string()))?;
+        let request_file = InteractiveRequestFile::from_existing_path(request_path);
         serde_json::to_writer(&mut file, &request).map_err(|error| (1, error.to_string()))?;
         file.sync_all().map_err(|error| (1, error.to_string()))?;
+        drop(file);
         let code = crate::remote_admin::run(
             &remote.profile,
             &[
                 "internal".into(),
                 "remote-interactive".into(),
                 "--request-file".into(),
-                request_path.to_string_lossy().into_owned(),
+                request_file.path().to_string_lossy().into_owned(),
             ],
             true,
         )
         .map_err(|error| (1, error.to_string()))?;
-        let _ = fs::remove_file(&request_path);
         return if code == 0 {
             Ok(())
         } else {
@@ -1001,6 +1193,10 @@ fn remote_fans(
         }
         index += 1;
     }
+    remote
+        .client
+        .set_timeouts(Duration::from_secs(65))
+        .map_err(|error| (1, error.to_string()))?;
     let payload = remote
         .client
         .request(ControlCommand::FanControl { node_id, policy })
@@ -7944,6 +8140,13 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 ))
             }
         }
+        Some("submit-preflight") => {
+            if args.len() != 1 {
+                return Err((2, "internal submit-preflight takes no arguments".into()));
+            }
+            preflight_agent_update("submit", &[], &global)?;
+            Ok(())
+        }
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -7952,7 +8155,6 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
         Some("client-bootstrap") => {
             let options = &args[1..];
-            let control_only = options.iter().any(|argument| argument == "--control-only");
             let client_key_digest =
                 option_value(options, "--client-key-digest")?.ok_or_else(|| {
                     (
@@ -7966,7 +8168,6 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                     .any(|argument| argument == "--client-key-digest")
                 || options.iter().enumerate().any(|(index, argument)| {
                     argument != "--json"
-                        && argument != "--control-only"
                         && argument != "--client-key-digest"
                         && !(index > 0
                             && options
@@ -7980,7 +8181,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             {
                 return Err((
                     2,
-                    "internal client-bootstrap requires --json --client-key-digest HEX [--control-only]".into(),
+                    "internal client-bootstrap requires --json --client-key-digest HEX".into(),
                 ));
             }
             let config_path = resolved_config_path(global.config.as_deref());
@@ -8016,12 +8217,6 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 .ok_or_else(|| (1, "configured local login node is missing".into()))?;
             let host_fingerprint =
                 crate::ssh_bootstrap::host_key_fingerprint(login).map_err(|error| (1, error))?;
-            if !control_only {
-                crate::client_access::authorize_registered_client(
-                    &config, &state_dir, &client_id, &client_ip,
-                )
-                .map_err(|error| (1, error))?;
-            }
             let binary = env::current_exe().map_err(|error| (1, error.to_string()))?;
             let response = crate::client_join::BootstrapResponse {
                 descriptor,
@@ -8038,6 +8233,30 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 "{}",
                 serde_json::to_string(&response).map_err(|error| (1, error.to_string()))?
             );
+            Ok(())
+        }
+        Some("client-authorize") => {
+            if !args.iter().skip(1).any(|argument| argument == "--json") {
+                return Err((2, "internal client-authorize requires --json".into()));
+            }
+            let client_id = option_value(&args[1..], "--client-id")?
+                .ok_or_else(|| (2, "internal client-authorize requires --client-id".into()))?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            if crate::init::reset::journal_path(&config_path).exists() {
+                return Err((
+                    1,
+                    "cluster reset is in progress; retry login-client authorization after reset completes"
+                        .into(),
+                ));
+            }
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            let client_ip =
+                crate::client_access::current_ssh_client_ipv4().map_err(|error| (1, error))?;
+            crate::client_access::authorize_registered_client(
+                &config, &state_dir, &client_id, &client_ip,
+            )
+            .map_err(|error| (1, error))?;
             Ok(())
         }
         Some("client-revoke") => {
@@ -11653,7 +11872,8 @@ mod update_terminal_regressions {
 #[cfg(test)]
 mod remote_client_regressions {
     use super::{
-        job_uses_remote_cli, queue_uses_remote_cli, remote_command_requires_client_storage,
+        Id128, InteractiveRequestFile, job_uses_remote_cli, queue_uses_remote_cli,
+        remote_command_requires_client_storage,
     };
 
     #[test]
@@ -11687,12 +11907,24 @@ mod remote_client_regressions {
     #[test]
     fn only_storage_dependent_remote_commands_refresh_client_nfs_access() {
         assert!(remote_command_requires_client_storage("submit", &[]));
-        assert!(remote_command_requires_client_storage(
+        assert!(!remote_command_requires_client_storage(
             "job",
             &["--log".into(), "12".into()]
         ));
         assert!(!remote_command_requires_client_storage("job", &[]));
         assert!(!remote_command_requires_client_storage("queue", &[]));
         assert!(!remote_command_requires_client_storage("top", &[]));
+    }
+
+    #[test]
+    fn interactive_request_file_is_removed_when_remote_launch_fails() {
+        let path =
+            std::env::temp_dir().join(format!("macluster-interactive-request-{}", Id128::random()));
+        std::fs::write(&path, b"{}").unwrap();
+        {
+            let _request = InteractiveRequestFile::from_existing_path(path.clone());
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
     }
 }

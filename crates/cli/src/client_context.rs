@@ -24,15 +24,33 @@ impl RemoteContext {
         mut profile: ClientProfile,
         ensure_client_storage: bool,
     ) -> Result<Self, String> {
+        if storage_command_blocked_by_leave(&profile, ensure_client_storage) {
+            return Err(
+                "cluster leave is incomplete; rerun `--leave` to finish it or `--join` to reactivate storage"
+                    .into(),
+            );
+        }
+        if profile.version == 1 {
+            if profile.mounts_enabled {
+                profile.mounted_descriptor = profile.descriptor.clone();
+            }
+        }
+        profile.version = crate::client_profile::CLIENT_PROFILE_VERSION;
+        let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
         let timeout = Duration::from_secs(8);
         let mut client = ControlClient::connect_remote(&profile, timeout, ensure_client_storage)
             .map_err(|error| error.to_string())?;
         let mut descriptor = request_descriptor(&mut client)?;
-        if profile.mounts_enabled {
-            let mut installed = profile.descriptor.clone();
+        if needs_mount_reconciliation(
+            profile.mounts_enabled,
+            ensure_client_storage,
+            profile.installed_mount_descriptor(),
+            &descriptor,
+        ) {
+            let mut installed = profile.installed_mount_descriptor().cloned();
             for attempt in 0..3 {
                 let mounts_changed = installed.as_ref().is_none_or(|previous| {
-                    previous.config_generation != descriptor.config_generation
+                    !crate::client_storage::mount_layout_matches(previous, &descriptor)
                 });
                 if !mounts_changed {
                     break;
@@ -43,6 +61,16 @@ impl RemoteContext {
                             .into(),
                     );
                 }
+                for descriptor in installed.iter().chain(std::iter::once(&descriptor)) {
+                    if !profile.transition_mount_descriptors.iter().any(|existing| {
+                        crate::client_storage::mount_layout_matches(existing, descriptor)
+                    }) {
+                        profile
+                            .transition_mount_descriptors
+                            .push(descriptor.clone());
+                    }
+                }
+                store.save(&profile).map_err(|error| error.to_string())?;
                 // Do not leave an authenticated control stream idle while
                 // administrator prompts can take minutes.
                 drop(client);
@@ -64,9 +92,11 @@ impl RemoteContext {
                 descriptor = request_descriptor(&mut client)?;
             }
         }
+        if profile.mounts_enabled && ensure_client_storage {
+            profile.mounted_descriptor = Some(descriptor.clone());
+        }
         profile.descriptor_generation = descriptor.config_generation;
         profile.descriptor = Some(descriptor.clone());
-        let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
         store.save(&profile).map_err(|error| error.to_string())?;
         store
             .mark_used(&profile.cluster_uuid)
@@ -169,6 +199,23 @@ fn request_descriptor(client: &mut ControlClient) -> Result<ClientDescriptor, St
     Ok(descriptor)
 }
 
+fn needs_mount_reconciliation(
+    mounts_enabled: bool,
+    storage_command: bool,
+    installed: Option<&ClientDescriptor>,
+    current: &ClientDescriptor,
+) -> bool {
+    mounts_enabled
+        && storage_command
+        && installed.is_none_or(|installed| {
+            !crate::client_storage::mount_layout_matches(installed, current)
+        })
+}
+
+fn storage_command_blocked_by_leave(profile: &ClientProfile, storage_command: bool) -> bool {
+    storage_command && profile.leave_phase.is_some()
+}
+
 pub(crate) fn select_remote_profile(
     config_path: &Path,
     command: &str,
@@ -214,7 +261,10 @@ mod tests {
 
     use macluster_protocol::identifiers::Id128;
 
-    use super::{remote_command_supported, select_remote_profile, should_consider_remote_profile};
+    use super::{
+        needs_mount_reconciliation, remote_command_supported, select_remote_profile,
+        should_consider_remote_profile,
+    };
 
     #[test]
     fn remote_command_selection_is_limited_to_cluster_operations() {
@@ -250,5 +300,127 @@ mod tests {
         assert!(!should_consider_remote_profile(false, None, true));
         assert!(should_consider_remote_profile(true, Some("remote"), false));
         assert!(should_consider_remote_profile(false, Some("remote"), true));
+    }
+
+    #[test]
+    fn read_only_remote_commands_never_trigger_mount_reconciliation() {
+        let descriptor = macluster_protocol::control::ClientDescriptor {
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            default_queue: "default".parse().unwrap(),
+            config_generation: 2,
+            controller_build_id: "test".into(),
+            controller_uid: 501,
+            capabilities: vec![],
+            primary_mount_root: "/Users/Shared/macluster".into(),
+            primary_source_root: "/Users/Shared/macluster".into(),
+            primary_source_host: "192.0.2.1".into(),
+            shares: vec![],
+            queues: vec![],
+        };
+        let mut older = descriptor.clone();
+        older.config_generation = 1;
+        assert!(!needs_mount_reconciliation(
+            true,
+            false,
+            Some(&older),
+            &descriptor
+        ));
+        assert!(!needs_mount_reconciliation(false, true, None, &descriptor));
+        assert!(needs_mount_reconciliation(true, true, None, &descriptor));
+        assert!(!needs_mount_reconciliation(
+            true,
+            true,
+            Some(&older),
+            &descriptor
+        ));
+    }
+
+    #[test]
+    fn storage_commands_must_wait_for_an_interrupted_leave_to_finish() {
+        let mut profile = super::ClientProfile {
+            version: crate::client_profile::CLIENT_PROFILE_VERSION,
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            binding_digest: "b".repeat(64),
+            namespace: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            descriptor_generation: 1,
+            controller_host: "192.0.2.1".into(),
+            controller_user: "mac".into(),
+            controller_port: 22,
+            known_hosts_path: "/tmp/known_hosts".into(),
+            identity_file: "/tmp/id_ed25519".into(),
+            remote_uid: 501,
+            remote_binary: "/opt/homebrew/bin/macluster".into(),
+            remote_config: "/tmp/config.toml".into(),
+            remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: true,
+            nfs_client_id: "client-test".into(),
+            nfs_client_ip: "192.0.2.10".into(),
+            last_used_unix_ms: 1,
+            descriptor: None,
+            mounted_descriptor: None,
+            transition_mount_descriptors: vec![],
+            retired_access: vec![],
+            leave_phase: None,
+        };
+        assert!(!super::storage_command_blocked_by_leave(&profile, true));
+        profile.leave_phase = Some(crate::client_profile::ClientLeavePhase::MountsDetached);
+        assert!(super::storage_command_blocked_by_leave(&profile, true));
+        assert!(!super::storage_command_blocked_by_leave(&profile, false));
+    }
+
+    #[test]
+    fn configuration_generation_changes_do_not_remount_an_identical_layout() {
+        let descriptor = macluster_protocol::control::ClientDescriptor {
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            default_queue: "default".parse().unwrap(),
+            config_generation: 8,
+            controller_build_id: "new-build".into(),
+            controller_uid: 501,
+            capabilities: vec![],
+            primary_mount_root: "/Users/Shared/macluster".into(),
+            primary_source_root: "/Users/Shared/macluster".into(),
+            primary_source_host: "192.0.2.1".into(),
+            shares: vec![],
+            queues: vec![],
+        };
+        let mut installed = descriptor.clone();
+        installed.config_generation = 7;
+        installed.default_queue = "batch".parse().unwrap();
+        installed.controller_build_id = "old-build".into();
+        assert!(!needs_mount_reconciliation(
+            true,
+            true,
+            Some(&installed),
+            &descriptor
+        ));
+    }
+
+    #[test]
+    fn changing_a_mount_source_requires_reconciliation() {
+        let descriptor = macluster_protocol::control::ClientDescriptor {
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            default_queue: "default".parse().unwrap(),
+            config_generation: 8,
+            controller_build_id: "same-build".into(),
+            controller_uid: 501,
+            capabilities: vec![],
+            primary_mount_root: "/Users/Shared/macluster".into(),
+            primary_source_root: "/Users/Shared/macluster-v2".into(),
+            primary_source_host: "192.0.2.1".into(),
+            shares: vec![],
+            queues: vec![],
+        };
+        let mut installed = descriptor.clone();
+        installed.primary_source_root = "/Users/Shared/macluster".into();
+        assert!(needs_mount_reconciliation(
+            true,
+            true,
+            Some(&installed),
+            &descriptor
+        ));
     }
 }

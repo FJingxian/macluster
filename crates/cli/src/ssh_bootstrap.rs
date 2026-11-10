@@ -24,6 +24,12 @@ struct SshIdentity {
     public_key: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SshAccessReceipt {
+    pub key_installed: bool,
+    pub public_key: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostKeyDecision {
     Accept,
@@ -696,6 +702,13 @@ fn recover_changed_host_key(node: &NodeConfig, error: &str) -> Result<(), String
 }
 
 pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result<(), String> {
+    ensure_ssh_access_with_receipt(node, endpoint).map(|_| ())
+}
+
+pub(super) fn ensure_ssh_access_with_receipt(
+    node: &mut NodeConfig,
+    endpoint: &str,
+) -> Result<SshAccessReceipt, String> {
     match probe_key_auth(node) {
         Ok(()) => return ensure_managed_ssh_identity(node, endpoint, true),
         Err(error) => match classify_ssh_error(&error) {
@@ -749,9 +762,9 @@ fn ensure_managed_ssh_identity(
     node: &mut NodeConfig,
     endpoint: &str,
     authenticated_with_existing_identity: bool,
-) -> Result<(), String> {
+) -> Result<SshAccessReceipt, String> {
     if authenticated_with_existing_identity && node.ssh_identity_file.is_some() {
-        return Ok(());
+        return Ok(SshAccessReceipt::default());
     }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
@@ -766,18 +779,29 @@ fn ensure_managed_ssh_identity(
     node.ssh_identity_file = Some(identity_text);
 
     match probe_key_auth(node) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            return Ok(SshAccessReceipt {
+                key_installed: false,
+                public_key: Some(identity.public_key),
+            });
+        }
         Err(error) if classify_ssh_error(&error) == SshFailureKind::Authentication => {}
         Err(error) => return Err(error),
     }
     let script = install_public_key_script(&identity.public_key)?;
     let mut authenticated_transport = node.clone();
     authenticated_transport.ssh_identity_file = previous_identity;
-    if node_admin::ssh_output(&authenticated_transport, &script, None)
-        .is_ok_and(|output| output.status.success())
-        && probe_key_auth(node).is_ok()
-    {
-        return Ok(());
+    let noninteractive_install_succeeded =
+        node_admin::ssh_output(&authenticated_transport, &script, None)
+            .is_ok_and(|output| output.status.success());
+    if noninteractive_install_succeeded {
+        return match probe_key_auth(node) {
+            Ok(()) => Ok(SshAccessReceipt {
+                key_installed: true,
+                public_key: Some(identity.public_key),
+            }),
+            Err(error) => Err(error_after_key_install(node, &identity.public_key, error)),
+        };
     }
     let account = node
         .ssh_user
@@ -799,17 +823,55 @@ fn ensure_managed_ssh_identity(
         ],
         &script,
     )? {
-        return Err(format!(
+        let error = format!(
             "could not install the SSH public key on {}; check the account password and make sure macOS Remote Login allows password authentication",
             node.host
-        ));
+        );
+        return Err(error_after_key_install(node, &identity.public_key, error));
     }
     probe_key_auth(node).map_err(|error| {
-        format!(
+        let error = format!(
             "the public key was installed on {}, but noninteractive key verification failed: {error}",
             node.host
-        )
+        );
+        error_after_key_install(node, &identity.public_key, error)
+    })?;
+    Ok(SshAccessReceipt {
+        key_installed: true,
+        public_key: Some(identity.public_key),
     })
+}
+
+fn error_after_key_install(node: &NodeConfig, public_key: &str, error: String) -> String {
+    match revoke_public_key(node, public_key) {
+        Ok(()) => error,
+        Err(cleanup_error) => format!(
+            "{error}; the newly installed client key also could not be removed: {cleanup_error}"
+        ),
+    }
+}
+
+pub(super) fn revoke_public_key(node: &NodeConfig, public_key: &str) -> Result<(), String> {
+    let fields = public_key.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 2
+        || fields[0] != "ssh-ed25519"
+        || public_key.contains('\n')
+        || public_key.chars().any(char::is_control)
+    {
+        return Err("refusing to revoke an invalid Ed25519 public key".into());
+    }
+    let key = shell_quote(public_key);
+    let script = format!(
+        "set -eu; f=\"$HOME/.ssh/authorized_keys\"; [ -f \"$f\" ] || exit 0; [ ! -L \"$f\" ]; t=\"$f.macluster.$$\"; /usr/bin/awk -v key={key} '$0 != key {{ print }}' \"$f\" > \"$t\"; /bin/chmod 600 \"$t\"; /bin/mv \"$t\" \"$f\""
+    );
+    match node_admin::ssh_output(node, &script, None) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "remote public-key revocation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err((_, error)) => Err(error),
+    }
 }
 
 pub(crate) fn pin_client_host_key(
@@ -845,7 +907,8 @@ pub(crate) fn pin_client_host_key(
     if fields.len() != 3 {
         return Err("scanned SSH host key is malformed".into());
     }
-    let alias_line = format!("{host_alias} {} {}", fields[1], fields[2]);
+    let lookup = client_host_pin_alias(host_alias, node.ssh_port.unwrap_or(22));
+    let alias_line = format!("{lookup} {} {}", fields[1], fields[2]);
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "cannot locate the client account HOME for SSH host pinning".to_owned())?;
@@ -904,6 +967,10 @@ pub(crate) fn pin_client_host_key(
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn client_host_pin_alias(host_alias: &str, port: u16) -> String {
+    known_host_lookup(host_alias, port)
 }
 
 fn probe_key_auth(node: &NodeConfig) -> Result<(), String> {
@@ -1311,5 +1378,17 @@ mod tests {
             "192.0.2.1 ssh-ed25519 AAAAold\n192.0.2.3 ssh-ed25519 AAAAnew\n"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_host_pin_uses_port_qualified_host_key_alias() {
+        assert_eq!(
+            super::client_host_pin_alias("macluster-cluster", 22),
+            "macluster-cluster"
+        );
+        assert_eq!(
+            super::client_host_pin_alias("macluster-cluster", 2222),
+            "[macluster-cluster]:2222"
+        );
     }
 }

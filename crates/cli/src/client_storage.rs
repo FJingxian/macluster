@@ -28,6 +28,26 @@ fn mounts(descriptor: &ClientDescriptor) -> Vec<(String, String)> {
     mounts
 }
 
+pub(crate) fn mount_layout_matches(left: &ClientDescriptor, right: &ClientDescriptor) -> bool {
+    mounts(left).into_iter().collect::<BTreeSet<_>>()
+        == mounts(right).into_iter().collect::<BTreeSet<_>>()
+}
+
+pub(crate) fn distinct_mount_layouts<'a>(
+    descriptors: impl IntoIterator<Item = &'a ClientDescriptor>,
+) -> Vec<ClientDescriptor> {
+    let mut layouts = Vec::new();
+    for descriptor in descriptors {
+        if !layouts
+            .iter()
+            .any(|existing| mount_layout_matches(existing, descriptor))
+        {
+            layouts.push(descriptor.clone());
+        }
+    }
+    layouts
+}
+
 fn retired_mounts(previous: &ClientDescriptor, next: &ClientDescriptor) -> Vec<(String, String)> {
     let retained = mounts(next).into_iter().collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
@@ -56,7 +76,7 @@ fn client_mount_script(
         let mounted_target = shell_quote(&format!(" on {target} ("));
         let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
         body.push_str(&format!(
-            "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    /sbin/umount {target_arg}\n    /sbin/mount_nfs -o resvport {source_arg} {target_arg}\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /sbin/mount_nfs -o resvport {source_arg} {target_arg}\nfi\n"
+            "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    echo 'macluster client mount target is already mounted from a different source; refusing to replace it' >&2\n    exit 1\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /sbin/mount_nfs -o resvport {source_arg} {target_arg}\nfi\n"
         ));
     }
     let plist_body = format!(
@@ -340,7 +360,8 @@ pub(crate) fn remove_client_mounts(
 #[cfg(test)]
 mod tests {
     use super::{
-        client_mount_script, client_remove_script, missing_mounts, overlay_targets, retired_mounts,
+        client_mount_script, client_remove_script, distinct_mount_layouts, missing_mounts,
+        mount_layout_matches, overlay_targets, retired_mounts,
     };
     use macluster_protocol::control::{
         ClientDescriptor, ClientQueueDescriptor, ClientShareDescriptor,
@@ -373,6 +394,30 @@ mod tests {
                 nodes: vec![],
             }],
         }
+    }
+
+    #[test]
+    fn mount_layout_ignores_queue_and_generation_metadata() {
+        let mut next = descriptor();
+        next.config_generation = 9;
+        next.controller_build_id = "new-build".into();
+        next.default_queue = "batch".parse().unwrap();
+        next.queues[0].name = "batch".parse().unwrap();
+        assert!(mount_layout_matches(&descriptor(), &next));
+
+        next.primary_source_root = "/Users/Shared/macluster-v2".into();
+        assert!(!mount_layout_matches(&descriptor(), &next));
+    }
+
+    #[test]
+    fn distinct_mount_layouts_keeps_each_source_for_cleanup() {
+        let first = descriptor();
+        let mut second = first.clone();
+        second.primary_source_root = "/Users/Shared/macluster-v2".into();
+        assert_eq!(
+            distinct_mount_layouts([&first, &second]),
+            vec![first, second]
+        );
     }
 
     #[test]
@@ -414,13 +459,12 @@ mod tests {
     }
 
     #[test]
-    fn mount_helper_repairs_a_target_mounted_from_the_wrong_source() {
+    fn mount_helper_refuses_a_target_mounted_from_the_wrong_source() {
         let root = std::env::temp_dir().join(format!("macluster-client-mount-{}", Id128::random()));
         let target = root.join("shared");
         fs::create_dir_all(&target).unwrap();
         let fake_mount = root.join("mount");
         let fake_mount_nfs = root.join("mount_nfs");
-        let fake_umount = root.join("umount");
         let marker = root.join("mount-nfs-called");
         fs::write(
             &fake_mount,
@@ -435,10 +479,8 @@ mod tests {
             format!("#!/bin/sh\nprintf called > '{}'\n", marker.display()),
         )
         .unwrap();
-        fs::write(&fake_umount, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&fake_mount, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&fake_mount_nfs, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(&fake_umount, fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut descriptor = descriptor();
         descriptor.primary_mount_root = target.to_string_lossy().into_owned();
@@ -451,20 +493,23 @@ mod tests {
             .map(|(helper, _)| helper)
             .expect("outer mount script contains a helper heredoc")
             .replace("/sbin/mount_nfs", &fake_mount_nfs.to_string_lossy())
-            .replace("/sbin/umount", &fake_umount.to_string_lossy())
             .replace("/sbin/mount", &fake_mount.to_string_lossy());
         let output = Command::new("/bin/sh")
             .args(["-c", &helper])
             .output()
             .expect("run generated mount helper");
         assert!(
-            output.status.success(),
-            "mount helper failed:\n{}",
+            !output.status.success(),
+            "mount helper must not replace a foreign NFS source"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("different source"),
+            "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            marker.exists(),
-            "a mount from the wrong source must be repaired instead of treated as ready"
+            !marker.exists(),
+            "a foreign NFS mount must not be unmounted or replaced"
         );
         fs::remove_dir_all(root).unwrap();
     }

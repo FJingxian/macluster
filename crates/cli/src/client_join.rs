@@ -136,12 +136,15 @@ pub fn profile_from_bootstrap(
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "cannot locate the client account HOME for SSH host pinning".to_owned())?;
+    let endpoint_digest =
+        sha256_hex(format!("{}\0{}\0{}", endpoint.user, endpoint.host, endpoint.port).as_bytes())
+            .map_err(|error| error.to_string())?;
     let known_hosts_path = home
         .join(".ssh/macluster")
         .join(&bootstrap.descriptor.cluster_uuid)
-        .join("known_hosts");
+        .join(format!("known_hosts-{}", &endpoint_digest[..16]));
     Ok(ClientProfile {
-        version: 1,
+        version: crate::client_profile::CLIENT_PROFILE_VERSION,
         cluster_uuid: bootstrap.descriptor.cluster_uuid.to_ascii_lowercase(),
         cluster_name: bootstrap.descriptor.cluster_name.clone(),
         binding_digest: bootstrap.binding_digest,
@@ -161,13 +164,17 @@ pub fn profile_from_bootstrap(
         nfs_client_ip: bootstrap.nfs_client_ip,
         last_used_unix_ms: 0,
         descriptor: Some(bootstrap.descriptor),
+        mounted_descriptor: None,
+        transition_mount_descriptors: vec![],
+        retired_access: vec![],
+        leave_phase: None,
     })
 }
 
 pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile, String> {
     let endpoint = JoinEndpoint::parse(endpoint)?;
     let mut node = endpoint.node();
-    ssh_bootstrap::ensure_ssh_access(
+    let access = ssh_bootstrap::ensure_ssh_access_with_receipt(
         &mut node,
         &format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port),
     )?;
@@ -175,81 +182,341 @@ pub fn join_cluster(endpoint: &str, control_only: bool) -> Result<ClientProfile,
         .ssh_identity_file
         .as_deref()
         .ok_or_else(|| "SSH bootstrap did not retain a client identity".to_owned())?;
-    let public_key = fs::read(format!("{identity}.pub"))
-        .map_err(|error| format!("cannot read the dedicated client public key: {error}"))?;
+    let public_key = access
+        .public_key
+        .clone()
+        .map(String::into_bytes)
+        .or_else(|| fs::read(format!("{identity}.pub")).ok())
+        .ok_or_else(|| "cannot read the dedicated client public key".to_owned())?;
     let client_key_digest =
         sha256_hex(&public_key).map_err(|error| format!("cannot hash the client key: {error}"))?;
-    let bootstrap_command = format!(
-        "macluster internal client-bootstrap --json{} --client-key-digest {client_key_digest}",
-        if control_only { " --control-only" } else { "" }
-    );
-    let output =
-        node_admin::ssh_output(&node, &bootstrap_command, None).map_err(|(_, error)| error)?;
-    if !output.status.success() {
-        return Err(format!(
-            "Controller bootstrap failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let bootstrap: BootstrapResponse = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("Controller bootstrap returned invalid JSON: {error}"))?;
-    let host_fingerprint = bootstrap.host_fingerprint.clone();
-    let mut profile = profile_from_bootstrap(&endpoint, bootstrap, PathBuf::from(identity))?;
-    ssh_bootstrap::pin_client_host_key(
-        &endpoint.node(),
-        &format!("macluster-{}", profile.cluster_uuid),
-        &host_fingerprint,
-        std::path::Path::new(&profile.known_hosts_path),
-    )?;
-    let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
-    let existing = match store.load(&profile.cluster_uuid) {
-        Ok(existing) => Some(existing),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.to_string()),
-    };
-    if control_only && let Some(existing) = existing.as_ref().filter(|value| value.mounts_enabled) {
-        if let Some(descriptor) = existing.descriptor.as_ref() {
-            crate::client_storage::remove_client_mounts(&existing.cluster_uuid, descriptor)?;
+    let mut profile_persisted = false;
+    let mut known_hosts_cleanup = None;
+    let result = (|| {
+        let bootstrap_command = format!(
+            "macluster internal client-bootstrap --json --client-key-digest {client_key_digest}"
+        );
+        let output =
+            node_admin::ssh_output(&node, &bootstrap_command, None).map_err(|(_, error)| error)?;
+        if !output.status.success() {
+            return Err(format!(
+                "Controller bootstrap failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
-        crate::remote_admin::revoke_client_nfs_access(existing)?;
-    }
-    if !control_only {
-        if let Some(descriptor) = profile.descriptor.as_ref() {
-            let result = if let Some(previous) = existing
+        let bootstrap: BootstrapResponse = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Controller bootstrap returned invalid JSON: {error}"))?;
+        let host_fingerprint = bootstrap.host_fingerprint.clone();
+        let mut profile = profile_from_bootstrap(&endpoint, bootstrap, PathBuf::from(identity))?;
+        let known_hosts_path = PathBuf::from(&profile.known_hosts_path);
+        if !known_hosts_path.exists() {
+            known_hosts_cleanup = Some(known_hosts_path.clone());
+        }
+        ssh_bootstrap::pin_client_host_key(
+            &endpoint.node(),
+            &format!("macluster-{}", profile.cluster_uuid),
+            &host_fingerprint,
+            &known_hosts_path,
+        )?;
+        let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
+        let existing = match store.load(&profile.cluster_uuid) {
+            Ok(existing) => Some(existing),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        profile.mounts_enabled = !control_only;
+        profile.retired_access = existing
+            .as_ref()
+            .map(|existing| existing.retired_access.clone())
+            .unwrap_or_default();
+        if let Some(existing) = existing.as_ref()
+            && existing.identity_file != profile.identity_file
+            && !profile
+                .retired_access
+                .iter()
+                .any(|retired| retired.identity_file == existing.identity_file)
+        {
+            profile
+                .retired_access
+                .push(crate::client_profile::RetiredClientAccess::from_profile(
+                    existing,
+                ));
+        }
+        if control_only
+            && let Some(existing) = existing.as_ref().filter(|value| {
+                !value.nfs_client_id.is_empty()
+                    && value.nfs_client_ip.parse::<std::net::Ipv4Addr>().is_ok()
+            })
+            && !profile.retired_access.iter().any(|retired| {
+                retired.identity_file == existing.identity_file
+                    && retired.nfs_client_id == existing.nfs_client_id
+                    && retired.nfs_client_ip == existing.nfs_client_ip
+            })
+        {
+            profile.retired_access.push(
+                crate::client_profile::RetiredClientAccess::nfs_cleanup_from_profile(existing),
+            );
+        }
+        let existing_mounts_active = existing.as_ref().is_some_and(existing_mounts_are_active);
+        profile.mounted_descriptor = existing
+            .as_ref()
+            .filter(|_| existing_mounts_active)
+            .and_then(|value| value.installed_mount_descriptor().cloned());
+        if control_only {
+            profile.transition_mount_descriptors = existing
                 .as_ref()
-                .filter(|value| value.mounts_enabled)
-                .and_then(|value| value.descriptor.as_ref())
+                .filter(|_| existing_mounts_active)
+                .map(|value| {
+                    crate::client_storage::distinct_mount_layouts(value.mount_cleanup_descriptors())
+                })
+                .unwrap_or_default();
+        } else {
+            profile.transition_mount_descriptors = existing
+                .as_ref()
+                .filter(|_| existing_mounts_active)
+                .map(|value| value.transition_mount_descriptors.clone())
+                .unwrap_or_default();
+        }
+        // Persist the previous access and every interrupted mount layout before
+        // mutating the host or discarding the old profile.
+        store.save(&profile).map_err(|error| error.to_string())?;
+        profile_persisted = true;
+        if control_only && let Some(existing) = existing.as_ref() {
+            for descriptor in
+                crate::client_storage::distinct_mount_layouts(existing.mount_cleanup_descriptors())
             {
-                crate::client_storage::replace_client_mounts(
-                    &profile.cluster_uuid,
-                    previous,
-                    descriptor,
-                )
-            } else {
-                crate::client_storage::install_client_mounts(&profile.cluster_uuid, descriptor)
-            };
-            result.map_err(|error| {
+                crate::client_storage::remove_client_mounts(&existing.cluster_uuid, &descriptor)?;
+            }
+            profile.mounted_descriptor = None;
+            profile.transition_mount_descriptors.clear();
+        }
+        if !control_only {
+            crate::remote_admin::authorize_client_nfs_access(&profile).map_err(|error| {
                 format!(
-                    "Controller access is ready, but client NFS mounts were not configured: {error}. If you only need remote control commands, rerun `macluster --join --control-only {}@{}:{}`.",
-                    endpoint.user, endpoint.host, endpoint.port
+                    "Controller access is ready, but login-client NFS authorization failed: {error}. Run `macluster --cluster {} --leave` to clean up, then retry `--join`.",
+                    profile.cluster_uuid
                 )
             })?;
+            let client_id = profile.nfs_client_id.clone();
+            if profile.supersede_nfs_cleanup_for(&client_id) {
+                store.save(&profile).map_err(|error| error.to_string())?;
+            }
+            if let Some(descriptor) = profile.descriptor.as_ref() {
+                let previous = profile.mounted_descriptor.clone();
+                profile
+                    .transition_mount_descriptors
+                    .extend(previous.clone());
+                profile
+                    .transition_mount_descriptors
+                    .push(descriptor.clone());
+                // An explicit join is also a repair operation. Always run the
+                // idempotent mount helper even when the cached layout matches,
+                // because the helper or a mount may have disappeared.
+                profile.mounted_descriptor = Some(descriptor.clone());
+                store.save(&profile).map_err(|error| error.to_string())?;
+                let result = if let Some(previous) = previous.as_ref() {
+                    crate::client_storage::replace_client_mounts(
+                        &profile.cluster_uuid,
+                        previous,
+                        descriptor,
+                    )
+                } else {
+                    crate::client_storage::install_client_mounts(&profile.cluster_uuid, descriptor)
+                };
+                result.map_err(|error| {
+                    format!(
+                        "Controller access is ready, but client NFS mounts were not configured: {error}. If you only need remote control commands, rerun `macluster --join --control-only {}@{}:{}`.",
+                        endpoint.user, endpoint.host, endpoint.port
+                    )
+                })?;
+            }
         }
-        profile.mounts_enabled = true;
+        resume_retired_access(&store, &mut profile, false)?;
+        store.save(&profile).map_err(|error| error.to_string())?;
+        if let Err(error) = store.mark_used(&profile.cluster_uuid) {
+            eprintln!(
+                "Client profile was saved, but its last-used time could not be updated: {error}"
+            );
+        }
+        store
+            .load(&profile.cluster_uuid)
+            .map_err(|error| error.to_string())
+    })();
+
+    match result {
+        Ok(profile) => Ok(profile),
+        Err(error) => {
+            let mut error = error;
+            if join_key_cleanup_required(profile_persisted, access.key_installed) {
+                let public_key = String::from_utf8_lossy(&public_key);
+                match ssh_bootstrap::revoke_public_key(&node, &public_key) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(identity);
+                        let _ = fs::remove_file(format!("{identity}.pub"));
+                    }
+                    Err(cleanup_error) => {
+                        error.push_str(&format!(
+                            "; the newly installed client key also could not be removed: {cleanup_error}"
+                        ));
+                    }
+                }
+            }
+            if join_local_cleanup_required(profile_persisted)
+                && let Some(path) = known_hosts_cleanup
+            {
+                let _ = fs::remove_file(&path);
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+            Err(error)
+        }
     }
-    store.save(&profile).map_err(|error| error.to_string())?;
-    store
-        .mark_used(&profile.cluster_uuid)
-        .map_err(|error| error.to_string())?;
-    let profile = store
-        .load(&profile.cluster_uuid)
-        .map_err(|error| error.to_string())?;
-    Ok(profile)
+}
+
+fn join_key_cleanup_required(profile_persisted: bool, key_installed: bool) -> bool {
+    key_installed && !profile_persisted
+}
+
+fn join_local_cleanup_required(profile_persisted: bool) -> bool {
+    !profile_persisted
+}
+
+fn existing_mounts_are_active(profile: &ClientProfile) -> bool {
+    profile.mounts_enabled
+        && !profile.leave_has_completed(crate::client_profile::ClientLeavePhase::MountsDetached)
+}
+
+pub(crate) fn resume_retired_access(
+    store: &ClientProfileStore,
+    profile: &mut ClientProfile,
+    require_complete: bool,
+) -> Result<(), String> {
+    let mut index = 0;
+    while index < profile.retired_access.len() {
+        let retired = profile.retired_access[index].clone();
+        let mut changed = false;
+        if retired.nfs_revocation_pending {
+            match crate::remote_admin::revoke_client_nfs_access_target(
+                profile,
+                &retired.nfs_client_id,
+                &retired.nfs_client_ip,
+            ) {
+                Ok(()) => {
+                    profile.retired_access[index].nfs_revocation_pending = false;
+                    changed = true;
+                }
+                Err(error) => eprintln!(
+                    "Warning: a previous login-client NFS registration still needs cleanup: {error}"
+                ),
+            }
+        }
+        if profile.retired_access[index].key_revocation_pending {
+            let identity_shared = store.load_all().map_or(true, |profiles| {
+                profiles.iter().any(|other| {
+                    other.cluster_uuid != profile.cluster_uuid
+                        && other.identity_file == retired.identity_file
+                })
+            });
+            if identity_shared {
+                profile.retired_access[index].key_revocation_pending = false;
+                changed = true;
+            } else {
+                let public_key = retired.public_key.clone().or_else(|| {
+                    fs::read_to_string(format!("{}.pub", retired.identity_file))
+                        .ok()
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                });
+                match public_key {
+                    Some(public_key) => {
+                        let transport = if profile.controller_user == retired.controller_user {
+                            profile.clone()
+                        } else {
+                            retired_transport_profile(profile, &retired)
+                        };
+                        match crate::remote_admin::revoke_retired_public_key_with_transport(
+                            &transport,
+                            &public_key,
+                        ) {
+                            Ok(()) => {
+                                let _ = fs::remove_file(&retired.identity_file);
+                                let _ = fs::remove_file(format!("{}.pub", retired.identity_file));
+                                let _ = fs::remove_file(&retired.known_hosts_path);
+                                if let Some(parent) =
+                                    std::path::Path::new(&retired.known_hosts_path).parent()
+                                {
+                                    let _ = fs::remove_dir(parent);
+                                }
+                                profile.retired_access[index].key_revocation_pending = false;
+                                changed = true;
+                            }
+                            Err(error) => eprintln!(
+                                "Warning: a previous login-client SSH key still needs cleanup: {error}"
+                            ),
+                        }
+                    }
+                    None => eprintln!(
+                        "Warning: a previous login-client SSH public key is unavailable; its remote authorization cannot be verified or revoked automatically"
+                    ),
+                }
+            }
+        }
+        if profile.retired_access[index].control_master_close_pending {
+            match crate::remote_admin::close_control_master_for(
+                &profile.cluster_uuid,
+                &retired.controller_user,
+                &retired.controller_host,
+                retired.controller_port,
+                &retired.identity_file,
+            ) {
+                Ok(()) => {
+                    profile.retired_access[index].control_master_close_pending = false;
+                    changed = true;
+                }
+                Err(error) => eprintln!(
+                    "Warning: a previous login-client SSH control connection still needs cleanup: {error}"
+                ),
+            }
+        }
+        if changed {
+            store.save(profile).map_err(|error| error.to_string())?;
+        }
+        if profile.retired_access[index].has_pending_cleanup() {
+            index += 1;
+        } else {
+            profile.retired_access.remove(index);
+            store.save(profile).map_err(|error| error.to_string())?;
+        }
+    }
+    if require_complete && profile.has_pending_retired_access() {
+        return Err(
+            "previous login-client access still needs cleanup; reconnect its endpoint or resolve the warning above, then rerun the command"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn retired_transport_profile(
+    current: &ClientProfile,
+    retired: &crate::client_profile::RetiredClientAccess,
+) -> ClientProfile {
+    let mut profile = current.clone();
+    profile.controller_host = retired.controller_host.clone();
+    profile.controller_user = retired.controller_user.clone();
+    profile.controller_port = retired.controller_port;
+    profile.known_hosts_path = retired.known_hosts_path.clone();
+    profile.identity_file = retired.identity_file.clone();
+    profile
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BootstrapResponse, JoinEndpoint, profile_from_bootstrap};
+    use super::{
+        BootstrapResponse, JoinEndpoint, existing_mounts_are_active, join_key_cleanup_required,
+        join_local_cleanup_required, profile_from_bootstrap,
+    };
 
     fn descriptor() -> macluster_protocol::control::ClientDescriptor {
         macluster_protocol::control::ClientDescriptor {
@@ -296,6 +563,79 @@ mod tests {
             nfs_client_ip: "192.0.2.10".into(),
         };
         assert!(profile_from_bootstrap(&endpoint, bootstrap, "/tmp/key".into()).is_err());
+    }
+
+    #[test]
+    fn failed_join_revokes_only_a_key_installed_before_profile_persistence() {
+        assert!(join_key_cleanup_required(false, true));
+        assert!(!join_key_cleanup_required(true, true));
+        assert!(!join_key_cleanup_required(false, false));
+        assert!(join_local_cleanup_required(false));
+        assert!(!join_local_cleanup_required(true));
+    }
+
+    #[test]
+    fn host_pins_are_isolated_by_controller_endpoint() {
+        let first_endpoint = JoinEndpoint::parse("mac@192.0.2.1:22").unwrap();
+        let second_endpoint = JoinEndpoint::parse("mac@192.0.2.2:22").unwrap();
+        let first = profile_from_bootstrap(
+            &first_endpoint,
+            BootstrapResponse {
+                descriptor: descriptor(),
+                binding_digest: "b".repeat(64),
+                remote_uid: 501,
+                remote_binary: "/opt/homebrew/bin/macluster".into(),
+                remote_config: "/tmp/config".into(),
+                remote_state_dir: "/tmp/state".into(),
+                host_fingerprint: "SHA256:first".into(),
+                nfs_client_id: "client-one".into(),
+                nfs_client_ip: "192.0.2.10".into(),
+            },
+            "/tmp/key-one".into(),
+        )
+        .unwrap();
+        let second = profile_from_bootstrap(
+            &second_endpoint,
+            BootstrapResponse {
+                descriptor: descriptor(),
+                binding_digest: "b".repeat(64),
+                remote_uid: 501,
+                remote_binary: "/opt/homebrew/bin/macluster".into(),
+                remote_config: "/tmp/config".into(),
+                remote_state_dir: "/tmp/state".into(),
+                host_fingerprint: "SHA256:second".into(),
+                nfs_client_id: "client-two".into(),
+                nfs_client_ip: "192.0.2.11".into(),
+            },
+            "/tmp/key-two".into(),
+        )
+        .unwrap();
+        assert_ne!(first.known_hosts_path, second.known_hosts_path);
+    }
+
+    #[test]
+    fn an_interrupted_leave_cannot_make_rejoin_trust_stale_mounts() {
+        let endpoint = JoinEndpoint::parse("mac@192.0.2.1").unwrap();
+        let mut profile = profile_from_bootstrap(
+            &endpoint,
+            BootstrapResponse {
+                descriptor: descriptor(),
+                binding_digest: "b".repeat(64),
+                remote_uid: 501,
+                remote_binary: "/opt/homebrew/bin/macluster".into(),
+                remote_config: "/tmp/config".into(),
+                remote_state_dir: "/tmp/state".into(),
+                host_fingerprint: "SHA256:test".into(),
+                nfs_client_id: "client-test".into(),
+                nfs_client_ip: "192.0.2.10".into(),
+            },
+            "/tmp/key".into(),
+        )
+        .unwrap();
+        profile.mounts_enabled = true;
+        assert!(existing_mounts_are_active(&profile));
+        profile.leave_phase = Some(crate::client_profile::ClientLeavePhase::MountsDetached);
+        assert!(!existing_mounts_are_active(&profile));
     }
 
     #[test]

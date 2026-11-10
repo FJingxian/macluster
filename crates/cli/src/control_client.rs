@@ -137,7 +137,7 @@ impl ControlClient {
         timeout: Duration,
         ensure_client_storage: bool,
     ) -> Result<Self, ControlClientError> {
-        let stream = RemoteControlStream::connect(profile, ensure_client_storage)?;
+        let stream = RemoteControlStream::connect(profile, ensure_client_storage, timeout)?;
         Self::handshake(
             ControlStream::Remote(stream),
             timeout,
@@ -176,9 +176,12 @@ impl ControlClient {
     }
 
     pub fn set_timeouts(&self, timeout: Duration) -> Result<(), ControlClientError> {
-        if let ControlStream::Local(stream) = &self.stream {
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
+        match &self.stream {
+            ControlStream::Local(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))?;
+            }
+            ControlStream::Remote(stream) => stream.set_timeout(timeout),
         }
         Ok(())
     }

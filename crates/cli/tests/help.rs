@@ -90,6 +90,7 @@ fn main_help_is_a_compact_module_index() {
 #[test]
 fn top_level_init_and_web_shortcuts_have_help() {
     assert!(help(&["--init", "--help"]).contains("FIRST SETUP"));
+    assert!(help(&["--join", "--help"]).contains("multi-entry cluster"));
     let web = help(&["--web", "--help"]);
     assert!(web.contains("127.0.0.1[:PORT]"), "{web}");
     assert!(web.contains("local-only"), "{web}");

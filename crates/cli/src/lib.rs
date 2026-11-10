@@ -2,6 +2,7 @@
 
 mod app;
 pub mod arguments;
+pub mod client_join;
 pub mod client_profile;
 mod control_client;
 pub mod discovery;

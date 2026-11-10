@@ -100,6 +100,19 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         if command_arg == "--init" {
             command = Some("init".into());
             args.remove(command_index);
+        } else if command_arg == "--join" {
+            let (endpoint, control_only) = parse_join_shortcut(&args[command_index + 1..])?;
+            let profile = crate::client_join::join_cluster(&endpoint, control_only)
+                .map_err(|error| (1, error))?;
+            println!(
+                "Joined cluster '{}' at {}@{}:{} (compute=false{}).",
+                profile.cluster_name,
+                profile.controller_user,
+                profile.controller_host,
+                profile.controller_port,
+                if control_only { ", control-only" } else { "" }
+            );
+            return Ok(());
         } else if command_arg == "--web" {
             if let Some(mode) = help_mode(&args[command_index + 1..]) {
                 println!("{}", web_shortcut_help(mode));
@@ -1222,6 +1235,34 @@ fn take_global_options(
         index += 1;
     }
     Ok((options, remaining))
+}
+
+fn parse_join_shortcut(args: &[String]) -> AppResult<(String, bool)> {
+    let mut endpoint = None;
+    let mut control_only = false;
+    for value in args {
+        match value.as_str() {
+            "--control-only" if !control_only => control_only = true,
+            "--control-only" => {
+                return Err((2, "--control-only may only be specified once".into()));
+            }
+            "-h" | "--help" => {
+                println!(
+                    "Usage\n  macluster --join [--control-only] USER@HOST[:PORT]\n\nJoins an existing multi-entry cluster as a login client."
+                );
+                return Err((0, String::new()));
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown join option '{value}'")));
+            }
+            value if endpoint.is_none() => endpoint = Some(value.to_owned()),
+            value => return Err((2, format!("unexpected join argument '{value}'"))),
+        }
+    }
+    Ok((
+        endpoint.ok_or_else(|| (2, "--join requires USER@HOST[:PORT]".into()))?,
+        control_only,
+    ))
 }
 
 fn submit_option_takes_value(key: &str) -> bool {
@@ -7071,6 +7112,52 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 return Err((2, "internal controller-service takes no arguments".into()));
             }
             controller(global, &["run".into()], true, false, None)
+        }
+        Some("client-bootstrap") => {
+            if args.len() != 2 || args.get(1).is_none_or(|value| value != "--json") {
+                return Err((2, "internal client-bootstrap only supports --json".into()));
+            }
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let config = load_config(Some(&config_path)).map_err(config_error)?;
+            let mut controller = online_controller(&config_path, &state_dir, false)?
+                .ok_or_else(|| (1, "Controller is unavailable".into()))?;
+            let payload = controller
+                .client
+                .request(ControlCommand::ClientDescriptor)
+                .map_err(|error| (1, error.to_string()))?;
+            let ControlPayload::ClientDescriptor(descriptor) = payload else {
+                return Err((
+                    1,
+                    "Controller returned an unexpected bootstrap response".into(),
+                ));
+            };
+            let login = config
+                .nodes
+                .iter()
+                .find(|(id, node)| config.is_login_node(id) && node.transport == Transport::Local)
+                .map(|(_, node)| node)
+                .ok_or_else(|| (1, "configured local login node is missing".into()))?;
+            let host_fingerprint =
+                crate::ssh_bootstrap::host_key_fingerprint(login).map_err(|error| (1, error))?;
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .ok_or_else(|| (1, "HOME is not set".into()))?;
+            let binary = env::current_exe().map_err(|error| (1, error.to_string()))?;
+            let response = crate::client_join::BootstrapResponse {
+                descriptor,
+                remote_uid: unsafe { libc::geteuid() },
+                remote_binary: binary.to_string_lossy().into_owned(),
+                remote_config: config_path.to_string_lossy().into_owned(),
+                remote_state_dir: state_dir.to_string_lossy().into_owned(),
+                host_fingerprint,
+                known_hosts_path: home.join(".ssh/known_hosts").to_string_lossy().into_owned(),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&response).map_err(|error| (1, error.to_string()))?
+            );
+            Ok(())
         }
         Some("claim-agent") => {
             let node_id = option_value(args, "--node")?

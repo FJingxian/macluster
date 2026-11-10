@@ -654,6 +654,7 @@ impl ControlApi {
         ClientDescriptor {
             cluster_uuid: self.config.share_uuid.to_ascii_lowercase(),
             cluster_name: self.config.name.clone(),
+            default_queue: self.config.default_queue.clone(),
             config_generation: self.hello.config_generation,
             controller_build_id: self.hello.build_id.clone(),
             controller_uid: self.hello.uid,
@@ -669,6 +670,7 @@ impl ControlApi {
                     server: share.server.clone(),
                     source_root: share.source_root.display().to_string(),
                     mount_root: share.mount_root.display().to_string(),
+                    share_uuid: share.share_uuid.clone(),
                 })
                 .collect(),
             queues: self

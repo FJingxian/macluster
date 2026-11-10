@@ -23,6 +23,7 @@ pub const MULTI_ENTRY_CLIENT_FEATURE: &str = "multi-entry-client.v1";
 pub struct ClientDescriptor {
     pub cluster_uuid: String,
     pub cluster_name: String,
+    pub default_queue: QueueName,
     pub config_generation: u64,
     pub controller_build_id: String,
     pub controller_uid: u32,
@@ -39,6 +40,7 @@ pub struct ClientShareDescriptor {
     pub server: NodeId,
     pub source_root: String,
     pub mount_root: String,
+    pub share_uuid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -485,6 +487,7 @@ mod client_descriptor_tests {
         let descriptor = ClientDescriptor {
             cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
             cluster_name: "multi-entry".into(),
+            default_queue: "compute".parse().unwrap(),
             config_generation: 17,
             controller_build_id: "macluster/test".into(),
             controller_uid: 501,
@@ -496,6 +499,7 @@ mod client_descriptor_tests {
                 server: "login".parse().unwrap(),
                 source_root: "/opt/homebrew".into(),
                 mount_root: "/opt/homebrew".into(),
+                share_uuid: "82d02835-f6ab-52b4-aaab-f90cafde9981".into(),
             }],
             queues: vec![super::ClientQueueDescriptor {
                 name: "compute".parse().unwrap(),

@@ -142,6 +142,15 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     let command = command.expect("argv0 alias or parsed subcommand is present");
 
     let (global, args) = take_global_options(args, command == "submit")?;
+    if let Some(profile) = crate::client_context::select_remote_profile(
+        &resolved_config_path(global.config.as_deref()),
+        &command,
+        &args,
+    )
+    .map_err(|error| (1, error))?
+    {
+        return remote_command(profile, &command, &args);
+    }
     if command == "submit"
         && parse_submit_args(&args).is_ok_and(|options| options.interactive)
         && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
@@ -299,6 +308,373 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         "agent" => Err((1, format!("`{command}` is not implemented yet"))),
         _ => unreachable!(),
     }
+}
+
+fn remote_command(
+    profile: crate::client_profile::ClientProfile,
+    command: &str,
+    args: &[String],
+) -> AppResult<()> {
+    let mut remote =
+        crate::client_context::RemoteContext::connect(profile).map_err(|error| (1, error))?;
+    match command {
+        "submit" => remote_submit(&mut remote, args),
+        "queue" => remote_queue(&mut remote, args),
+        "job" => remote_job(&mut remote, args),
+        "kill" => remote_kill(&mut remote, args),
+        "fans" => remote_fans(&mut remote, args),
+        "top" => {
+            let code = crate::remote_admin::run(
+                &remote.profile,
+                std::iter::once("top".to_owned())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                true,
+            )
+            .map_err(|error| (1, error.to_string()))?;
+            if code == 0 {
+                Ok(())
+            } else {
+                Err((code, "remote mtop failed".into()))
+            }
+        }
+        "node" => {
+            let code = crate::remote_admin::run(
+                &remote.profile,
+                std::iter::once("node".to_owned())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                true,
+            )
+            .map_err(|error| (1, error.to_string()))?;
+            if code == 0 {
+                Ok(())
+            } else {
+                Err((code, "remote mnode failed".into()))
+            }
+        }
+        _ => Err((
+            1,
+            format!("command '{command}' is not yet available through the login-client transport"),
+        )),
+    }
+}
+
+fn remote_submit(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let options = promote_inline_command(parse_submit_args(args).map_err(cli_error)?);
+    if options.interactive {
+        return Err((
+            2,
+            "remote interactive submission requires the Controller attach proxy and is not available yet".into(),
+        ));
+    }
+    let config = remote.submission_config();
+    let (mut spec, script) = build_submission(&config, &options)?;
+    let request_id = options
+        .request_id
+        .unwrap_or_else(|| RequestId(Id128::random()));
+    if !script.is_empty() {
+        let expected = snapshot_reference(&script)?;
+        spec.snapshot = Some(expected.clone());
+        let upload_id = Id128::random();
+        match remote
+            .client
+            .request(ControlCommand::BeginSnapshot {
+                upload_id,
+                size_bytes: expected.size_bytes,
+                sha256: expected.sha256.clone(),
+            })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::SnapshotProgress { offset: 0 } => {}
+            _ => return Err((1, "Controller returned an invalid snapshot response".into())),
+        }
+        let mut offset = 0_u64;
+        for bytes in script.chunks(MAX_CONTROL_SNAPSHOT_CHUNK_BYTES) {
+            let payload = remote
+                .client
+                .request(ControlCommand::PutSnapshotChunk {
+                    upload_id,
+                    offset,
+                    bytes: bytes.to_vec(),
+                })
+                .map_err(|error| (1, error.to_string()))?;
+            offset += bytes.len() as u64;
+            if payload != (ControlPayload::SnapshotProgress { offset }) {
+                return Err((1, "Controller returned an invalid snapshot offset".into()));
+            }
+        }
+        if remote
+            .client
+            .request(ControlCommand::FinishSnapshot { upload_id })
+            .map_err(|error| (1, error.to_string()))?
+            != ControlPayload::SnapshotFinished(expected)
+        {
+            return Err((1, "Controller staged a different script snapshot".into()));
+        }
+    }
+    let record = match remote
+        .client
+        .request(ControlCommand::Submit { request_id, spec })
+        .map_err(|error| (1, error.to_string()))?
+    {
+        ControlPayload::Submission(record) => record,
+        _ => {
+            return Err((
+                1,
+                "Controller returned an invalid submission response".into(),
+            ));
+        }
+    };
+    println!("Submitted job {} ({})", record.id, record.spec.name);
+    println!("Request ID: {request_id}");
+    if record.snapshot_sync_pending {
+        println!("shared snapshot pending");
+    }
+    Ok(())
+}
+
+fn remote_queue(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let mut json = false;
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "-q" | "--queue" => {
+                index += 1;
+                selected = Some(
+                    args.get(index)
+                        .ok_or_else(|| (2, "missing queue name".into()))?
+                        .clone(),
+                );
+            }
+            "--jobs" => {}
+            "--watch" => {
+                index += 1;
+                let _ = args
+                    .get(index)
+                    .ok_or_else(|| (2, "missing --watch interval".into()))?;
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mqueue option '{value}'")));
+            }
+            value => return Err((2, format!("unexpected mqueue argument '{value}'"))),
+        }
+        index += 1;
+    }
+    let ControlPayload::Queues(mut queues) = remote
+        .client
+        .request(ControlCommand::QueryQueues)
+        .map_err(|error| (1, error.to_string()))?
+    else {
+        return Err((1, "Controller returned an invalid queue response".into()));
+    };
+    if let Some(selected) = selected {
+        queues.retain(|queue| queue.name == selected);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&queues).map_err(|error| (1, error.to_string()))?
+        );
+        return Ok(());
+    }
+    println!("QUEUE    NODES    PENDING  RUNNING  COMPLETED  FAILED");
+    for queue in queues {
+        println!(
+            "{:<8} {:<8} {:>7}  {:>7}  {:>9}  {:>6}",
+            queue.name,
+            queue.nodes.join(","),
+            queue.pending,
+            queue.running,
+            queue.completed,
+            queue.failed
+        );
+    }
+    Ok(())
+}
+
+fn remote_job(remote: &mut crate::client_context::RemoteContext, args: &[String]) -> AppResult<()> {
+    let mut json = false;
+    let mut all = false;
+    let mut positional = None;
+    let mut request_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--all" => all = true,
+            "--request-id" => {
+                index += 1;
+                request_id = Some(RequestId(
+                    Id128::parse(
+                        args.get(index)
+                            .ok_or_else(|| (2, "--request-id requires a UUID".into()))?,
+                    )
+                    .map_err(|_| (2, "--request-id must be a UUID".into()))?,
+                ));
+            }
+            "--state" => {
+                index += 1;
+                let _ = args
+                    .get(index)
+                    .ok_or_else(|| (2, "--state requires a value".into()))?;
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown mjob option '{value}'")));
+            }
+            value if positional.is_none() => positional = Some(parse_job_id(value)?),
+            value => return Err((2, format!("unexpected mjob argument '{value}'"))),
+        }
+        index += 1;
+    }
+    let jobs = if let Some(id) = positional {
+        match remote
+            .client
+            .request(ControlCommand::LookupJob { job_id: id })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::Job(job) => vec![job],
+            _ => return Err((1, "Controller returned an invalid job response".into())),
+        }
+    } else if let Some(request_id) = request_id {
+        match remote
+            .client
+            .request(ControlCommand::LookupRequest { request_id })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::Lookup(Some(job)) => vec![job],
+            ControlPayload::Lookup(None) => Vec::new(),
+            _ => return Err((1, "Controller returned an invalid request lookup".into())),
+        }
+    } else {
+        match remote
+            .client
+            .request(ControlCommand::QueryJobs {
+                offset: 0,
+                limit: 256,
+                state: None,
+                active_only: !all,
+            })
+            .map_err(|error| (1, error.to_string()))?
+        {
+            ControlPayload::Jobs(page) => page.jobs,
+            _ => return Err((1, "Controller returned an invalid job list".into())),
+        }
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&jobs).map_err(|error| (1, error.to_string()))?
+        );
+    } else if jobs.len() == 1 {
+        print!("{}", format_job_details(&jobs[0]));
+    } else {
+        print!("{}", format_jobs_table(&jobs, all));
+    }
+    Ok(())
+}
+
+fn remote_kill(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    let mut force = false;
+    let mut ids = Vec::new();
+    for arg in args {
+        if arg == "--force" {
+            force = true;
+        } else if arg.starts_with('-') {
+            return Err((2, format!("unknown mkill option '{arg}'")));
+        } else {
+            ids.push(parse_job_id(arg)?);
+        }
+    }
+    if ids.is_empty() {
+        return Err((2, "mkill requires one or more job IDs".into()));
+    }
+    let mut failures = 0;
+    for id in ids {
+        match remote
+            .client
+            .request(ControlCommand::CancelJob { job_id: id, force })
+        {
+            Ok(ControlPayload::Job(job)) => println!("Job {}: {:?}", id, job.state),
+            Ok(_) => {
+                eprintln!("Job {id}: invalid cancellation response");
+                failures += 1;
+            }
+            Err(error) => {
+                eprintln!("Job {id}: {error}");
+                failures += 1;
+            }
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err((1, format!("failed to cancel {failures} job(s)")))
+    }
+}
+
+fn remote_fans(
+    remote: &mut crate::client_context::RemoteContext,
+    args: &[String],
+) -> AppResult<()> {
+    if args.iter().any(|arg| {
+        arg.starts_with('-')
+            && arg != "--json"
+            && arg != "--status"
+            && arg != "-l"
+            && arg != "--reset"
+            && arg != "--auto"
+            && arg != "--power"
+            && arg != "--node"
+    }) {
+        return Err((2, "unsupported remote mfans option".into()));
+    }
+    let policy = if args.iter().any(|arg| arg == "--reset") {
+        Some(FanPolicy::System)
+    } else if args.iter().any(|arg| arg == "--auto") {
+        Some(FanPolicy::Auto)
+    } else if args.iter().any(|arg| arg == "--power") {
+        Some(FanPolicy::Power)
+    } else {
+        None
+    };
+    let node_id = args
+        .windows(2)
+        .find(|pair| pair[0] == "--node")
+        .and_then(|pair| pair[1].parse::<NodeId>().ok());
+    let payload = remote
+        .client
+        .request(ControlCommand::FanControl { node_id, policy })
+        .map_err(|error| (1, error.to_string()))?;
+    let ControlPayload::FanControl(response) = payload else {
+        return Err((1, "Controller returned an invalid fan response".into()));
+    };
+    let results = match response {
+        FanControlPayload::Detailed { nodes, .. } => nodes,
+        FanControlPayload::Legacy(nodes) => nodes,
+    };
+    if args.iter().any(|arg| arg == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string(&results).map_err(|error| (1, error.to_string()))?
+        );
+    } else {
+        print!("{}", format_fan_control_table(&results));
+    }
+    Ok(())
 }
 
 // The controller runs the address watcher continuously. When it is healthy,

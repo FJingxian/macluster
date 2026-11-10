@@ -102,7 +102,7 @@ pub fn profile_from_bootstrap(
     Ok(ClientProfile {
         version: 1,
         cluster_uuid: bootstrap.descriptor.cluster_uuid.to_ascii_lowercase(),
-        cluster_name: bootstrap.descriptor.cluster_name,
+        cluster_name: bootstrap.descriptor.cluster_name.clone(),
         binding_digest: bootstrap.binding_digest,
         namespace: bootstrap.descriptor.cluster_uuid.clone(),
         descriptor_generation: bootstrap.descriptor.config_generation,
@@ -116,6 +116,7 @@ pub fn profile_from_bootstrap(
         remote_config: bootstrap.remote_config,
         remote_state_dir: bootstrap.remote_state_dir,
         last_used_unix_ms: 0,
+        descriptor: Some(bootstrap.descriptor),
     })
 }
 
@@ -159,6 +160,7 @@ mod tests {
         macluster_protocol::control::ClientDescriptor {
             cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
             cluster_name: "home".into(),
+            default_queue: "default".parse().unwrap(),
             config_generation: 7,
             controller_build_id: "macluster/0.1.8".into(),
             controller_uid: 501,

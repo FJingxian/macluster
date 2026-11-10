@@ -2,6 +2,7 @@
 
 mod app;
 pub mod arguments;
+pub mod client_context;
 pub mod client_join;
 pub mod client_profile;
 mod control_client;
@@ -12,6 +13,7 @@ mod job_resources;
 mod mtop;
 mod nfs_recovery;
 mod node_admin;
+mod remote_admin;
 mod remote_transport;
 pub mod service;
 mod ssh_bootstrap;

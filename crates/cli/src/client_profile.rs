@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use macluster_protocol::identifiers::Id128;
+use macluster_protocol::{control::ClientDescriptor, identifiers::Id128};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,6 +27,8 @@ pub struct ClientProfile {
     pub remote_config: String,
     pub remote_state_dir: String,
     pub last_used_unix_ms: u64,
+    #[serde(default)]
+    pub descriptor: Option<ClientDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,6 +260,7 @@ mod tests {
             remote_config: "/Users/mac/.config/macluster/config.toml".into(),
             remote_state_dir: "/Users/mac/Library/Application Support/macluster/controller".into(),
             last_used_unix_ms,
+            descriptor: None,
         }
     }
 

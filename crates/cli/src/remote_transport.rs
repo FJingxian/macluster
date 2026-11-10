@@ -128,6 +128,7 @@ mod tests {
             remote_config: "/tmp/config.toml".into(),
             remote_state_dir: "/tmp/state".into(),
             last_used_unix_ms: 0,
+            descriptor: None,
         }
     }
 

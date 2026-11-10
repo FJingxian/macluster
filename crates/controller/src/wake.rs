@@ -11,6 +11,7 @@ use std::{
 };
 
 const MAX_SOCKET_PATH_BYTES: usize = 100;
+const SOCKET_ROOT: &str = "/private/tmp";
 
 #[derive(Debug, thiserror::Error)]
 pub enum WakeError {
@@ -109,7 +110,7 @@ fn wake_socket_path(state_dir: &Path) -> Result<PathBuf, WakeError> {
     let canonical = state_dir.canonicalize()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     canonical.as_os_str().as_encoded_bytes().hash(&mut hasher);
-    let path = std::env::temp_dir().join(format!(
+    let path = PathBuf::from(SOCKET_ROOT).join(format!(
         "mcw-{:x}-{:x}.sock",
         unsafe { libc::getuid() },
         hasher.finish()
@@ -169,6 +170,17 @@ mod tests {
 
         assert!(
             matches!(error, WakeError::Io(ref error) if error.kind() == io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn wake_socket_path_does_not_depend_on_the_callers_temp_directory() {
+        let root = TempState::new();
+        let path = super::wake_socket_path(root.path()).unwrap();
+        assert!(
+            path.starts_with("/private/tmp"),
+            "wake socket unexpectedly depends on TMPDIR: {}",
+            path.display()
         );
     }
 

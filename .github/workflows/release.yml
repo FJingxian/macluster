@@ -4,26 +4,34 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, for example v0.1.7"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-latest
     env:
       CARGO_TERM_COLOR: always
       TARGET: aarch64-apple-darwin
       GITHUB_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - name: Check out tagged source
+      - name: Check out release source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust 1.90
         run: |
@@ -35,7 +43,7 @@ jobs:
 
       - name: Verify tag matches workspace version
         run: |
-          python3 - "$GITHUB_REF_NAME" <<'PY'
+          python3 - "$RELEASE_TAG" <<'PY'
           import pathlib
           import re
           import sys
@@ -62,7 +70,9 @@ jobs:
           test -x "$BIN"
           file "$BIN"
           file "$BIN" | grep -q "Mach-O 64-bit executable arm64"
-          "$BIN" --version | grep -F "macluster ${GITHUB_REF_NAME#v}"
+          if test "$(uname -m)" = arm64; then
+            "$BIN" --version | grep -F "macluster ${RELEASE_TAG#v}"
+          fi
 
       - name: Validate Homebrew tap credentials
         env:
@@ -84,7 +94,7 @@ jobs:
         run: |
           python3 scripts/release/package_macos.py \
             --binary "target/$TARGET/release/macluster" \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${RELEASE_TAG#v}" \
             --output-dir dist
           cd dist
           shasum -a 256 -c SHA256SUMS
@@ -94,7 +104,7 @@ jobs:
         run: |
           SHA256="$(awk '{print $1}' dist/SHA256SUMS)"
           python3 scripts/release/homebrew_formula.py \
-            --version "${GITHUB_REF_NAME#v}" \
+            --version "${RELEASE_TAG#v}" \
             --sha256 "$SHA256" \
             --output dist/macluster.rb
           ruby -c dist/macluster.rb
@@ -104,7 +114,7 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           ## English
 
-          macluster $GITHUB_REF_NAME is an ad-hoc signed Apple silicon
+          macluster $RELEASE_TAG is an ad-hoc signed Apple silicon
           early-access build.
 
           Homebrew (after the tap is published):
@@ -117,7 +127,7 @@ jobs:
 
           ## 简体中文
 
-          macluster $GITHUB_REF_NAME 是 ad-hoc 签名、无需付费开发者证书的
+          macluster $RELEASE_TAG 是 ad-hoc 签名、无需付费开发者证书的
           Apple silicon 早期版本。
 
           Homebrew 安装（tap 发布后）：
@@ -128,22 +138,22 @@ jobs:
 
           完整改动请查看 commit 记录。
           EOF
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
               dist/macluster-v*-macos-arm64.tar.gz \
               dist/SHA256SUMS \
               dist/macluster.rb \
               --clobber
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "$GITHUB_REF_NAME" \
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               dist/macluster-v*-macos-arm64.tar.gz \
               dist/SHA256SUMS \
               dist/macluster.rb \
               --verify-tag \
-              --title "$GITHUB_REF_NAME" \
+              --title "$RELEASE_TAG" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
 
@@ -169,5 +179,5 @@ jobs:
             echo "Homebrew formula is already current."
             exit 0
           fi
-          git -C "$TAP_DIR" commit -m "macluster ${GITHUB_REF_NAME#v}"
+          git -C "$TAP_DIR" commit -m "macluster ${RELEASE_TAG#v}"
           git -C "$TAP_DIR" push origin HEAD:main

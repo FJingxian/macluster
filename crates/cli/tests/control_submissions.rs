@@ -31,7 +31,7 @@ impl Fixture {
         fs::write(
             root.join("config.toml"),
             format!(
-                "[cluster]\nname=\"online-submit\"\nlogin_node=\"login\"\ndefault_queue=\"cpu\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.cpu]\nnodes=[\"compute\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.compute]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n",
+                "[cluster]\nname=\"online-submit\"\nlogin_node=\"login\"\ndefault_queue=\"cpu\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.cpu]\nnodes=[\"compute\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.compute]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n",
                 root.join("shared").display(),
                 uid
             ),
@@ -80,7 +80,7 @@ fn job_spec(binding: &ServiceBinding, name: &str) -> JobSpec {
     let config = ClusterConfig::parse(&fs::read_to_string(binding.config_path()).unwrap()).unwrap();
     let shared = config.shared_root;
     JobSpec {
-        storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+        storage_namespace: Some(Id128::parse("f779bcf5-ea85-5caa-9579-74b395f3cce5").unwrap()),
         required_shares: Some(Vec::new()),
         queue: QueueName::new("cpu").unwrap(),
         node: Some(NodeId::new("compute").unwrap()),

@@ -1067,22 +1067,22 @@ mod primary_share_tests {
 
     #[test]
     fn primary_mount_validation_accepts_distinct_source_and_mount_paths() {
-        let output = "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
+        let output = "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
         assert!(primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Users/Shared/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/other"),
         ));

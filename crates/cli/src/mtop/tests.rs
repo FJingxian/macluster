@@ -123,20 +123,20 @@ fn controller_monitor_request_latency_reaches_node_details() {
 #[test]
 fn login_compute_identity_is_merged_by_machine_uuid_once() {
     let login = LoginIdentity {
-        host: "192.168.2.2".into(),
+        host: "192.0.2.2".into(),
         machine_uuid: Some("login-uuid".into()),
     };
     let nodes = vec![
         ConfiguredNode {
             id: "mini01-c".into(),
-            host: "192.168.2.2".into(),
+            host: "192.0.2.2".into(),
             machine_uuid: Some("login-uuid".into()),
             queues: vec!["mini01".into()],
             local_transport: false,
         },
         ConfiguredNode {
             id: "mini01-a".into(),
-            host: "192.168.2.1".into(),
+            host: "192.0.2.1".into(),
             machine_uuid: Some("mini-uuid".into()),
             queues: vec!["mini01".into()],
             local_transport: false,
@@ -149,26 +149,26 @@ fn login_compute_identity_is_merged_by_machine_uuid_once() {
     assert_eq!(rows[0].id, "mini01-a");
     let local = rows.iter().find(|row| row.id == "mini01-c").unwrap();
     assert_eq!(local.role, NodeRole::LoginCompute);
-    assert_eq!(local.host, "192.168.2.2");
+    assert_eq!(local.host, "192.0.2.2");
 }
 
 #[test]
 fn queue_filter_keeps_out_of_queue_login_separate() {
     let login = LoginIdentity {
-        host: "192.168.2.2".into(),
+        host: "192.0.2.2".into(),
         machine_uuid: Some("login-uuid".into()),
     };
     let nodes = vec![
         ConfiguredNode {
             id: "mini01-c".into(),
-            host: "192.168.2.2".into(),
+            host: "192.0.2.2".into(),
             machine_uuid: Some("login-uuid".into()),
             queues: vec!["other".into()],
             local_transport: true,
         },
         ConfiguredNode {
             id: "mini01-a".into(),
-            host: "192.168.2.1".into(),
+            host: "192.0.2.1".into(),
             machine_uuid: Some("mini-uuid".into()),
             queues: vec!["mini01".into()],
             local_transport: false,
@@ -187,12 +187,12 @@ fn queue_filter_keeps_out_of_queue_login_separate() {
 #[test]
 fn login_without_compute_membership_stays_separate_in_full_cluster_view() {
     let login = LoginIdentity {
-        host: "192.168.2.2".into(),
+        host: "192.0.2.2".into(),
         machine_uuid: Some("login-uuid".into()),
     };
     let nodes = vec![ConfiguredNode {
         id: "login-01".into(),
-        host: "192.168.2.2".into(),
+        host: "192.0.2.2".into(),
         machine_uuid: Some("login-uuid".into()),
         queues: Vec::new(),
         local_transport: true,
@@ -228,7 +228,7 @@ fn synthetic_login_key_cannot_collide_with_a_configured_node_id() {
     };
     let nodes = vec![ConfiguredNode {
         id: "login".into(),
-        host: "192.168.2.9".into(),
+        host: "192.0.2.9".into(),
         machine_uuid: None,
         queues: vec!["mini01".into()],
         local_transport: false,

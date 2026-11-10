@@ -5983,6 +5983,7 @@ fn controller(
                         macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
                         "maintenance.v1".into(),
                         "web.v1".into(),
+                        macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE.into(),
                     ],
                     controller_epoch: service.epoch(),
                     config_generation: maintenance.generation(),
@@ -8146,7 +8147,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             &["-a".into(), "operator@192.0.2.20".into()]
         ));
         assert!(
-            should_preflight_agent_update("node", &["-rm".into(), "share:wdisk".into()],),
+            should_preflight_agent_update("node", &["-rm".into(), "share:external-disk".into()],),
             "named-share removal needs the current privileged NFS protocol"
         );
     }
@@ -8753,7 +8754,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             &config_path,
             format!(
-                "[cluster]\nname=\"online-env\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n[shares.mamba]\nserver=\"login\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"340edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\n",
+                "[cluster]\nname=\"online-env\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\n[shares.mamba]\nserver=\"login\"\nsource_root=\"{}\"\nmount_root=\"{}\"\nshare_uuid=\"82d02835-f6ab-52b4-aaab-f90cafde9981\"\n",
                 shared_root.display(),
                 unsafe { libc::geteuid() },
                 software_root.display(),
@@ -8803,7 +8804,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         ]);
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
         let spec = JobSpec {
-            storage_namespace: Some(Id128::parse("240edfcc-0fe5-4fa8-83a2-29c6ede02b42").unwrap()),
+            storage_namespace: Some(Id128::parse("f779bcf5-ea85-5caa-9579-74b395f3cce5").unwrap()),
             required_shares: Some(Vec::new()),
             queue: QueueName::new("compute").unwrap(),
             node: Some(NodeId::new("worker").unwrap()),
@@ -10153,14 +10154,14 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         let nodes = vec![
             NodeMetricRow {
                 id: "mini01-a".into(),
-                host: "192.168.2.1".into(),
+                host: "192.0.2.1".into(),
                 reachable: true,
                 metrics: Some(first),
                 error: None,
             },
             NodeMetricRow {
                 id: "mini01-b".into(),
-                host: "192.168.2.2".into(),
+                host: "192.0.2.2".into(),
                 reachable: true,
                 metrics: Some(second),
                 error: None,
@@ -10221,7 +10222,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             &config_path,
             format!(
-                "[cluster]\nname=\"monitor-cache\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                "[cluster]\nname=\"monitor-cache\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
                 root.join("shared").display(),
                 unsafe { libc::geteuid() }
             ),
@@ -10350,7 +10351,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         fs::write(
             root.join("config.toml"),
             format!(
-                "[cluster]\nname=\"preflight\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+                "[cluster]\nname=\"preflight\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/tmp/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
                 root.display(),
                 unsafe { libc::geteuid() }
             ),

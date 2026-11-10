@@ -1580,7 +1580,7 @@ mod tests {
         let base_python = base_bin.join("python");
         let activated_python = activated_bin.join("python");
         fs::write(&base_python, "#!/bin/sh\necho BASE\n").unwrap();
-        fs::write(&activated_python, "#!/bin/sh\necho JXFU\n").unwrap();
+        fs::write(&activated_python, "#!/bin/sh\necho cluster-user\n").unwrap();
         fs::set_permissions(&base_python, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&activated_python, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1604,7 +1604,7 @@ mod tests {
             .unwrap();
 
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "JXFU\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "cluster-user\n");
         fs::remove_dir_all(root).unwrap();
     }
 

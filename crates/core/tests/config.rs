@@ -14,7 +14,7 @@ nodes = ["mini01-a"]
 scheduler = "fifo"
 
 [nodes.mini01-a]
-host = "192.168.2.1"
+host = "192.0.2.1"
 transport = "ssh"
 "#;
 
@@ -24,7 +24,7 @@ fn documented_config_resolves_queue_members_and_storage_role() {
 
     assert_eq!(config.name, "macluster");
     assert_eq!(config.default_queue.as_str(), "mini01");
-    assert_eq!(config.nodes["mini01-a"].host, "192.168.2.1");
+    assert_eq!(config.nodes["mini01-a"].host, "192.0.2.1");
     assert_eq!(
         config.nodes["mini01-a"].remote_binary,
         "/usr/local/bin/macluster"
@@ -145,7 +145,7 @@ fn storage_server_must_be_a_declared_compute_node() {
 #[test]
 fn duplicate_ssh_hosts_and_unsafe_remote_binary_paths_are_rejected() {
     let duplicate_host =
-        format!("{VALID}\n[nodes.mini01-b]\nhost = \"192.168.2.1\"\ntransport = \"ssh\"\n");
+        format!("{VALID}\n[nodes.mini01-b]\nhost = \"192.0.2.1\"\ntransport = \"ssh\"\n");
     assert!(matches!(
         ClusterConfig::parse(&duplicate_host),
         Err(ConfigError::DuplicateHost(_))
@@ -287,7 +287,7 @@ fn extended_config() -> String {
 {VALID}
 
 [nodes.login]
-host = "192.168.2.3"
+host = "192.0.2.3"
 transport = "local"
 machine_uuid = "00000000-0000-4000-8000-000000000003"
 execution_uid = 501
@@ -319,7 +319,7 @@ fn local_transport_requires_machine_uuid_and_execution_uid() {
 #[test]
 fn config_allows_only_one_local_transport_node() {
     let duplicate = format!(
-        "{}\n[nodes.login2]\nhost = \"192.168.2.4\"\ntransport = \"local\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000005\"\nexecution_uid = 501\n",
+        "{}\n[nodes.login2]\nhost = \"192.0.2.4\"\ntransport = \"local\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000005\"\nexecution_uid = 501\n",
         extended_config()
     );
     assert!(matches!(
@@ -331,7 +331,7 @@ fn config_allows_only_one_local_transport_node() {
 #[test]
 fn one_machine_uuid_cannot_be_declared_under_two_node_ids() {
     let duplicate = format!(
-        "{}\n[nodes.mini01-b]\nhost = \"192.168.2.2\"\ntransport = \"ssh\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000003\"\n",
+        "{}\n[nodes.mini01-b]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000003\"\n",
         extended_config()
     );
     assert!(ClusterConfig::parse(&duplicate).is_err());

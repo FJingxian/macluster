@@ -2698,7 +2698,7 @@ nodes = ["login"]
 scheduler = "fifo"
 
 [nodes.login]
-host = "192.168.2.3"
+host = "192.0.2.3"
 transport = "local"
 machine_uuid = "00000000-0000-4000-8000-000000000003"
 execution_uid = 501
@@ -3033,22 +3033,22 @@ execution_uid = 501
 
     #[test]
     fn primary_mount_validation_uses_server_source_and_client_mount_paths() {
-        let output = "192.168.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
+        let output = "192.0.2.1:/Volumes/Storage/macluster on /Users/Shared/macluster (nfs, nodev, nosuid)\n";
         assert!(primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Users/Shared/macluster"),
             Path::new("/Users/Shared/macluster"),
         ));
         assert!(!primary_nfs_mount_matches(
             output,
-            "192.168.2.1",
+            "192.0.2.1",
             Path::new("/Volumes/Storage/macluster"),
             Path::new("/Users/Shared/other"),
         ));
@@ -3060,7 +3060,7 @@ execution_uid = 501
         let server_id = NodeId::new("mini01-a").unwrap();
         config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
         config.shares.insert(
-            "wdisk".into(),
+            "external-disk".into(),
             macluster_core::config::ShareConfig {
                 server: server_id,
                 source_root: PathBuf::from("/Volumes/archive"),
@@ -3075,7 +3075,7 @@ execution_uid = 501
         let result = verify_named_share_with_mount_output(
             &config,
             "login-01",
-            config.shares.get("wdisk").unwrap(),
+            config.shares.get("external-disk").unwrap(),
             mount_output,
         );
 

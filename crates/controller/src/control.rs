@@ -15,9 +15,10 @@ use macluster_core::{
 };
 use macluster_protocol::{
     control::{
-        AgentCompatibilityRecord, AgentCompatibilityState, ControlCommand, ControlError,
-        ControlErrorCode, ControlPayload, ControlRequest, ControllerHello, ControllerLifecycle,
-        JobPage, MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_JOB_PAGE, MAX_CONTROL_MONITOR_NODES,
+        AgentCompatibilityRecord, AgentCompatibilityState, ClientDescriptor, ClientQueueDescriptor,
+        ClientShareDescriptor, ControlCommand, ControlError, ControlErrorCode, ControlPayload,
+        ControlRequest, ControllerHello, ControllerLifecycle, JobPage,
+        MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_JOB_PAGE, MAX_CONTROL_MONITOR_NODES,
         MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, MaintenanceScope,
         MaintenanceTicket, QueueSummary,
     },
@@ -259,6 +260,9 @@ impl ControlApi {
                 Ok(ControlPayload::MonitorAcknowledged)
             }
             ControlCommand::Status => Ok(ControlPayload::Status(self.hello.clone())),
+            ControlCommand::ClientDescriptor => {
+                Ok(ControlPayload::ClientDescriptor(self.client_descriptor()))
+            }
             ControlCommand::BeginMaintenance {
                 operation_id,
                 scope,
@@ -646,6 +650,45 @@ impl ControlApi {
         }
     }
 
+    fn client_descriptor(&self) -> ClientDescriptor {
+        ClientDescriptor {
+            cluster_uuid: self.config.share_uuid.to_ascii_lowercase(),
+            cluster_name: self.config.name.clone(),
+            config_generation: self.hello.config_generation,
+            controller_build_id: self.hello.build_id.clone(),
+            controller_uid: self.hello.uid,
+            capabilities: self.hello.capabilities.clone(),
+            primary_mount_root: self.config.shared_root.display().to_string(),
+            primary_source_root: self.config.primary_source_root().display().to_string(),
+            shares: self
+                .config
+                .shares
+                .iter()
+                .map(|(id, share)| ClientShareDescriptor {
+                    id: id.clone(),
+                    server: share.server.clone(),
+                    source_root: share.source_root.display().to_string(),
+                    mount_root: share.mount_root.display().to_string(),
+                })
+                .collect(),
+            queues: self
+                .config
+                .queues
+                .iter()
+                .filter_map(|(name, queue)| {
+                    Some(ClientQueueDescriptor {
+                        name: name.parse().ok()?,
+                        nodes: queue
+                            .nodes
+                            .iter()
+                            .filter_map(|node| node.parse().ok())
+                            .collect(),
+                    })
+                })
+                .collect(),
+        }
+    }
+
     pub(crate) fn validate_generation(
         &self,
         expected_generation: Option<u64>,
@@ -889,7 +932,7 @@ mod tests {
 
         fn config(&self) -> ClusterConfig {
             ClusterConfig::parse(&format!(
-                "[cluster]\nname=\"compat\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n",
+                "[cluster]\nname=\"compat\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n",
                 self.0.display(),
                 unsafe { libc::geteuid() }
             ))
@@ -918,7 +961,7 @@ mod tests {
 
         fn maintenance_api(&self) -> (ControlApi, ClusterConfig, PathBuf, PathBuf) {
             let config_text = format!(
-                "[cluster]\nname=\"compat\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-a83a-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
+                "[cluster]\nname=\"compat\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-a83a-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
                 self.0.display(),
                 unsafe { libc::geteuid() }
             );
@@ -1083,6 +1126,62 @@ mod tests {
 
         assert_eq!(error.code, ControlErrorCode::StaleGeneration);
         assert!(error.message.contains("reconnect"));
+    }
+
+    #[test]
+    fn controller_client_descriptor_excludes_ssh_and_private_keys() {
+        let fixture = Fixture::new();
+        let config = ClusterConfig::parse(&format!(
+            "[cluster]\nname=\"multi-entry\"\nlogin_node=\"login\"\ndefault_queue=\"compute\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"worker-a\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[shares.tools]\nserver=\"login\"\nsource_root=\"/opt/homebrew\"\nmount_root=\"/opt/homebrew\"\nshare_uuid=\"82d02835-f6ab-52b4-aaab-f90cafde9981\"\n",
+            fixture.0.display(),
+            unsafe { libc::geteuid() }
+        ))
+        .unwrap();
+        let storage = Storage::open(fixture.0.join("descriptor-state")).unwrap();
+        let hello = macluster_protocol::control::ControllerHello {
+            protocol_version: macluster_protocol::control::CONTROL_PROTOCOL_VERSION,
+            binding_digest: "b".repeat(64),
+            namespace: config.share_uuid.clone(),
+            uid: unsafe { libc::geteuid() },
+            build_id: "macluster/test".into(),
+            capabilities: vec![macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE.into()],
+            controller_epoch: ControllerEpoch {
+                controller_uuid: ControllerUuid::random(),
+                epoch: 1,
+            },
+            config_generation: 23,
+            lifecycle: ControllerLifecycle::Ready,
+        };
+        let mut api = ControlApi::new(config, storage, hello);
+
+        let ControlPayload::ClientDescriptor(descriptor) = api
+            .handle(Id128::random(), request(ControlCommand::ClientDescriptor))
+            .unwrap()
+        else {
+            panic!("client descriptor response required")
+        };
+
+        assert_eq!(descriptor.cluster_name, "multi-entry");
+        assert_eq!(descriptor.config_generation, 23);
+        assert_eq!(descriptor.queues[0].name.as_str(), "compute");
+        assert_eq!(descriptor.queues[0].nodes[0].as_str(), "worker-a");
+        assert_eq!(descriptor.shares[0].id, "tools");
+        assert_eq!(descriptor.shares[0].mount_root, "/opt/homebrew");
+        assert!(
+            descriptor
+                .capabilities
+                .iter()
+                .any(|feature| feature == macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE)
+        );
+        let encoded = serde_json::to_string(&descriptor).unwrap();
+        for forbidden in [
+            "ssh_user",
+            "remote_binary",
+            "machine_uuid",
+            "cluster-update",
+        ] {
+            assert!(!encoded.contains(forbidden), "{encoded}");
+        }
     }
 
     #[test]
@@ -1318,7 +1417,7 @@ mod tests {
 
         let fixture = Fixture::new();
         let config = ClusterConfig::parse(&format!(
-            "[cluster]\nname=\"monitor-counts\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
+            "[cluster]\nname=\"monitor-counts\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker-a\",\"worker-b\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker-a]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n[nodes.worker-b]\nhost=\"192.0.2.51\"\ntransport=\"ssh\"\nremote_binary=\"/tmp/macluster\"\nssh_user=\"worker\"\n",
             fixture.0.display(),
             unsafe { libc::geteuid() }
         ))

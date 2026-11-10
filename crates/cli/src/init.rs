@@ -2453,7 +2453,7 @@ mod tests {
             "--shared-root".into(),
             "/Users/Shared/macluster".into(),
             "--primary-nfs".into(),
-            "operator@192.168.2.1:22:/Volumes/Storage/macluster".into(),
+            "operator@192.0.2.1:22:/Volumes/Storage/macluster".into(),
         ])
         .expect("parse remote primary options");
         let source = render_config(&options, &context()).expect("render remote topology");
@@ -2571,13 +2571,13 @@ mod tests {
     fn primary_nfs_endpoint_defaults_to_port_22_and_requires_source_path() {
         let options = parse_options(&[
             "--primary-nfs".into(),
-            "user@192.168.2.1:/Volumes/Data".into(),
+            "user@192.0.2.1:/Volumes/Data".into(),
         ])
         .expect("parse endpoint without port");
         let primary = options.primary_nfs.expect("remote NFS configuration");
         assert_eq!(primary.port, 22);
         assert_eq!(primary.source_root, PathBuf::from("/Volumes/Data"));
-        assert!(parse_options(&["--primary-nfs".into(), "user@192.168.2.1:22".into()]).is_err());
+        assert!(parse_options(&["--primary-nfs".into(), "user@192.0.2.1:22".into()]).is_err());
     }
 
     #[test]
@@ -2599,7 +2599,7 @@ mod tests {
             "--shared-root".into(),
             root.join("shared").display().to_string(),
             "--primary-nfs".into(),
-            "user@192.168.2.1:/Volumes/Data".into(),
+            "user@192.0.2.1:/Volumes/Data".into(),
         ])
         .unwrap();
         let source = render_config(&options, &context()).unwrap();

@@ -323,7 +323,7 @@ nodes = ["mini01-a"]
 scheduler = "fifo"
 
 [nodes.mini01-a]
-host = "192.168.2.1"
+host = "192.0.2.1"
 transport = "ssh"
 "#,
         shared.display()

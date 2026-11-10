@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn slow_compatibility_probe_runs_in_background_without_blocking_cache_queries() {
         let config = ClusterConfig::parse(&format!(
-            "[cluster]\nname=\"compatibility-test\"\ndefault_queue=\"q\"\nlogin_node=\"worker\"\nshared_root=\"/tmp/macluster-compatibility-test\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"worker\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.worker]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/bin/true\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n",
+            "[cluster]\nname=\"compatibility-test\"\ndefault_queue=\"q\"\nlogin_node=\"worker\"\nshared_root=\"/tmp/macluster-compatibility-test\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"worker\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.worker]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/bin/true\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n",
             unsafe { libc::geteuid() }
         ))
         .unwrap();

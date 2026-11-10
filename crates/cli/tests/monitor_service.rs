@@ -18,7 +18,7 @@ use macluster_protocol::{
 
 fn config() -> ClusterConfig {
     ClusterConfig::parse(&format!(
-        "[cluster]\nname=\"monitor-test\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-monitor-test\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
+        "[cluster]\nname=\"monitor-test\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-monitor-test\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n[nodes.worker]\nhost=\"192.0.2.50\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\nssh_user=\"worker\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036be\"\n",
         unsafe { libc::geteuid() }
     ))
     .unwrap()
@@ -273,7 +273,7 @@ fn monitor_pages_are_bounded_and_same_cache_state_has_one_sequence() {
         .map(|index| format!("worker-{index:03}"))
         .collect::<Vec<_>>();
     let mut text = format!(
-        "[cluster]\nname=\"monitor-pages\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-monitor-pages\"\nshare_uuid=\"240edfcc-0fe5-4fa8-83a2-29c6ede02b42\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes={workers:?}\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"962f7a62-961f-5dd2-aa71-c978863036bd\"\nexecution_uid={}\n",
+        "[cluster]\nname=\"monitor-pages\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-monitor-pages\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes={workers:?}\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid={}\n",
         unsafe { libc::geteuid() }
     );
     for (index, worker) in workers.iter().enumerate() {

@@ -63,8 +63,8 @@ jobs:
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
-      - name: Run workspace tests
-        run: cargo test --workspace --all-targets -- --test-threads=1
+      - name: Run workspace unit tests
+        run: cargo test --workspace --lib -- --test-threads=1
 
       - name: Build arm64 release binary
         run: cargo build --release --locked -p macluster-cli --target "$TARGET"

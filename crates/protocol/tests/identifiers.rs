@@ -4,7 +4,7 @@ use macluster_protocol::identifiers::{Id128, NodeId, QueueName, validate_name};
 fn names_accept_bounded_ascii_ids_and_reject_option_looking_values() {
     assert!(NodeId::new("mini01-a").is_ok());
     assert!(QueueName::new("pool_2").is_ok());
-    assert!(NodeId::new(&format!("n{}", "a".repeat(63))).is_ok());
+    assert!(NodeId::new(format!("n{}", "a".repeat(63))).is_ok());
     assert!(NodeId::new("-mini01").is_err());
     assert!(QueueName::new("has space").is_err());
     assert!(validate_name(&"n".repeat(65)).is_err());

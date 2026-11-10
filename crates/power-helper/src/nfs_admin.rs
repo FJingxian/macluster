@@ -627,11 +627,11 @@ mod tests {
 
         let result = run_child_bounded(command, b"{}", Duration::from_millis(100));
         let elapsed = started.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+        if let Ok(pid) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = pid.trim().parse::<libc::pid_t>()
+        {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
             }
         }
         let _ = std::fs::remove_file(pid_file);

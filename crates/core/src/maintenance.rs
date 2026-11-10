@@ -314,7 +314,7 @@ impl MaintenanceLock {
     }
 
     fn acquire_resolved(config_path: &Path, operation: libc::c_int) -> io::Result<Self> {
-        let lock_path = lock_path(&config_path);
+        let lock_path = lock_path(config_path);
         let file = OpenOptions::new()
             .read(true)
             .write(true)

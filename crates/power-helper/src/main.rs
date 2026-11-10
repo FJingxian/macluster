@@ -63,6 +63,13 @@ struct GpuReading {
     window_ms: u32,
 }
 
+type HardwareSample = (
+    Result<GpuReading, String>,
+    Option<PowerReading>,
+    Option<f32>,
+    Option<Vec<FanReading>>,
+);
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct GpuSampler {
     sampler: macmon::Sampler,
@@ -82,14 +89,7 @@ impl GpuSampler {
         Ok(Self { sampler, supported })
     }
 
-    fn sample(
-        &mut self,
-    ) -> (
-        Result<GpuReading, String>,
-        Option<PowerReading>,
-        Option<f32>,
-        Option<Vec<FanReading>>,
-    ) {
+    fn sample(&mut self) -> HardwareSample {
         let metrics = match self.sampler.get_metrics(GPU_SAMPLE_WINDOW_MS) {
             Ok(metrics) => metrics,
             Err(error) => {
@@ -429,7 +429,7 @@ fn serve_power_client(
     peer_uid: libc::uid_t,
     cache: &Mutex<PowerCache>,
 ) -> Result<(), String> {
-    if peer_uid_for(&stream).ok() != Some(peer_uid) {
+    if peer_uid_for(stream).ok() != Some(peer_uid) {
         let _ = stream.write_all(b"{\"watts\":null,\"scope\":null,\"available\":false,\"reason\":\"unauthorized local user\"}\n");
         return Ok(());
     }

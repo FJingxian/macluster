@@ -1225,10 +1225,10 @@ mod tests {
         fs::write(&payload, b"payload").unwrap();
         let staged = std::collections::BTreeMap::from([("payload".into(), payload.clone())]);
 
-        let result: Result<(), ()> = (|| {
+        let result: Result<(), ()> = {
             let _guard = super::PayloadCleanupGuard(staged);
             Err(())
-        })();
+        };
 
         assert!(result.is_err());
         assert!(!payload.exists());

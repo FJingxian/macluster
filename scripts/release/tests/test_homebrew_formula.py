@@ -22,7 +22,7 @@ class HomebrewFormulaTests(unittest.TestCase):
         )
         self.assertIn(f'sha256 "{digest}"', formula)
         self.assertIn("depends_on arch: :arm64", formula)
-        self.assertIn('depends_on macos: ">= :monterey"', formula)
+        self.assertIn("depends_on macos: :monterey", formula)
         self.assertIn('bin.install "macluster"', formula)
         self.assertIn(
             "aliases = %w[msub mjob mqueue mkill mtop mnode mfans]",
@@ -30,6 +30,7 @@ class HomebrewFormulaTests(unittest.TestCase):
         )
         self.assertIn('bin.install_symlink bin/"macluster" => name', formula)
         self.assertIn('assert_match version.to_s', formula)
+        self.assertIn('assert_predicate bin/name, :symlink?', formula)
         self.assertTrue(formula.startswith("# typed: strict\n"))
         self.assertIn("livecheck do", formula)
         self.assertIn("strategy :github_latest", formula)

@@ -49,7 +49,7 @@ class Macluster < Formula
   end
 
   depends_on arch: :arm64
-  depends_on macos: ">= :monterey"
+  depends_on macos: :monterey
 
   def install
     bin.install "macluster"
@@ -61,6 +61,10 @@ class Macluster < Formula
 
   test do
     assert_match version.to_s, shell_output("#{{bin}}/macluster --version")
+    aliases = %w[msub mjob mqueue mkill mtop mnode mfans]
+    aliases.each do |name|
+      assert_predicate bin/name, :symlink?
+    end
   end
 end
 """

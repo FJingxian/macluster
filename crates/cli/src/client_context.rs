@@ -46,11 +46,16 @@ impl RemoteContext {
             ensure_client_storage,
             profile.installed_mount_descriptor(),
             &descriptor,
+            &profile.nfs_client_ip,
         ) {
             let mut installed = profile.installed_mount_descriptor().cloned();
             for attempt in 0..3 {
                 let mounts_changed = installed.as_ref().is_none_or(|previous| {
-                    !crate::client_storage::mount_layout_matches(previous, &descriptor)
+                    !crate::client_storage::mount_layout_matches(
+                        previous,
+                        &descriptor,
+                        &profile.nfs_client_ip,
+                    )
                 });
                 if !mounts_changed {
                     break;
@@ -63,7 +68,11 @@ impl RemoteContext {
                 }
                 for descriptor in installed.iter().chain(std::iter::once(&descriptor)) {
                     if !profile.transition_mount_descriptors.iter().any(|existing| {
-                        crate::client_storage::mount_layout_matches(existing, descriptor)
+                        crate::client_storage::mount_layout_matches(
+                            existing,
+                            descriptor,
+                            &profile.nfs_client_ip,
+                        )
                     }) {
                         profile
                             .transition_mount_descriptors
@@ -79,11 +88,13 @@ impl RemoteContext {
                         &profile.cluster_uuid,
                         previous,
                         &descriptor,
+                        &profile.nfs_client_ip,
                     )?;
                 } else {
                     crate::client_storage::install_client_mounts(
                         &profile.cluster_uuid,
                         &descriptor,
+                        &profile.nfs_client_ip,
                     )?;
                 }
                 installed = Some(descriptor.clone());
@@ -204,11 +215,12 @@ fn needs_mount_reconciliation(
     storage_command: bool,
     installed: Option<&ClientDescriptor>,
     current: &ClientDescriptor,
+    client_ip: &str,
 ) -> bool {
     mounts_enabled
         && storage_command
         && installed.is_none_or(|installed| {
-            !crate::client_storage::mount_layout_matches(installed, current)
+            !crate::client_storage::mount_layout_matches(installed, current, client_ip)
         })
 }
 
@@ -324,15 +336,29 @@ mod tests {
             true,
             false,
             Some(&older),
-            &descriptor
+            &descriptor,
+            "192.0.2.10",
         ));
-        assert!(!needs_mount_reconciliation(false, true, None, &descriptor));
-        assert!(needs_mount_reconciliation(true, true, None, &descriptor));
+        assert!(!needs_mount_reconciliation(
+            false,
+            true,
+            None,
+            &descriptor,
+            "192.0.2.10"
+        ));
+        assert!(needs_mount_reconciliation(
+            true,
+            true,
+            None,
+            &descriptor,
+            "192.0.2.10"
+        ));
         assert!(!needs_mount_reconciliation(
             true,
             true,
             Some(&older),
-            &descriptor
+            &descriptor,
+            "192.0.2.10",
         ));
     }
 
@@ -394,7 +420,8 @@ mod tests {
             true,
             true,
             Some(&installed),
-            &descriptor
+            &descriptor,
+            "192.0.2.10",
         ));
     }
 
@@ -420,7 +447,8 @@ mod tests {
             true,
             true,
             Some(&installed),
-            &descriptor
+            &descriptor,
+            "192.0.2.10",
         ));
     }
 }

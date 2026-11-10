@@ -279,7 +279,10 @@ pub fn join_cluster_expected(
                 .as_ref()
                 .filter(|_| existing_mounts_active)
                 .map(|value| {
-                    crate::client_storage::distinct_mount_layouts(value.mount_cleanup_descriptors())
+                    crate::client_storage::distinct_mount_layouts(
+                        value.mount_cleanup_descriptors(),
+                        &value.nfs_client_ip,
+                    )
                 })
                 .unwrap_or_default();
         } else {
@@ -294,10 +297,15 @@ pub fn join_cluster_expected(
         store.save(&profile).map_err(|error| error.to_string())?;
         profile_persisted = true;
         if control_only && let Some(existing) = existing.as_ref() {
-            for descriptor in
-                crate::client_storage::distinct_mount_layouts(existing.mount_cleanup_descriptors())
-            {
-                crate::client_storage::remove_client_mounts(&existing.cluster_uuid, &descriptor)?;
+            for descriptor in crate::client_storage::distinct_mount_layouts(
+                existing.mount_cleanup_descriptors(),
+                &existing.nfs_client_ip,
+            ) {
+                crate::client_storage::remove_client_mounts(
+                    &existing.cluster_uuid,
+                    &descriptor,
+                    &existing.nfs_client_ip,
+                )?;
             }
             profile.mounted_descriptor = None;
             profile.transition_mount_descriptors.clear();
@@ -331,9 +339,14 @@ pub fn join_cluster_expected(
                         &profile.cluster_uuid,
                         previous,
                         descriptor,
+                        &profile.nfs_client_ip,
                     )
                 } else {
-                    crate::client_storage::install_client_mounts(&profile.cluster_uuid, descriptor)
+                    crate::client_storage::install_client_mounts(
+                        &profile.cluster_uuid,
+                        descriptor,
+                        &profile.nfs_client_ip,
+                    )
                 };
                 result.map_err(|error| {
                     format!(

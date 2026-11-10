@@ -201,6 +201,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                     if let Err(error) = crate::client_storage::remove_client_mounts(
                         &profile.cluster_uuid,
                         &descriptor,
+                        &profile.nfs_client_ip,
                     ) {
                         return Err((
                             1,
@@ -755,7 +756,10 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
 fn mount_cleanup_layouts(
     profile: &crate::client_profile::ClientProfile,
 ) -> Vec<macluster_protocol::control::ClientDescriptor> {
-    crate::client_storage::distinct_mount_layouts(profile.mount_cleanup_descriptors())
+    crate::client_storage::distinct_mount_layouts(
+        profile.mount_cleanup_descriptors(),
+        &profile.nfs_client_ip,
+    )
 }
 
 struct InteractiveRequestFile {
@@ -824,6 +828,14 @@ fn remote_command(
     command: &str,
     args: &[String],
 ) -> AppResult<()> {
+    let profile = ensure_remote_command_storage_with(
+        profile,
+        command,
+        args,
+        |endpoint, control_only, expected_cluster_uuid| {
+            crate::client_join::join_cluster_expected(endpoint, control_only, expected_cluster_uuid)
+        },
+    )?;
     if command == "submit" {
         run_remote_submit_preflight(&profile)?;
     }
@@ -867,6 +879,48 @@ fn remote_command(
             format!("command '{command}' is not yet available through the login-client transport"),
         )),
     }
+}
+
+fn ensure_remote_command_storage_with<F>(
+    profile: crate::client_profile::ClientProfile,
+    command: &str,
+    args: &[String],
+    mut enable_storage: F,
+) -> AppResult<crate::client_profile::ClientProfile>
+where
+    F: FnMut(&str, bool, Option<&str>) -> Result<crate::client_profile::ClientProfile, String>,
+{
+    if profile.mounts_enabled || !remote_command_requires_client_storage(command, args) {
+        return Ok(profile);
+    }
+    let endpoint = format!(
+        "{}@{}:{}",
+        profile.controller_user, profile.controller_host, profile.controller_port
+    );
+    eprintln!(
+        "Cluster '{}' is currently a control-only login client; enabling shared storage and submissions.",
+        profile.cluster_name
+    );
+    let upgraded =
+        enable_storage(&endpoint, false, Some(profile.cluster_uuid.as_str())).map_err(|error| {
+            (
+                1,
+                format!(
+                    "could not enable shared storage for cluster '{}': {error}",
+                    profile.cluster_name
+                ),
+            )
+        })?;
+    if !upgraded.mounts_enabled {
+        return Err((
+            1,
+            format!(
+                "cluster '{}' remained a control-only login client after storage setup",
+                profile.cluster_name
+            ),
+        ));
+    }
+    Ok(upgraded)
 }
 
 fn run_remote_submit_preflight(profile: &crate::client_profile::ClientProfile) -> AppResult<()> {
@@ -936,6 +990,12 @@ fn remote_command_requires_client_storage(command: &str, _args: &[String]) -> bo
     command == "submit"
 }
 
+fn remote_interactive_submission_args(args: &[String]) -> Vec<String> {
+    std::iter::once("submit".to_owned())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
 fn remote_submit(
     remote: &mut crate::client_context::RemoteContext,
     args: &[String],
@@ -959,6 +1019,7 @@ fn remote_submit(
         crate::client_storage::verify_client_mounts(
             &remote.descriptor,
             spec.required_shares.as_deref(),
+            &remote.profile.nfs_client_ip,
         )
         .map_err(|error| (1, error))?;
         let cwd = PathBuf::from(&spec.cwd);
@@ -968,7 +1029,7 @@ fn remote_submit(
             .map_err(|error| (1, error.to_string()))?;
         let request_path = request_dir.join(format!("{}.json", Id128::random()));
         let request = crate::remote_admin::InteractiveRequest {
-            args: args.to_vec(),
+            args: remote_interactive_submission_args(args),
             cwd: cwd.to_string_lossy().into_owned(),
             environment: env::vars().collect(),
         };
@@ -1004,6 +1065,7 @@ fn remote_submit(
     crate::client_storage::verify_client_mounts(
         &remote.descriptor,
         spec.required_shares.as_deref(),
+        &remote.profile.nfs_client_ip,
     )
     .map_err(|error| (1, error))?;
     let request_id = options
@@ -12025,10 +12087,90 @@ mod update_terminal_regressions {
 #[cfg(test)]
 mod remote_client_regressions {
     use super::{
-        AutomaticJoinCandidate, Id128, InteractiveRequestFile, job_uses_remote_cli,
-        queue_uses_remote_cli, remote_command_requires_client_storage,
-        select_automatic_join_candidates,
+        AutomaticJoinCandidate, Id128, InteractiveRequestFile, ensure_remote_command_storage_with,
+        job_uses_remote_cli, queue_uses_remote_cli, remote_command_requires_client_storage,
+        remote_interactive_submission_args, select_automatic_join_candidates,
     };
+
+    fn control_only_profile() -> crate::client_profile::ClientProfile {
+        crate::client_profile::ClientProfile {
+            version: crate::client_profile::CLIENT_PROFILE_VERSION,
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            binding_digest: "b".repeat(64),
+            namespace: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            descriptor_generation: 1,
+            controller_host: "192.0.2.1".into(),
+            controller_user: "login".into(),
+            controller_port: 2222,
+            known_hosts_path: "/tmp/known_hosts".into(),
+            identity_file: "/tmp/id_ed25519".into(),
+            remote_uid: 501,
+            remote_binary: "/opt/homebrew/bin/macluster".into(),
+            remote_config: "/tmp/config.toml".into(),
+            remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: false,
+            nfs_client_id: "client-test".into(),
+            nfs_client_ip: "192.0.2.10".into(),
+            last_used_unix_ms: 1,
+            descriptor: None,
+            mounted_descriptor: None,
+            transition_mount_descriptors: vec![],
+            retired_access: vec![],
+            leave_phase: None,
+        }
+    }
+
+    #[test]
+    fn storage_command_upgrades_a_control_only_profile_for_the_same_cluster() {
+        let profile = control_only_profile();
+        let expected_uuid = profile.cluster_uuid.clone();
+        let mut join_request = None;
+        let upgraded = ensure_remote_command_storage_with(
+            profile,
+            "submit",
+            &[],
+            |endpoint, control_only, expected_cluster_uuid| {
+                join_request = Some((
+                    endpoint.to_owned(),
+                    control_only,
+                    expected_cluster_uuid.map(str::to_owned),
+                ));
+                let mut upgraded = control_only_profile();
+                upgraded.mounts_enabled = true;
+                Ok(upgraded)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            join_request,
+            Some(("login@192.0.2.1:2222".into(), false, Some(expected_uuid)))
+        );
+        assert!(upgraded.mounts_enabled);
+    }
+
+    #[test]
+    fn remote_interactive_submission_keeps_the_submit_module() {
+        assert_eq!(
+            remote_interactive_submission_args(&["-Is".into(), "pwd".into()]),
+            vec!["submit", "-Is", "pwd"]
+        );
+    }
+
+    #[test]
+    fn monitoring_does_not_upgrade_a_control_only_profile() {
+        let profile = ensure_remote_command_storage_with(
+            control_only_profile(),
+            "top",
+            &[],
+            |_, _, _| -> Result<crate::client_profile::ClientProfile, String> {
+                panic!("monitoring must not enable client storage")
+            },
+        )
+        .unwrap();
+        assert!(!profile.mounts_enabled);
+    }
 
     #[test]
     fn remote_job_logs_and_resource_streams_use_the_full_controller_cli() {

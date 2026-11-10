@@ -11,36 +11,56 @@ use crate::node_admin::shell_quote;
 const HELPER_ROOT: &str = "/Library/PrivilegedHelperTools";
 const DAEMON_ROOT: &str = "/Library/LaunchDaemons";
 
-fn mounts(descriptor: &ClientDescriptor) -> Vec<(String, String)> {
-    let mut mounts = vec![(
-        format!(
-            "{}:{}",
-            descriptor.primary_source_host, descriptor.primary_source_root
-        ),
-        descriptor.primary_mount_root.clone(),
-    )];
-    mounts.extend(descriptor.shares.iter().map(|share| {
-        (
-            format!("{}:{}", share.server_host, share.source_root),
-            share.mount_root.clone(),
-        )
-    }));
+fn source_is_client_local(source_host: &str, client_ip: &str) -> bool {
+    source_host == client_ip
+}
+
+fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<(String, String)> {
+    let mut mounts = Vec::new();
+    if !source_is_client_local(&descriptor.primary_source_host, client_ip) {
+        mounts.push((
+            format!(
+                "{}:{}",
+                descriptor.primary_source_host, descriptor.primary_source_root
+            ),
+            descriptor.primary_mount_root.clone(),
+        ));
+    }
+    mounts.extend(
+        descriptor
+            .shares
+            .iter()
+            .filter(|share| !source_is_client_local(&share.server_host, client_ip))
+            .map(|share| {
+                (
+                    format!("{}:{}", share.server_host, share.source_root),
+                    share.mount_root.clone(),
+                )
+            }),
+    );
     mounts
 }
 
-pub(crate) fn mount_layout_matches(left: &ClientDescriptor, right: &ClientDescriptor) -> bool {
-    mounts(left).into_iter().collect::<BTreeSet<_>>()
-        == mounts(right).into_iter().collect::<BTreeSet<_>>()
+pub(crate) fn mount_layout_matches(
+    left: &ClientDescriptor,
+    right: &ClientDescriptor,
+    client_ip: &str,
+) -> bool {
+    mounts(left, client_ip).into_iter().collect::<BTreeSet<_>>()
+        == mounts(right, client_ip)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
 }
 
 pub(crate) fn distinct_mount_layouts<'a>(
     descriptors: impl IntoIterator<Item = &'a ClientDescriptor>,
+    client_ip: &str,
 ) -> Vec<ClientDescriptor> {
     let mut layouts = Vec::new();
     for descriptor in descriptors {
         if !layouts
             .iter()
-            .any(|existing| mount_layout_matches(existing, descriptor))
+            .any(|existing| mount_layout_matches(existing, descriptor, client_ip))
         {
             layouts.push(descriptor.clone());
         }
@@ -48,10 +68,14 @@ pub(crate) fn distinct_mount_layouts<'a>(
     layouts
 }
 
-fn retired_mounts(previous: &ClientDescriptor, next: &ClientDescriptor) -> Vec<(String, String)> {
-    let retained = mounts(next).into_iter().collect::<BTreeSet<_>>();
+fn retired_mounts(
+    previous: &ClientDescriptor,
+    next: &ClientDescriptor,
+    client_ip: &str,
+) -> Vec<(String, String)> {
+    let retained = mounts(next, client_ip).into_iter().collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
-    mounts(previous)
+    mounts(previous, client_ip)
         .into_iter()
         .filter(|mount| !retained.contains(mount) && seen.insert(mount.clone()))
         .collect()
@@ -65,12 +89,13 @@ fn client_mount_script(
     cluster_uuid: &str,
     descriptor: &ClientDescriptor,
     previous: Option<&ClientDescriptor>,
+    client_ip: &str,
 ) -> String {
     let label = label(cluster_uuid);
     let helper = format!("{HELPER_ROOT}/{label}.sh");
     let plist = format!("{DAEMON_ROOT}/{label}.plist");
     let mut body = "#!/bin/sh\nset -eu\n".to_owned();
-    for (source, target) in mounts(descriptor) {
+    for (source, target) in mounts(descriptor, client_ip) {
         let source_arg = shell_quote(&source);
         let target_arg = shell_quote(&target);
         let mounted_target = shell_quote(&format!(" on {target} ("));
@@ -84,7 +109,7 @@ fn client_mount_script(
     );
     let mut retired = String::new();
     if let Some(previous) = previous {
-        for (source, target) in retired_mounts(previous, descriptor) {
+        for (source, target) in retired_mounts(previous, descriptor, client_ip) {
             let target_arg = shell_quote(&target);
             let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
             retired.push_str(&format!(
@@ -99,14 +124,18 @@ fn client_mount_script(
     )
 }
 
-fn client_remove_script(cluster_uuid: &str, descriptor: &ClientDescriptor) -> String {
+fn client_remove_script(
+    cluster_uuid: &str,
+    descriptor: &ClientDescriptor,
+    client_ip: &str,
+) -> String {
     let label = label(cluster_uuid);
     let helper = format!("{HELPER_ROOT}/{label}.sh");
     let plist = format!("{DAEMON_ROOT}/{label}.plist");
     let mut script = format!(
         "#!/bin/sh\nset -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\n"
     );
-    for (source, target) in mounts(descriptor) {
+    for (source, target) in mounts(descriptor, client_ip) {
         let target_arg = shell_quote(&target);
         let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
         script.push_str(&format!(
@@ -121,7 +150,7 @@ fn client_remove_script(cluster_uuid: &str, descriptor: &ClientDescriptor) -> St
     script
 }
 
-fn overlay_targets(descriptor: &ClientDescriptor) -> Result<Vec<PathBuf>, String> {
+fn overlay_targets(descriptor: &ClientDescriptor, client_ip: &str) -> Result<Vec<PathBuf>, String> {
     let mount_table = Command::new("/sbin/mount")
         .output()
         .map_err(|error| format!("cannot inspect current mounts: {error}"))?;
@@ -133,7 +162,7 @@ fn overlay_targets(descriptor: &ClientDescriptor) -> Result<Vec<PathBuf>, String
     }
     let mount_table = String::from_utf8_lossy(&mount_table.stdout);
     let mut overlays = Vec::new();
-    for (source, target) in mounts(descriptor) {
+    for (source, target) in mounts(descriptor, client_ip) {
         let path = PathBuf::from(&target);
         if mount_table_has_exact(&mount_table, &source, &target) {
             continue;
@@ -194,20 +223,26 @@ fn mount_table_has_exact(mount_table: &str, source: &str, target: &str) -> bool 
 fn required_mounts(
     descriptor: &ClientDescriptor,
     required_shares: Option<&[String]>,
+    client_ip: &str,
 ) -> Vec<(String, String)> {
-    let mut required = vec![(
-        format!(
-            "{}:{}",
-            descriptor.primary_source_host, descriptor.primary_source_root
-        ),
-        descriptor.primary_mount_root.clone(),
-    )];
+    let mut required = Vec::new();
+    if !source_is_client_local(&descriptor.primary_source_host, client_ip) {
+        required.push((
+            format!(
+                "{}:{}",
+                descriptor.primary_source_host, descriptor.primary_source_root
+            ),
+            descriptor.primary_mount_root.clone(),
+        ));
+    }
     required.extend(
         descriptor
             .shares
             .iter()
             .filter(|share| {
-                required_shares.is_none_or(|required| required.iter().any(|id| id == &share.id))
+                !source_is_client_local(&share.server_host, client_ip)
+                    && required_shares
+                        .is_none_or(|required| required.iter().any(|id| id == &share.id))
             })
             .map(|share| {
                 (
@@ -223,8 +258,9 @@ fn missing_mounts(
     descriptor: &ClientDescriptor,
     mount_table: &str,
     required_shares: Option<&[String]>,
+    client_ip: &str,
 ) -> Vec<(String, String)> {
-    required_mounts(descriptor, required_shares)
+    required_mounts(descriptor, required_shares, client_ip)
         .into_iter()
         .filter(|(source, target)| !mount_table_has_exact(mount_table, source, target))
         .collect()
@@ -233,6 +269,7 @@ fn missing_mounts(
 pub(crate) fn verify_client_mounts(
     descriptor: &ClientDescriptor,
     required_shares: Option<&[String]>,
+    client_ip: &str,
 ) -> Result<(), String> {
     let mount_table = Command::new("/sbin/mount")
         .output()
@@ -247,6 +284,7 @@ pub(crate) fn verify_client_mounts(
         descriptor,
         &String::from_utf8_lossy(&mount_table.stdout),
         required_shares,
+        client_ip,
     );
     if missing.is_empty() {
         Ok(())
@@ -262,8 +300,8 @@ pub(crate) fn verify_client_mounts(
     }
 }
 
-fn confirm_overlays(descriptor: &ClientDescriptor) -> Result<(), String> {
-    let overlays = overlay_targets(descriptor)?;
+fn confirm_overlays(descriptor: &ClientDescriptor, client_ip: &str) -> Result<(), String> {
+    let overlays = overlay_targets(descriptor, client_ip)?;
     if overlays.is_empty() {
         return Ok(());
     }
@@ -305,21 +343,29 @@ fn confirm_overlays(descriptor: &ClientDescriptor) -> Result<(), String> {
 pub(crate) fn install_client_mounts(
     cluster_uuid: &str,
     descriptor: &ClientDescriptor,
+    client_ip: &str,
 ) -> Result<(), String> {
-    confirm_overlays(descriptor)?;
-    run_client_mount_script(client_mount_script(cluster_uuid, descriptor, None))
+    confirm_overlays(descriptor, client_ip)?;
+    run_client_mount_script(client_mount_script(
+        cluster_uuid,
+        descriptor,
+        None,
+        client_ip,
+    ))
 }
 
 pub(crate) fn replace_client_mounts(
     cluster_uuid: &str,
     previous: &ClientDescriptor,
     descriptor: &ClientDescriptor,
+    client_ip: &str,
 ) -> Result<(), String> {
-    confirm_overlays(descriptor)?;
+    confirm_overlays(descriptor, client_ip)?;
     run_client_mount_script(client_mount_script(
         cluster_uuid,
         descriptor,
         Some(previous),
+        client_ip,
     ))
 }
 
@@ -341,8 +387,9 @@ fn run_client_mount_script(script: String) -> Result<(), String> {
 pub(crate) fn remove_client_mounts(
     cluster_uuid: &str,
     descriptor: &ClientDescriptor,
+    client_ip: &str,
 ) -> Result<(), String> {
-    let script = client_remove_script(cluster_uuid, descriptor);
+    let script = client_remove_script(cluster_uuid, descriptor, client_ip);
     let status = std::process::Command::new("/usr/bin/sudo")
         .args(["/bin/sh", "-c", &script])
         .status()
@@ -403,10 +450,10 @@ mod tests {
         next.controller_build_id = "new-build".into();
         next.default_queue = "batch".parse().unwrap();
         next.queues[0].name = "batch".parse().unwrap();
-        assert!(mount_layout_matches(&descriptor(), &next));
+        assert!(mount_layout_matches(&descriptor(), &next, "192.0.2.10"));
 
         next.primary_source_root = "/Users/Shared/macluster-v2".into();
-        assert!(!mount_layout_matches(&descriptor(), &next));
+        assert!(!mount_layout_matches(&descriptor(), &next, "192.0.2.10"));
     }
 
     #[test]
@@ -415,15 +462,19 @@ mod tests {
         let mut second = first.clone();
         second.primary_source_root = "/Users/Shared/macluster-v2".into();
         assert_eq!(
-            distinct_mount_layouts([&first, &second]),
+            distinct_mount_layouts([&first, &second], "192.0.2.10"),
             vec![first, second]
         );
     }
 
     #[test]
     fn mount_script_contains_exact_primary_and_named_sources() {
-        let script =
-            client_mount_script("f779bcf5-ea85-5caa-9579-74b395f3cce5", &descriptor(), None);
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor(),
+            None,
+            "192.0.2.10",
+        );
         assert!(script.contains("192.0.2.1:/Users/Shared/macluster"));
         assert!(script.contains("192.0.2.1:/opt/homebrew"));
         assert!(script.contains("/Library/LaunchDaemons/org.macluster.client-mount."));
@@ -431,8 +482,34 @@ mod tests {
     }
 
     #[test]
+    fn client_does_not_mount_storage_hosted_on_its_own_address() {
+        let mut descriptor = descriptor();
+        descriptor.shares.push(ClientShareDescriptor {
+            id: "local-disk".into(),
+            server: "worker".parse().unwrap(),
+            server_host: "192.0.2.10".into(),
+            source_root: "/Volumes/data".into(),
+            mount_root: "/Volumes/data".into(),
+            share_uuid: "55fb9b02-ce96-5a69-8ad3-356563eff27b".into(),
+        });
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor,
+            None,
+            "192.0.2.10",
+        );
+        assert!(!script.contains("192.0.2.10:/Volumes/data"));
+        assert!(script.contains("192.0.2.1:/Users/Shared/macluster"));
+        assert_eq!(missing_mounts(&descriptor, "", None, "192.0.2.10").len(), 2);
+    }
+
+    #[test]
     fn remove_script_unloads_only_its_cluster_daemon() {
-        let script = client_remove_script("f779bcf5-ea85-5caa-9579-74b395f3cce5", &descriptor());
+        let script = client_remove_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor(),
+            "192.0.2.10",
+        );
         assert!(script.contains("org.macluster.client-mount.240edfcc"));
         assert!(script.contains("/Users/Shared/macluster"));
         assert!(script.contains("/opt/homebrew"));
@@ -440,8 +517,12 @@ mod tests {
 
     #[test]
     fn mount_helper_is_valid_posix_shell() {
-        let script =
-            client_mount_script("f779bcf5-ea85-5caa-9579-74b395f3cce5", &descriptor(), None);
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor(),
+            None,
+            "192.0.2.10",
+        );
         let helper = script
             .split_once("<<'MACLUSTER_HELPER'\n")
             .and_then(|(_, remainder)| remainder.split_once("\nMACLUSTER_HELPER"))
@@ -486,7 +567,12 @@ mod tests {
         descriptor.primary_mount_root = target.to_string_lossy().into_owned();
         descriptor.primary_source_root = root.join("source").to_string_lossy().into_owned();
         descriptor.shares.clear();
-        let script = client_mount_script("f779bcf5-ea85-5caa-9579-74b395f3cce5", &descriptor, None);
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor,
+            None,
+            "192.0.2.10",
+        );
         let helper = script
             .split_once("<<'MACLUSTER_HELPER'\n")
             .and_then(|(_, remainder)| remainder.split_once("\nMACLUSTER_HELPER"))
@@ -525,7 +611,10 @@ mod tests {
         let mut descriptor = descriptor();
         descriptor.primary_mount_root = target.to_string_lossy().into_owned();
         descriptor.shares.clear();
-        assert_eq!(overlay_targets(&descriptor).unwrap(), vec![target.clone()]);
+        assert_eq!(
+            overlay_targets(&descriptor, "192.0.2.10").unwrap(),
+            vec![target.clone()]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -535,12 +624,12 @@ mod tests {
         let mut next = old.clone();
         next.shares[0].source_root = "/opt/homebrew-next".into();
         assert_eq!(
-            retired_mounts(&old, &next),
+            retired_mounts(&old, &next, "192.0.2.10"),
             vec![("192.0.2.1:/opt/homebrew".into(), "/opt/homebrew".into())]
         );
         next.shares.clear();
         assert_eq!(
-            retired_mounts(&old, &next),
+            retired_mounts(&old, &next, "192.0.2.10"),
             vec![("192.0.2.1:/opt/homebrew".into(), "/opt/homebrew".into())]
         );
     }
@@ -548,24 +637,28 @@ mod tests {
     #[test]
     fn storage_verification_requires_every_exact_source_and_target() {
         let descriptor = descriptor();
-        assert_eq!(missing_mounts(&descriptor, "", None).len(), 2);
+        assert_eq!(missing_mounts(&descriptor, "", None, "192.0.2.10").len(), 2);
         let mounted = "192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs, nodev)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs, nodev)\n";
-        assert!(missing_mounts(&descriptor, mounted, None).is_empty());
+        assert!(missing_mounts(&descriptor, mounted, None, "192.0.2.10").is_empty());
         let wrong = "198.51.100.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
         assert_eq!(
-            missing_mounts(&descriptor, wrong, None),
+            missing_mounts(&descriptor, wrong, None, "192.0.2.10"),
             vec![(
                 "192.0.2.1:/Users/Shared/macluster".into(),
                 "/Users/Shared/macluster".into()
             )]
         );
         let prefix_collision = "x192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew-old (nfs)\n";
-        assert_eq!(missing_mounts(&descriptor, prefix_collision, None).len(), 2);
+        assert_eq!(
+            missing_mounts(&descriptor, prefix_collision, None, "192.0.2.10").len(),
+            2
+        );
         assert_eq!(
             missing_mounts(
                 &descriptor,
                 "192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n",
                 Some(&[]),
+                "192.0.2.10",
             )
             .len(),
             0

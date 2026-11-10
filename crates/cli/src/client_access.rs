@@ -44,16 +44,34 @@ fn client_requests(
     validate_client_ip(client_ip)?;
 
     let mut grouped = BTreeMap::new();
-    grouped
-        .entry(config.storage_server.to_string())
-        .or_insert_with(Vec::new)
-        .push(NfsExportRequest {
-            root: config.primary_source_root().to_string_lossy().into_owned(),
-            client_ip: client_ip.to_owned(),
-            share_uuid: config.share_uuid.to_ascii_lowercase(),
-            node_id: client_id.to_owned(),
-        });
+    let primary_server = config
+        .nodes
+        .get(config.storage_server.as_str())
+        .ok_or_else(|| {
+            format!(
+                "NFS storage server '{}' is not configured",
+                config.storage_server
+            )
+        })?;
+    if primary_server.host != client_ip {
+        grouped
+            .entry(config.storage_server.to_string())
+            .or_insert_with(Vec::new)
+            .push(NfsExportRequest {
+                root: config.primary_source_root().to_string_lossy().into_owned(),
+                client_ip: client_ip.to_owned(),
+                share_uuid: config.share_uuid.to_ascii_lowercase(),
+                node_id: client_id.to_owned(),
+            });
+    }
     for share in config.shares.values() {
+        let server = config
+            .nodes
+            .get(share.server.as_str())
+            .ok_or_else(|| format!("NFS storage server '{}' is not configured", share.server))?;
+        if server.host == client_ip {
+            continue;
+        }
         grouped
             .entry(share.server.to_string())
             .or_insert_with(Vec::new)
@@ -431,6 +449,60 @@ share_uuid = "82d02835-f6ab-52b4-aaab-f90cafde9981"
             request.root == "/Users/Shared/tools"
                 && request.share_uuid == "82d02835-f6ab-52b4-aaab-f90cafde9981"
         }));
+    }
+
+    #[test]
+    fn client_requests_skip_storage_hosted_by_the_client_itself() {
+        let config = ClusterConfig::parse(
+            r#"
+[cluster]
+name = "client-access"
+login_node = "login"
+default_queue = "compute"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "f779bcf5-ea85-5caa-9579-74b395f3cce5"
+storage_server = "login"
+protocol_version = 1
+
+[queues.compute]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.1"
+transport = "local"
+machine_uuid = "4c0f4722-1130-50cf-ae36-55ff1abb5146"
+execution_uid = 501
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+
+[shares.tools]
+server = "login"
+source_root = "/Users/Shared/tools"
+mount_root = "/Users/Shared/tools"
+share_uuid = "82d02835-f6ab-52b4-aaab-f90cafde9981"
+
+[shares.local-disk]
+server = "worker"
+source_root = "/Volumes/data"
+mount_root = "/Volumes/data"
+share_uuid = "55fb9b02-ce96-5a69-8ad3-356563eff27b"
+"#,
+        )
+        .unwrap();
+
+        let same_host = client_requests(&config, "client-test", "192.0.2.2").unwrap();
+        assert_eq!(
+            same_host.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["login"]
+        );
+        assert_eq!(same_host["login"].len(), 2);
+
+        let other_host = client_requests(&config, "client-test", "192.0.2.10").unwrap();
+        assert!(other_host.contains_key("login"));
+        assert!(other_host.contains_key("worker"));
     }
 
     #[test]

@@ -21417,7 +21417,7 @@ remote_binary = "/usr/local/bin/macluster"
             serde_json::to_string(&serde_json::to_string(&health).unwrap()).unwrap();
         let log_path = serde_json::to_string(log.to_str().unwrap()).unwrap();
         fs::write(&binary, format!(
-            "#!/usr/bin/python3\nimport json,struct,sys\nwith open({log_path},'a') as f: f.write('call\\n')\nif 'agent-stdio' not in sys.argv: sys.exit(77)\nn=struct.unpack('>I',sys.stdin.buffer.read(4))[0]\nr=json.loads(sys.stdin.buffer.read(n))\nh=json.loads({encoded_health})\np=json.dumps({{'protocol_version':r['protocol_version'],'request_id':r['request_id'],'result':{{'Ok':{{'type':'health','payload':h}}}}}}).encode()\nsys.stdout.buffer.write(struct.pack('>I',len(p))+p)\n"
+            "#!/usr/bin/env python3\nimport json,struct,sys\nwith open({log_path},'a') as f: f.write('call\\n')\nif 'agent-stdio' not in sys.argv: sys.exit(77)\nn=struct.unpack('>I',sys.stdin.buffer.read(4))[0]\nr=json.loads(sys.stdin.buffer.read(n))\nh=json.loads({encoded_health})\np=json.dumps({{'protocol_version':r['protocol_version'],'request_id':r['request_id'],'result':{{'Ok':{{'type':'health','payload':h}}}}}}).encode()\nsys.stdout.buffer.write(struct.pack('>I',len(p))+p)\n"
         )).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         let mut node = parse_build_test_config().nodes["login"].clone();

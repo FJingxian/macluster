@@ -147,7 +147,8 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         false
     };
     reset::ensure_no_reset_in_progress(&config_path, &state_dir)?;
-    if state_dir_has_entries(&state_dir)? {
+    let unbound_controller_state = state_dir_has_entries(&state_dir)?;
+    if unbound_controller_state {
         if reset_completed {
             if let Some(archive) = archive_unbound_controller_state(&state_dir)? {
                 println!(
@@ -156,13 +157,10 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
                 );
             }
         } else {
-            return Err((
-                1,
-                format!(
-                    "controller state directory {} is not empty but no active config exists; restore its matching archived config before rerunning `macluster --init`",
-                    state_dir.display()
-                ),
-            ));
+            eprintln!(
+                "Controller state exists without an active cluster config at {}. It will be archived after you confirm the new cluster.",
+                state_dir.display()
+            );
         }
     }
 
@@ -273,6 +271,26 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
             2,
             "cluster initialization requires terminal confirmation; run `macluster --init` from an interactive Terminal".into(),
         ));
+    }
+
+    if unbound_controller_state && !reset_completed {
+        let controller_lock =
+            macluster_controller::InstanceLock::acquire(&state_dir).map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "cannot archive unbound controller state at {} because a controller still holds its lock: {error}. Stop it, then rerun `macluster --init`",
+                        state_dir.display()
+                    ),
+                )
+            })?;
+        if let Some(archive) = archive_unbound_controller_state(&state_dir)? {
+            println!(
+                "Preserved the pre-existing unbound controller state at {}.",
+                archive.display()
+            );
+        }
+        drop(controller_lock);
     }
 
     if let Some(primary) = options.primary_nfs.as_ref() {

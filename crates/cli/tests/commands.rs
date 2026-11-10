@@ -470,6 +470,77 @@ fn first_top_can_decline_setup_without_creating_or_resetting_state() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn first_top_accept_setup_reenters_init_as_a_top_level_option() {
+    let (root, shared, config) = fixture();
+    fs::remove_file(&config).unwrap();
+    let state = root.join("controller");
+    let input = format!("y\n\n\n{}\n\n\n\n\n\n\n\n\n\n\n\n", shared.display());
+    let (status, output) = command_in_pty_with_args(&config, &state, "mtop", &[], input.as_bytes());
+
+    assert!(!status.success(), "{output}");
+    assert!(output.contains("Cluster name"), "{output}");
+    assert!(
+        !output.contains("`init` is an option, not a command"),
+        "{output}"
+    );
+    assert!(!config.exists());
+    assert!(!state.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn init_archives_unbound_state_left_by_a_former_compute_node() {
+    let (root, shared, _fixture_config) = fixture();
+    let root = root.canonicalize().unwrap();
+    let shared = shared.canonicalize().unwrap();
+    let config = root.join("config.toml");
+    fs::remove_file(&config).unwrap();
+    let state = root.join("controller");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("old-state.txt"), "former compute node state").unwrap();
+    let interfaces = Command::new("/sbin/ifconfig").output().unwrap();
+    let host = String::from_utf8_lossy(&interfaces.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("inet "))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|value| value.parse::<std::net::Ipv4Addr>().ok())
+        .find(|ip| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
+        .expect("init needs a local cluster interface");
+    let args = vec![
+        "--name".into(),
+        "former-compute-login".into(),
+        "--queue".into(),
+        "q".into(),
+        "--shared-root".into(),
+        shared.display().to_string(),
+        "--host".into(),
+        host.to_string(),
+    ];
+
+    let (status, output) = init_in_pty_with_args(&config, &state, &args, b"N\nY\n");
+
+    assert!(status.success(), "{output}");
+    assert!(
+        output.contains("Preserved the pre-existing unbound controller state"),
+        "{output}"
+    );
+    assert!(config.exists());
+    let archive_root = root.join("macluster-archive");
+    let archived = fs::read_dir(archive_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("controller/old-state.txt"))
+        .find(|path| path.is_file())
+        .expect("old controller state should be archived");
+    assert_eq!(
+        fs::read_to_string(archived).unwrap(),
+        "former compute node state"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn init_in_pty(
     config: &std::path::Path,
     state: &std::path::Path,

@@ -5416,7 +5416,7 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
             config_path.to_string_lossy().into_owned(),
             "--state-dir".into(),
             state_dir.to_string_lossy().into_owned(),
-            "init".into(),
+            "--init".into(),
         ];
         run("macluster", &init_args)?;
         if !config_path.is_file() {

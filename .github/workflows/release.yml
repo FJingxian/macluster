@@ -58,6 +58,11 @@ jobs:
           print(f"release version: {version}")
           PY
 
+      - name: Prepare isolated test home permissions
+        run: |
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
       - name: Run workspace tests
         run: cargo test --workspace --all-targets -- --test-threads=1
 

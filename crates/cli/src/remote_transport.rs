@@ -1,5 +1,8 @@
 use std::{
+    fs,
     io::{self, Read, Write},
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
@@ -12,9 +15,18 @@ pub(crate) struct RemoteControlStream {
 }
 
 impl RemoteControlStream {
-    pub(crate) fn connect(profile: &ClientProfile) -> io::Result<Self> {
+    pub(crate) fn connect(
+        profile: &ClientProfile,
+        ensure_client_storage: bool,
+    ) -> io::Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+        let directory = home.join(".ssh/macluster");
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         let mut child = Command::new("/usr/bin/ssh")
-            .args(remote_ssh_args(profile))
+            .args(remote_ssh_args(profile, ensure_client_storage))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -62,8 +74,32 @@ impl Drop for RemoteControlStream {
     }
 }
 
-pub(crate) fn remote_ssh_args(profile: &ClientProfile) -> Vec<String> {
-    vec![
+pub(crate) fn control_socket_path(profile: &ClientProfile) -> io::Result<String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
+    let endpoint = format!(
+        "{}\0{}\0{}\0{}",
+        profile.controller_user,
+        profile.controller_host,
+        profile.controller_port,
+        profile.identity_file
+    );
+    let digest = macluster_protocol::framing::sha256_hex(endpoint.as_bytes())
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    Ok(home
+        .join(".ssh/macluster")
+        .join(format!(
+            "mc-{}-{}.sock",
+            &profile.cluster_uuid[..8],
+            &digest[..16]
+        ))
+        .to_string_lossy()
+        .into_owned())
+}
+
+pub(crate) fn remote_ssh_args(profile: &ClientProfile, ensure_client_storage: bool) -> Vec<String> {
+    let mut args = vec![
         "-T".into(),
         "-oLogLevel=ERROR".into(),
         "-oBatchMode=yes".into(),
@@ -72,13 +108,16 @@ pub(crate) fn remote_ssh_args(profile: &ClientProfile) -> Vec<String> {
         format!("-oHostKeyAlias=macluster-{}", profile.cluster_uuid),
         "-oConnectTimeout=4".into(),
         "-oConnectionAttempts=1".into(),
+        "-oServerAliveInterval=5".into(),
+        "-oServerAliveCountMax=3".into(),
         "-oControlMaster=auto".into(),
         "-oControlPersist=300".into(),
-        format!(
-            "-oControlPath={}/.ssh/macluster/client-{}.sock",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-            profile.cluster_uuid
-        ),
+    ];
+    let control_path = control_socket_path(profile)
+        .map(|path| format!("-oControlPath={path}"))
+        .unwrap_or_else(|_| "-oControlMaster=no".into());
+    args.push(control_path);
+    args.extend([
         "-i".into(),
         profile.identity_file.clone(),
         "-oIdentitiesOnly=yes".into(),
@@ -94,14 +133,44 @@ pub(crate) fn remote_ssh_args(profile: &ClientProfile) -> Vec<String> {
         profile.remote_state_dir.clone(),
         "internal".into(),
         "control-proxy".into(),
-    ]
+    ]);
+    if ensure_client_storage && profile.mounts_enabled {
+        args.extend([
+            "--client-storage-id".into(),
+            profile.nfs_client_id.clone(),
+            "--registered-client-ip".into(),
+            profile.nfs_client_ip.clone(),
+        ]);
+    }
+    args
 }
 
-pub(crate) fn validate_proxy_args(args: &[String]) -> Result<(String, String), String> {
-    if args.len() != 4 || args[0] != "--config" || args[2] != "--state-dir" {
+pub(crate) struct ProxyArgs {
+    pub(crate) config_path: String,
+    pub(crate) state_dir: String,
+    pub(crate) client_storage: Option<(String, String)>,
+}
+
+pub(crate) fn validate_proxy_args(args: &[String]) -> Result<ProxyArgs, String> {
+    if args.len() != 4 && args.len() != 8 {
+        return Err("control-proxy requires --config PATH --state-dir PATH [--client-storage-id ID --registered-client-ip IP]".into());
+    }
+    if args[0] != "--config" || args[2] != "--state-dir" {
         return Err("control-proxy requires --config PATH --state-dir PATH".into());
     }
-    Ok((args[1].clone(), args[3].clone()))
+    let client_storage = if args.len() == 8 {
+        if args[4] != "--client-storage-id" || args[6] != "--registered-client-ip" {
+            return Err("control-proxy received invalid client-storage arguments".into());
+        }
+        Some((args[5].clone(), args[7].clone()))
+    } else {
+        None
+    };
+    Ok(ProxyArgs {
+        config_path: args[1].clone(),
+        state_dir: args[3].clone(),
+        client_storage,
+    })
 }
 
 #[cfg(test)]
@@ -127,6 +196,9 @@ mod tests {
             remote_binary: "/opt/homebrew/bin/macluster".into(),
             remote_config: "/tmp/config.toml".into(),
             remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: true,
+            nfs_client_id: "client-240edfcc".into(),
+            nfs_client_ip: "192.0.2.10".into(),
             last_used_unix_ms: 0,
             descriptor: None,
         }
@@ -134,7 +206,7 @@ mod tests {
 
     #[test]
     fn remote_ssh_args_pin_host_and_identity() {
-        let args = remote_ssh_args(&profile());
+        let args = remote_ssh_args(&profile(), false);
         assert!(args.contains(&"-oUserKnownHostsFile=/tmp/known_hosts".into()));
         assert!(args.contains(&"-oStrictHostKeyChecking=yes".into()));
         assert!(
@@ -148,7 +220,7 @@ mod tests {
 
     #[test]
     fn remote_proxy_command_uses_profile_paths() {
-        let args = remote_ssh_args(&profile());
+        let args = remote_ssh_args(&profile(), false);
         let command = args.iter().rposition(|value| value == "192.0.2.1").unwrap() + 1;
         assert_eq!(
             &args[command..],
@@ -176,5 +248,34 @@ mod tests {
             .is_ok()
         );
         assert!(super::validate_proxy_args(&["extra".into()]).is_err());
+        assert!(
+            super::validate_proxy_args(&[
+                "--config".into(),
+                "x".into(),
+                "--state-dir".into(),
+                "y".into(),
+                "--client-storage-id".into(),
+                "client-test".into(),
+                "--registered-client-ip".into(),
+                "192.0.2.10".into(),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn control_socket_identity_changes_with_the_controller_endpoint() {
+        let first = profile();
+        let mut second = first.clone();
+        second.controller_host = "192.0.2.2".into();
+        let control_path = |args: Vec<String>| {
+            args.into_iter()
+                .find(|argument| argument.starts_with("-oControlPath="))
+                .expect("SSH arguments include a control path")
+        };
+        assert_ne!(
+            control_path(remote_ssh_args(&first, false)),
+            control_path(remote_ssh_args(&second, false))
+        );
     }
 }

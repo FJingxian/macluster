@@ -2,9 +2,11 @@
 
 mod app;
 pub mod arguments;
+mod client_access;
 pub mod client_context;
 pub mod client_join;
 pub mod client_profile;
+pub mod client_storage;
 mod control_client;
 pub mod discovery;
 mod embedded_power;

@@ -30,6 +30,7 @@ pub struct ClientDescriptor {
     pub capabilities: Vec<String>,
     pub primary_mount_root: String,
     pub primary_source_root: String,
+    pub primary_source_host: String,
     pub shares: Vec<ClientShareDescriptor>,
     pub queues: Vec<ClientQueueDescriptor>,
 }
@@ -39,6 +40,7 @@ pub struct ClientShareDescriptor {
     pub id: String,
     pub server: NodeId,
     pub source_root: String,
+    pub server_host: String,
     pub mount_root: String,
     pub share_uuid: String,
 }
@@ -494,10 +496,12 @@ mod client_descriptor_tests {
             capabilities: vec![super::MULTI_ENTRY_CLIENT_FEATURE.into()],
             primary_mount_root: "/Users/Shared/macluster".into(),
             primary_source_root: "/Users/Shared/macluster".into(),
+            primary_source_host: "192.0.2.1".into(),
             shares: vec![super::ClientShareDescriptor {
                 id: "tools".into(),
                 server: "login".parse().unwrap(),
                 source_root: "/opt/homebrew".into(),
+                server_host: "192.0.2.1".into(),
                 mount_root: "/opt/homebrew".into(),
                 share_uuid: "82d02835-f6ab-52b4-aaab-f90cafde9981".into(),
             }],

@@ -17,6 +17,8 @@ pub struct DiscoveryRecord {
     pub controller_build: String,
     pub ssh_host_fingerprint: String,
     pub transport: String,
+    pub resolved_address: Option<String>,
+    pub ssh_port: Option<u16>,
 }
 
 impl DiscoveryRecord {
@@ -65,6 +67,8 @@ impl DiscoveryRecord {
             controller_build: controller_build.into(),
             ssh_host_fingerprint: ssh_host_fingerprint.into(),
             transport: transport.into(),
+            resolved_address: None,
+            ssh_port: None,
         })
     }
 
@@ -149,7 +153,15 @@ pub fn discover_clusters(timeout: Duration) -> Result<Vec<DiscoveryRecord>, Stri
                     .iter()
                     .map(|property| (property.key().to_owned(), property.val_str().to_owned()))
                     .collect::<BTreeMap<_, _>>();
-                if let Ok(record) = DiscoveryRecord::from_properties(&info.fullname, &properties) {
+                if let Ok(mut record) =
+                    DiscoveryRecord::from_properties(&info.fullname, &properties)
+                {
+                    record.resolved_address = info
+                        .addresses
+                        .iter()
+                        .find(|address| address.is_ipv4())
+                        .map(ToString::to_string);
+                    record.ssh_port = Some(info.port);
                     records.push(record);
                 }
             }
@@ -175,7 +187,7 @@ mod tests {
             ),
             ("cluster_name".into(), "home".into()),
             ("protocol_version".into(), "2".into()),
-            ("controller_build".into(), "macluster/0.1.8".into()),
+            ("controller_build".into(), "macluster/0.2.0".into()),
             (
                 "ssh_host_fingerprint".into(),
                 "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCD".into(),

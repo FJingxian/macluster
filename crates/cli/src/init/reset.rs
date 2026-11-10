@@ -328,6 +328,15 @@ pub(crate) fn run(
                 ));
             }
         };
+        if let Err(error) = crate::client_access::revoke_all_registered_clients(&old, &state_dir) {
+            cancel_temporary_drain(&path);
+            return Err((
+                1,
+                format!(
+                    "reset was cancelled before cleanup because login-client NFS access could not be revoked: {error}. Restart the controller with `macluster controller run` after resolving the issue."
+                ),
+            ));
+        }
         begin_controller_reset(&config_path, &state_dir)?;
         journal.phase = "CLEANING".into();
         save_journal(&path, &journal, false)?;
@@ -349,6 +358,12 @@ pub(crate) fn run(
             journal.discard_terminal_sync,
             &journal.abandoned_sync_jobs,
         )?;
+        crate::client_access::revoke_all_registered_clients(&old, &state_dir).map_err(|error| {
+            (
+                1,
+                format!("reset cleanup cannot revoke login-client NFS access: {error}"),
+            )
+        })?;
         cleanup_resources(&mut journal, &plan, &path)?;
         journal.phase = "REMOTE_CONFIGS".into();
         save_journal(&path, &journal, false)?;

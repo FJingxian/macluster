@@ -35,9 +35,9 @@ Homebrew version format.
 4. Create and push the matching tag:
 
 ```sh
-git tag v0.1.7
+git tag v0.2.0
 git push origin main
-git push origin v0.1.7
+git push origin v0.2.0
 ```
 
 The tag workflow rejects a tag whose version differs from `Cargo.toml`. It also

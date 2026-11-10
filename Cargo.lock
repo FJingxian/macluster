@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-agent"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "libc",
  "macluster-core",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-cli"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "ed25519-dalek",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-controller"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -739,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-core"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "libc",
  "macluster-protocol",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-metrics"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "libc",
  "macluster-protocol",
@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-power-helper"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "libc",
  "macluster-protocol",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "macluster-protocol"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "libc",

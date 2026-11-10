@@ -26,6 +26,12 @@ pub struct ClientProfile {
     pub remote_binary: String,
     pub remote_config: String,
     pub remote_state_dir: String,
+    #[serde(default)]
+    pub mounts_enabled: bool,
+    #[serde(default)]
+    pub nfs_client_id: String,
+    #[serde(default)]
+    pub nfs_client_ip: String,
     pub last_used_unix_ms: u64,
     #[serde(default)]
     pub descriptor: Option<ClientDescriptor>,
@@ -225,6 +231,19 @@ fn validate_profile(profile: &ClientProfile) -> io::Result<()> {
         || profile.remote_binary.is_empty()
         || profile.remote_config.is_empty()
         || profile.remote_state_dir.is_empty()
+        || (profile.mounts_enabled
+            && (profile.nfs_client_id.is_empty()
+                || profile.nfs_client_id.len() > 64
+                || !profile
+                    .nfs_client_id
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !profile
+                    .nfs_client_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || profile.nfs_client_ip.parse::<std::net::Ipv4Addr>().is_err()))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -259,6 +278,9 @@ mod tests {
             remote_binary: "/opt/homebrew/bin/macluster".into(),
             remote_config: "/Users/mac/.config/macluster/config.toml".into(),
             remote_state_dir: "/Users/mac/Library/Application Support/macluster/controller".into(),
+            mounts_enabled: true,
+            nfs_client_id: "client-240edfcc".into(),
+            nfs_client_ip: "192.0.2.10".into(),
             last_used_unix_ms,
             descriptor: None,
         }
@@ -351,6 +373,16 @@ mod tests {
         store.remove(&value.cluster_uuid).unwrap();
         assert!(!store.path_for(&value.cluster_uuid).unwrap().exists());
         assert_eq!(fs::read_to_string(unrelated).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mounted_profile_rejects_an_unsafe_nfs_client_identity() {
+        let (root, store) = temp_store();
+        let mut value = profile("1eab1da8-e7c1-553e-8bf5-acde7f7388dc", 10);
+        value.nfs_client_id = "bad\nclient".into();
+        assert!(store.save(&value).is_err());
+        assert!(!store.path_for(&value.cluster_uuid).unwrap().exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

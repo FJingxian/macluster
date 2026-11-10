@@ -20,15 +20,50 @@ pub(crate) struct RemoteContext {
 }
 
 impl RemoteContext {
-    pub(crate) fn connect(mut profile: ClientProfile) -> Result<Self, String> {
-        let mut client = ControlClient::connect_remote(&profile, Duration::from_secs(8))
+    pub(crate) fn connect(
+        mut profile: ClientProfile,
+        ensure_client_storage: bool,
+    ) -> Result<Self, String> {
+        let timeout = Duration::from_secs(8);
+        let mut client = ControlClient::connect_remote(&profile, timeout, ensure_client_storage)
             .map_err(|error| error.to_string())?;
-        let ControlPayload::ClientDescriptor(descriptor) = client
-            .request(ControlCommand::ClientDescriptor)
-            .map_err(|error| error.to_string())?
-        else {
-            return Err("Controller returned an invalid client descriptor".into());
-        };
+        let mut descriptor = request_descriptor(&mut client)?;
+        if profile.mounts_enabled {
+            let mut installed = profile.descriptor.clone();
+            for attempt in 0..3 {
+                let mounts_changed = installed.as_ref().is_none_or(|previous| {
+                    previous.config_generation != descriptor.config_generation
+                });
+                if !mounts_changed {
+                    break;
+                }
+                if attempt == 2 {
+                    return Err(
+                        "Controller configuration kept changing while client mounts were updated; retry the command"
+                            .into(),
+                    );
+                }
+                // Do not leave an authenticated control stream idle while
+                // administrator prompts can take minutes.
+                drop(client);
+                if let Some(previous) = installed.as_ref() {
+                    crate::client_storage::replace_client_mounts(
+                        &profile.cluster_uuid,
+                        previous,
+                        &descriptor,
+                    )?;
+                } else {
+                    crate::client_storage::install_client_mounts(
+                        &profile.cluster_uuid,
+                        &descriptor,
+                    )?;
+                }
+                installed = Some(descriptor.clone());
+                client = ControlClient::connect_remote(&profile, timeout, ensure_client_storage)
+                    .map_err(|error| error.to_string())?;
+                descriptor = request_descriptor(&mut client)?;
+            }
+        }
         profile.descriptor_generation = descriptor.config_generation;
         profile.descriptor = Some(descriptor.clone());
         let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
@@ -124,21 +159,33 @@ impl RemoteContext {
     }
 }
 
+fn request_descriptor(client: &mut ControlClient) -> Result<ClientDescriptor, String> {
+    let ControlPayload::ClientDescriptor(descriptor) = client
+        .request(ControlCommand::ClientDescriptor)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("Controller returned an invalid client descriptor".into());
+    };
+    Ok(descriptor)
+}
+
 pub(crate) fn select_remote_profile(
     config_path: &Path,
     command: &str,
     args: &[String],
+    explicit: Option<&str>,
+    config_explicit: bool,
 ) -> Result<Option<ClientProfile>, String> {
-    if config_path.exists()
-        || !remote_command_supported(command)
+    if !remote_command_supported(command)
         || args
             .iter()
             .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || !should_consider_remote_profile(config_path.exists(), explicit, config_explicit)
     {
         return Ok(None);
     }
     let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
-    match store.select(None).map_err(|error| error.to_string())? {
+    match store.select(explicit).map_err(|error| error.to_string())? {
         ClientSelection::Explicit(profile)
         | ClientSelection::LastUsed(profile)
         | ClientSelection::Sole(profile) => Ok(Some(profile)),
@@ -146,7 +193,15 @@ pub(crate) fn select_remote_profile(
     }
 }
 
-fn remote_command_supported(command: &str) -> bool {
+fn should_consider_remote_profile(
+    config_exists: bool,
+    explicit: Option<&str>,
+    config_explicit: bool,
+) -> bool {
+    explicit.is_some() || !config_explicit && !config_exists
+}
+
+pub(crate) fn remote_command_supported(command: &str) -> bool {
     matches!(
         command,
         "submit" | "job" | "queue" | "kill" | "top" | "fans" | "node"
@@ -159,7 +214,7 @@ mod tests {
 
     use macluster_protocol::identifiers::Id128;
 
-    use super::{remote_command_supported, select_remote_profile};
+    use super::{remote_command_supported, select_remote_profile, should_consider_remote_profile};
 
     #[test]
     fn remote_command_selection_is_limited_to_cluster_operations() {
@@ -176,10 +231,24 @@ mod tests {
         let config = root.join("config.toml");
         fs::write(&config, "config").unwrap();
         assert!(
-            select_remote_profile(&config, "queue", &[])
+            select_remote_profile(&config, "queue", &[], None, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            select_remote_profile(&config, "queue", &[], None, true)
                 .unwrap()
                 .is_none()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_cluster_selection_overrides_a_local_controller_config() {
+        assert!(should_consider_remote_profile(false, None, false));
+        assert!(!should_consider_remote_profile(true, None, false));
+        assert!(!should_consider_remote_profile(false, None, true));
+        assert!(should_consider_remote_profile(true, Some("remote"), false));
+        assert!(should_consider_remote_profile(false, Some("remote"), true));
     }
 }

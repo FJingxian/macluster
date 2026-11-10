@@ -10646,6 +10646,28 @@ fn remember_deferred_share_server_cleanup(
             cleanup,
         );
     }
+    for request in crate::client_access::registered_client_share_requests(state_dir, share)
+        .map_err(|error| (1, error))?
+    {
+        let cleanup = DeferredShareExportCleanup {
+            share_id: share_id.to_owned(),
+            node_id: server_id.to_owned(),
+            source_root: request.root,
+            client_ip: request.client_ip,
+            client_node_id: request.node_id,
+            share_uuid: share.share_uuid.clone(),
+            machine_uuid: Some(machine_uuid.clone()),
+        };
+        pending.exports.insert(
+            export_cleanup_key(
+                share_id,
+                server_id,
+                &cleanup.client_node_id,
+                &share.share_uuid,
+            ),
+            cleanup,
+        );
+    }
     save_deferred_share_cleanup(state_dir, &pending)
 }
 
@@ -11564,7 +11586,7 @@ fn remove_registered_share(
             check_remote_idle(node, node_id, &config_path)?;
         }
 
-        let export_requests = config
+        let mut export_requests = config
             .nodes
             .iter()
             .filter(|(node_id, _)| node_id.as_str() != server_id)
@@ -11575,6 +11597,17 @@ fn remove_registered_share(
                 node_id: node_id.clone(),
             })
             .collect::<Vec<_>>();
+        export_requests.extend(
+            crate::client_access::registered_client_share_requests(state_dir, &share)
+                .map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot inspect login-client export cleanup for share {share_id}: {error}"
+                        ),
+                    )
+                })?,
+        );
         let missing_source_cleanup_proven = if !export_requests.is_empty() && !server_offline {
             let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
                 (

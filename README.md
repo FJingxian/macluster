@@ -13,12 +13,12 @@ Written in Rust. One binary to distribute. SSH connects nodes; NFS shares projec
 ## How it works
 
 ```text
-Login Mac                         Compute Macs
-CLI + background controller  ───►  One job per Mac
-NFS storage by default       ◄──►  Shared projects and tools
+Login clients                     Login Mac / Controller             Compute Macs
+CLI over pinned SSH        ───►   CLI + background service    ───►   One job per Mac
+Optional NFS mount          ◄──►   NFS storage by default       ◄──►   Shared projects and tools
 ```
 
-The login Mac stays outside compute queues. Jobs occupy a whole compute node, with no CPU-core or memory quota. You can choose a separate storage Mac during setup.
+The Mac running the controller stays outside compute queues. Another Mac can join the same cluster as a login client and submit or inspect work without becoming a compute node. Jobs occupy a whole compute node, with no CPU-core or memory quota. You can choose a separate storage Mac during setup.
 
 This is an early-stage project for personal and lab clusters. It uses macOS accounts and shared storage as its trust boundary.
 
@@ -73,6 +73,30 @@ macluster controller stop
 ```
 
 `controller run` runs in the foreground for troubleshooting. Do not run `macluster --init` just to start the controller: when a configuration exists, it offers to reset it.
+
+## Use another Mac as a login client
+
+Run the same binary on another Mac and join the existing controller:
+
+```sh
+macluster --join cluster-user@192.0.2.1
+macluster --clusters
+macluster queue
+macluster submit hostname
+```
+
+The command installs a dedicated SSH key and a cluster-specific SSH host pin. By default it also mounts the primary and named NFS shares and installs a root LaunchDaemon that remounts them after reconnect. If a mount would hide existing local files, macluster lists those paths and requires `y`. Use `--join --control-only` when the Mac only needs queue, job, node, and monitoring access without mounting cluster storage.
+
+When one compatible cluster is discoverable on the local network, an ordinary command such as `mtop` offers to join it. macOS may ask for Local Network permission on first discovery; denying it only disables automatic discovery, not the explicit `--join` flow.
+
+```sh
+macluster --cluster home mtop
+macluster --cluster home --leave
+```
+
+`--cluster` accepts a profile name or full UUID and overrides a local controller configuration for that command. `--leave` stops the client mount service, detaches its mounts, revokes that client's NFS export entries and SSH key, then removes the local profile. A failed cleanup leaves the profile intact so the same command can be retried.
+
+The controller records the SSH peer's IPv4 address and adds only that address to the managed NFS exports. The first join or a later address change may therefore trigger administrator authorization on the controller or its NFS servers. Rejoining with the same client key reuses its identity.
 
 ## Run jobs
 
@@ -201,6 +225,8 @@ The storage Mac stays outside compute queues. Same-subnet IP changes can retain 
 | Python/compiler missing | Activate the intended environment and share its installation path |
 | Wrong working directory | `node -l` mappings; submit from a share or use `--cwd` |
 | NFS export denied | Filesystem, permissions, and nfsd privacy authorization on the storage Mac |
+| Login client cannot discover a cluster | Allow Local Network access, or run explicit `--join USER@HOST[:PORT]` |
+| Login client storage is stale after an IP change | Run a storage-dependent command such as `submit`; its next controller connection updates the recorded NFS client address |
 | Controller failed to start | `controller status`; logs in `~/Library/Logs/macluster/` |
 
 Use `macluster --help` or `macluster submit --help` for options. Keep SSH host-key checking enabled; verify changed fingerprints before updating trust.

@@ -135,8 +135,9 @@ impl ControlClient {
     pub fn connect_remote(
         profile: &ClientProfile,
         timeout: Duration,
+        ensure_client_storage: bool,
     ) -> Result<Self, ControlClientError> {
-        let stream = RemoteControlStream::connect(profile)?;
+        let stream = RemoteControlStream::connect(profile, ensure_client_storage)?;
         Self::handshake(
             ControlStream::Remote(stream),
             timeout,

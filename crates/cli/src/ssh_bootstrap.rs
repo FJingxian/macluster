@@ -7,7 +7,7 @@ use std::{
 };
 
 use macluster_core::config::NodeConfig;
-use macluster_protocol::framing::sha256_hex;
+use macluster_protocol::{framing::sha256_hex, identifiers::Id128};
 
 use crate::node_admin;
 
@@ -408,7 +408,7 @@ fn fingerprint_for_host_key(known_hosts_line: &str) -> Result<String, String> {
     let path = env::temp_dir().join(format!(
         "macluster-host-key-{}-{}",
         std::process::id(),
-        macluster_protocol::identifiers::Id128::random()
+        Id128::random()
     ));
     let result = (|| {
         let mut file = fs::OpenOptions::new()
@@ -697,13 +697,13 @@ fn recover_changed_host_key(node: &NodeConfig, error: &str) -> Result<(), String
 
 pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result<(), String> {
     match probe_key_auth(node) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return ensure_managed_ssh_identity(node, endpoint, true),
         Err(error) => match classify_ssh_error(&error) {
             SshFailureKind::Authentication => {}
             SshFailureKind::UnknownHostKey => {
                 run_host_key_confirmation(node)?;
                 match probe_key_auth(node) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return ensure_managed_ssh_identity(node, endpoint, true),
                     Err(error) => match classify_ssh_error(&error) {
                         SshFailureKind::Authentication => {}
                         SshFailureKind::UnknownHostKey | SshFailureKind::ChangedHostKey => {
@@ -719,7 +719,7 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
             SshFailureKind::ChangedHostKey => {
                 recover_changed_host_key(node, &error)?;
                 match probe_key_auth(node) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return ensure_managed_ssh_identity(node, endpoint, true),
                     Err(error) => match classify_ssh_error(&error) {
                         SshFailureKind::Authentication => {}
                         SshFailureKind::UnknownHostKey => {
@@ -742,6 +742,17 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
         },
     }
 
+    ensure_managed_ssh_identity(node, endpoint, false)
+}
+
+fn ensure_managed_ssh_identity(
+    node: &mut NodeConfig,
+    endpoint: &str,
+    authenticated_with_existing_identity: bool,
+) -> Result<(), String> {
+    if authenticated_with_existing_identity && node.ssh_identity_file.is_some() {
+        return Ok(());
+    }
     let home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "cannot find the login account's HOME for SSH key setup".to_owned())?;
@@ -751,6 +762,7 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
         .to_str()
         .ok_or_else(|| "generated SSH identity path is not valid UTF-8".to_owned())?
         .to_owned();
+    let previous_identity = node.ssh_identity_file.clone();
     node.ssh_identity_file = Some(identity_text);
 
     match probe_key_auth(node) {
@@ -759,6 +771,14 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
         Err(error) => return Err(error),
     }
     let script = install_public_key_script(&identity.public_key)?;
+    let mut authenticated_transport = node.clone();
+    authenticated_transport.ssh_identity_file = previous_identity;
+    if node_admin::ssh_output(&authenticated_transport, &script, None)
+        .is_ok_and(|output| output.status.success())
+        && probe_key_auth(node).is_ok()
+    {
+        return Ok(());
+    }
     let account = node
         .ssh_user
         .as_deref()
@@ -790,6 +810,100 @@ pub(super) fn ensure_ssh_access(node: &mut NodeConfig, endpoint: &str) -> Result
             node.host
         )
     })
+}
+
+pub(crate) fn pin_client_host_key(
+    node: &NodeConfig,
+    host_alias: &str,
+    expected_fingerprint: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    if host_alias.is_empty()
+        || host_alias.len() > 128
+        || !host_alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return Err("client SSH host alias is invalid".into());
+    }
+    if !expected_fingerprint.starts_with("SHA256:")
+        || expected_fingerprint.chars().any(char::is_control)
+    {
+        return Err("advertised SSH host fingerprint is invalid".into());
+    }
+    let scanned = scan_host_key(node)?;
+    if scanned.fingerprint != expected_fingerprint {
+        return Err(format!(
+            "Controller advertised {}, but the SSH endpoint currently presents {}",
+            expected_fingerprint, scanned.fingerprint
+        ));
+    }
+    let fields = scanned
+        .known_hosts_line
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if fields.len() != 3 {
+        return Err("scanned SSH host key is malformed".into());
+    }
+    let alias_line = format!("{host_alias} {} {}", fields[1], fields[2]);
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot locate the client account HOME for SSH host pinning".to_owned())?;
+    ensure_directory(&home.join(".ssh"), 0o700, false)?;
+    ensure_directory(&home.join(".ssh/macluster"), 0o700, true)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "client SSH host pin has no parent directory".to_owned())?;
+    ensure_directory(parent, 0o700, true)?;
+    match fs::symlink_metadata(destination) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            if fs::read_to_string(destination)
+                .map_err(|error| format!("cannot read client SSH host pin: {error}"))?
+                .trim()
+                == alias_line
+            {
+                return Ok(());
+            }
+        }
+        Ok(_) => {
+            return Err(format!(
+                "client SSH host pin {} is not a private regular file",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect client SSH host pin {}: {error}",
+                destination.display()
+            ));
+        }
+    }
+    let temporary = parent.join(format!(".known-hosts-{}", Id128::random()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("cannot create client SSH host pin: {error}"))?;
+        writeln!(file, "{alias_line}")
+            .map_err(|error| format!("cannot write client SSH host pin: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot save client SSH host pin: {error}"))?;
+        fs::rename(&temporary, destination)
+            .map_err(|error| format!("cannot install client SSH host pin: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn probe_key_auth(node: &NodeConfig) -> Result<(), String> {

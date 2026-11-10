@@ -661,6 +661,12 @@ impl ControlApi {
             capabilities: self.hello.capabilities.clone(),
             primary_mount_root: self.config.shared_root.display().to_string(),
             primary_source_root: self.config.primary_source_root().display().to_string(),
+            primary_source_host: self
+                .config
+                .nodes
+                .get(self.config.storage_server.as_str())
+                .map(|node| node.host.clone())
+                .unwrap_or_default(),
             shares: self
                 .config
                 .shares
@@ -669,6 +675,12 @@ impl ControlApi {
                     id: id.clone(),
                     server: share.server.clone(),
                     source_root: share.source_root.display().to_string(),
+                    server_host: self
+                        .config
+                        .nodes
+                        .get(share.server.as_str())
+                        .map(|node| node.host.clone())
+                        .unwrap_or_default(),
                     mount_root: share.mount_root.display().to_string(),
                     share_uuid: share.share_uuid.clone(),
                 })

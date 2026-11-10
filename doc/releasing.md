@@ -1,16 +1,11 @@
 # Releasing macluster
 
-The release workflow builds the Apple silicon binary, signs it with a Developer
-ID Application certificate, notarizes it with Apple, publishes the GitHub
-Release, and updates the Homebrew tap.
+The release workflow builds the Apple silicon binary, applies an ad-hoc code
+signature, publishes the GitHub Release, and updates the Homebrew tap. No paid
+Apple Developer Program certificate is required for this early-access channel.
 
 ## Requirements
 
-- An active Apple Developer Program membership.
-- A `Developer ID Application` certificate and private key installed in the
-  Keychain. An `Apple Development` certificate is not sufficient for public
-  distribution or notarization.
-- An Apple app-specific password for notarization.
 - A public `FJingxian/homebrew-macluster` repository.
 - A write-enabled SSH deploy key for that tap repository.
 
@@ -20,27 +15,17 @@ Configure these repository secrets in `FJingxian/macluster`:
 
 | Secret | Value |
 | --- | --- |
-| `APPLE_CERTIFICATE_P12_BASE64` | Base64 of the exported Developer ID Application `.p12` |
-| `APPLE_CERTIFICATE_PASSWORD` | Password used when exporting the `.p12` |
-| `APPLE_ID` | Apple Developer account email |
-| `APPLE_TEAM_ID` | Apple Developer team identifier |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password used by `notarytool` |
 | `HOMEBREW_TAP_SSH_KEY` | Private half of the write-enabled tap deploy key |
 
 Optionally set the repository variable `HOMEBREW_TAP_REPOSITORY`. The default is
 `FJingxian/homebrew-macluster`.
 
-Export only the Developer ID Application identity from Keychain Access as a
-password-protected `.p12`, then create the base64 secret:
+Never commit the tap deploy key.
 
-```sh
-base64 < developer-id.p12 | tr -d '\n' > developer-id.p12.base64
-gh secret set APPLE_CERTIFICATE_P12_BASE64 \
-  --repo FJingxian/macluster < developer-id.p12.base64
-```
-
-Never commit the `.p12`, its password, the app-specific password, or the tap
-deploy key.
+The current ad-hoc signature allows normal Homebrew installation, but manually
+downloaded binaries may still trigger stronger Gatekeeper warnings. Developer ID
+signing and notarization can be added later without changing the Release or
+Homebrew version format.
 
 ## Release process
 

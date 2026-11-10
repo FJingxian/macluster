@@ -26,7 +26,7 @@
 
 要求：macOS 12 或更新版本；计算节点开启“远程登录”，登录 Mac 可以通过 SSH 连接。源码编译需要 Rust 1.90 或更新版本。
 
-Apple silicon 用户可以直接安装经过签名和公证的最新版本：
+Apple silicon 用户可以通过 Homebrew 安装最新版本：
 
 ```sh
 brew install FJingxian/macluster/macluster

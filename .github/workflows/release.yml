@@ -64,86 +64,21 @@ jobs:
           file "$BIN" | grep -q "Mach-O 64-bit executable arm64"
           "$BIN" --version | grep -F "macluster ${GITHUB_REF_NAME#v}"
 
-      - name: Validate signing credentials
+      - name: Validate Homebrew tap credentials
         env:
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
         run: |
-          test -n "$APPLE_CERTIFICATE_P12_BASE64" || { echo "::error::APPLE_CERTIFICATE_P12_BASE64 is not configured"; exit 1; }
-          test -n "$APPLE_CERTIFICATE_PASSWORD" || { echo "::error::APPLE_CERTIFICATE_PASSWORD is not configured"; exit 1; }
-          test -n "$APPLE_ID" || { echo "::error::APPLE_ID is not configured"; exit 1; }
-          test -n "$APPLE_TEAM_ID" || { echo "::error::APPLE_TEAM_ID is not configured"; exit 1; }
-          test -n "$APPLE_APP_SPECIFIC_PASSWORD" || { echo "::error::APPLE_APP_SPECIFIC_PASSWORD is not configured"; exit 1; }
-          test -n "$HOMEBREW_TAP_SSH_KEY" || { echo "::error::HOMEBREW_TAP_SSH_KEY is not configured"; exit 1; }
-
-      - name: Import Developer ID certificate
-        env:
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          CERTIFICATE="$RUNNER_TEMP/developer-id.p12"
-          KEYCHAIN="$RUNNER_TEMP/macluster-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$CERTIFICATE" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" \
-            -t cert -f pkcs12 -T /usr/bin/codesign -k "$KEYCHAIN"
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security list-keychains -d user -s \
-            "$KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" |
-            awk -F '"' '/Developer ID Application/ {print $2; exit}')"
-          test -n "$IDENTITY" || {
-            echo "::error::the imported certificate is not a Developer ID Application identity"
+          test -n "$HOMEBREW_TAP_SSH_KEY" || {
+            echo "::error::HOMEBREW_TAP_SSH_KEY is not configured"
             exit 1
           }
-          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
-          echo "MACOS_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
 
-      - name: Sign release binary
+      - name: Ad-hoc sign release binary
         run: |
           BIN="target/$TARGET/release/macluster"
-          codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGN_IDENTITY" "$BIN"
+          codesign --force --sign - "$BIN"
           codesign --verify --strict --verbose=4 "$BIN"
           codesign -dv --verbose=4 "$BIN"
-
-      - name: Notarize signed binary
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: |
-          BIN="target/$TARGET/release/macluster"
-          ARCHIVE="$RUNNER_TEMP/macluster-notarization.zip"
-          /usr/bin/ditto -c -k --keepParent "$BIN" "$ARCHIVE"
-          xcrun notarytool submit "$ARCHIVE" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait \
-            --output-format json > "$RUNNER_TEMP/notarization.json"
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-
-          result = json.loads(
-              pathlib.Path(os.environ["RUNNER_TEMP"], "notarization.json").read_text()
-          )
-          if result.get("status") != "Accepted":
-              raise SystemExit(f"notarization failed: {result}")
-          print(f"notarization submission: {result.get('id')}")
-          PY
 
       - name: Package signed release
         run: |
@@ -169,7 +104,8 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           ## English
 
-          macluster $GITHUB_REF_NAME is a signed and notarized Apple silicon build.
+          macluster $GITHUB_REF_NAME is an ad-hoc signed Apple silicon
+          early-access build.
 
           Homebrew (after the tap is published):
 
@@ -181,7 +117,8 @@ jobs:
 
           ## 简体中文
 
-          macluster $GITHUB_REF_NAME 是经过签名和 Apple notarization 的 Apple silicon 版本。
+          macluster $GITHUB_REF_NAME 是 ad-hoc 签名、无需付费开发者证书的
+          Apple silicon 早期版本。
 
           Homebrew 安装（tap 发布后）：
 
@@ -234,10 +171,3 @@ jobs:
           fi
           git -C "$TAP_DIR" commit -m "macluster ${GITHUB_REF_NAME#v}"
           git -C "$TAP_DIR" push origin HEAD:main
-
-      - name: Remove temporary signing keychain
-        if: always()
-        run: |
-          if test -n "${MACOS_KEYCHAIN:-}" && test -e "$MACOS_KEYCHAIN"; then
-            security delete-keychain "$MACOS_KEYCHAIN"
-          fi

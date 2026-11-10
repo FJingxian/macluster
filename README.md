@@ -26,7 +26,7 @@ This is an early-stage project for personal and lab clusters. It uses macOS acco
 
 Requirements: macOS 12+, Remote Login enabled on compute Macs, and SSH access from the login Mac. Building requires Rust 1.90+.
 
-On Apple silicon, install the latest signed release with Homebrew:
+On Apple silicon, install the latest release with Homebrew:
 
 ```sh
 brew install FJingxian/macluster/macluster

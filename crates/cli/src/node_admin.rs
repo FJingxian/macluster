@@ -4273,6 +4273,7 @@ fn compute_role_candidate(
     }
     let role_value = roles
         .iter()
+        .filter(|role| **role != macluster_core::config::NodeRole::Storage)
         .map(|role| format!("\"{}\"", role.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
@@ -21841,7 +21842,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
 
         assert!(updated.is_compute_node("login"));
         assert!(updated.queues["compute"].nodes.contains(&"login".into()));
-        assert!(candidate.contains("roles = [\"controller\", \"compute\", \"storage\"]"));
+        assert!(candidate.contains("roles = [\"controller\", \"compute\"]"));
     }
 
     #[test]

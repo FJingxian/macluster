@@ -56,6 +56,41 @@ fn explicit_node_roles_can_overlap() {
 }
 
 #[test]
+fn storage_role_is_derived_from_active_share_ownership() {
+    let idle_node = "\n[nodes.idle]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nroles = [\"storage\"]\n";
+    let without_share = format!("{}{idle_node}", extended_config());
+    let without_share = ClusterConfig::parse(&without_share).unwrap();
+    assert!(
+        !without_share
+            .node_roles("idle")
+            .contains(&NodeRole::Storage)
+    );
+
+    let with_share = format!(
+        "{}{idle_node}\n[shares.idle]\nserver = \"idle\"\nsource_root = \"/Volumes/idle\"\nmount_root = \"/Volumes/idle-cache\"\nshare_uuid = \"00000000-0000-4000-8000-000000000006\"\n",
+        extended_config()
+    );
+    let with_share = ClusterConfig::parse(&with_share).unwrap();
+    assert!(with_share.node_roles("idle").contains(&NodeRole::Storage));
+}
+
+#[test]
+fn config_rejects_a_second_explicit_controller_role() {
+    let source = format!(
+        "{}\n[nodes.idle]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nroles = [\"controller\"]\n",
+        extended_config().replace(
+            "storage_server = \"mini01-a\"",
+            "storage_server = \"mini01-a\"\nlogin_node = \"login\"",
+        )
+    );
+
+    assert!(matches!(
+        ClusterConfig::parse(&source),
+        Err(ConfigError::InvalidNodeRole(message)) if message.contains("controller")
+    ));
+}
+
+#[test]
 fn legacy_controller_queue_membership_is_not_implicit_compute() {
     let source = extended_config()
         .replace(

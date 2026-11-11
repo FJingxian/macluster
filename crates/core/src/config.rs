@@ -317,9 +317,11 @@ impl ClusterConfig {
     }
 
     pub fn node_roles(&self, node_id: &str) -> BTreeSet<NodeRole> {
-        if let Some(roles) = self.roles.get(node_id) {
-            return roles.clone();
-        }
+        let configured = self.roles.get(node_id);
+        let mut roles = configured.cloned().unwrap_or_default();
+        // Storage is a derived capability. Ignore stale explicit values so
+        // the advertised role cannot disagree with the active share table.
+        roles.remove(&NodeRole::Storage);
         let controller = self
             .login_node
             .as_ref()
@@ -330,7 +332,6 @@ impl ClusterConfig {
                     .filter(|node| node.transport == Transport::Local)
                     .map(|_| node_id)
             });
-        let mut roles = BTreeSet::new();
         if controller == Some(node_id) {
             roles.insert(NodeRole::Controller);
         }
@@ -342,7 +343,8 @@ impl ClusterConfig {
         {
             roles.insert(NodeRole::Storage);
         }
-        if controller != Some(node_id)
+        if configured.is_none()
+            && controller != Some(node_id)
             && self
                 .queues
                 .values()
@@ -747,6 +749,7 @@ impl ClusterConfig {
         let mut roles = BTreeMap::new();
         for name in nodes.keys() {
             let mut node_roles = explicit_roles.remove(name).unwrap_or_default();
+            node_roles.remove(&NodeRole::Storage);
             if node_roles.contains(&NodeRole::Controller)
                 && controller_id.as_deref() != Some(name.as_str())
             {
@@ -759,13 +762,6 @@ impl ClusterConfig {
             }
             if controller_id.as_deref() == Some(name.as_str()) {
                 node_roles.insert(NodeRole::Controller);
-            }
-            if storage_server.as_str() == name
-                || shares
-                    .values()
-                    .any(|share| share.server.as_str() == name.as_str())
-            {
-                node_roles.insert(NodeRole::Storage);
             }
             if controller_id.as_deref() != Some(name.as_str())
                 && queues

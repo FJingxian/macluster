@@ -7641,7 +7641,7 @@ fn sample_cluster(
                     .queue_for_dispatch(queue.as_str())
                     .is_some_and(|queue| queue.nodes.iter().any(|member| member == *id))
             });
-            is_local && selected && !config.is_login_node(id)
+            is_local && selected && config.is_compute_node(id)
         })
         .map(|(id, _)| id.clone());
     let (login, samples) =
@@ -7718,7 +7718,7 @@ fn cached_monitor_samples(
         .nodes
         .iter()
         .filter(|(id, _)| {
-            !config.is_login_node(id)
+            config.is_compute_node(id)
                 && allowed
                     .as_ref()
                     .is_none_or(|members| members.iter().any(|member| member == *id))
@@ -7760,7 +7760,7 @@ fn one_shot_task_counts(
     let mut counts: BTreeMap<String, (usize, usize)> = config
         .nodes
         .keys()
-        .filter(|id| !config.is_login_node(id))
+        .filter(|id| config.is_compute_node(&id))
         .map(|id| (id.clone(), (0, 0)))
         .collect();
 

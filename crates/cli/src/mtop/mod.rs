@@ -132,7 +132,7 @@ pub(crate) fn sample_one_shot(
         .nodes
         .iter()
         .filter(|(id, _)| {
-            !config.is_login_node(id)
+            config.is_compute_node(id)
                 && allowed
                     .as_ref()
                     .is_none_or(|members| members.iter().any(|member| member == *id))
@@ -775,7 +775,7 @@ fn configured_node_identities(config: &ClusterConfig) -> Vec<ConfiguredNode> {
                 .queues
                 .iter()
                 .filter(|(_, queue)| {
-                    queue.nodes.iter().any(|member| member == id) && !config.is_login_node(id)
+                    queue.nodes.iter().any(|member| member == id) && config.is_compute_node(id)
                 })
                 .map(|(name, _)| name.clone())
                 .collect(),

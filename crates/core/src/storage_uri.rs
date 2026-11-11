@@ -70,6 +70,11 @@ impl StorageUri {
         let server = NodeId::new(server_text.to_owned())
             .map_err(|_| StorageUriError::InvalidServer(server_text.to_owned()))?;
         let decoded = percent_decode(path_tail)?;
+        if decoded.chars().any(char::is_control) {
+            return Err(StorageUriError::Invalid(
+                "decoded path contains control characters",
+            ));
+        }
         if decoded.contains('\\') {
             return Err(StorageUriError::Invalid(
                 "backslashes are not valid in a storage URI path",

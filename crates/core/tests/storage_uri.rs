@@ -39,6 +39,8 @@ fn uri_rejects_noncanonical_or_ambiguous_inputs() {
         "nfs://default-001/a#fragment",
         "ssh://default-001/a",
         "nfs:///a",
+        "nfs://default-001/a%00b",
+        "nfs://default-001/a%0Ab",
         "/Volumes/external-disk",
     ] {
         assert!(

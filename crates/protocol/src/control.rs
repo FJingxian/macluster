@@ -45,6 +45,8 @@ pub struct ClientShareDescriptor {
     pub server_host: String,
     pub mount_root: String,
     pub share_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smb_user: Option<String>,
 }
 
 fn default_storage_protocol() -> String {
@@ -511,6 +513,7 @@ mod client_descriptor_tests {
                 server_host: "192.0.2.1".into(),
                 mount_root: "/opt/homebrew".into(),
                 share_uuid: "82d02835-f6ab-52b4-aaab-f90cafde9981".into(),
+                smb_user: None,
             }],
             queues: vec![super::ClientQueueDescriptor {
                 name: "compute".parse().unwrap(),
@@ -526,5 +529,25 @@ mod client_descriptor_tests {
             encoded["capabilities"][0],
             super::MULTI_ENTRY_CLIENT_FEATURE
         );
+    }
+
+    #[test]
+    fn client_share_descriptor_round_trips_smb_user_and_accepts_legacy_json() {
+        let descriptor = super::ClientShareDescriptor {
+            id: "nas".into(),
+            server: "nas-01".parse().unwrap(),
+            protocol: "smb".into(),
+            source_root: "/data".into(),
+            server_host: "192.0.2.20".into(),
+            mount_root: "/Users/Shared/nas-data".into(),
+            share_uuid: "63f5531b-0e1d-56c5-bf98-90ef8f83df5f".into(),
+            smb_user: Some("smb-user".into()),
+        };
+        let mut value = serde_json::to_value(&descriptor).unwrap();
+        assert_eq!(value["smb_user"], "smb-user");
+
+        value.as_object_mut().unwrap().remove("smb_user");
+        let legacy: super::ClientShareDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.smb_user, None);
     }
 }

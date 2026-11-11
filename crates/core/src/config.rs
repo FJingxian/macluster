@@ -86,6 +86,7 @@ pub struct ShareConfig {
     pub source_root: PathBuf,
     pub mount_root: PathBuf,
     pub share_uuid: String,
+    pub smb_user: Option<String>,
     /// Whether this share was explicitly authorized to cover pre-existing
     /// client files at the same source and mount path.
     pub allow_existing_contents: bool,
@@ -244,6 +245,10 @@ pub enum ConfigError {
     InvalidHost,
     #[error("SSH user is empty or contains characters unsupported by mnode")]
     InvalidSshUser,
+    #[error("SMB user is empty or contains characters unsupported by mnode")]
+    InvalidSmbUser,
+    #[error("multiple SMB accounts are configured for server node '{node}'; specify --smb-user")]
+    AmbiguousSmbUser { node: String },
     #[error("SSH port must be in 1..=65535")]
     InvalidSshPort,
     #[error("ssh_identity_file must be an absolute path without control characters")]
@@ -634,6 +639,16 @@ impl ClusterConfig {
                 let allow_existing_contents =
                     take_optional_bool(&mut table, &section, "allow_existing_contents")?
                         .unwrap_or(false);
+                let smb_user = take_optional_string(&mut table, &section, "smb_user")?;
+                if smb_user.is_some() && protocol != StorageProtocol::Smb {
+                    return Err(ConfigError::InvalidSmbUser);
+                }
+                if smb_user
+                    .as_deref()
+                    .is_some_and(|user| !valid_cluster_user(user))
+                {
+                    return Err(ConfigError::InvalidSmbUser);
+                }
                 if allow_existing_contents && source_raw != mount_raw {
                     return Err(ConfigError::InvalidSharePath);
                 }
@@ -650,6 +665,7 @@ impl ClusterConfig {
                         source_root: PathBuf::from(source_raw),
                         mount_root: PathBuf::from(mount_raw),
                         share_uuid: share_uuid.to_ascii_lowercase(),
+                        smb_user,
                         allow_existing_contents,
                     },
                 );
@@ -869,6 +885,9 @@ impl ClusterConfig {
             if share.protocol != StorageProtocol::Nfs {
                 rows.push(format!("share-protocol\0{id}\0{}", share.protocol));
             }
+            if let Some(smb_user) = &share.smb_user {
+                rows.push(format!("share-smb-user\0{id}\0{smb_user}"));
+            }
         }
         if let Some(login_node) = &self.login_node {
             rows.push(format!("login\0{login_node}"));
@@ -895,6 +914,18 @@ fn safe_absolute_remote_file(path: &str) -> bool {
             .split('/')
             .skip(1)
             .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn valid_cluster_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 64
+        && user.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+            }
+        })
 }
 
 fn safe_absolute_ssh_identity_file(path: &str) -> bool {

@@ -184,6 +184,7 @@ impl RemoteContext {
                     source_root: PathBuf::from(&share.source_root),
                     mount_root: PathBuf::from(&share.mount_root),
                     share_uuid: share.share_uuid.clone(),
+                    smb_user: share.smb_user.clone(),
                     allow_existing_contents: false,
                 },
             );

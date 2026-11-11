@@ -684,6 +684,7 @@ impl ControlApi {
                         .unwrap_or_default(),
                     mount_root: share.mount_root.display().to_string(),
                     share_uuid: share.share_uuid.clone(),
+                    smb_user: share.smb_user.clone(),
                 })
                 .collect(),
             queues: self

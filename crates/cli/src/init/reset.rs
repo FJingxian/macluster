@@ -4710,6 +4710,7 @@ mod tests {
                 source_root: std::path::PathBuf::from("/Volumes/Tools"),
                 mount_root: std::path::PathBuf::from("/Users/Shared/tools"),
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );

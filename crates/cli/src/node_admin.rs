@@ -31,7 +31,7 @@ use macluster_controller::ssh::{ConnectionKey, SshPool};
 use macluster_controller::transport::{ClusterTransport, NodeTransport};
 use macluster_core::{
     agent_update::AutoAgentUpdateReceipts,
-    config::{ClusterConfig, NodeConfig, ShareConfig, Transport},
+    config::{ClusterConfig, ConfigError, NodeConfig, ShareConfig, Transport},
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
     nfs_reconcile::{
         DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
@@ -1866,6 +1866,14 @@ struct AddOptions {
     overlay_existing: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StorageMountOptions {
+    pub mount_root: PathBuf,
+    pub overlay_existing: bool,
+    pub smb_user: Option<String>,
+    pub update_credential: bool,
+}
+
 #[derive(Debug)]
 enum Action {
     Add(AddOptions),
@@ -1876,8 +1884,7 @@ enum Action {
     },
     Mount {
         uri: StorageUri,
-        mount_root: PathBuf,
-        overlay_existing: bool,
+        options: StorageMountOptions,
     },
     MigrateController(NodeId),
     List {
@@ -2020,11 +2027,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::AddStorage { node_id, host } => {
             add_storage_node(&config_path, &state_dir, &node_id, host)
         }
-        Action::Mount {
-            uri,
-            mount_root,
-            overlay_existing,
-        } => mount_storage(&config_path, &state_dir, uri, mount_root, overlay_existing),
+        Action::Mount { uri, options } => mount_storage(&config_path, &state_dir, uri, options),
         Action::MigrateController(node_id) => {
             migrate_controller(&config_path, &state_dir, &node_id)
         }
@@ -3638,6 +3641,8 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         let uri = StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?;
         let mut mount_root = None;
         let mut overlay_existing = false;
+        let mut smb_user = None;
+        let mut update_credential = false;
         let mut index = if inline.is_some() { 1 } else { 2 };
         while index < args.len() {
             match args[index].as_str() {
@@ -3646,6 +3651,13 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                         return Err((2, "--overlay-existing may only be specified once".into()));
                     }
                     overlay_existing = true;
+                    index += 1;
+                }
+                "--update-credential" => {
+                    if update_credential {
+                        return Err((2, "--update-credential may only be specified once".into()));
+                    }
+                    update_credential = true;
                     index += 1;
                 }
                 "--mount-root" => {
@@ -3666,14 +3678,41 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     mount_root = Some(PathBuf::from(value));
                     index += 2;
                 }
+                "--smb-user" => {
+                    if smb_user.is_some() {
+                        return Err((2, "--smb-user may only be specified once".into()));
+                    }
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| (2, "--smb-user requires an account name".into()))?
+                        .clone();
+                    if !valid_smb_user(&value) {
+                        return Err((
+                            2,
+                            "SMB user is invalid; use letters, digits, '_', '.', or '-'".into(),
+                        ));
+                    }
+                    smb_user = Some(value);
+                    index += 2;
+                }
                 option => return Err((2, format!("unknown mnode mount option '{option}'"))),
             }
         }
+        if uri.protocol != StorageProtocol::Smb && (smb_user.is_some() || update_credential) {
+            return Err((
+                2,
+                "--smb-user and --update-credential are only valid for SMB storage URIs".into(),
+            ));
+        }
         return Ok(Action::Mount {
             uri,
-            mount_root: mount_root
-                .ok_or_else(|| (2, "mnode -mount requires --mount-root".into()))?,
-            overlay_existing,
+            options: StorageMountOptions {
+                mount_root: mount_root
+                    .ok_or_else(|| (2, "mnode -mount requires --mount-root".into()))?,
+                overlay_existing,
+                smb_user,
+                update_credential,
+            },
         });
     }
     if key == "-umount" || key == "--umount" {
@@ -11165,6 +11204,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             source_root: source_root.clone(),
             mount_root: mount_root.clone(),
             share_uuid: share_uuid.to_owned(),
+            smb_user: None,
             allow_existing_contents,
         };
         let replaced = replaced_child_shares(&config, &pending_share);
@@ -12306,6 +12346,7 @@ fn remove_registered_share(
                 source_root: source_root.clone(),
                 mount_root: mount_root.clone(),
                 share_uuid: share_uuid.to_owned(),
+                smb_user: None,
                 allow_existing_contents,
             },
         };
@@ -14908,8 +14949,7 @@ fn mount_storage(
     config_path: &Path,
     state_dir: &Path,
     uri: StorageUri,
-    mount_root: PathBuf,
-    overlay_existing: bool,
+    options: StorageMountOptions,
 ) -> AppResult<()> {
     let config = read_config(config_path)?;
     if !config.nodes.contains_key(uri.server.as_str()) {
@@ -14918,12 +14958,12 @@ fn mount_storage(
             format!("storage server '{}' is not a registered node", uri.server),
         ));
     }
-    if managed_paths_overlap(&mount_root, &config.shared_root) {
+    if managed_paths_overlap(&options.mount_root, &config.shared_root) {
         return Err((
             2,
             format!(
                 "mount root {} overlaps primary share {}",
-                mount_root.display(),
+                options.mount_root.display(),
                 config.shared_root.display()
             ),
         ));
@@ -14933,7 +14973,7 @@ fn mount_storage(
             && share.server == uri.server
             && share.source_root == Path::new(&uri.source)
         {
-            if share.mount_root != mount_root {
+            if share.mount_root != options.mount_root {
                 return Err((
                     2,
                     format!(
@@ -14945,14 +14985,7 @@ fn mount_storage(
                 ));
             }
             if uri.protocol == StorageProtocol::Smb {
-                return register_smb_share(
-                    config_path,
-                    state_dir,
-                    share_id,
-                    &uri,
-                    &mount_root,
-                    overlay_existing,
-                );
+                return register_smb_share(config_path, state_dir, share_id, &uri, &options);
             }
             return register_named_share(
                 config_path,
@@ -14961,24 +14994,24 @@ fn mount_storage(
                 None,
                 share_id,
                 &uri.source,
-                Some(&mount_root.to_string_lossy()),
-                overlay_existing,
+                Some(&options.mount_root.to_string_lossy()),
+                options.overlay_existing,
                 false,
             );
         }
-        if managed_paths_overlap(&mount_root, &share.mount_root) {
+        if managed_paths_overlap(&options.mount_root, &share.mount_root) {
             return Err((
                 2,
                 format!(
                     "mount root {} overlaps managed share {} at {}",
-                    mount_root.display(),
+                    options.mount_root.display(),
                     share_id,
                     share.mount_root.display()
                 ),
             ));
         }
     }
-    if overlay_existing && Path::new(&uri.source) != mount_root {
+    if options.overlay_existing && Path::new(&uri.source) != options.mount_root {
         return Err((
             2,
             "--overlay-existing requires the URI source path to equal --mount-root".into(),
@@ -14986,14 +15019,7 @@ fn mount_storage(
     }
     let share_id = managed_storage_share_id(&uri);
     if uri.protocol == StorageProtocol::Smb {
-        return register_smb_share(
-            config_path,
-            state_dir,
-            &share_id,
-            &uri,
-            &mount_root,
-            overlay_existing,
-        );
+        return register_smb_share(config_path, state_dir, &share_id, &uri, &options);
     }
     register_named_share(
         config_path,
@@ -15002,8 +15028,8 @@ fn mount_storage(
         None,
         &share_id,
         &uri.source,
-        Some(&mount_root.to_string_lossy()),
-        overlay_existing,
+        Some(&options.mount_root.to_string_lossy()),
+        options.overlay_existing,
         false,
     )
 }
@@ -15044,6 +15070,48 @@ fn smb_share_parts(share: &ShareConfig) -> AppResult<(String, String)> {
     }
 }
 
+pub(crate) fn resolve_smb_user(
+    config: &ClusterConfig,
+    server: &NodeId,
+    requested: Option<&str>,
+) -> Result<String, ConfigError> {
+    if let Some(requested) = requested {
+        return valid_smb_user(requested)
+            .then(|| requested.to_owned())
+            .ok_or(ConfigError::InvalidSmbUser);
+    }
+    let accounts = config
+        .shares
+        .values()
+        .filter(|share| share.server == *server)
+        .filter_map(|share| share.smb_user.clone())
+        .collect::<BTreeSet<_>>();
+    match accounts.len() {
+        0 => {
+            let current = std::env::var("USER").unwrap_or_default();
+            valid_smb_user(&current)
+                .then_some(current)
+                .ok_or(ConfigError::InvalidSmbUser)
+        }
+        1 => Ok(accounts.into_iter().next().expect("one account exists")),
+        _ => Err(ConfigError::AmbiguousSmbUser {
+            node: server.to_string(),
+        }),
+    }
+}
+
+fn valid_smb_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 64
+        && user.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+            }
+        })
+}
+
 fn smb_backing_path(share_uuid: &str) -> PathBuf {
     PathBuf::from("/Users/Shared/.macluster-mounts").join(share_uuid.trim())
 }
@@ -15061,7 +15129,13 @@ fn smb_alias_path(share: &ShareConfig) -> AppResult<PathBuf> {
 
 fn smb_mount_script(share: &ShareConfig, server: &NodeConfig) -> AppResult<String> {
     let (share_name, _) = smb_share_parts(share)?;
-    let source = format!("//{}/{}", server.host, share_name);
+    let smb_user = share.smb_user.as_deref().ok_or_else(|| {
+        (
+            2,
+            "SMB share has no configured account; rerun mnode -mount with --smb-user".into(),
+        )
+    })?;
+    let source = format!("//{smb_user}@{}/{}", server.host, share_name);
     let physical = shell_quote(&smb_backing_path(&share.share_uuid).to_string_lossy());
     let logical = shell_quote(&share.mount_root.to_string_lossy());
     let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
@@ -15175,6 +15249,7 @@ fn reconcile_local_smb_shares_with_home(
                     source_root: PathBuf::from(source_root),
                     mount_root: PathBuf::from(mount_root),
                     share_uuid: share_uuid.to_owned(),
+                    smb_user: None,
                     allow_existing_contents: false,
                 };
                 let script = smb_unmount_script(&stale)?;
@@ -15276,9 +15351,9 @@ fn register_smb_share(
     state_dir: &Path,
     share_id: &str,
     uri: &StorageUri,
-    mount_root: &Path,
-    _overlay_existing: bool,
+    options: &StorageMountOptions,
 ) -> AppResult<()> {
+    let _credential_rotation_requested = options.update_credential;
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
         state_dir,
@@ -15307,12 +15382,20 @@ fn register_smb_share(
             node_ssh_endpoint_reachable,
         );
         let existing = config.shares.get(share_id);
+        let smb_user = match options.smb_user.as_deref() {
+            Some(requested) => resolve_smb_user(&config, &uri.server, Some(requested)),
+            None => existing
+                .and_then(|share| share.smb_user.clone())
+                .map(Ok)
+                .unwrap_or_else(|| resolve_smb_user(&config, &uri.server, None)),
+        }
+        .map_err(|error| (2, error.to_string()))?;
         let repairing = existing.is_some();
         let share = if let Some(existing) = existing {
             if existing.protocol != StorageProtocol::Smb
                 || existing.server != uri.server
                 || existing.source_root != Path::new(&uri.source)
-                || existing.mount_root != mount_root
+                || existing.mount_root != options.mount_root
             {
                 return Err((
                     2,
@@ -15321,14 +15404,19 @@ fn register_smb_share(
                     ),
                 ));
             }
-            existing.clone()
+            let mut share = existing.clone();
+            if options.smb_user.is_some() || share.smb_user.is_none() {
+                share.smb_user = Some(smb_user.clone());
+            }
+            share
         } else {
             ShareConfig {
                 protocol: StorageProtocol::Smb,
                 server: uri.server.clone(),
                 source_root: PathBuf::from(&uri.source),
-                mount_root: mount_root.to_path_buf(),
+                mount_root: options.mount_root.clone(),
                 share_uuid: Id128::random().to_string(),
+                smb_user: Some(smb_user),
                 allow_existing_contents: false,
             }
         };
@@ -15378,12 +15466,12 @@ fn register_smb_share(
         if repairing {
             println!(
                 "Repaired SMB share {uri} at {} on reachable nodes.",
-                mount_root.display()
+                options.mount_root.display()
             );
         } else {
             println!(
                 "Mounted SMB share {uri} at {} and added it to the cluster.",
-                mount_root.display()
+                options.mount_root.display()
             );
         }
         if !deferred_clients.is_empty() {
@@ -15673,6 +15761,7 @@ fn register_named_share(
             source_root: source_root.clone(),
             mount_root: mount_root.clone(),
             share_uuid: marker_uuid.clone(),
+            smb_user: None,
             allow_existing_contents,
         };
         let queued_source = if queue_server {
@@ -16590,7 +16679,9 @@ fn append_share_config(
     let replaced = replaced_child_shares(&config, share);
     let mut candidate = remove_share_sections(source, &replaced);
     if let Some(existing) = config.shares.get(share_id) {
-        if existing != share {
+        let mut comparable = share.clone();
+        comparable.smb_user = existing.smb_user.clone();
+        if existing != &comparable {
             return Err((
                 2,
                 format!("share ID '{share_id}' is already configured differently"),
@@ -16609,6 +16700,9 @@ fn append_share_config(
         share.mount_root.display(),
         share.share_uuid,
     ));
+    if let Some(smb_user) = &share.smb_user {
+        candidate.push_str(&format!("smb_user = \"{smb_user}\"\n"));
+    }
     if share.allow_existing_contents {
         candidate.push_str("allow_existing_contents = true\n");
     }
@@ -19172,7 +19266,7 @@ fn add_existing_ssh_node_to_queue(
 mod tests {
     use super::{
         Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
-        ClientMountRequest, ClientUnmountRequest, ClusterConfig, NFS_DAEMON_PATH,
+        ClientMountRequest, ClientUnmountRequest, ClusterConfig, ConfigError, NFS_DAEMON_PATH,
         NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
         ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds,
         acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
@@ -19263,6 +19357,7 @@ mod tests {
             source_root: source.clone(),
             mount_root: mount.clone(),
             share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+            smb_user: None,
             allow_existing_contents: false,
         };
         let state = AdminState {
@@ -21302,6 +21397,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 source_root: "/Users/shared/tools".into(),
                 mount_root: "/Users/shared/tools".into(),
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );
@@ -21457,6 +21553,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 source_root: "/Users/example/script/JanusX".into(),
                 mount_root: "/Users/Shared/JanusX".into(),
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );
@@ -21521,6 +21618,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 source_root: "/team/project".into(),
                 mount_root: "/Volumes/project".into(),
                 share_uuid: "00000000-0000-4000-8000-000000000003".into(),
+                smb_user: Some("smb-user".into()),
                 allow_existing_contents: false,
             },
         );
@@ -22249,6 +22347,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             source_root: source.clone(),
             mount_root: source.clone(),
             share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+            smb_user: None,
             allow_existing_contents: false,
         };
         let error = super::preflight_share_clients(&config, &share, &BTreeSet::new()).unwrap_err();
@@ -22490,9 +22589,10 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         .map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::Mount { uri, mount_root, overlay_existing: false })
+            Ok(Action::Mount { uri, options })
                 if uri.canonical == "nfs://default-001/Volumes/external-disk"
-                    && mount_root == PathBuf::from("/Volumes/external-disk")
+                    && options.mount_root == PathBuf::from("/Volumes/external-disk")
+                    && !options.overlay_existing
         ));
 
         let missing = ["-mount", "nfs://default-001/Volumes/external-disk"].map(str::to_owned);
@@ -22518,6 +22618,38 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn smb_mount_options_capture_account_and_rotation_without_accepting_them_for_nfs() {
+        let args = [
+            "-mount",
+            "smb://nas-01/data",
+            "--mount-root",
+            "/Users/Shared/nas-data",
+            "--smb-user",
+            "smb-user",
+            "--update-credential",
+        ]
+        .map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Mount { options, .. })
+                if options.smb_user.as_deref() == Some("smb-user")
+                    && options.update_credential
+                    && options.mount_root == PathBuf::from("/Users/Shared/nas-data")
+        ));
+
+        let invalid = [
+            "-mount",
+            "nfs://login-01/Volumes/data",
+            "--mount-root",
+            "/Volumes/data",
+            "--smb-user",
+            "smb-user",
+        ]
+        .map(str::to_owned);
+        assert!(parse_action(&invalid).is_err());
+    }
+
+    #[test]
     fn managed_share_id_is_stable_for_the_canonical_uri() {
         let first = StorageUri::parse("nfs://default-001/Volumes/external-disk/").unwrap();
         let second = StorageUri::parse("nfs://default-001/Volumes/external-disk").unwrap();
@@ -22525,6 +22657,57 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             super::managed_storage_share_id(&first),
             super::managed_storage_share_id(&second)
         );
+    }
+
+    fn smb_identity_config(accounts: &[&str]) -> ClusterConfig {
+        let mut source = "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"nas-01\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n".to_owned();
+        for (index, account) in accounts.iter().enumerate() {
+            source.push_str(&format!(
+                "\n[shares.smb-{index}]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/share-{index}\"\nmount_root = \"/Users/Shared/share-{index}\"\nshare_uuid = \"00000000-0000-4000-8000-00000000010{index}\"\nsmb_user = \"{account}\"\n"
+            ));
+        }
+        ClusterConfig::parse(&source).unwrap()
+    }
+
+    #[test]
+    fn smb_user_resolution_prefers_request_then_a_single_configured_account() {
+        let server = NodeId::new("nas-01").unwrap();
+        let config = smb_identity_config(&["smb-user"]);
+
+        assert_eq!(
+            super::resolve_smb_user(&config, &server, Some("Requested")).unwrap(),
+            "Requested"
+        );
+        assert_eq!(
+            super::resolve_smb_user(&config, &server, None).unwrap(),
+            "smb-user"
+        );
+    }
+
+    #[test]
+    fn smb_user_resolution_rejects_ambiguous_server_accounts() {
+        let server = NodeId::new("nas-01").unwrap();
+        let config = smb_identity_config(&["smb-user", "backup"]);
+
+        assert!(matches!(
+            super::resolve_smb_user(&config, &server, None),
+            Err(ConfigError::AmbiguousSmbUser { node }) if node == "nas-01"
+        ));
+    }
+
+    #[test]
+    fn appending_the_same_smb_share_upgrades_only_its_account_identity() {
+        let source = "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"nas-01\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n\n[shares.smb]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/data/project\"\nmount_root = \"/Users/Shared/project\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        let mut share = config.shares["smb"].clone();
+        assert_eq!(share.smb_user, None);
+        share.smb_user = Some("smb-user".into());
+
+        let updated = super::append_share_config(source, "smb", &share).unwrap();
+        let updated = ClusterConfig::parse(&updated).unwrap();
+        assert_eq!(updated.shares["smb"].share_uuid, share.share_uuid);
+        assert_eq!(updated.shares["smb"].smb_user.as_deref(), Some("smb-user"));
+        assert_eq!(updated.shares.len(), 1);
     }
 
     #[test]
@@ -22547,10 +22730,11 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             mount_root: "/Volumes/project".into(),
             share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
             allow_existing_contents: false,
+            smb_user: Some("smb-user".into()),
         };
         let script = super::smb_mount_script(&share, &server).unwrap();
 
-        assert!(script.contains("//192.0.2.20/data"));
+        assert!(script.contains("//smb-user@192.0.2.20/data"));
         assert!(script.contains("/Volumes/project"));
         assert!(script.contains("project"));
         assert!(script.contains("mount_smbfs"));
@@ -22581,11 +22765,12 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             mount_root: "/Volumes/data".into(),
             share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
             allow_existing_contents: false,
+            smb_user: Some("smb-user".into()),
         };
 
         let script = super::smb_mount_script(&share, &server).unwrap();
 
-        assert!(script.contains("//192.0.2.20/data"), "{script}");
+        assert!(script.contains("//smb-user@192.0.2.20/data"), "{script}");
         assert!(script.contains("/Volumes/data"), "{script}");
     }
 
@@ -22608,6 +22793,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             source_root: "/data".into(),
             mount_root: "/Users/Shared/nas-data".into(),
             share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            smb_user: Some("smb-user".into()),
             allow_existing_contents: false,
         };
 
@@ -24283,6 +24469,7 @@ ssh_port = 22
             source_root: PathBuf::from("/Users/Shared/tools"),
             mount_root: PathBuf::from("/Users/Shared/macluster-shares/tools"),
             share_uuid: String::new(),
+            smb_user: None,
             allow_existing_contents: false,
         };
 
@@ -24304,6 +24491,7 @@ ssh_port = 22
             source_root: PathBuf::from("/Users/Shared/tools"),
             mount_root: PathBuf::from("/Users/Shared/macluster-shares/tools"),
             share_uuid: String::new(),
+            smb_user: None,
             allow_existing_contents: false,
         };
 
@@ -25635,6 +25823,7 @@ execution_uid = 501
             source_root: source.clone(),
             mount_root: mount.clone(),
             share_uuid: Id128::random().to_string(),
+            smb_user: None,
             allow_existing_contents: false,
         };
         let child_uuid = Id128::random().to_string();
@@ -25755,6 +25944,7 @@ share_uuid="00000000-0000-4000-8000-000000000002"
             source_root: "/source/JanusX".into(),
             mount_root: "/mount/JanusX".into(),
             share_uuid: "00000000-0000-4000-8000-000000000003".into(),
+            smb_user: None,
             allow_existing_contents: false,
         };
         let candidate = super::append_share_config(source, "parent", &parent).unwrap();

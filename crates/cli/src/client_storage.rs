@@ -47,9 +47,14 @@ impl ClientMount {
 fn smb_mount(share: &macluster_protocol::control::ClientShareDescriptor) -> ClientMount {
     let path = share.source_root.trim_start_matches('/');
     let (share_name, subpath) = path.split_once('/').unwrap_or((path, ""));
+    let authority = share
+        .smb_user
+        .as_deref()
+        .map(|user| format!("{user}@{}", share.server_host))
+        .unwrap_or_else(|| share.server_host.clone());
     ClientMount {
         protocol: "smb".into(),
-        source: format!("//{}/{}", share.server_host, share_name),
+        source: format!("//{authority}/{share_name}"),
         physical_target: format!(
             "/Users/Shared/.macluster-mounts/{}",
             share.share_uuid.trim()
@@ -561,6 +566,7 @@ mod tests {
                 source_root: "/opt/homebrew".into(),
                 mount_root: "/opt/homebrew".into(),
                 share_uuid: "82d02835-f6ab-52b4-aaab-f90cafde9981".into(),
+                smb_user: None,
             }],
             queues: vec![ClientQueueDescriptor {
                 name: "default".parse().unwrap(),
@@ -618,6 +624,7 @@ mod tests {
             source_root: "/Volumes/data".into(),
             mount_root: "/Volumes/data".into(),
             share_uuid: "55fb9b02-ce96-5a69-8ad3-356563eff27b".into(),
+            smb_user: None,
         });
         let script = client_mount_script(
             "f779bcf5-ea85-5caa-9579-74b395f3cce5",
@@ -641,6 +648,7 @@ mod tests {
             source_root: "/data/project".into(),
             mount_root: "/Volumes/project".into(),
             share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            smb_user: Some("smb-user".into()),
         });
         let script = client_mount_script(
             "f779bcf5-ea85-5caa-9579-74b395f3cce5",
@@ -650,7 +658,7 @@ mod tests {
         );
 
         assert!(script.contains("mount_smbfs"));
-        assert!(script.contains("//192.0.2.20/data"));
+        assert!(script.contains("//smb-user@192.0.2.20/data"));
         assert!(script.contains("/Volumes/project"));
         assert!(script.contains("ln -s"));
         assert!(!script.contains("password"));
@@ -805,6 +813,7 @@ mod tests {
             source_root: "/data/project/nested".into(),
             mount_root: logical.to_string_lossy().into_owned(),
             share_uuid: share_uuid.into(),
+            smb_user: Some("smb-user".into()),
         }];
 
         assert!(

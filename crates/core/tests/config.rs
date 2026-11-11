@@ -366,6 +366,22 @@ fn named_share_protocol_defaults_to_nfs_and_accepts_smb() {
     let config = ClusterConfig::parse(&smb).unwrap();
 
     assert_eq!(config.shares["smb"].protocol, StorageProtocol::Smb);
+    assert_eq!(config.shares["smb"].smb_user, None);
+}
+
+#[test]
+fn named_share_smb_user_persists_validated_account_and_defaults_legacy_to_none() {
+    let smb = format!(
+        "{VALID}\n[shares.smb]\nprotocol = \"smb\"\nserver = \"mini01-a\"\nsource_root = \"/data/project\"\nmount_root = \"/Volumes/project\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\nsmb_user = \"smb-user\"\n"
+    );
+    let config = ClusterConfig::parse(&smb).unwrap();
+    assert_eq!(config.shares["smb"].smb_user.as_deref(), Some("smb-user"));
+
+    let invalid = smb.replace("smb_user = \"smb-user\"", "smb_user = \"bad$user\"");
+    assert!(matches!(
+        ClusterConfig::parse(&invalid),
+        Err(ConfigError::InvalidSmbUser)
+    ));
 }
 
 #[test]

@@ -44,19 +44,27 @@ struct HostProbe {
     rdp: bool,
     afp: bool,
     ard: bool,
+    smb: bool,
+    nfs: bool,
 }
 
 impl HostProbe {
     fn has_service(&self) -> bool {
-        self.ssh == PortState::Open || self.rdp || self.afp || self.ard
+        self.ssh == PortState::Open || self.rdp || self.afp || self.ard || self.smb || self.nfs
     }
 
     fn services(&self) -> String {
-        [(self.rdp, "RDP"), (self.afp, "AFP"), (self.ard, "ARD")]
-            .into_iter()
-            .filter_map(|(open, name)| open.then_some(name))
-            .collect::<Vec<_>>()
-            .join(", ")
+        [
+            (self.rdp, "RDP"),
+            (self.afp, "AFP"),
+            (self.ard, "ARD"),
+            (self.smb, "SMB"),
+            (self.nfs, "NFS"),
+        ]
+        .into_iter()
+        .filter_map(|(open, name)| open.then_some(name))
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 }
 
@@ -224,6 +232,8 @@ fn probe_host(ip: Ipv4Addr) -> HostProbe {
         rdp: probe_port(ip, 3389),
         afp: probe_port(ip, 548),
         ard: probe_port(ip, 3283),
+        smb: probe_port(ip, 445),
+        nfs: probe_port(ip, 2049),
     }
 }
 
@@ -508,6 +518,9 @@ fn format_scan_results(
         output.push_str("No other cluster candidates were found.\n");
     }
     output.push_str("Add a candidate with `mnode -a USER@IP`; SSH host fingerprint verification still applies.\n");
+    output.push_str(
+        "SMB/NFS columns identify services only; authenticated share paths are not scanned.\n",
+    );
     output
 }
 
@@ -538,7 +551,7 @@ pub(super) fn scan_nodes(config: &ClusterConfig) -> AppResult<()> {
     let candidates = candidate_addresses(interface, &local_addresses)?;
     let subnet = subnet_cidr(interface);
     println!(
-        "Scanning {subnet} on {} ({} addresses; SSH/RDP/Apple service probes)...",
+        "Scanning {subnet} on {} ({} addresses; SSH/RDP/Apple/SMB/NFS service probes)...",
         interface.interface,
         candidates.len()
     );
@@ -592,8 +605,9 @@ pub(super) fn scan_nodes(config: &ClusterConfig) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceAddress, PortState, ScanRow, candidate_addresses, format_scan_results, os_guess,
-        parse_ifconfig_link_rate, parse_thunderbolt_link_rate, scan_worker_count, select_interface,
+        HostProbe, InterfaceAddress, PortState, ScanRow, candidate_addresses, format_scan_results,
+        os_guess, parse_ifconfig_link_rate, parse_thunderbolt_link_rate, row_for,
+        scan_worker_count, select_interface,
     };
     use serde_json::json;
     use std::net::Ipv4Addr;
@@ -679,6 +693,25 @@ mod tests {
     }
 
     #[test]
+    fn scan_reports_smb_and_nfs_service_candidates_without_claiming_share_paths() {
+        let probe = HostProbe {
+            ip: "192.0.2.20".parse().unwrap(),
+            ssh: PortState::Closed,
+            banner: None,
+            rdp: false,
+            afp: false,
+            ard: false,
+            smb: true,
+            nfs: true,
+        };
+
+        assert_eq!(probe.services(), "SMB, NFS");
+        let row = row_for(probe.ip, Some(&probe), None, &[], false);
+        assert_eq!(row.state, "SERVICE OPEN");
+        assert_eq!(row.services, "SMB, NFS");
+    }
+
+    #[test]
     fn scan_output_is_left_aligned_and_explains_add_command() {
         let output = format_scan_results(
             "192.0.2.0/24",
@@ -701,6 +734,10 @@ mod tests {
         assert!(output.contains("IP         MAC"), "{output}");
         assert!(output.contains("192.0.2.3  00:11:22:33:44:55"), "{output}");
         assert!(output.contains("mnode -a USER@IP"), "{output}");
+        assert!(
+            output.contains("authenticated share paths are not scanned"),
+            "{output}"
+        );
     }
 
     #[test]

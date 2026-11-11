@@ -184,6 +184,15 @@ The NAS becomes a `STORAGE` node only after it serves a share. The first new ser
 
 Use `--update-credential` to validate and rotate the password before replacing the old master. Offline nodes receive the new generation automatically after reconnect. Removing the last share for a server/account schedules cleanup of the master and node credentials.
 
+Inspect the mapping ID, canonical source URI, and local target with `mnode -l`. Remove a managed mount through either endpoint:
+
+```sh
+macluster node -umount mnt-d2d3885d51b734dd
+macluster node -umount smb://nas-01/data
+```
+
+`mnode --scan` identifies SMB and NFS service candidates on the cluster subnet. It cannot safely enumerate authenticated SMB shares or NFS exports, so mountable paths come from the NAS/provider administrator or a known share URI.
+
 Older shares without `smb_user` migrate in place by rerunning `mnode -mount` with the same URI, the same mount root, and `--smb-user ACCOUNT`. This preserves the existing share ID and UUID and does not create a duplicate:
 
 ```sh
@@ -215,6 +224,7 @@ The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an 
 | `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
 | `macluster node -rm share:SHARE_ID [--force]` | Remove a configured share or cancel incomplete setup; `--force` handles a mounted share still in use |
+| `macluster node -umount MAPPING_ID\|SOURCE_URI` | Detach a named NFS/SMB mount using the ID or source URI shown by `node -l` |
 | `macluster fans --status [--node ID]` | Fan policy and support |
 | `macluster fans --auto [--node ID]` | Linear 40–80°C temperature curve |
 | `macluster fans --power [--node ID]` | Logarithmic 40–80°C temperature curve |
@@ -237,6 +247,8 @@ macluster --init --name home --queue default \
 ```
 
 The storage Mac stays outside compute queues. Same-subnet IP changes can retain node IDs after SSH trust and machine identity are verified. Migration waits for active work to drain and may require authorization for NFS changes.
+
+Interactive controller migration lists forceable blockers and asks once. Answering `y` force-cancels active jobs and attach sessions, carries deferred offline-Mac helper work to the new controller, and completes the migration. Target identity, build, storage, credential, and controller-stop failures remain hard errors.
 
 ## Troubleshooting
 

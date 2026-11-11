@@ -1901,7 +1901,13 @@ enum Action {
         force: bool,
     },
     RemoveCompute(NodeId),
-    Umount(StorageUri),
+    Umount(UmountTarget),
+}
+
+#[derive(Clone, Debug)]
+enum UmountTarget {
+    ShareId(String),
+    Uri(StorageUri),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2049,7 +2055,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::RemoveCompute(node_id) => {
             mutate_compute_role(&config_path, &state_dir, &node_id, false)
         }
-        Action::Umount(uri) => umount_storage(&config_path, &state_dir, uri),
+        Action::Umount(target) => umount_storage(&config_path, &state_dir, target),
     }
 }
 
@@ -2216,7 +2222,12 @@ pub(crate) fn agent_helper_refresh_pending_nodes(
     if contents.trim() == "pending" {
         // Upgrade the old cluster-wide marker conservatively. New writes track
         // the specific Macs whose helper refresh still needs attention.
-        return Ok(config.nodes.keys().cloned().collect());
+        return Ok(config
+            .nodes
+            .keys()
+            .filter(|node_id| config.is_operational_node(node_id))
+            .cloned()
+            .collect());
     }
     let pending: AgentHelperRefreshPending = serde_json::from_str(&contents)
         .map_err(|error| format!("helper refresh marker is invalid: {error}"))?;
@@ -2228,7 +2239,11 @@ pub(crate) fn agent_helper_refresh_pending_nodes(
     {
         return Err("helper refresh marker does not match the active node configuration".into());
     }
-    Ok(pending.nodes)
+    Ok(pending
+        .nodes
+        .into_iter()
+        .filter(|node_id| config.is_operational_node(node_id))
+        .collect())
 }
 
 fn set_agent_helper_refresh_pending_nodes(state_dir: &Path, nodes: BTreeSet<String>) {
@@ -3741,9 +3756,21 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
             .map(str::to_owned)
             .or_else(|| args.get(1).cloned())
             .ok_or_else(|| (2, format!("{key} requires a storage URI")))?;
-        return Ok(Action::Umount(
-            StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?,
-        ));
+        let target = if uri_text.contains("://") {
+            UmountTarget::Uri(StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?)
+        } else {
+            if !uri_text.bytes().enumerate().all(|(index, byte)| {
+                if index == 0 {
+                    byte.is_ascii_alphanumeric()
+                } else {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+                }
+            }) {
+                return Err((2, format!("invalid storage mapping ID '{uri_text}'")));
+            }
+            UmountTarget::ShareId(uri_text)
+        };
+        return Ok(Action::Umount(target));
     }
     if key == "-migrate" || key == "--migrate" {
         if args.len() != (if inline.is_some() { 1 } else { 2 }) {
@@ -4036,7 +4063,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -a compute:NODE_ID
   mnode -a storage:NODE_ID@IPv4
   mnode -mount URI --mount-root PATH
-  mnode -umount URI
+  mnode -umount MAPPING_ID|SOURCE_URI
   mnode -migrate controller:NODE_ID
   mnode -l|--list [--all] [--storage]
   mnode -rm|--remove NODE_ID|compute:NODE_ID|share:SHARE_ID
@@ -4053,7 +4080,7 @@ EXAMPLES
   mnode -a compute:default-001
   mnode -a storage:nas-01@192.0.2.5
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
-  mnode -umount nfs://login-01/Users/Shared/tools
+  mnode -umount mnt-0123456789abcdef
   mnode -l --storage
 
 Use `mnode -l --all` to include unreachable compute nodes.
@@ -4069,7 +4096,7 @@ Use --help for scan, SSH, and migration details."#;
   mnode -mount nfs://NODE/PATH --mount-root PATH [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH
         [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
-  mnode -umount URI
+  mnode -umount MAPPING_ID|SOURCE_URI
   mnode -migrate controller:NODE_ID
   mnode -l|--list [--all] [--storage]
   mnode --scan
@@ -4097,6 +4124,7 @@ EXAMPLES
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
   mnode -mount smb://nas-01/data/project --mount-root /Volumes/project \
     --smb-user smb-user
+  mnode -umount mnt-0123456789abcdef
   mnode -umount smb://nas-01/data/project
   mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
@@ -4161,19 +4189,24 @@ REMOVE NODES
 
 SCAN NETWORK
   `mnode --scan` searches only the subnet attached to the configured login
-  address. It reports IP, MAC when known, service availability, registered
-  node ID, and a best-effort OS guess. Generic SSH banners may not identify
-  macOS or Linux. Reachability checks do not verify login credentials.
+  address. It reports IP, MAC when known, SSH/RDP/AFP/ARD/SMB/NFS service
+  availability, registered node ID, and a best-effort OS guess. Generic SSH
+  banners may not identify macOS or Linux. Reachability checks do not verify
+  login credentials and cannot enumerate authenticated SMB shares or NFS
+  exports; use `mnode -l` for already configured source and target mappings.
   The interface link rate is shown when macOS reports it; this is not a
   throughput benchmark. Scanning is read-only; it does not enroll nodes or
   change SSH trust. Add a result separately with `mnode -a USER@IP`.
 
 CONTROLLER MAINTENANCE
   Node, share, and controller-role changes pause submissions. Running jobs are
-  not killed. `mnode -migrate controller:NODE_ID` requires zero pending jobs,
-  zero running jobs, complete output synchronization, and no maintenance in
-  flight. It moves the controller SQLite and activation state, fences the old
-  controller, and restarts it automatically on failure."#
+  not killed by ordinary maintenance. `mnode -migrate controller:NODE_ID`
+  performs one interactive confirmation when active jobs or deferred helper
+  work remains. Answer y to force-cancel active jobs, carry deferred offline
+  Mac helper work to the new controller, and complete migration. Target
+  identity, build, storage, credential, and controller-stop failures remain
+  hard errors. The command moves the controller SQLite and activation state,
+  fences the old controller, and restarts it automatically on failure."#
 }
 
 fn read_config(path: &Path) -> AppResult<ClusterConfig> {
@@ -4433,6 +4466,39 @@ fn controller_migration_idle_error(
         })
 }
 
+fn controller_migration_post_stop_error(
+    force_migration: bool,
+    jobs: &[macluster_protocol::types::JobRecord],
+) -> Option<String> {
+    if force_migration {
+        None
+    } else {
+        controller_migration_idle_error(jobs)
+    }
+}
+
+fn controller_migration_job_blockers(jobs: &[macluster_protocol::types::JobRecord]) -> Vec<String> {
+    jobs.iter()
+        .filter_map(|job| {
+            if !job.state.is_terminal() {
+                Some(format!(
+                    "active job {} is {:?} on {} and will be force-cancelled",
+                    job.id,
+                    job.state,
+                    job.node.as_ref().map_or("-", NodeId::as_str)
+                ))
+            } else if job.snapshot_sync_pending || job.log_sync_pending {
+                Some(format!(
+                    "job {} has pending output synchronization and will be carried to the target controller",
+                    job.id
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn controller_migration_maintenance_error(status: Option<&MaintenanceStatus>) -> Option<String> {
     status.map(|status| {
         format!(
@@ -4440,6 +4506,118 @@ fn controller_migration_maintenance_error(status: Option<&MaintenanceStatus>) ->
             status.ticket.operation_id, status.phase, status.scope
         )
     })
+}
+
+fn migration_jobs_to_cancel(jobs: &[macluster_protocol::types::JobRecord]) -> Vec<u64> {
+    jobs.iter()
+        .filter(|job| !job.state.is_terminal())
+        .map(|job| job.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn confirm_force_controller_migration(blockers: &[String]) -> AppResult<()> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err((
+            2,
+            format!(
+                "controller migration has forceable blockers; rerun in Terminal to confirm: {}",
+                blockers.join("; ")
+            ),
+        ));
+    }
+    eprintln!(
+        "Controller migration will force-cancel active jobs and carry deferred work forward:"
+    );
+    for blocker in blockers {
+        eprintln!("  - {blocker}");
+    }
+    eprint!(
+        "Continue migration now? y force-cancels active jobs, carries deferred work forward, and completes migration. [y/N]: "
+    );
+    io::stderr().flush().map_err(io_error)?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).map_err(io_error)?;
+    if shutdown_confirmation_accepted(&response) {
+        Ok(())
+    } else {
+        Err((
+            1,
+            "controller migration cancelled; no jobs or controller processes were stopped".into(),
+        ))
+    }
+}
+
+fn force_cancel_migration_jobs(
+    binding: &ServiceBinding,
+    state_dir: &Path,
+    jobs: &[macluster_protocol::types::JobRecord],
+) {
+    let ids = migration_jobs_to_cancel(jobs);
+    if ids.is_empty() {
+        return;
+    }
+    eprintln!(
+        "Force-cancelling active job(s): {}",
+        ids.iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match ControlClient::connect(binding, MAINTENANCE_CONTROL_TIMEOUT) {
+        Ok(mut client) => {
+            for job_id in &ids {
+                if let Err(error) = client.request(ControlCommand::CancelJob {
+                    job_id: *job_id,
+                    force: true,
+                }) {
+                    eprintln!("Warning: job {job_id} cancellation request failed: {error}");
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: controller was not available to cancel job(s) {}: {error}",
+                ids.iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_notice = Instant::now();
+    while Instant::now() < deadline {
+        let remaining = ReadOnlyJobStore::open(state_dir)
+            .ok()
+            .and_then(|storage| storage.list_active_jobs().ok())
+            .map(|jobs| migration_jobs_to_cancel(&jobs));
+        match remaining {
+            Some(remaining) if remaining.is_empty() => return,
+            Some(remaining) if last_notice.elapsed() >= Duration::from_secs(3) => {
+                eprintln!(
+                    "Waiting for cancelled job(s) to stop: {}",
+                    remaining
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                last_notice = Instant::now();
+            }
+            Some(_) => {}
+            None if last_notice.elapsed() >= Duration::from_secs(3) => {
+                eprintln!("Waiting for the job database while cancelling migration blockers");
+                last_notice = Instant::now();
+            }
+            None => {}
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!(
+        "Warning: some jobs remain active after 30 seconds; the target controller will reconcile their cancellation state."
+    );
 }
 
 fn controller_migration_candidate(
@@ -4550,6 +4728,40 @@ fn controller_migration_primary_marker_check(shared_root: &Path, cluster_uuid: &
     format!(
         "/bin/test -f {marker} && /bin/test ! -L {marker} && /usr/bin/grep -Fqx {} {marker}",
         shell_quote(cluster_uuid)
+    )
+}
+
+fn controller_migration_target_preflight_script(
+    shared_root: &Path,
+    cluster_uuid: &str,
+    target_config: &Path,
+    target_state: &Path,
+    remote_binary: &str,
+) -> String {
+    let marker_check = controller_migration_primary_marker_check(shared_root, cluster_uuid);
+    let archive_root = target_state
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("controller-archive");
+    format!(
+        "set -eu\n\
+shared={shared}\n\
+config={config}\n\
+state={state}\n\
+archive_root={archive_root}\n\
+if /bin/test -e \"$state/controller.sqlite3\"; then\n\
+  /bin/test ! -e \"$config\" || {{ echo 'target already has an active controller config with stale state' >&2; exit 9; }}\n\
+  /bin/mkdir -p \"$archive_root\"\n\
+  archive=\"$archive_root/migration-$(/bin/date +%s)-$$\"\n\
+  /bin/mv \"$state\" \"$archive\"\n\
+  echo \"Archived stale target controller state at $archive\" >&2\n\
+fi\n\
+/bin/test -d \"$shared\" && {marker_check} && /bin/test ! -e \"$config\" && /bin/test ! -e \"$state/controller.sqlite3\" && /usr/bin/shasum -a 256 {binary} | /usr/bin/awk '{{print $1}}'\n",
+        shared = shell_quote(&shared_root.to_string_lossy()),
+        config = shell_quote(&target_config.to_string_lossy()),
+        state = shell_quote(&target_state.to_string_lossy()),
+        archive_root = shell_quote(&archive_root.to_string_lossy()),
+        binary = shell_quote(remote_binary),
     )
 }
 
@@ -4766,6 +4978,20 @@ fn controller_migration_may_restart_old(was_running: bool, target_cleanup_ok: bo
 fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) -> AppResult<()> {
     let config_path = config_path.canonicalize().map_err(io_error)?;
     let config = read_config(&config_path)?;
+    let (migration_config, recovered_smb_users, mut preflight_warnings) =
+        recover_missing_smb_users(&config);
+    let smb_masters = match macluster_controller::smb_credential::export_smb_masters(
+        &migration_config,
+        &macluster_controller::smb_credential::CredentialHelperClient::system(),
+    ) {
+        Ok(masters) => masters,
+        Err(error) => {
+            preflight_warnings.push(format!(
+                "SMB master credentials will not be migrated: {error}; existing node Keychain credentials remain in place"
+            ));
+            Vec::new()
+        }
+    };
     let target = config
         .nodes
         .get(target_id.as_str())
@@ -4783,36 +5009,30 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         .map_err(|error| (1, error.to_string()))?
         .list_active_jobs()
         .map_err(|error| (1, error.to_string()))?;
-    if let Some(error) = controller_migration_idle_error(&active) {
-        return Err((1, error));
+    let mut blockers = controller_migration_job_blockers(&active);
+    blockers.extend(preflight_warnings);
+    if let Err(error) = ensure_no_node_maintenance_in_progress(&config_path, state_dir) {
+        blockers.push(error);
     }
-    ensure_no_node_maintenance_in_progress(&config_path, state_dir).map_err(|error| (1, error))?;
     if node_admin_recovery_pending(&config_path, state_dir).map_err(|error| (1, error))? {
-        return Err((
-            1,
-            "controller migration requires all node administration recovery to be complete".into(),
-        ));
+        blockers.push("node administration recovery is pending".into());
     }
     if peer_config_sync_pending(&config_path, state_dir).map_err(|error| (1, error))? {
-        return Err((
-            1,
-            "controller migration requires all peer configuration synchronization to complete"
-                .into(),
-        ));
+        blockers.push("peer configuration synchronization is pending".into());
     }
     if agent_update_recovery_pending(&config_path, state_dir).map_err(|error| (1, error))? {
-        return Err((
-            1,
-            "controller migration requires all Agent update recovery to complete".into(),
-        ));
+        blockers.push("Agent update recovery is pending".into());
     }
-    if !agent_helper_refresh_pending_nodes(state_dir, &config)
-        .map_err(|error| (1, error))?
-        .is_empty()
-    {
-        return Err((
-            1,
-            "controller migration requires all privileged helper refresh work to complete".into(),
+    let pending_helpers =
+        agent_helper_refresh_pending_nodes(state_dir, &config).map_err(|error| (1, error))?;
+    if !pending_helpers.is_empty() {
+        blockers.push(format!(
+            "privileged helper refresh is deferred for: {}",
+            pending_helpers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     let binding = ServiceBinding::load(&config_path, state_dir).map_err(|error| {
@@ -4831,42 +5051,45 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         .inspect(Duration::from_secs(2))
         .map_err(|error| (1, format!("cannot inspect current controller: {error}")))?;
     if inspection.loaded && inspection.hello.is_none() {
-        return Err((
-            1,
-            "controller migration cannot verify the running controller's maintenance state".into(),
-        ));
+        blockers.push("running controller did not expose a verifiable maintenance state".into());
     }
     if inspection.hello.is_some() {
         if !matches!(
             inspection.hello.as_ref().map(|hello| hello.lifecycle),
             Some(macluster_protocol::control::ControllerLifecycle::Ready)
         ) {
-            return Err((
-                1,
-                "controller migration requires a Ready controller or a fully stopped controller"
+            blockers.push(
+                "controller is not Ready; migration will stop it and start the target controller"
                     .into(),
-            ));
+            );
         }
-        let mut client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
-            .map_err(control_client_error)?;
-        let maintenance = match client
-            .request(ControlCommand::InspectMaintenance)
-            .map_err(control_client_error)?
-        {
-            ControlPayload::Maintenance(status) => status,
-            _ => {
-                return Err((
-                    1,
+        match ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT) {
+            Ok(mut client) => match client.request(ControlCommand::InspectMaintenance) {
+                Ok(ControlPayload::Maintenance(maintenance)) => {
+                    if let Some(error) =
+                        controller_migration_maintenance_error(maintenance.as_ref())
+                    {
+                        blockers.push(error);
+                    }
+                }
+                Ok(_) => blockers.push(
                     "controller returned an invalid maintenance status before migration".into(),
-                ));
-            }
-        };
-        if let Some(error) = controller_migration_maintenance_error(maintenance.as_ref()) {
-            return Err((1, error));
+                ),
+                Err(error) => blockers.push(format!(
+                    "controller maintenance state could not be inspected: {error}"
+                )),
+            },
+            Err(error) => blockers.push(format!(
+                "controller maintenance state could not be inspected: {error}"
+            )),
         }
     }
+    let force_migration = !blockers.is_empty();
+    if force_migration {
+        confirm_force_controller_migration(&blockers)?;
+    }
     let facts = read_remote_facts(&target).map_err(|(_, error)| (1, error))?;
-    if facts.os != "macos" {
+    if !remote_os_is_macos(&facts.os) {
         return Err((1, "controller target must be a macOS node".into()));
     }
     let target_home = PathBuf::from(checked_remote_path(&facts.home)?);
@@ -4874,14 +5097,12 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let target_state = target_home.join("Library/Application Support/macluster/controller");
     let local_binary = std::env::current_exe().map_err(io_error)?;
     let local_hash = local_sha256(&local_binary)?;
-    let marker_check =
-        controller_migration_primary_marker_check(&config.shared_root, &config.share_uuid);
-    let preflight = format!(
-        "test -d {} && {marker_check} && test ! -e {} && test ! -e {}/controller.sqlite3 && /usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}'",
-        shell_quote(&config.shared_root.to_string_lossy()),
-        shell_quote(&target_config.to_string_lossy()),
-        shell_quote(&target_state.to_string_lossy()),
-        shell_quote(&target.remote_binary),
+    let preflight = controller_migration_target_preflight_script(
+        &config.shared_root,
+        &config.share_uuid,
+        &target_config,
+        &target_state,
+        &target.remote_binary,
     );
     let preflight = ssh_output(&target, &preflight, None).map_err(|(_, error)| (1, error))?;
     if !preflight.status.success() {
@@ -4904,23 +5125,13 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     }
     let source = fs::read_to_string(&config_path).map_err(io_error)?;
     let candidate =
-        controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
+        controller_migration_candidate(&migration_config, &source, target_id.as_str(), facts.uid)?;
+    let candidate = apply_recovered_smb_users(&candidate, &recovered_smb_users)?;
+    ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
     let was_running = manager
         .intent()
         .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
         == macluster_core::service::ServiceIntent::Auto;
-    let smb_masters = macluster_controller::smb_credential::export_smb_masters(
-        &config,
-        &macluster_controller::smb_credential::CredentialHelperClient::system(),
-    )
-    .map_err(|error| {
-        (
-            1,
-            format!(
-                "controller migration could not export SMB master credentials; no controller was stopped: {error}"
-            ),
-        )
-    })?;
     stage_target_smb_masters(
         &smb_masters,
         |provision| run_target_smb_master_command(&target, "import", provision, true),
@@ -4937,6 +5148,9 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             ),
         )
     })?;
+    if force_migration {
+        force_cancel_migration_jobs(&binding, state_dir, &active);
+    }
     if let Err(error) = manager.stop() {
         cleanup_target_smb_masters(&target, &smb_masters);
         return Err((
@@ -4973,7 +5187,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             return Err((1, message));
         }
     };
-    if let Some(error) = controller_migration_idle_error(&post_stop_active) {
+    if let Some(error) = controller_migration_post_stop_error(force_migration, &post_stop_active) {
         cleanup_target_smb_masters(&target, &smb_masters);
         let restart = if was_running {
             manager
@@ -5011,6 +5225,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         }
         Err((1, message))
     };
+    set_agent_helper_refresh_pending_nodes(state_dir, pending_helpers);
     let archive = match controller_migration_archive(candidate.as_bytes(), state_dir) {
         Ok(archive) => archive,
         Err((_, error)) => {
@@ -5490,6 +5705,73 @@ pub(crate) fn read_remote_facts(node: &NodeConfig) -> AppResult<RemoteFacts> {
             .parse()
             .map_err(|_| (1, "remote free disk size was not numeric".into()))?,
     })
+}
+
+fn remote_os_is_macos(value: &str) -> bool {
+    value.eq_ignore_ascii_case("darwin") || value.eq_ignore_ascii_case("macos")
+}
+
+fn parse_security_internet_account(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (_, value) = line.trim().split_once("\"acct\"<blob>=")?;
+        let account = value.trim().trim_matches('"');
+        valid_smb_user(account).then(|| account.to_owned())
+    })
+}
+
+fn recover_missing_smb_users(
+    config: &ClusterConfig,
+) -> (ClusterConfig, BTreeMap<String, String>, Vec<String>) {
+    let mut recovered_config = config.clone();
+    let mut recovered = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for (share_id, share) in &mut recovered_config.shares {
+        if share.protocol != StorageProtocol::Smb || share.smb_user.is_some() {
+            continue;
+        }
+        let Some(server) = config.nodes.get(share.server.as_str()) else {
+            warnings.push(format!(
+                "SMB mapping {share_id} uses missing server {}",
+                share.server
+            ));
+            continue;
+        };
+        let account = Command::new("/usr/bin/security")
+            .args(["find-internet-password", "-s", &server.host])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                parse_security_internet_account(&String::from_utf8_lossy(&output.stdout))
+            });
+        match account {
+            Some(account) => {
+                share.smb_user = Some(account.clone());
+                recovered.insert(share_id.clone(), account);
+            }
+            None => warnings.push(format!(
+                "SMB account metadata is missing for {share_id} on {}",
+                server.host
+            )),
+        }
+    }
+    (recovered_config, recovered, warnings)
+}
+
+fn apply_recovered_smb_users(
+    candidate: &str,
+    recovered: &BTreeMap<String, String>,
+) -> AppResult<String> {
+    let mut candidate = candidate.to_owned();
+    for (share_id, account) in recovered {
+        candidate = replace_section_key(
+            &candidate,
+            &format!("[shares.{share_id}]"),
+            "smb_user",
+            &format!("\"{account}\""),
+        )?;
+    }
+    Ok(candidate)
 }
 
 fn remote_route_ipv4(node: &NodeConfig, destination: &str) -> AppResult<Ipv4Addr> {
@@ -7817,6 +8099,20 @@ fn refresh_agent_helpers_for_update(
     refresh_agent_helpers_with_signed_updater(config, operation_id, state_dir, reachable_nodes)
 }
 
+fn helper_refresh_deferred_nodes(
+    config: &ClusterConfig,
+    reachable_nodes: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    config
+        .nodes
+        .keys()
+        .filter(|node_id| {
+            config.is_operational_node(node_id) && !reachable_nodes.contains(*node_id)
+        })
+        .cloned()
+        .collect()
+}
+
 fn refresh_agent_helpers_with_signed_updater(
     config: &ClusterConfig,
     operation_id: &str,
@@ -7830,12 +8126,7 @@ fn refresh_agent_helpers_with_signed_updater(
         cluster_id: signing_key.cluster_id().to_owned(),
         public_key: signing_key.public_key_bytes(),
     };
-    let mut deferred = config
-        .nodes
-        .keys()
-        .filter(|node_id| !reachable_nodes.contains(*node_id))
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut deferred = helper_refresh_deferred_nodes(config, reachable_nodes);
     for (node_id, node) in &config.nodes {
         if !reachable_nodes.contains(node_id) {
             continue;
@@ -14310,6 +14601,7 @@ struct NodeNfsMapping {
     state: &'static str,
     kind: &'static str,
     source_node: String,
+    source_uri: String,
     target: String,
 }
 
@@ -14392,18 +14684,20 @@ fn nfs_mapping(
             "ALIAS"
         },
         source_node: server_id.to_owned(),
+        source_uri: format!("{protocol}://{server_id}{}", source.to_string_lossy()),
         target: target.to_string_lossy().into_owned(),
     }
 }
 
 fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
-    let mut indexes: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
+    let mut indexes: BTreeMap<(String, String, String, String, String), usize> = BTreeMap::new();
     let mut mappings: Vec<NodeNfsMapping> = Vec::new();
     for mapping in rows.iter().flat_map(|row| &row.mappings) {
         let key = (
             mapping.name.clone(),
             mapping.protocol.to_string(),
             mapping.source_node.clone(),
+            mapping.source_uri.clone(),
             mapping.target.clone(),
         );
         if let Some(index) = indexes.get(&key).copied() {
@@ -14498,14 +14792,26 @@ fn format_node_list(rows: &[NodeListRow], detailed_storage: bool) -> String {
             .iter()
             .map(|mapping| mapping.name.chars().count())
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max("ID".len());
+        let source_width = mappings
+            .iter()
+            .map(|mapping| mapping.source_uri.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("SOURCE".len());
+        output.push_str(&format!(
+            "    {:<name_width$}  {:<4}  {:<7}  {:<6}  {:<source_width$}  TARGET\n",
+            "ID", "TYPE", "STATE", "KIND", "SOURCE",
+        ));
         for mapping in mappings {
             output.push_str(&format!(
-                "    {:<name_width$}  {:<3}  {:<7}  {} → {}\n",
+                "    {:<name_width$}  {:<4}  {:<7}  {:<6}  {:<source_width$}  {}\n",
                 mapping.name,
                 mapping.protocol.to_string().to_ascii_uppercase(),
+                mapping.state,
                 mapping.kind,
-                mapping.source_node,
+                mapping.source_uri,
                 mapping.target,
             ));
         }
@@ -15579,24 +15885,87 @@ fn mount_storage(
     )
 }
 
-fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppResult<()> {
-    let config = read_config(config_path)?;
-    let configured = config
-        .shares
-        .iter()
-        .find(|(_, share)| {
-            share.protocol == uri.protocol
-                && share.server == uri.server
-                && share.source_root == Path::new(&uri.source)
-        })
-        .map(|(id, share)| (id.clone(), share.protocol, share.mount_root.clone()));
-    let (share_id, protocol, mount_root) = configured
-        .unwrap_or_else(|| (managed_storage_share_id(&uri), uri.protocol, PathBuf::new()));
-    if protocol == StorageProtocol::Smb {
-        if mount_root.as_os_str().is_empty() {
-            return Err((2, format!("storage URI {uri} is not mounted")));
+fn resolve_umount_share(
+    config: &ClusterConfig,
+    target: &UmountTarget,
+) -> AppResult<(String, ShareConfig)> {
+    match target {
+        UmountTarget::ShareId(share_id) => {
+            if share_id == "primary" {
+                return Err((
+                    2,
+                    "the primary share is part of cluster initialization and cannot be unmounted with mnode".into(),
+                ));
+            }
+            config
+                .shares
+                .get(share_id)
+                .cloned()
+                .map(|share| (share_id.clone(), share))
+                .ok_or_else(|| {
+                    (
+                        2,
+                        format!(
+                            "storage mapping '{share_id}' is not configured; run `mnode -l` to list mapping IDs"
+                        ),
+                    )
+                })
         }
-        return unregister_smb_share(config_path, state_dir, &share_id, &mount_root);
+        UmountTarget::Uri(uri) => {
+            let direct = config
+                .shares
+                .iter()
+                .filter(|(_, share)| {
+                    share.protocol == uri.protocol
+                        && share.server == uri.server
+                        && share.source_root == Path::new(&uri.source)
+                })
+                .map(|(id, share)| (id.clone(), share.clone()))
+                .collect::<Vec<_>>();
+            if direct.len() == 1 {
+                return Ok(direct.into_iter().next().expect("one direct match"));
+            }
+            if direct.len() > 1 {
+                return Err((
+                    2,
+                    format!("storage URI {uri} matches more than one configured mapping"),
+                ));
+            }
+
+            let target_path = PathBuf::from(format!("/{}{}", uri.server, uri.source));
+            let compatible = config
+                .shares
+                .iter()
+                .filter(|(_, share)| {
+                    share.protocol == uri.protocol && share.mount_root == target_path
+                })
+                .map(|(id, share)| (id.clone(), share.clone()))
+                .collect::<Vec<_>>();
+            match compatible.as_slice() {
+                [(id, share)] => Ok((id.clone(), share.clone())),
+                [] => Err((
+                    2,
+                    format!(
+                        "storage URI {uri} is not mounted; run `mnode -l` to list source and target mappings"
+                    ),
+                )),
+                _ => Err((
+                    2,
+                    format!(
+                        "storage target {} matches more than one configured mapping",
+                        target_path.display()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+fn umount_storage(config_path: &Path, state_dir: &Path, target: UmountTarget) -> AppResult<()> {
+    let config = read_config(config_path)?;
+    let (share_id, share) = resolve_umount_share(&config, &target)?;
+    if share.protocol == StorageProtocol::Smb {
+        return unregister_smb_share(config_path, state_dir, &share_id, &share.mount_root);
     }
     remove_share(config_path, state_dir, &share_id, false)
 }
@@ -20206,7 +20575,7 @@ mod tests {
         Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
         ClientMountRequest, ClientUnmountRequest, ClusterConfig, ConfigError, NFS_DAEMON_PATH,
         NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
-        NodeShareCapacity, NodeStorageInventory, ShareConfig, UpdateRecovery,
+        NodeShareCapacity, NodeStorageInventory, ShareConfig, UmountTarget, UpdateRecovery,
         abort_duplicate_pristine_adds, acquire_maintenance_client_lock, acquire_node_maintenance,
         acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
         admin_shell_command, agent_update_completion_summary, agent_update_maintenance_scope,
@@ -22383,6 +22752,63 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn deferred_helper_refresh_excludes_external_storage_nodes() {
+        let mut config = parse_build_test_config();
+        config.nodes.insert(
+            "nas-01".into(),
+            NodeConfig {
+                host: "192.0.2.20".into(),
+                transport: Transport::Storage,
+                remote_binary: "/usr/local/bin/macluster".into(),
+                ssh_user: None,
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
+        let reachable = BTreeSet::from(["login".to_owned(), "arm-a".to_owned()]);
+
+        assert_eq!(
+            super::helper_refresh_deferred_nodes(&config, &reachable),
+            BTreeSet::from(["arm-b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn pending_helper_marker_ignores_external_storage_nodes() {
+        let mut config = parse_build_test_config();
+        config.nodes.insert(
+            "nas-01".into(),
+            NodeConfig {
+                host: "192.0.2.20".into(),
+                transport: Transport::Storage,
+                remote_binary: "/usr/local/bin/macluster".into(),
+                ssh_user: None,
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        super::atomic_write(
+            &root.join(super::HELPER_REFRESH_PENDING_FILE),
+            br#"{"schema":1,"nodes":["arm-b","nas-01"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::agent_helper_refresh_pending_nodes(&root, &config).unwrap(),
+            BTreeSet::from(["arm-b".to_owned()])
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn power_preparation_failure_stays_pending_until_a_successful_retry() {
         let mut config = parse_build_test_config();
         config.nodes.retain(|id, _| id == "login");
@@ -22580,13 +23006,14 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
 
         assert!(output.contains("STORAGE MAPPINGS"), "{output}");
         assert!(
-            output.contains("primary  NFS  LOCAL    login → /tmp/macluster-shared"),
+            output.contains("primary  NFS   UNKNOWN  LOCAL   nfs://login/tmp/macluster-shared"),
             "{output}"
         );
         assert!(
-            output.contains("project  SMB  ALIAS    login → /Volumes/project"),
+            output.contains("project  SMB   UNKNOWN  ALIAS   smb://login/team/project"),
             "{output}"
         );
+        assert!(output.contains("/Volumes/project"), "{output}");
     }
 
     #[test]
@@ -23706,9 +24133,37 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let args = ["-umount", "nfs://default-001/Volumes/external-disk/"].map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::Umount(uri))
+            Ok(Action::Umount(UmountTarget::Uri(uri)))
                 if uri.canonical == "nfs://default-001/Volumes/external-disk"
         ));
+
+        let args = ["-umount", "smb-0"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Umount(UmountTarget::ShareId(id))) if id == "smb-0"
+        ));
+    }
+
+    #[test]
+    fn unmount_resolves_mapping_ids_source_uris_and_compatible_target_paths() {
+        let config = smb_identity_config(&["smb-user"]);
+
+        let (id, share) =
+            super::resolve_umount_share(&config, &UmountTarget::ShareId("smb-0".into())).unwrap();
+        assert_eq!(id, "smb-0");
+        assert_eq!(share.mount_root, Path::new("/Users/Shared/share-0"));
+
+        let uri = StorageUri::parse("smb://nas-01/share-0").unwrap();
+        let (id, _) = super::resolve_umount_share(&config, &UmountTarget::Uri(uri)).unwrap();
+        assert_eq!(id, "smb-0");
+
+        let target_uri = StorageUri::parse("smb://Users/Shared/share-0").unwrap();
+        let (id, _) = super::resolve_umount_share(&config, &UmountTarget::Uri(target_uri)).unwrap();
+        assert_eq!(id, "smb-0");
+
+        assert!(
+            super::resolve_umount_share(&config, &UmountTarget::ShareId("missing".into())).is_err()
+        );
     }
 
     #[test]
@@ -24066,10 +24521,64 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         };
         assert!(super::controller_migration_idle_error(std::slice::from_ref(&record)).is_some());
         assert!(super::controller_migration_idle_error(&[]).is_none());
+        assert!(
+            super::controller_migration_post_stop_error(true, std::slice::from_ref(&record))
+                .is_none()
+        );
+        assert!(
+            super::controller_migration_post_stop_error(false, std::slice::from_ref(&record))
+                .is_some()
+        );
     }
 
     #[test]
-    fn controller_migration_rejects_active_controller_maintenance() {
+    fn forced_controller_migration_cancels_only_nonterminal_jobs() {
+        let spec = JobSpec {
+            storage_namespace: None,
+            required_shares: None,
+            queue: "compute".parse().unwrap(),
+            node: None,
+            name: "job".into(),
+            cwd: "/Users/Shared/macluster".into(),
+            stdout_path: "/tmp/out".into(),
+            stderr_path: "/tmp/err".into(),
+            walltime_secs: None,
+            env: BTreeMap::new(),
+            mode: JobMode::Batch,
+            snapshot: None,
+        };
+        let job = |id, state| macluster_protocol::types::JobRecord {
+            id,
+            spec: spec.clone(),
+            state,
+            node: Some(NodeId::new("default-001").unwrap()),
+            start_token: None,
+            cancel_force: false,
+            created_unix_ms: 1,
+            started_unix_ms: Some(2),
+            finished_unix_ms: None,
+            exit_code: None,
+            end_reason: None,
+            waiting_reason: None,
+            snapshot_sync_pending: false,
+            log_sync_pending: false,
+        };
+        let jobs = vec![
+            job(1, macluster_protocol::types::JobState::Running),
+            job(2, macluster_protocol::types::JobState::Cancelling),
+            job(3, macluster_protocol::types::JobState::Completed),
+        ];
+
+        assert_eq!(super::migration_jobs_to_cancel(&jobs), [1, 2]);
+        let blockers = super::controller_migration_job_blockers(&jobs);
+        assert_eq!(blockers.len(), 2);
+        assert!(blockers[0].contains("job 1"));
+        assert!(blockers[0].contains("force-cancelled"));
+        assert!(blockers[1].contains("job 2"));
+    }
+
+    #[test]
+    fn controller_migration_describes_active_controller_maintenance() {
         let status = macluster_protocol::control::MaintenanceStatus {
             ticket: macluster_protocol::control::MaintenanceTicket {
                 operation_id: Id128::random(),
@@ -24112,6 +24621,91 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 .success()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controller_migration_archives_stale_target_state_before_activation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-migration-stale-state-{}",
+            Id128::random()
+        ));
+        let shared = root.join("shared");
+        let config = root.join("target-config.toml");
+        let state = root.join("target-state");
+        let binary = root.join("macluster");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(shared.join(".macluster-share-id"), "share-uuid\n").unwrap();
+        fs::write(state.join("controller.sqlite3"), b"stale").unwrap();
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = super::local_sha256(&binary).unwrap();
+        let script = super::controller_migration_target_preflight_script(
+            &shared,
+            "share-uuid",
+            &config,
+            &state,
+            &binary.to_string_lossy(),
+        );
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        assert!(!state.join("controller.sqlite3").exists());
+        assert!(
+            fs::read_dir(root.join("controller-archive"))
+                .unwrap()
+                .any(|entry| entry.unwrap().path().join("controller.sqlite3").is_file())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_migration_recognizes_darwin_remote_facts() {
+        assert!(super::remote_os_is_macos("Darwin"));
+        assert!(super::remote_os_is_macos("macos"));
+        assert!(!super::remote_os_is_macos("Linux"));
+        assert!(!super::remote_os_is_macos("Windows_NT"));
+    }
+
+    #[test]
+    fn smb_account_recovery_reads_only_keychain_metadata() {
+        let output = "keychain: \"login.keychain-db\"\nversion: 512\nclass: \"inet\"\nattributes:\n    0x00000007 <blob>=\"192.0.2.5\"\n    \"acct\"<blob>=\"smb-user\"\n    \"ptcl\"<uint32>=\"smb \"\n";
+
+        assert_eq!(
+            super::parse_security_internet_account(output).as_deref(),
+            Some("smb-user")
+        );
+        assert_eq!(super::parse_security_internet_account("no account"), None);
+    }
+
+    #[test]
+    fn controller_migration_candidate_adds_every_recovered_smb_user() {
+        let candidate = "[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nlogin_node=\"login\"\nshared_root=\"/share\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.nas-01]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.one]\nprotocol=\"smb\"\nserver=\"nas-01\"\nsource_root=\"/one\"\nmount_root=\"/Users/Shared/one\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n[shares.two]\nprotocol=\"smb\"\nserver=\"nas-01\"\nsource_root=\"/two\"\nmount_root=\"/Users/Shared/two\"\nshare_uuid=\"00000000-0000-4000-8000-000000000003\"\n";
+        let patched = super::apply_recovered_smb_users(
+            candidate,
+            &BTreeMap::from([
+                ("one".into(), "smb-user".into()),
+                ("two".into(), "smb-user".into()),
+            ]),
+        )
+        .unwrap();
+        let config = ClusterConfig::parse(&patched).unwrap();
+
+        assert_eq!(config.shares["one"].smb_user.as_deref(), Some("smb-user"));
+        assert_eq!(config.shares["two"].smb_user.as_deref(), Some("smb-user"));
     }
 
     #[test]
@@ -25218,6 +25812,7 @@ remote_binary = "/usr/local/bin/macluster"
                         state,
                         kind: "MOUNT",
                         source_node: "login-01".into(),
+                        source_uri: "nfs://login-01/Users/Shared/macluster".into(),
                         target: target.into(),
                     }],
                     storage: NodeStorageInventory::default(),
@@ -25253,16 +25848,22 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(mappings_heading < first_mapping, "{output}");
         assert_eq!(
             output
-                .matches("primary  NFS  MOUNT    login-01 → /Users/Shared/macluster")
+                .lines()
+                .filter(|line| line.trim_start().starts_with("primary  NFS"))
                 .count(),
             1,
             "{output}"
         );
+        assert!(
+            output.contains("nfs://login-01/Users/Shared/macluster"),
+            "{output}"
+        );
+        assert!(output.contains("/Users/Shared/macluster"), "{output}");
         assert!(!output.contains("\n  login-01\n"), "{output}");
         assert!(!output.contains("\n  arm-a\n"), "{output}");
         assert!(!output.contains("PHASE"));
-        assert!(!output.contains("SOURCE"));
-        assert!(!output.contains("TARGET"));
+        assert!(output.contains("SOURCE"), "{output}");
+        assert!(output.contains("TARGET"), "{output}");
         assert!(output.contains("ROLES"), "{output}");
         assert!(output.contains("CONTROLLER"), "{output}");
         assert!(output.contains("COMPUTE"), "{output}");

@@ -186,6 +186,15 @@ macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
 
 使用 `--update-credential` 时，新密码必须先验证成功，才会替换旧主密码。离线节点重连后会自动接收新的 generation；移除某个服务器/账户的最后一个共享时，会安排清理主密码与节点凭据。
 
+用 `mnode -l` 查看 mapping ID、标准 source URI 和本机 target。可以用任一端点卸载：
+
+```sh
+macluster node -umount mnt-d2d3885d51b734dd
+macluster node -umount smb://nas-01/data
+```
+
+`mnode --scan` 可以发现集群网段中的 SMB/NFS 服务候选，但不能安全枚举需要认证的 SMB 共享或 NFS exports。可挂载路径需要来自 NAS/存储管理员或已知共享 URI。
+
 旧共享没有 `smb_user` 时，用相同 URI、相同挂载路径和 `--smb-user ACCOUNT` 重新执行 `mnode -mount` 即可原地迁移。原有 share ID 与 UUID 不变，也不会产生重复记录：
 
 ```sh
@@ -238,7 +247,7 @@ macluster --init --name home --queue default \
   --shared-root /Users/Shared/macluster
 ```
 
-存储 Mac 不加入计算队列。同网段 IP 变化时，核实 SSH 信任与机器身份后可以保留节点 ID；迁移等待活动任务结束，NFS 调整可能需要管理员授权。
+存储 Mac 不加入计算队列。同网段 IP 变化时，核实 SSH 信任与机器身份后可以保留节点 ID。交互式 controller 迁移会列出可强制处理的阻滞项并只确认一次；输入 `y` 后会强制取消活动任务和附加会话，把离线 Mac 的 helper 刷新延后交给新 controller，然后完成迁移。目标身份、版本、存储、凭据或旧 controller 停止失败仍会终止迁移。
 
 ## 排查问题
 

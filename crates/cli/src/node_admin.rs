@@ -1874,6 +1874,7 @@ enum Action {
         mount_root: PathBuf,
         overlay_existing: bool,
     },
+    MigrateController(NodeId),
     List {
         all: bool,
     },
@@ -2015,6 +2016,9 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
             mount_root,
             overlay_existing,
         } => mount_storage(&config_path, &state_dir, uri, mount_root, overlay_existing),
+        Action::MigrateController(node_id) => {
+            migrate_controller(&config_path, &state_dir, &node_id)
+        }
         Action::Remove {
             target,
             connect,
@@ -3667,6 +3671,21 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
             StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?,
         ));
     }
+    if key == "-migrate" || key == "--migrate" {
+        if args.len() != (if inline.is_some() { 1 } else { 2 }) {
+            return Err((2, format!("{key} requires controller:NODE_ID")));
+        }
+        let value = inline
+            .map(str::to_owned)
+            .or_else(|| args.get(1).cloned())
+            .ok_or_else(|| (2, format!("{key} requires controller:NODE_ID")))?;
+        let node_id = value
+            .strip_prefix("controller:")
+            .ok_or_else(|| (2, format!("{key} requires controller:NODE_ID")))?;
+        return Ok(Action::MigrateController(
+            NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
+        ));
+    }
     match key {
         "-a" | "--add" => {
             let endpoint = if let Some(value) = inline {
@@ -3920,6 +3939,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -a compute:NODE_ID
   mnode -mount URI --mount-root PATH
   mnode -umount URI
+  mnode -migrate controller:NODE_ID
   mnode -l|--list [--all]
   mnode -rm|--remove NODE_ID|compute:NODE_ID|share:SHARE_ID
 
@@ -3947,6 +3967,7 @@ Use --help for scan, SSH, and migration details."#;
   mnode -mount nfs://NODE/PATH --mount-root PATH [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH [--overlay-existing]
   mnode -umount URI
+  mnode -migrate controller:NODE_ID
   mnode -l|--list [--all]
   mnode --scan
   mnode --failed
@@ -3989,6 +4010,8 @@ ADD NODES
   the host fingerprint and enter the SSH account password once. Strict
   host-key verification remains enabled. Administrator authorization may be needed
   separately on each Mac. The configured login Mac stays outside compute queues.
+  `mnode -a compute:NODE_ID` adds the compute capability to an existing node.
+  `mnode -rm compute:NODE_ID` drains it before removing that capability.
 
 SHARES
   `local` enrolls this Mac without SSH. Add `:SOURCE_PATH` to share a directory;
@@ -4021,9 +4044,11 @@ SCAN NETWORK
   change SSH trust. Add a result separately with `mnode -a USER@IP`.
 
 CONTROLLER MAINTENANCE
-  Node and share changes pause submissions. If the controller is running,
-  mnode asks before stopping it. Running jobs are not killed, but active jobs
-  or output sync can pause maintenance. Restart with `macluster controller run`."#
+  Node, share, and controller-role changes pause submissions. Running jobs are
+  not killed. `mnode -migrate controller:NODE_ID` requires zero pending jobs,
+  zero running jobs, complete output synchronization, and no maintenance in
+  flight. It moves the controller SQLite and activation state, fences the old
+  controller, and restarts it automatically on failure."#
 }
 
 fn read_config(path: &Path) -> AppResult<ClusterConfig> {
@@ -4265,6 +4290,302 @@ fn compute_role_candidate(
         ));
     }
     Ok(candidate)
+}
+
+fn controller_migration_idle_error(
+    jobs: &[macluster_protocol::types::JobRecord],
+) -> Option<String> {
+    jobs.iter()
+        .find(|job| {
+            !job.state.is_terminal() || job.snapshot_sync_pending || job.log_sync_pending
+        })
+        .map(|job| {
+            format!(
+                "controller migration requires a completely idle cluster; job {} is {:?} and still blocks migration",
+                job.id, job.state
+            )
+        })
+}
+
+fn controller_migration_candidate(
+    config: &ClusterConfig,
+    source: &str,
+    target_id: &str,
+    target_uid: u32,
+) -> AppResult<String> {
+    let target = config.nodes.get(target_id).cloned().ok_or_else(|| {
+        (
+            2,
+            format!("controller target '{target_id}' is not configured"),
+        )
+    })?;
+    if target.transport != Transport::Ssh {
+        return Err((2, "controller target must be a registered SSH node".into()));
+    }
+    let current_id = config
+        .login_node
+        .as_ref()
+        .map(|node| node.as_str().to_owned())
+        .or_else(|| {
+            config
+                .nodes
+                .iter()
+                .find(|(_, node)| node.transport == Transport::Local)
+                .map(|(id, _)| id.clone())
+        })
+        .ok_or_else(|| (2, "configured controller node is missing".into()))?;
+    if current_id == target_id {
+        return Err((2, format!("node '{target_id}' is already the controller")));
+    }
+    let old = config
+        .nodes
+        .get(&current_id)
+        .expect("configured controller exists");
+    let user = std::env::var("USER")
+        .ok()
+        .filter(|user| !user.is_empty())
+        .ok_or_else(|| (1, "USER is not set for controller migration".into()))?;
+    let old_entry = format!(
+        "[nodes.{current_id}]\nhost = \"{}\"\ntransport = \"ssh\"\nremote_binary = \"{}\"\nssh_user = \"{}\"\nssh_port = {}\nmachine_uuid = \"{}\"\nexecution_uid = {}\n",
+        old.host,
+        old.remote_binary,
+        old.ssh_user.as_deref().unwrap_or(&user),
+        old.ssh_port.unwrap_or(22),
+        old.machine_uuid.as_deref().unwrap_or_default(),
+        old.execution_uid.unwrap_or_default(),
+    );
+    let target_entry = format!(
+        "[nodes.{target_id}]\nhost = \"{}\"\ntransport = \"local\"\nremote_binary = \"{}\"\nmachine_uuid = \"{}\"\nexecution_uid = {}\n",
+        target.host,
+        target.remote_binary,
+        target.machine_uuid.as_deref().unwrap_or_default(),
+        target_uid,
+    );
+    let mut candidate = replace_section_key(
+        source,
+        "[cluster]",
+        "login_node",
+        &format!("\"{target_id}\""),
+    )?;
+    candidate = replace_or_append_table(&candidate, &format!("[nodes.{current_id}]"), &old_entry);
+    candidate = replace_or_append_table(&candidate, &format!("[nodes.{target_id}]"), &target_entry);
+    ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+    Ok(candidate)
+}
+
+fn copy_controller_state_selection(source: &Path, destination: &Path) -> AppResult<()> {
+    fs::create_dir_all(destination).map_err(io_error)?;
+    for name in [
+        "controller.sqlite3",
+        "controller.sqlite3-wal",
+        "controller.sqlite3-shm",
+        "cluster-update.key",
+        "cluster-update.sequence",
+        "deferred-share-cleanup.json",
+    ] {
+        let from = source.join(name);
+        if from.is_file() {
+            fs::copy(&from, destination.join(name)).map_err(io_error)?;
+        }
+    }
+    for name in ["client-networks", "snapshots", "client-submissions"] {
+        let from = source.join(name);
+        if from.is_dir() {
+            copy_directory_private(&from, &destination.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_directory_private(source: &Path, destination: &Path) -> AppResult<()> {
+    fs::create_dir_all(destination).map_err(io_error)?;
+    for entry in fs::read_dir(source).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        let target = destination.join(entry.file_name());
+        if metadata.file_type().is_symlink() {
+            return Err((
+                1,
+                format!(
+                    "controller migration encountered an unsupported symlink at {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        if metadata.is_dir() {
+            copy_directory_private(&entry.path(), &target)?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), target).map_err(io_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn controller_migration_archive(config_source: &[u8], state_dir: &Path) -> AppResult<Vec<u8>> {
+    let root = std::env::temp_dir().join(format!(
+        "macluster-controller-migration-{}",
+        Id128::random()
+    ));
+    fs::create_dir_all(&root).map_err(io_error)?;
+    let result = (|| -> AppResult<Vec<u8>> {
+        fs::write(root.join("config.toml"), config_source).map_err(io_error)?;
+        copy_controller_state_selection(state_dir, &root.join("controller"))?;
+        let archive = root.join("controller-migration.tar.gz");
+        let status = Command::new("/usr/bin/tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&root)
+            .arg("config.toml")
+            .arg("controller")
+            .status()
+            .map_err(io_error)?;
+        if !status.success() {
+            return Err((1, "controller migration archive creation failed".into()));
+        }
+        fs::read(&archive).map_err(io_error)
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+fn controller_migration_target_script(
+    target: &NodeConfig,
+    target_home: &Path,
+    operation_id: &str,
+) -> String {
+    let config_path = target_home.join(".config/macluster/config.toml");
+    let state_dir = target_home.join("Library/Application Support/macluster/controller");
+    let staging = target_home.join(format!(".macluster-controller-migration-{operation_id}"));
+    format!(
+        "set -eu\nconfig={config}\nstate={state}\nstaging={staging}\nif [ -e \"$config\" ] || [ -e \"$state/controller.sqlite3\" ]; then echo 'target already has active controller configuration or state' >&2; exit 9; fi\n/bin/rm -rf \"$staging\"\n/bin/mkdir -p \"$staging\"\n/usr/bin/tar -xzf - -C \"$staging\"\n/bin/mkdir -p \"$(/usr/bin/dirname \"$config\")\" \"$state\"\n/bin/cp \"$staging/config.toml\" \"$config\"\n/bin/cp -R \"$staging/controller/.\" \"$state/\"\n{bin} --config \"$config\" --state-dir \"$state\" controller start\n/bin/rm -rf \"$staging\"\n",
+        config = shell_quote(&config_path.to_string_lossy()),
+        state = shell_quote(&state_dir.to_string_lossy()),
+        staging = shell_quote(&staging.to_string_lossy()),
+        bin = shell_quote(&target.remote_binary),
+    )
+}
+
+fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) -> AppResult<()> {
+    let config_path = config_path.canonicalize().map_err(io_error)?;
+    let config = read_config(&config_path)?;
+    let target = config
+        .nodes
+        .get(target_id.as_str())
+        .cloned()
+        .ok_or_else(|| {
+            (
+                2,
+                format!("controller target '{target_id}' is not configured"),
+            )
+        })?;
+    if target.transport != Transport::Ssh {
+        return Err((2, "controller target must be a registered SSH node".into()));
+    }
+    let active = ReadOnlyJobStore::open(state_dir)
+        .map_err(|error| (1, error.to_string()))?
+        .list_active_jobs()
+        .map_err(|error| (1, error.to_string()))?;
+    if let Some(error) = controller_migration_idle_error(&active) {
+        return Err((1, error));
+    }
+    let facts = read_remote_facts(&target).map_err(|(_, error)| (1, error))?;
+    if facts.os != "macos" {
+        return Err((1, "controller target must be a macOS node".into()));
+    }
+    let source = fs::read_to_string(&config_path).map_err(io_error)?;
+    let candidate =
+        controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
+    let binding = ServiceBinding::load(&config_path, state_dir).map_err(|error| {
+        (
+            1,
+            format!("cannot resolve current controller binding: {error}"),
+        )
+    })?;
+    let manager = crate::service::ServiceManager::current(binding).map_err(|error| {
+        (
+            1,
+            format!("cannot manage current controller service: {error}"),
+        )
+    })?;
+    let was_running = manager
+        .intent()
+        .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
+        == macluster_core::service::ServiceIntent::Auto;
+    manager.stop().map_err(|error| {
+        (
+            1,
+            format!("cannot stop the current controller for migration: {error}"),
+        )
+    })?;
+    let post_stop_active = ReadOnlyJobStore::open(state_dir)
+        .map_err(|error| (1, error.to_string()))?
+        .list_active_jobs()
+        .map_err(|error| (1, error.to_string()))?;
+    if let Some(error) = controller_migration_idle_error(&post_stop_active) {
+        if was_running {
+            let _ = manager.start(Duration::from_secs(30));
+        }
+        return Err((1, error));
+    }
+    let operation_id = Id128::random().to_string();
+    let archive = controller_migration_archive(candidate.as_bytes(), state_dir)?;
+    let target_home = PathBuf::from(checked_remote_path(&facts.home)?);
+    let script = controller_migration_target_script(&target, &target_home, &operation_id);
+    let output =
+        ssh_output_with_timeout(&target, &script, Some(&archive), Duration::from_secs(120))
+            .map_err(|(_, error)| (1, error))?;
+    if !output.status.success() {
+        if was_running {
+            let _ = manager.start(Duration::from_secs(30));
+        }
+        return Err((
+            1,
+            format!(
+                "controller migration target activation failed: {}",
+                command_error("activate controller target", &output)
+            ),
+        ));
+    }
+    let config_path_text = target_home
+        .join(".config/macluster/config.toml")
+        .to_string_lossy()
+        .into_owned();
+    let state_dir_text = target_home
+        .join("Library/Application Support/macluster/controller")
+        .to_string_lossy()
+        .into_owned();
+    let verify = format!(
+        "{} --config {} --state-dir {} controller status",
+        shell_quote(&target.remote_binary),
+        shell_quote(&config_path_text),
+        shell_quote(&state_dir_text),
+    );
+    let verified = ssh_output_with_timeout(&target, &verify, None, Duration::from_secs(30))
+        .map_err(|(_, error)| (1, error))?;
+    if !verified.status.success() || !String::from_utf8_lossy(&verified.stdout).contains("Ready") {
+        let cleanup = format!(
+            "{} --config {} --state-dir {} controller stop",
+            shell_quote(&target.remote_binary),
+            shell_quote(&config_path_text),
+            shell_quote(&state_dir_text),
+        );
+        let _ = ssh_output_with_timeout(&target, &cleanup, None, Duration::from_secs(30));
+        if was_running {
+            let _ = manager.start(Duration::from_secs(30));
+        }
+        return Err((
+            1,
+            format!(
+                "controller target did not become Ready: {}",
+                String::from_utf8_lossy(&verified.stderr).trim()
+            ),
+        ));
+    }
+    println!(
+        "Controller migrated to {target_id}. Existing login clients may need to rejoin through mDNS or `--join`."
+    );
+    Ok(())
 }
 
 fn remove_node_from_config(
@@ -21403,6 +21724,68 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(script.contains("mount_smbfs"));
         assert!(script.contains("nopassprompt"));
         assert!(!script.to_ascii_lowercase().contains("password="));
+    }
+
+    #[test]
+    fn controller_migration_selector_is_parsed_explicitly() {
+        let args = ["-migrate", "controller:default-001"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::MigrateController(node)) if node.as_str() == "default-001"
+        ));
+    }
+
+    #[test]
+    fn controller_migration_candidate_switches_local_transport() {
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"default-001\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.default-001]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nssh_user=\"worker\"\nssh_port=22\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdee\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        let candidate =
+            super::controller_migration_candidate(&config, source, "default-001", 502).unwrap();
+        let updated = ClusterConfig::parse(&candidate).unwrap();
+
+        assert_eq!(
+            updated.login_node.as_ref().map(NodeId::as_str),
+            Some("default-001")
+        );
+        assert_eq!(updated.nodes["default-001"].transport, Transport::Local);
+        assert_eq!(updated.nodes["default-001"].execution_uid, Some(502));
+        assert_eq!(updated.nodes["login"].transport, Transport::Ssh);
+    }
+
+    #[test]
+    fn controller_migration_requires_a_completely_idle_cluster() {
+        let active_job = JobSpec {
+            storage_namespace: None,
+            required_shares: None,
+            queue: "compute".parse().unwrap(),
+            node: None,
+            name: "active".into(),
+            cwd: "/Users/Shared/macluster".into(),
+            stdout_path: "/tmp/out".into(),
+            stderr_path: "/tmp/err".into(),
+            walltime_secs: None,
+            env: BTreeMap::new(),
+            mode: JobMode::Batch,
+            snapshot: None,
+        };
+        let record = macluster_protocol::types::JobRecord {
+            id: 1,
+            spec: active_job,
+            state: macluster_protocol::types::JobState::Running,
+            node: Some(NodeId::new("default-001").unwrap()),
+            start_token: None,
+            cancel_force: false,
+            created_unix_ms: 1,
+            started_unix_ms: Some(2),
+            finished_unix_ms: None,
+            exit_code: None,
+            end_reason: None,
+            waiting_reason: None,
+            snapshot_sync_pending: false,
+            log_sync_pending: false,
+        };
+        assert!(super::controller_migration_idle_error(std::slice::from_ref(&record)).is_some());
+        assert!(super::controller_migration_idle_error(&[]).is_none());
     }
 
     #[test]

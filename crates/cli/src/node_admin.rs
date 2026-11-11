@@ -14996,16 +14996,7 @@ fn unregister_smb_share(
             .map_err(|error| (1, error.to_string()))?
             .list_active_jobs()
             .map_err(|error| (1, error.to_string()))?;
-        let blockers = active
-            .iter()
-            .filter(|job| {
-                job.spec
-                    .required_shares
-                    .as_ref()
-                    .is_some_and(|required| required.iter().any(|id| id == share_id))
-            })
-            .map(|job| job.id.to_string())
-            .collect::<Vec<_>>();
+        let blockers = smb_share_removal_blockers(&active, share_id);
         if !blockers.is_empty() {
             return Err((
                 1,
@@ -15015,15 +15006,35 @@ fn unregister_smb_share(
                 ),
             ));
         }
+        let unavailable = unavailable_share_client_nodes(
+            &config,
+            share.server.as_str(),
+            node_ssh_endpoint_reachable,
+        );
+        if !unavailable.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "cannot unmount SMB share {share_id} until all clients are reachable; reconnect {} and retry. No configuration was changed",
+                    unavailable.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
         let unmount_script = smb_unmount_script(&share)?;
         for (node_id, node) in smb_client_nodes(&config, share.server.as_str()) {
-            if let Err(error) = run_interactive_admin_with_reason(
+            run_interactive_admin_with_reason(
                 node,
                 &format!("unmount SMB share {share_id} from {node_id}"),
                 &unmount_script,
-            ) {
-                eprintln!("Warning: SMB cleanup on {node_id} failed: {error}");
-            }
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "cannot unmount SMB share {share_id} from {node_id}: {error}. The cluster configuration was not changed; rerun the umount after resolving the client error"
+                    ),
+                )
+            })?;
         }
         let candidate = remove_share_sections(&source, &BTreeSet::from([share_id.to_owned()]));
         let candidate_config =
@@ -15047,6 +15058,35 @@ fn unregister_smb_share(
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
+}
+
+fn smb_share_removal_blockers(
+    jobs: &[macluster_protocol::types::JobRecord],
+    share_id: &str,
+) -> Vec<String> {
+    jobs.iter()
+        .filter_map(|job| {
+            if matches!(
+                job.state,
+                macluster_protocol::types::JobState::Starting
+                    | macluster_protocol::types::JobState::Running
+                    | macluster_protocol::types::JobState::Cancelling
+            ) {
+                return Some(format!("job {} is {:?}", job.id, job.state));
+            }
+            let sync_uses_share =
+                (job.snapshot_sync_pending || job.log_sync_pending)
+                    && job.spec.required_shares.as_ref().is_none_or(|required| {
+                        required.iter().any(|required| required == share_id)
+                    });
+            sync_uses_share.then(|| {
+                format!(
+                    "job {} output synchronization may still use SMB share {share_id}",
+                    job.id
+                )
+            })
+        })
+        .collect()
 }
 
 fn register_named_share(
@@ -25192,6 +25232,91 @@ share_uuid="928e8976-c946-509d-9e62-a3ef787664b7"
         assert_eq!(
             candidate.matches("[shares.mnt-550edfcc0fe54fa8]").count(),
             1
+        );
+    }
+
+    #[test]
+    fn smb_removal_blocks_active_jobs_and_pending_outputs_that_may_use_the_share() {
+        fn job(
+            id: u64,
+            state: macluster_protocol::types::JobState,
+            required_shares: Option<Vec<String>>,
+            log_sync_pending: bool,
+        ) -> macluster_protocol::types::JobRecord {
+            macluster_protocol::types::JobRecord {
+                id,
+                spec: JobSpec {
+                    storage_namespace: None,
+                    required_shares,
+                    queue: "compute".parse().unwrap(),
+                    node: Some(NodeId::new("worker").unwrap()),
+                    name: "test".into(),
+                    cwd: "/Users/Shared/macluster".into(),
+                    stdout_path: "/Users/Shared/macluster/out".into(),
+                    stderr_path: "/Users/Shared/macluster/err".into(),
+                    walltime_secs: None,
+                    env: BTreeMap::new(),
+                    mode: JobMode::Batch,
+                    snapshot: None,
+                },
+                state,
+                node: Some(NodeId::new("worker").unwrap()),
+                start_token: None,
+                cancel_force: false,
+                created_unix_ms: 1,
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                exit_code: None,
+                end_reason: None,
+                waiting_reason: None,
+                snapshot_sync_pending: false,
+                log_sync_pending,
+            }
+        }
+        let jobs = vec![
+            job(
+                1,
+                macluster_protocol::types::JobState::Running,
+                Some(Vec::new()),
+                false,
+            ),
+            job(
+                2,
+                macluster_protocol::types::JobState::Completed,
+                None,
+                true,
+            ),
+            job(
+                3,
+                macluster_protocol::types::JobState::Completed,
+                Some(vec!["other".into()]),
+                true,
+            ),
+            job(
+                4,
+                macluster_protocol::types::JobState::Completed,
+                None,
+                false,
+            ),
+        ];
+
+        let blockers = super::smb_share_removal_blockers(&jobs, "smb-project");
+
+        assert!(
+            blockers.iter().any(|blocker| blocker.contains("job 1")),
+            "{blockers:?}"
+        );
+        assert!(
+            blockers.iter().any(|blocker| blocker.contains("job 2")),
+            "{blockers:?}"
+        );
+        assert!(
+            !blockers.iter().any(|blocker| blocker.contains("job 3")),
+            "{blockers:?}"
+        );
+        assert!(
+            !blockers.iter().any(|blocker| blocker.contains("job 4")),
+            "{blockers:?}"
         );
     }
 

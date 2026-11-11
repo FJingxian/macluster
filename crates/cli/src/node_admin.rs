@@ -4565,8 +4565,10 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         .map_err(|(_, error)| (1, error))?;
     if !verified.status.success() || !String::from_utf8_lossy(&verified.stdout).contains("Ready") {
         let cleanup = format!(
-            "{} --config {} --state-dir {} controller stop",
+            "{} --config {} --state-dir {} controller stop >/dev/null 2>&1 || true; /bin/rm -f {}; /bin/rm -rf {}",
             shell_quote(&target.remote_binary),
+            shell_quote(&config_path_text),
+            shell_quote(&state_dir_text),
             shell_quote(&config_path_text),
             shell_quote(&state_dir_text),
         );
@@ -14516,7 +14518,7 @@ fn mount_storage(
 
 fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppResult<()> {
     let config = read_config(config_path)?;
-    let (share_id, protocol, mount_root) = config
+    let configured = config
         .shares
         .iter()
         .find(|(_, share)| {
@@ -14524,9 +14526,13 @@ fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppR
                 && share.server == uri.server
                 && share.source_root == Path::new(&uri.source)
         })
-        .map(|(id, share)| (id.clone(), share.protocol, share.mount_root.clone()))
-        .ok_or_else(|| (2, format!("storage URI {uri} is not mounted")))?;
+        .map(|(id, share)| (id.clone(), share.protocol, share.mount_root.clone()));
+    let (share_id, protocol, mount_root) = configured
+        .unwrap_or_else(|| (managed_storage_share_id(&uri), uri.protocol, PathBuf::new()));
     if protocol == StorageProtocol::Smb {
+        if mount_root.as_os_str().is_empty() {
+            return Err((2, format!("storage URI {uri} is not mounted")));
+        }
         return unregister_smb_share(config_path, state_dir, &share_id, &mount_root);
     }
     remove_share(config_path, state_dir, &share_id, false)

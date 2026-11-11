@@ -14493,6 +14493,16 @@ fn mount_storage(
                     ),
                 ));
             }
+            if uri.protocol == StorageProtocol::Smb {
+                return register_smb_share(
+                    config_path,
+                    state_dir,
+                    share_id,
+                    &uri,
+                    &mount_root,
+                    overlay_existing,
+                );
+            }
             return register_named_share(
                 config_path,
                 state_dir,
@@ -14676,13 +14686,31 @@ fn register_smb_share(
                 format!("storage server '{}' is not a registered node", uri.server),
             )
         })?;
-        let share = ShareConfig {
-            protocol: StorageProtocol::Smb,
-            server: uri.server.clone(),
-            source_root: PathBuf::from(&uri.source),
-            mount_root: mount_root.to_path_buf(),
-            share_uuid: Id128::random().to_string(),
-            allow_existing_contents: false,
+        let existing = config.shares.get(share_id);
+        let repairing = existing.is_some();
+        let share = if let Some(existing) = existing {
+            if existing.protocol != StorageProtocol::Smb
+                || existing.server != uri.server
+                || existing.source_root != Path::new(&uri.source)
+                || existing.mount_root != mount_root
+            {
+                return Err((
+                    2,
+                    format!(
+                        "SMB share ID {share_id} is already configured for a different server, source path, or mount root"
+                    ),
+                ));
+            }
+            existing.clone()
+        } else {
+            ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: uri.server.clone(),
+                source_root: PathBuf::from(&uri.source),
+                mount_root: mount_root.to_path_buf(),
+                share_uuid: Id128::random().to_string(),
+                allow_existing_contents: false,
+            }
         };
         smb_share_parts(&share)?;
         let candidate = append_share_config(&source, share_id, &share)?;
@@ -14714,21 +14742,35 @@ fn register_smb_share(
             mounted_nodes.push(node_id.clone());
         }
         let operation_id = Id128::random().to_string();
-        backup_config(&config_path, &operation_id)?;
-        atomic_write(&config_path, candidate.as_bytes())?;
+        if !repairing {
+            backup_config(&config_path, &operation_id)?;
+            atomic_write(&config_path, candidate.as_bytes())?;
+        }
         sync_remote_configs_online_nodes(&candidate_config, &candidate, state_dir, &operation_id)
             .map_err(|error| {
             (
                 1,
                 format!(
-                    "SMB share {share_id} was mounted locally, but peer config sync failed: {error}"
+                    "SMB share {share_id} was mounted locally, but {} failed: {error}",
+                    if repairing {
+                        "repair verification"
+                    } else {
+                        "peer config sync"
+                    }
                 ),
             )
         })?;
-        println!(
-            "Mounted SMB share {uri} at {} and added it to the cluster.",
-            mount_root.display()
-        );
+        if repairing {
+            println!(
+                "Repaired SMB share {uri} at {} on reachable nodes.",
+                mount_root.display()
+            );
+        } else {
+            println!(
+                "Mounted SMB share {uri} at {} and added it to the cluster.",
+                mount_root.display()
+            );
+        }
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
@@ -15897,6 +15939,18 @@ fn append_share_config(
     let config = ClusterConfig::parse(source).map_err(|error| (2, error.to_string()))?;
     let replaced = replaced_child_shares(&config, share);
     let mut candidate = remove_share_sections(source, &replaced);
+    if let Some(existing) = config.shares.get(share_id) {
+        if existing != share {
+            return Err((
+                2,
+                format!("share ID '{share_id}' is already configured differently"),
+            ));
+        }
+        candidate = remove_share_sections(
+            &candidate,
+            &BTreeSet::from([share_id.to_owned()]),
+        );
+    }
     if !candidate.ends_with('\n') {
         candidate.push('\n');
     }
@@ -24745,6 +24799,45 @@ share_uuid="00000000-0000-4000-8000-000000000002"
         assert_eq!(config.shares["parent"].source_root, parent.source_root);
         let incompatible = source.replace("/mount/JanusX/python", "/mount/JanusX/other");
         assert!(super::append_share_config(&incompatible, "parent", &parent).is_err());
+    }
+
+    #[test]
+    fn appending_the_same_smb_share_is_idempotent() {
+        let source = r#"[cluster]
+name="test"
+default_queue="q"
+shared_root="/Users/Shared/macluster"
+share_uuid="00000000-0000-4000-8000-000000000001"
+storage_server="nas"
+protocol_version=1
+[queues.q]
+nodes=[]
+scheduler="fifo"
+[nodes.nas]
+host="192.0.2.20"
+transport="ssh"
+[shares.mnt-550edfcc0fe54fa8]
+protocol="smb"
+server="nas"
+source_root="/data/project"
+mount_root="/Volumes/project"
+share_uuid="928e8976-c946-509d-9e62-a3ef787664b7"
+"#;
+        let config = ClusterConfig::parse(source).unwrap();
+        let share = config.shares["mnt-550edfcc0fe54fa8"].clone();
+
+        let candidate =
+            super::append_share_config(source, "mnt-550edfcc0fe54fa8", &share).unwrap();
+        let repaired = ClusterConfig::parse(&candidate).unwrap();
+
+        assert_eq!(repaired.shares.len(), 1);
+        assert_eq!(repaired.shares["mnt-550edfcc0fe54fa8"], share);
+        assert_eq!(
+            candidate
+                .matches("[shares.mnt-550edfcc0fe54fa8]")
+                .count(),
+            1
+        );
     }
 
     #[test]

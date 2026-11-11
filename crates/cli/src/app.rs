@@ -2033,7 +2033,13 @@ fn query_controller_agent_compatibility(
     state_dir: &Path,
     config: &ClusterConfig,
 ) -> Option<crate::node_admin::AgentBuildCompatibility> {
-    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+    if config
+        .nodes
+        .values()
+        .filter(|node| node.transport != Transport::Storage)
+        .count()
+        > MAX_CONTROL_COMPATIBILITY_NODES
+    {
         return None;
     }
     let binding = ServiceBinding::load(config_path, state_dir).ok()?;
@@ -2049,8 +2055,9 @@ fn query_controller_agent_compatibility(
     }
     let node_ids = config
         .nodes
-        .keys()
-        .map(|id| id.parse::<NodeId>().ok())
+        .iter()
+        .filter(|(_, node)| node.transport != Transport::Storage)
+        .map(|(id, _)| id.parse::<NodeId>().ok())
         .collect::<Option<Vec<_>>>()?;
     let payload = client
         .request(ControlCommand::QueryAgentCompatibility {
@@ -2103,7 +2110,13 @@ fn publish_controller_agent_compatibility(
     compatibility: &crate::node_admin::AgentBuildCompatibility,
     age_ms: u64,
 ) {
-    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+    if config
+        .nodes
+        .values()
+        .filter(|node| node.transport != Transport::Storage)
+        .count()
+        > MAX_CONTROL_COMPATIBILITY_NODES
+    {
         return;
     }
     let Some(mut client) = agent_compatibility_control_client(config_path, state_dir) else {
@@ -2111,8 +2124,9 @@ fn publish_controller_agent_compatibility(
     };
     let entries = config
         .nodes
-        .keys()
-        .filter_map(|id| {
+        .iter()
+        .filter(|(_, node)| node.transport != Transport::Storage)
+        .filter_map(|(id, _)| {
             let node_id = id.parse::<NodeId>().ok()?;
             let state = if compatibility.current.iter().any(|value| value == id) {
                 AgentCompatibilityState::Current
@@ -2137,7 +2151,13 @@ fn publish_unknown_controller_agent_compatibility(
     state_dir: &Path,
     config: &ClusterConfig,
 ) {
-    if config.nodes.len() > MAX_CONTROL_COMPATIBILITY_NODES {
+    if config
+        .nodes
+        .values()
+        .filter(|node| node.transport != Transport::Storage)
+        .count()
+        > MAX_CONTROL_COMPATIBILITY_NODES
+    {
         return;
     }
     let Some(mut client) = agent_compatibility_control_client(config_path, state_dir) else {
@@ -2145,8 +2165,9 @@ fn publish_unknown_controller_agent_compatibility(
     };
     let entries = config
         .nodes
-        .keys()
-        .filter_map(|id| {
+        .iter()
+        .filter(|(_, node)| node.transport != Transport::Storage)
+        .filter_map(|(id, _)| {
             Some(AgentCompatibilityUpdate {
                 node_id: id.parse::<NodeId>().ok()?,
                 state: AgentCompatibilityState::Unknown,
@@ -6093,6 +6114,7 @@ fn hidden_fan_node_count(config: &ClusterConfig, state_dir: &Path) -> usize {
     config
         .nodes
         .iter()
+        .filter(|(_, node)| node.transport != Transport::Storage)
         .filter(|(node_id, _)| !config.is_login_node(node_id))
         .filter(|(node_id, node)| {
             let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());

@@ -2858,6 +2858,7 @@ fn dispatch_fan_control<T: NodeTransport>(
         config
             .nodes
             .iter()
+            .filter(|(_, node)| node.transport != macluster_core::config::Transport::Storage)
             .filter(|(id, _)| !hidden_nodes.contains(*id))
             .filter_map(|(id, node)| NodeId::new(id.clone()).ok().map(|id| (id, node)))
             .collect::<Vec<_>>()
@@ -2949,6 +2950,7 @@ fn hidden_fan_nodes(
     config
         .nodes
         .iter()
+        .filter(|(_, node)| node.transport != macluster_core::config::Transport::Storage)
         .filter(|(node_id, _)| !config.is_login_node(node_id))
         .filter_map(|(node_id, node)| {
             let identity = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
@@ -5060,7 +5062,21 @@ scheduler = "fifo"
             Id128::random()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let config = simulated_fleet_config(&root, 3);
+        let mut config = simulated_fleet_config(&root, 3);
+        config.nodes.insert(
+            "nas-01".into(),
+            macluster_core::config::NodeConfig {
+                host: "192.0.2.50".into(),
+                transport: macluster_core::config::Transport::Storage,
+                remote_binary: "/usr/local/bin/macluster".into(),
+                ssh_user: None,
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
         let calls = Arc::new(AtomicUsize::new(0));
         let transport = Arc::new(OfflineEndpointFanTransport {
             calls: Arc::clone(&calls),
@@ -5083,6 +5099,11 @@ scheduler = "fifo"
         };
 
         assert_eq!(results.len(), 3);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.node_id.as_str() != "nas-01")
+        );
         assert_eq!(hidden_unreachable, 0);
         assert!(results.iter().all(|result| {
             result

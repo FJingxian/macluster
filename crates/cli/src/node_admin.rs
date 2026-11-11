@@ -11751,7 +11751,10 @@ fn share_removal_unavailable_nodes(config: &ClusterConfig) -> BTreeSet<String> {
     config
         .nodes
         .iter()
-        .filter_map(|(node_id, node)| (!node_ssh_endpoint_reachable(node)).then(|| node_id.clone()))
+        .filter_map(|(node_id, node)| {
+            (node.transport != Transport::Storage && !node_ssh_endpoint_reachable(node))
+                .then(|| node_id.clone())
+        })
         .collect()
 }
 

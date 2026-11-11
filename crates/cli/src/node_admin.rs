@@ -14910,6 +14910,20 @@ fn register_smb_share(
                 format!("storage server '{}' is not a registered node", uri.server),
             )
         })?;
+        let unavailable = unavailable_share_client_nodes(
+            &config,
+            uri.server.as_str(),
+            node_ssh_endpoint_reachable,
+        );
+        if !unavailable.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "cannot configure SMB share {uri} until all clients are reachable; reconnect {} and retry. No configuration was changed",
+                    unavailable.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
         let existing = config.shares.get(share_id);
         let repairing = existing.is_some();
         let share = if let Some(existing) = existing {

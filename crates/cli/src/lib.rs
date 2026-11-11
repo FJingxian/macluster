@@ -18,6 +18,7 @@ mod node_admin;
 mod remote_admin;
 mod remote_transport;
 pub mod service;
+mod smb_credentials;
 mod ssh_bootstrap;
 mod terminal;
 mod update_signing;

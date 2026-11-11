@@ -8,6 +8,7 @@ pub mod liveness;
 pub mod maintenance;
 pub mod monitor;
 mod runtime;
+pub mod smb_credential;
 pub mod ssh;
 pub mod transport;
 pub mod wake;

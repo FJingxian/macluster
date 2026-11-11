@@ -5767,6 +5767,8 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 }
             })
             .collect();
+        let unassigned_nodes =
+            visible_unassigned_operational_nodes(&config, &liveness, liveness_now_ms);
         let jobs = if show_jobs && !json {
             Some(
                 storage
@@ -5793,7 +5795,10 @@ fn queue(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             } else {
                 120
             };
-            print!("{}", format_queue_table(&rows, terminal_width));
+            print!(
+                "{}",
+                format_queue_output(&rows, &unassigned_nodes, terminal_width)
+            );
             if show_jobs {
                 let mut queue_jobs: Vec<_> = jobs
                     .as_ref()
@@ -6291,20 +6296,61 @@ fn visible_queue_nodes(
     config
         .queue_compute_nodes(queue)
         .into_iter()
-        .filter(|node_id| {
-            let Some(node) = config.nodes.get(node_id) else {
-                return false;
-            };
-            let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
-            let Some(record) = liveness.get(node_id) else {
-                // Queue membership is not proof of availability. Require at
-                // least one recent successful liveness observation before
-                // presenting the node as usable.
-                return false;
-            };
-            record.was_recently_reachable(identity_key, now_ms)
-        })
+        .filter(|node_id| queue_view_node_is_visible(config, node_id, liveness, now_ms))
         .collect()
+}
+
+fn queue_view_node_is_visible(
+    config: &ClusterConfig,
+    node_id: &str,
+    liveness: &BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    now_ms: u64,
+) -> bool {
+    let Some(node) = config.nodes.get(node_id) else {
+        return false;
+    };
+    if config.is_login_node(node_id) && node.transport == Transport::Local {
+        return true;
+    }
+    let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
+    liveness
+        .get(node_id)
+        .is_some_and(|record| record.was_recently_reachable(identity_key, now_ms))
+}
+
+fn visible_unassigned_operational_nodes(
+    config: &ClusterConfig,
+    liveness: &BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    now_ms: u64,
+) -> Vec<String> {
+    let assigned = config
+        .queues
+        .values()
+        .flat_map(|queue| queue.nodes.iter().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    config
+        .nodes
+        .keys()
+        .filter(|node_id| {
+            config.is_operational_node(node_id)
+                && !assigned.contains(node_id.as_str())
+                && queue_view_node_is_visible(config, node_id, liveness, now_ms)
+        })
+        .cloned()
+        .collect()
+}
+
+fn format_queue_output(
+    rows: &[QueueRow],
+    unassigned_nodes: &[String],
+    terminal_width: usize,
+) -> String {
+    let mut output = format_queue_table(rows, terminal_width);
+    if !unassigned_nodes.is_empty() {
+        output.push_str("\nUNASSIGNED MAC NODES\n");
+        append_queue_node_lines(&mut output, unassigned_nodes, terminal_width);
+    }
+    output
 }
 
 fn format_queue_table(rows: &[QueueRow], terminal_width: usize) -> String {
@@ -9297,12 +9343,13 @@ mod tests {
         can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
         controller_startup_policy, deferred_nodes_summary, display_width,
         explain_legacy_power_agent, format_fan_control_table, format_job_details,
-        format_jobs_table, format_power, interactive_job_ready_to_attach, is_macluster_binary_path,
-        maybe_run_agent_update, metric_row, metric_table_header, prepare_task_environment,
-        promote_inline_command, prune_submission_cache, required_named_shares,
+        format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
+        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
+        prepare_task_environment, promote_inline_command, prune_submission_cache,
+        required_named_shares,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        submission_must_wait_for_agent_update,
+        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -10080,6 +10127,52 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             );
         }
         assert!(row.ends_with("run analysis job"));
+    }
+
+    #[test]
+    fn mqueue_lists_unassigned_managed_macs_and_excludes_storage_transport() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname = \"test\"\nlogin_node = \"login\"\ndefault_queue = \"default\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"00000000-0000-4000-8000-000000000011\"\nexecution_uid = 501\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nroles = [\"compute\"]\n\n[nodes.spare]\nhost = \"192.0.2.3\"\ntransport = \"ssh\"\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n",
+        )
+        .unwrap();
+        let liveness = BTreeMap::from([
+            (
+                "worker".into(),
+                macluster_controller::liveness::NodeLiveness {
+                    identity_key: "192.0.2.2".into(),
+                    last_reachable_unix_ms: Some(1_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                "spare".into(),
+                macluster_controller::liveness::NodeLiveness {
+                    identity_key: "192.0.2.3".into(),
+                    last_reachable_unix_ms: Some(1_000),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let unassigned =
+            visible_unassigned_operational_nodes(&config, &liveness, 1_001);
+        assert_eq!(unassigned, ["login", "spare"]);
+
+        let rendered = format_queue_output(
+            &[super::QueueRow {
+                name: "default".into(),
+                nodes: vec!["worker".into()],
+                pending: 0,
+                running: 0,
+                completed: 0,
+                failed: 0,
+            }],
+            &unassigned,
+            120,
+        );
+        assert!(rendered.contains("UNASSIGNED MAC NODES"), "{rendered}");
+        assert!(rendered.contains("login, spare"), "{rendered}");
+        assert!(!rendered.contains("nas-01"), "{rendered}");
     }
 
     #[test]

@@ -13713,6 +13713,7 @@ struct NodeListRow {
 #[derive(Debug, Clone)]
 struct NodeNfsMapping {
     name: String,
+    protocol: StorageProtocol,
     state: &'static str,
     kind: &'static str,
     source_node: String,
@@ -13756,6 +13757,7 @@ fn node_nfs_mappings(
         config.storage_server.as_str(),
         config.primary_source_root(),
         &config.shared_root,
+        StorageProtocol::Nfs,
         state(health.map(|health| health.primary_share_ready)),
     )];
     for (name, share) in &config.shares {
@@ -13769,6 +13771,7 @@ fn node_nfs_mappings(
             share.server.as_str(),
             &share.source_root,
             &share.mount_root,
+            share.protocol,
             state(health.and_then(|health| health.shares.get(name).copied())),
         ));
     }
@@ -13781,10 +13784,12 @@ fn nfs_mapping(
     server_id: &str,
     source: &Path,
     target: &Path,
+    protocol: StorageProtocol,
     state: &'static str,
 ) -> NodeNfsMapping {
     NodeNfsMapping {
         name: name.to_owned(),
+        protocol,
         state,
         kind: if node_id != server_id {
             "MOUNT"
@@ -13799,11 +13804,12 @@ fn nfs_mapping(
 }
 
 fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
-    let mut indexes: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    let mut indexes: BTreeMap<(String, String, String, String), usize> = BTreeMap::new();
     let mut mappings: Vec<NodeNfsMapping> = Vec::new();
     for mapping in rows.iter().flat_map(|row| &row.mappings) {
         let key = (
             mapping.name.clone(),
+            mapping.protocol.to_string(),
             mapping.source_node.clone(),
             mapping.target.clone(),
         );
@@ -13858,7 +13864,7 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
     }
     let mappings = aggregate_nfs_mappings(rows);
     if !mappings.is_empty() {
-        output.push_str("\nNFS MAPPINGS\n");
+        output.push_str("\nSTORAGE MAPPINGS\n");
         let name_width = mappings
             .iter()
             .map(|mapping| mapping.name.chars().count())
@@ -13866,8 +13872,12 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
             .unwrap_or(0);
         for mapping in mappings {
             output.push_str(&format!(
-                "    {:<name_width$}  {:<7}  {} → {}\n",
-                mapping.name, mapping.kind, mapping.source_node, mapping.target,
+                "    {:<name_width$}  {:<3}  {:<7}  {} → {}\n",
+                mapping.name,
+                mapping.protocol.to_string().to_ascii_uppercase(),
+                mapping.kind,
+                mapping.source_node,
+                mapping.target,
             ));
         }
     }
@@ -20916,6 +20926,10 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         };
         let server = node_nfs_mappings(&config, "login", Some(&health));
         assert_eq!(server[0].name, "primary");
+        assert_eq!(
+            server[0].protocol,
+            macluster_core::storage_uri::StorageProtocol::Nfs
+        );
         assert_eq!(server[0].kind, "LOCAL");
         assert_eq!(server[0].state, "READY");
         assert_eq!(server[0].source_node, "login");
@@ -20947,6 +20961,45 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             node_nfs_mappings(&config, "login", Some(&health))
                 .iter()
                 .all(|mapping| mapping.state == "UNKNOWN")
+        );
+    }
+
+    #[test]
+    fn storage_mapping_display_distinguishes_nfs_and_smb() {
+        let mut config = parse_build_test_config();
+        config.shares.insert(
+            "project".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: NodeId::new("login").unwrap(),
+                source_root: "/team/project".into(),
+                mount_root: "/Volumes/project".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000003".into(),
+                allow_existing_contents: false,
+            },
+        );
+        let row = NodeListRow {
+            columns: [
+                "login".into(),
+                "192.0.2.1".into(),
+                "local".into(),
+                "22".into(),
+                "CONTROLLER,STORAGE".into(),
+                "-".into(),
+                "READY".into(),
+            ],
+            mappings: node_nfs_mappings(&config, "login", None),
+        };
+        let output = format_node_list(&[row]);
+
+        assert!(output.contains("STORAGE MAPPINGS"), "{output}");
+        assert!(
+            output.contains("primary  NFS  LOCAL    login → /tmp/macluster-shared"),
+            "{output}"
+        );
+        assert!(
+            output.contains("project  SMB  ALIAS    login → /Volumes/project"),
+            "{output}"
         );
     }
 
@@ -22942,7 +22995,7 @@ remote_binary = "/usr/local/bin/macluster"
     }
 
     #[test]
-    fn node_list_shows_common_nfs_mappings_once_after_all_node_rows() {
+    fn node_list_shows_common_storage_mappings_once_after_all_node_rows() {
         let row =
             |id: &str, host: &str, roles: &str, state: &'static str, target: &str| -> NodeListRow {
                 NodeListRow {
@@ -22957,6 +23010,7 @@ remote_binary = "/usr/local/bin/macluster"
                     ],
                     mappings: vec![NodeNfsMapping {
                         name: "primary".into(),
+                        protocol: StorageProtocol::Nfs,
                         state,
                         kind: "MOUNT",
                         source_node: "login-01".into(),
@@ -22983,7 +23037,7 @@ remote_binary = "/usr/local/bin/macluster"
 
         let login_row = output.find("login-01").unwrap();
         let worker_row = output.find("arm-a").unwrap();
-        let mappings_heading = output.find("NFS MAPPINGS").unwrap();
+        let mappings_heading = output.find("STORAGE MAPPINGS").unwrap();
         let first_mapping = output.find("    primary").unwrap();
         assert!(login_row < worker_row, "{output}");
         assert!(!output.contains("READY\n\narm-a"), "{output}");
@@ -22991,7 +23045,7 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(mappings_heading < first_mapping, "{output}");
         assert_eq!(
             output
-                .matches("primary  MOUNT    login-01 → /Users/Shared/macluster")
+                .matches("primary  NFS  MOUNT    login-01 → /Users/Shared/macluster")
                 .count(),
             1,
             "{output}"

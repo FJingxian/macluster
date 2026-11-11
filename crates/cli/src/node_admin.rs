@@ -4699,14 +4699,49 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         .list_active_jobs()
         .map_err(|error| (1, error.to_string()))?;
     if let Some(error) = controller_migration_idle_error(&post_stop_active) {
-        if was_running {
-            let _ = manager.start(Duration::from_secs(30));
+        let restart = if was_running {
+            manager
+                .start(Duration::from_secs(30))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        let mut message = format!(
+            "controller migration stopped checking the cluster as idle: {error}. No target was modified."
+        );
+        if let Err(error) = restart {
+            message.push_str(&format!(" Old controller restart failed: {error}."));
         }
-        return Err((1, error));
+        return Err((1, message));
     }
     let operation_id = Id128::random().to_string();
-    let archive = controller_migration_archive(candidate.as_bytes(), state_dir)?;
     let script = controller_migration_target_script(&target, &target_home, &operation_id);
+    let restart_old_without_target = |detail: String| -> AppResult<()> {
+        let restart = if was_running {
+            manager
+                .start(Duration::from_secs(30))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        let mut message = format!(
+            "controller migration failed before target activation: {detail}. No target was modified."
+        );
+        if let Err(error) = restart {
+            message.push_str(&format!(" Old controller restart failed: {error}."));
+        }
+        Err((1, message))
+    };
+    let archive = match controller_migration_archive(candidate.as_bytes(), state_dir) {
+        Ok(archive) => archive,
+        Err((_, error)) => {
+            return restart_old_without_target(format!(
+                "could not create the controller checkpoint: {error}"
+            ));
+        }
+    };
     let target_failure = |detail: String| -> AppResult<()> {
         let cleanup_script =
             controller_migration_target_cleanup_script(&target, &target_home, &operation_id);

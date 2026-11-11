@@ -176,10 +176,20 @@ NAS 或其他外部 SMB 存储不需要 SSH 和 Agent，可直接注册为外部
 
 ```sh
 macluster node -a storage:nas-01@192.0.2.5
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
+  --smb-user smb-user
 ```
 
-只有成功托管共享后，NAS 才显示 `STORAGE` 角色。SMB 密码只保存在 macOS 钥匙串或 `nsmb.conf`，不会写进集群配置、日志或任务环境。持久挂载由当前登录用户运行，因此能够读取该用户的钥匙串；离线计算节点重连并同步配置后，会自动补齐挂载。
+只有成功托管共享后，NAS 才显示 `STORAGE` 角色。首次为某个服务器/账户配置时，只在终端中隐藏输入一次 SMB 密码。controller 会把验证成功的主密码保存到 macOS **系统钥匙串**，再通过已固定身份的 SSH stdin 分发；每台可达 Mac 将 Internet Password 存入当前用户的登录钥匙串。密码不会进入集群配置、SQLite、journal、任务环境、命令参数、临时文件或日志。持久挂载由当前登录用户运行，因此重启后 `mount_smbfs -N` 仍可读取该用户的钥匙串。
+
+使用 `--update-credential` 时，新密码必须先验证成功，才会替换旧主密码。离线节点重连后会自动接收新的 generation；移除某个服务器/账户的最后一个共享时，会安排清理主密码与节点凭据。
+
+旧共享没有 `smb_user` 时，用相同 URI、相同挂载路径和 `--smb-user ACCOUNT` 重新执行 `mnode -mount` 即可原地迁移。原有 share ID 与 UUID 不变，也不会产生重复记录：
+
+```sh
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
+  --smb-user smb-user
+```
 
 ## 查看资源
 

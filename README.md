@@ -174,10 +174,20 @@ For a NAS or another external SMB provider, register it without SSH or an Agent:
 
 ```sh
 macluster node -a storage:nas-01@192.0.2.5
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
+  --smb-user smb-user
 ```
 
-The NAS becomes a `STORAGE` node only after it serves a share. SMB credentials stay in the macOS Keychain or `nsmb.conf`; macluster never writes them to the cluster config, logs, or job environment. Persistent mounts run as the logged-in user, so the mount process can access that user's Keychain. Offline compute nodes receive the new share table when they reconnect and reconcile their SMB mounts automatically.
+The NAS becomes a `STORAGE` node only after it serves a share. The first new server/account asks for the SMB password once with hidden input. The controller stores the validated master password in the macOS **System Keychain**; every reachable node then receives it through pinned SSH stdin and stores an Internet Password in that user's login Keychain. Passwords do not enter cluster configuration, SQLite, journals, job environment, command arguments, temporary files, or logs. Persistent mounts run as the logged-in user, so `mount_smbfs -N` can use that Keychain after reboot.
+
+Use `--update-credential` to validate and rotate the password before replacing the old master. Offline nodes receive the new generation automatically after reconnect. Removing the last share for a server/account schedules cleanup of the master and node credentials.
+
+Older shares without `smb_user` migrate in place by rerunning `mnode -mount` with the same URI, the same mount root, and `--smb-user ACCOUNT`. This preserves the existing share ID and UUID and does not create a duplicate:
+
+```sh
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
+  --smb-user smb-user
+```
 
 ## Monitor
 

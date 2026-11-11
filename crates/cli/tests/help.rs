@@ -142,6 +142,32 @@ fn detailed_help_has_clear_examples_and_section_headings() {
 }
 
 #[test]
+fn smb_keychain_help_and_docs_describe_one_prompt_migration_and_secret_boundaries() {
+    let node = help(&["mnode", "--help"]);
+    assert!(node.contains("--smb-user ACCOUNT"), "{node}");
+    assert!(node.contains("--update-credential"), "{node}");
+    assert!(node.contains("System Keychain"), "{node}");
+    assert!(node.contains("login Keychain"), "{node}");
+
+    let english = include_str!("../../../README.md");
+    let chinese = include_str!("../../../doc/README.zh-CN.md");
+    let skill = include_str!("../../../skills/macluster/SKILL.md");
+    for document in [english, chinese, skill] {
+        assert!(
+            document.contains("--smb-user")
+                && document.contains("--update-credential")
+                && (document.contains("Keychain") || document.contains("钥匙串")),
+            "SMB credential documentation is incomplete"
+        );
+    }
+    assert!(english.contains("System Keychain"));
+    assert!(english.contains("same URI"));
+    assert!(chinese.contains("系统钥匙串"));
+    assert!(chinese.contains("相同 URI"));
+    assert!(!english.contains("password in config"));
+}
+
+#[test]
 fn clusters_lists_joined_login_client_profiles() {
     let home = std::env::temp_dir().join(format!(
         "macluster-client-list-{}-{}",
@@ -195,4 +221,32 @@ fn clusters_lists_joined_login_client_profiles() {
     assert!(stdout.contains("home-cluster"), "{stdout}");
     assert!(stdout.contains("cluster@192.0.2.1:22"), "{stdout}");
     fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn internal_smb_master_cluster_uuid_is_not_parsed_as_a_login_profile() {
+    let output = Command::new(env!("CARGO_BIN_EXE_macluster"))
+        .args([
+            "internal",
+            "smb-master",
+            "delete",
+            "--cluster-uuid",
+            "not-a-uuid",
+            "--server-id",
+            "nas-01",
+            "--server",
+            "192.0.2.20",
+            "--account",
+            "smb-user",
+        ])
+        .output()
+        .expect("run internal SMB master command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("--cluster selects a joined login-client profile"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("canonical UUID"), "{stderr}");
 }

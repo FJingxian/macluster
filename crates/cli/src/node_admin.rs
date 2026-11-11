@@ -4691,8 +4691,17 @@ fn cleanup_target_smb_masters(
     target: &NodeConfig,
     provisions: &[macluster_protocol::smb_credential::SmbCredentialProvision],
 ) {
-    for provision in provisions {
+    cleanup_target_smb_masters_with(provisions, |provision| {
         let _ = run_target_smb_master_command(target, "delete", provision, false);
+    });
+}
+
+fn cleanup_target_smb_masters_with(
+    provisions: &[macluster_protocol::smb_credential::SmbCredentialProvision],
+    mut cleanup: impl FnMut(&macluster_protocol::smb_credential::SmbCredentialProvision),
+) {
+    for provision in provisions {
+        cleanup(provision);
     }
 }
 
@@ -4874,6 +4883,10 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let source = fs::read_to_string(&config_path).map_err(io_error)?;
     let candidate =
         controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
+    let was_running = manager
+        .intent()
+        .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
+        == macluster_core::service::ServiceIntent::Auto;
     let smb_masters = macluster_controller::smb_credential::export_smb_masters(
         &config,
         &macluster_controller::smb_credential::CredentialHelperClient::system(),
@@ -4902,21 +4915,44 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             ),
         )
     })?;
-    let was_running = manager
-        .intent()
-        .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
-        == macluster_core::service::ServiceIntent::Auto;
-    manager.stop().map_err(|error| {
-        (
+    if let Err(error) = manager.stop() {
+        cleanup_target_smb_masters(&target, &smb_masters);
+        return Err((
             1,
-            format!("cannot stop the current controller for migration: {error}"),
-        )
-    })?;
-    let post_stop_active = ReadOnlyJobStore::open(state_dir)
-        .map_err(|error| (1, error.to_string()))?
-        .list_active_jobs()
-        .map_err(|error| (1, error.to_string()))?;
+            format!(
+                "cannot stop the current controller for migration: {error}. Target SMB credentials were cleaned."
+            ),
+        ));
+    }
+    let post_stop_active = match ReadOnlyJobStore::open(state_dir)
+        .map_err(|error| (1, error.to_string()))
+        .and_then(|storage| {
+            storage
+                .list_active_jobs()
+                .map_err(|error| (1, error.to_string()))
+        }) {
+        Ok(active) => active,
+        Err((_, error)) => {
+            cleanup_target_smb_masters(&target, &smb_masters);
+            let restart = if was_running {
+                manager
+                    .start(Duration::from_secs(30))
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            };
+            let mut message = format!(
+                "controller migration could not recheck active jobs after stopping the old controller: {error}. Target SMB credentials were cleaned. No target controller was started."
+            );
+            if let Err(error) = restart {
+                message.push_str(&format!(" Old controller restart failed: {error}."));
+            }
+            return Err((1, message));
+        }
+    };
     if let Some(error) = controller_migration_idle_error(&post_stop_active) {
+        cleanup_target_smb_masters(&target, &smb_masters);
         let restart = if was_running {
             manager
                 .start(Duration::from_secs(30))
@@ -4926,7 +4962,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             Ok(())
         };
         let mut message = format!(
-            "controller migration stopped checking the cluster as idle: {error}. No target was modified."
+            "controller migration stopped checking the cluster as idle: {error}. Target SMB credentials were cleaned."
         );
         if let Err(error) = restart {
             message.push_str(&format!(" Old controller restart failed: {error}."));
@@ -4936,6 +4972,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let operation_id = Id128::random().to_string();
     let script = controller_migration_target_script(&target, &target_home, &operation_id);
     let restart_old_without_target = |detail: String| -> AppResult<()> {
+        cleanup_target_smb_masters(&target, &smb_masters);
         let restart = if was_running {
             manager
                 .start(Duration::from_secs(30))
@@ -4945,7 +4982,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             Ok(())
         };
         let mut message = format!(
-            "controller migration failed before target activation: {detail}. No target was modified."
+            "controller migration failed before target activation: {detail}. Target SMB credentials were cleaned."
         );
         if let Err(error) = restart {
             message.push_str(&format!(" Old controller restart failed: {error}."));
@@ -15607,7 +15644,7 @@ pub(crate) fn cleanup_smb_shares_for_reset(config: &ClusterConfig) -> AppResult<
     Ok(deferred)
 }
 
-pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> Vec<String> {
+pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> AppResult<Vec<String>> {
     let mut groups = BTreeMap::<
         String,
         (
@@ -15630,6 +15667,17 @@ pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> Vec<S
             .push(share.clone());
     }
     let mut warnings = Vec::new();
+    for (_, (key, _)) in &groups {
+        crate::smb_credentials::delete_master_credential(key).map_err(|error| {
+            (
+                1,
+                format!(
+                    "cannot remove old SMB master for server {} during reset: {error}",
+                    key.server_id
+                ),
+            )
+        })?;
+    }
     for (_, (key, shares)) in groups {
         let endpoint = key.endpoint();
         let nodes = smb_credential_nodes(config, key.server_id.as_str());
@@ -15662,12 +15710,8 @@ pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> Vec<S
                 );
             }
         }
-        if let Err(error) = crate::smb_credentials::delete_master_credential(&key) {
-            warnings.push(format!("master {} ({error})", key.server_id));
-            let _ = crate::smb_credentials::queue_global_master_cleanup(&key);
-        }
     }
-    warnings
+    Ok(warnings)
 }
 
 fn register_smb_share(
@@ -23660,6 +23704,26 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 "cleanup:nas-01"
             ]
         );
+    }
+
+    #[test]
+    fn controller_migration_smb_credential_preactivation_failure_cleans_all_staged_targets() {
+        let provisions = [
+            smb_test_provision(1),
+            smb_test_provision_for_server(2, "nas-02"),
+        ];
+        let cleaned = Arc::new(Mutex::new(Vec::new()));
+        super::cleanup_target_smb_masters_with(&provisions, {
+            let cleaned = Arc::clone(&cleaned);
+            move |provision| {
+                cleaned
+                    .lock()
+                    .unwrap()
+                    .push(provision.key.server_id.to_string());
+            }
+        });
+
+        assert_eq!(cleaned.lock().unwrap().as_slice(), ["nas-01", "nas-02"]);
     }
 
     #[test]

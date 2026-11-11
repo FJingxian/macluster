@@ -9,7 +9,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -36,41 +36,54 @@ trait SecretStore: Send + Sync {
 }
 
 struct SystemSecretStore {
-    keychain: OnceLock<Result<MacKeychain, String>>,
+    keychain: Mutex<Option<MacKeychain>>,
 }
 
 impl SystemSecretStore {
     fn new() -> Self {
         Self {
-            keychain: OnceLock::new(),
+            keychain: Mutex::new(None),
         }
     }
 
-    fn keychain(&self) -> Result<&MacKeychain, String> {
-        self.keychain
-            .get_or_init(|| MacKeychain::system().map_err(|error| error.to_string()))
-            .as_ref()
-            .map_err(Clone::clone)
+    fn with_keychain<T>(
+        &self,
+        operation: impl FnOnce(&MacKeychain) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut keychain = self
+            .keychain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keychain.is_none() {
+            *keychain = Some(MacKeychain::system().map_err(|error| error.to_string())?);
+        }
+        operation(keychain.as_ref().expect("System Keychain was initialized"))
     }
 }
 
 impl SecretStore for SystemSecretStore {
     fn get(&self, service: &str, account: &str) -> Result<Option<SecretString>, String> {
-        self.keychain()?
-            .get_generic_secret(service, account)
-            .map_err(|error| error.to_string())
+        self.with_keychain(|keychain| {
+            keychain
+                .get_generic_secret(service, account)
+                .map_err(|error| error.to_string())
+        })
     }
 
     fn set(&self, service: &str, account: &str, value: &str) -> Result<(), String> {
-        self.keychain()?
-            .set_generic_secret(service, account, &SecretString::new(value))
-            .map_err(|error| error.to_string())
+        self.with_keychain(|keychain| {
+            keychain
+                .set_generic_secret(service, account, &SecretString::new(value))
+                .map_err(|error| error.to_string())
+        })
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<bool, String> {
-        self.keychain()?
-            .delete_generic_secret(service, account)
-            .map_err(|error| error.to_string())
+        self.with_keychain(|keychain| {
+            keychain
+                .delete_generic_secret(service, account)
+                .map_err(|error| error.to_string())
+        })
     }
 }
 

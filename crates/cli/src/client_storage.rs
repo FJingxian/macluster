@@ -318,7 +318,16 @@ fn mount_table_has_exact(mount_table: &str, mount: &ClientMount) -> bool {
                 && actual_target == mount.physical_target
                 && filesystem == Some("nfs")
         } else {
-            actual_target == mount.physical_target && filesystem == Some("smbfs")
+            let expected = mount.source.trim_start_matches("//");
+            actual_target == mount.physical_target
+                && filesystem == Some("smbfs")
+                && actual_source
+                    .trim_start_matches("//")
+                    .rsplit_once('@')
+                    .map_or(actual_source.trim_start_matches("//"), |(_, endpoint)| {
+                        endpoint
+                    })
+                    .ends_with(expected)
         }
     })
 }
@@ -629,6 +638,11 @@ mod tests {
             )
             .len(),
             1
+        );
+        let wrong_source = "//other-server/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
+        assert_eq!(
+            missing_mounts(&descriptor, wrong_source, None, "192.0.2.10"),
+            vec!["/Volumes/project".to_owned()]
         );
     }
 

@@ -14,7 +14,7 @@ use crate::nfs_reconcile::DeferredSmbCredentialCleanup;
 const VERSION: u32 = 1;
 pub const GLOBAL_SMB_CLEANUP_FILE: &str = "smb-credential-cleanup.json";
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GlobalSmbCredentialCleanup {
     #[serde(default)]
     pub version: u32,
@@ -22,6 +22,16 @@ pub struct GlobalSmbCredentialCleanup {
     pub nodes: BTreeMap<String, DeferredSmbCredentialCleanup>,
     #[serde(default)]
     pub masters: BTreeMap<String, SmbCredentialKey>,
+}
+
+impl Default for GlobalSmbCredentialCleanup {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            nodes: BTreeMap::new(),
+            masters: BTreeMap::new(),
+        }
+    }
 }
 
 impl GlobalSmbCredentialCleanup {
@@ -111,8 +121,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(super::GLOBAL_SMB_CLEANUP_FILE);
-        let mut state = GlobalSmbCredentialCleanup::default();
-        state.version = super::VERSION;
+        let state = GlobalSmbCredentialCleanup::default();
         state.save(&path).unwrap();
         assert_eq!(GlobalSmbCredentialCleanup::load(&path).unwrap(), state);
         #[cfg(unix)]

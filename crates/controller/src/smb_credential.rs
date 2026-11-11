@@ -523,8 +523,7 @@ mod tests {
             credentials: BTreeMap::new(),
         };
         let error = super::export_smb_masters(&config, &missing)
-            .err()
-            .expect("missing master must fail export");
+            .expect_err("missing master must fail export");
         assert!(error.contains("missing"));
         assert!(!error.contains("test-secret"));
     }

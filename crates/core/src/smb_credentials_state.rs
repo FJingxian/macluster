@@ -206,11 +206,10 @@ mod tests {
 
         assert!(remove_endpoint(&root, &endpoint()).unwrap());
         assert!(
-            NodeKeychainState::load(&root)
+            !NodeKeychainState::load(&root)
                 .unwrap()
                 .entries
-                .get(&entry_key(&endpoint()))
-                .is_none()
+                .contains_key(&entry_key(&endpoint()))
         );
         let _ = std::fs::remove_dir_all(root);
     }

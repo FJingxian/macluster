@@ -509,6 +509,7 @@ pub(crate) fn ensure_smb_mount_credential(
     .map_err(|error| (1, error.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_smb_mount_credential_with(
     config: &ClusterConfig,
     uri: &StorageUri,
@@ -1197,14 +1198,23 @@ fn run_password_pty(
         Ok(())
     } else {
         Err(NodeKeychainError::SecurityFailed {
-            action: args
-                .first()
-                .cloned()
-                .unwrap_or_else(|| program.display().to_string()),
+            action: pty_action_name(program, args),
             code: Some(status.exit_code() as i32),
             detail: Some(redact_security_output(&output, password.as_secret())),
         })
     }
+}
+
+fn pty_action_name(program: &Path, args: &[String]) -> String {
+    args.first()
+        .filter(|argument| !argument.starts_with('-'))
+        .cloned()
+        .or_else(|| {
+            program
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| program.display().to_string())
 }
 
 fn redact_security_output(output: &[u8], secret: &str) -> String {
@@ -1278,8 +1288,8 @@ mod tests {
         MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, NodeKeychainState,
         PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError, SmbAuthenticator,
         cleanup_smb_credential_if_unused_with, ensure_smb_mount_credential_with,
-        provision_before_commit_with, rollback_smb_credential_plan, security_command,
-        store_from_reader, validate_mount_with_io,
+        provision_before_commit_with, pty_action_name, rollback_smb_credential_plan,
+        security_command, store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -1965,5 +1975,23 @@ mod tests {
         let output = b"prompt test-secret failed";
         let redacted = super::redact_security_output(output, "test-secret");
         assert_eq!(redacted, "prompt <redacted> failed");
+    }
+
+    #[test]
+    fn password_pty_error_uses_program_name_when_first_argument_is_a_flag() {
+        assert_eq!(
+            pty_action_name(
+                &PathBuf::from("/sbin/mount_smbfs"),
+                &["-s".into(), "//user@host/share".into()]
+            ),
+            "mount_smbfs"
+        );
+        assert_eq!(
+            pty_action_name(
+                &PathBuf::from("/usr/bin/security"),
+                &["add-internet-password".into(), "-a".into()]
+            ),
+            "add-internet-password"
+        );
     }
 }

@@ -23133,7 +23133,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             parse_action(&args),
             Ok(Action::Mount { uri, options })
                 if uri.canonical == "nfs://default-001/Volumes/external-disk"
-                    && options.mount_root == PathBuf::from("/Volumes/external-disk")
+                    && options.mount_root.as_path() == Path::new("/Volumes/external-disk")
                     && !options.overlay_existing
         ));
 
@@ -23176,7 +23176,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             Ok(Action::Mount { options, .. })
                 if options.smb_user.as_deref() == Some("smb-user")
                     && options.update_credential
-                    && options.mount_root == PathBuf::from("/Users/Shared/nas-data")
+                    && options.mount_root.as_path() == Path::new("/Users/Shared/nas-data")
         ));
 
         let invalid = [

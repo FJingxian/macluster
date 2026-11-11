@@ -35,7 +35,8 @@ use macluster_core::{
     maintenance::{MaintenanceLock, maintenance_barrier_path, read_maintenance_barrier},
     nfs_reconcile::{
         DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
-        DeferredShareMarkerCleanup, client_cleanup_key, export_cleanup_key, marker_cleanup_key,
+        DeferredShareMarkerCleanup, DeferredSmbCredentialCleanup, client_cleanup_key,
+        export_cleanup_key, marker_cleanup_key,
     },
     service::ServiceBinding,
     storage::{ReadOnlyJobStore, Storage},
@@ -13612,7 +13613,18 @@ fn remove_node(
             &machine_uuid,
         )?;
         check_remote_idle(&connection_node, node_id, &config_path)?;
-        state.machine_uuids.insert(node_id.to_owned(), machine_uuid);
+        state
+            .machine_uuids
+            .insert(node_id.to_owned(), machine_uuid.clone());
+        let mut smb_cleanup_node = connection_node.clone();
+        smb_cleanup_node.machine_uuid = Some(machine_uuid);
+        let (smb_warnings, smb_cleanup_tombstone) =
+            cleanup_smb_credentials_for_node_removal(&config, node_id, &smb_cleanup_node);
+        for warning in smb_warnings {
+            eprintln!(
+                "Warning: SMB credential cleanup for removed node {node_id} was deferred: {warning}"
+            );
+        }
 
         state.reserved_node_ids.insert(node_id.to_owned());
         let mut operation = state
@@ -13857,6 +13869,9 @@ fn remove_node(
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&journal_path, &state)?;
         atomic_write(&config_path, final_source.as_bytes())?;
+        if let Some(entry) = smb_cleanup_tombstone {
+            crate::smb_credentials::queue_global_node_cleanup(entry).map_err(|error| (1, error))?;
+        }
         let final_config =
             ClusterConfig::parse(&final_source).map_err(|error| (2, error.to_string()))?;
         operation.phase = "SYNC_PENDING".into();
@@ -15184,6 +15199,14 @@ fn run_smb_user_script(node: &NodeConfig, script: &str) -> Result<(), String> {
     }
 }
 
+pub(crate) fn unmount_smb_share_for_cleanup(
+    node: &NodeConfig,
+    share: &ShareConfig,
+) -> Result<(), String> {
+    let script = smb_unmount_script(share).map_err(|(_, error)| error)?;
+    run_smb_user_script(node, &script)
+}
+
 pub(crate) fn reconcile_local_smb_shares(config_path: &Path, local_node_id: &str) -> AppResult<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -15445,6 +15468,69 @@ pub(crate) fn cleanup_smb_shares_for_reset(config: &ClusterConfig) -> AppResult<
     Ok(deferred)
 }
 
+pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> Vec<String> {
+    let mut groups = BTreeMap::<
+        String,
+        (
+            macluster_protocol::smb_credential::SmbCredentialKey,
+            Vec<ShareConfig>,
+        ),
+    >::new();
+    for share in config
+        .shares
+        .values()
+        .filter(|share| share.protocol == StorageProtocol::Smb)
+    {
+        let Ok(key) = smb_credential_key_for_share(config, share) else {
+            continue;
+        };
+        groups
+            .entry(key.service_name())
+            .or_insert_with(|| (key, Vec::new()))
+            .1
+            .push(share.clone());
+    }
+    let mut warnings = Vec::new();
+    for (_, (key, shares)) in groups {
+        let endpoint = key.endpoint();
+        let nodes = smb_credential_nodes(config, key.server_id.as_str());
+        for (node_id, node) in nodes {
+            if node.transport == Transport::Ssh && !node_ssh_endpoint_reachable(&node) {
+                warnings.push(format!("{node_id} (offline)"));
+                let _ = crate::smb_credentials::queue_global_node_cleanup(
+                    DeferredSmbCredentialCleanup {
+                        node_id: node_id.to_string(),
+                        machine_uuid: node.machine_uuid.clone(),
+                        node,
+                        shares: shares.clone(),
+                        endpoints: vec![endpoint.clone()],
+                        wait_for_unmount: true,
+                    },
+                );
+                continue;
+            }
+            if let Err(error) = delete_smb_credential_on_node(&node, &endpoint) {
+                warnings.push(format!("{node_id} ({error})"));
+                let _ = crate::smb_credentials::queue_global_node_cleanup(
+                    DeferredSmbCredentialCleanup {
+                        node_id: node_id.to_string(),
+                        machine_uuid: node.machine_uuid.clone(),
+                        node,
+                        shares: shares.clone(),
+                        endpoints: vec![endpoint.clone()],
+                        wait_for_unmount: true,
+                    },
+                );
+            }
+        }
+        if let Err(error) = crate::smb_credentials::delete_master_credential(&key) {
+            warnings.push(format!("master {} ({error})", key.server_id));
+            let _ = crate::smb_credentials::queue_global_master_cleanup(&key);
+        }
+    }
+    warnings
+}
+
 fn register_smb_share(
     config_path: &Path,
     state_dir: &Path,
@@ -15662,11 +15748,14 @@ fn unregister_smb_share(
             node_ssh_endpoint_reachable,
         );
         let mut deferred_cleanup = unavailable;
+        let mut successfully_unmounted = BTreeSet::new();
         let unmount_script = smb_unmount_script(&share)?;
         for (node_id, node) in smb_client_nodes(&config, share.server.as_str()) {
             if let Err(error) = run_smb_user_script(node, &unmount_script) {
                 eprintln!("Warning: SMB cleanup on {node_id} was deferred: {error}");
                 deferred_cleanup.insert(node_id.clone());
+            } else {
+                successfully_unmounted.insert(node_id.clone());
             }
         }
         let candidate = remove_share_sections(&source, &BTreeSet::from([share_id.to_owned()]));
@@ -15684,6 +15773,55 @@ fn unregister_smb_share(
                 ),
             )
         })?;
+        if let Ok(key) = smb_credential_key_for_share(&config, &share) {
+            let endpoint = key.endpoint();
+            let still_used = candidate_config.shares.values().any(|remaining| {
+                remaining.protocol == StorageProtocol::Smb
+                    && remaining.server == key.server_id
+                    && remaining.smb_user.as_deref() == Some(key.account.as_str())
+            });
+            if !still_used {
+                for (node_id, node) in
+                    smb_credential_nodes(&candidate_config, key.server_id.as_str())
+                {
+                    if successfully_unmounted.contains(node_id.as_str()) {
+                        if let Err(error) = delete_smb_credential_on_node(&node, &endpoint) {
+                            eprintln!(
+                                "Warning: SMB credential deletion on {node_id} was deferred: {error}"
+                            );
+                            remember_deferred_smb_credential_cleanup(
+                                state_dir,
+                                node_id.as_str(),
+                                &node,
+                                &share,
+                                endpoint.clone(),
+                                true,
+                            )?;
+                        }
+                    } else {
+                        remember_deferred_smb_credential_cleanup(
+                            state_dir,
+                            node_id.as_str(),
+                            &node,
+                            &share,
+                            endpoint.clone(),
+                            true,
+                        )?;
+                    }
+                }
+                match crate::smb_credentials::cleanup_smb_credential_if_unused(
+                    &candidate_config,
+                    &key,
+                ) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("Warning: SMB master credential cleanup was deferred: {error}");
+                        crate::smb_credentials::queue_global_master_cleanup(&key)
+                            .map_err(|error| (1, error))?;
+                    }
+                }
+            }
+        }
         println!(
             "Unmounted SMB share {share_id} from {}.",
             mount_root.display()
@@ -15697,6 +15835,124 @@ fn unregister_smb_share(
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
+}
+
+fn smb_credential_key_for_share(
+    config: &ClusterConfig,
+    share: &ShareConfig,
+) -> AppResult<macluster_protocol::smb_credential::SmbCredentialKey> {
+    let account = share
+        .smb_user
+        .as_deref()
+        .ok_or_else(|| (2, "SMB share has no configured account identity".into()))?;
+    let server = config.nodes.get(share.server.as_str()).ok_or_else(|| {
+        (
+            1,
+            format!("SMB server '{}' is not configured", share.server),
+        )
+    })?;
+    Ok(macluster_protocol::smb_credential::SmbCredentialKey {
+        cluster_uuid: Id128::parse(&config.share_uuid).map_err(|error| (1, error.to_string()))?,
+        server_id: share.server.clone(),
+        server_host: server.host.clone(),
+        account: account.to_owned(),
+    })
+}
+
+fn remember_deferred_smb_credential_cleanup(
+    state_dir: &Path,
+    node_id: &str,
+    node: &NodeConfig,
+    share: &ShareConfig,
+    endpoint: macluster_protocol::smb_credential::SmbKeychainEndpoint,
+    wait_for_unmount: bool,
+) -> AppResult<()> {
+    let mut pending = read_deferred_share_cleanup(state_dir)?;
+    pending.version = 1;
+    let entry = pending
+        .credential_entries
+        .entry(node_id.to_owned())
+        .or_insert_with(|| DeferredSmbCredentialCleanup {
+            node_id: node_id.to_owned(),
+            machine_uuid: node.machine_uuid.clone(),
+            node: node.clone(),
+            shares: Vec::new(),
+            endpoints: Vec::new(),
+            wait_for_unmount,
+        });
+    entry.node = node.clone();
+    entry.machine_uuid = node.machine_uuid.clone();
+    if !entry
+        .shares
+        .iter()
+        .any(|candidate| candidate.share_uuid == share.share_uuid)
+    {
+        entry.shares.push(share.clone());
+    }
+    entry.wait_for_unmount |= wait_for_unmount;
+    if !entry.endpoints.contains(&endpoint) {
+        entry.endpoints.push(endpoint);
+        entry.endpoints.sort();
+    }
+    save_deferred_share_cleanup(state_dir, &pending)
+}
+
+fn cleanup_smb_credentials_for_node_removal(
+    config: &ClusterConfig,
+    node_id: &str,
+    node: &NodeConfig,
+) -> (Vec<String>, Option<DeferredSmbCredentialCleanup>) {
+    let shares = config
+        .shares
+        .values()
+        .filter(|share| share.protocol == StorageProtocol::Smb && share.server.as_str() != node_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    if shares.is_empty() {
+        return (Vec::new(), None);
+    }
+    let mut warnings = Vec::new();
+    let mut wait_for_unmount = false;
+    for share in &shares {
+        if let Err(error) = unmount_smb_share_for_cleanup(node, share) {
+            wait_for_unmount = true;
+            warnings.push(format!("unmount share '{}': {error}", share.share_uuid));
+        }
+    }
+    let mut endpoints = BTreeMap::new();
+    for share in &shares {
+        match smb_credential_key_for_share(config, share) {
+            Ok(key) => {
+                let endpoint = key.endpoint();
+                endpoints.insert(
+                    format!("{}/{}", endpoint.server, endpoint.account),
+                    endpoint,
+                );
+            }
+            Err((_, error)) => warnings.push(error),
+        }
+    }
+    if !wait_for_unmount {
+        for endpoint in endpoints.values() {
+            if let Err(error) = delete_smb_credential_on_node(node, endpoint) {
+                wait_for_unmount = true;
+                warnings.push(format!(
+                    "delete credential {}/{}: {error}",
+                    endpoint.server, endpoint.account
+                ));
+            }
+        }
+    }
+    let deferred =
+        (wait_for_unmount || !warnings.is_empty()).then_some(DeferredSmbCredentialCleanup {
+            node_id: node_id.to_owned(),
+            machine_uuid: node.machine_uuid.clone(),
+            node: node.clone(),
+            shares,
+            endpoints: endpoints.into_values().collect(),
+            wait_for_unmount,
+        });
+    (warnings, deferred)
 }
 
 fn smb_share_removal_blockers(

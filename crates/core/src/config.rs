@@ -80,7 +80,7 @@ pub struct NodeConfig {
     pub execution_uid: Option<u32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ShareConfig {
     pub protocol: StorageProtocol,
     pub server: NodeId,

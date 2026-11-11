@@ -44,6 +44,7 @@ const PROBE_WORKERS: usize = 8;
 const CONTROL_WORKERS: usize = 4;
 const FAN_CONTROL_WORKERS: usize = 2;
 const FAN_CONTROL_NODE_WORKERS: usize = 32;
+const SMB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const FAN_CONTROL_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
@@ -2550,6 +2551,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
     let mut queue_names = service.config.queues.keys().cloned().collect::<Vec<_>>();
     let mut next_maintenance_attempt = Instant::now();
     let mut next_job_storage_sweep = Instant::now();
+    let mut next_smb_cleanup_retry = Instant::now();
     let mut web_service: Option<crate::web::WebService> = None;
     if let Some((_, api)) = control.as_mut() {
         service.set_maintenance_scope(api.maintenance_scope());
@@ -2571,6 +2573,10 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
+        if Instant::now() >= next_smb_cleanup_retry && !maintenance_active {
+            start_global_smb_cleanup_retry();
+            next_smb_cleanup_retry = Instant::now() + SMB_CLEANUP_RETRY_INTERVAL;
+        }
         runtime.poll_workers(service)?;
         if let Some(measurement) = runtime.take_job_storage_measurement()
             && reset_policy.is_none()
@@ -3126,6 +3132,22 @@ fn retry_delay(failures: u8) -> Duration {
         .unwrap_or(30)
         .min(30);
     Duration::from_secs(seconds)
+}
+
+fn start_global_smb_cleanup_retry() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("macluster-smb-cleanup".into())
+        .spawn(move || {
+            let _ = std::process::Command::new(executable)
+                .args(["internal", "smb-cleanup", "retry"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
 }
 
 fn remove_acknowledged_nfs_cleanup(

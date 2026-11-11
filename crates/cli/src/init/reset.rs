@@ -2061,6 +2061,13 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
             ));
         }
     }
+    let credential_warnings = node_admin::cleanup_smb_credentials_for_reset(&old_config);
+    if !credential_warnings.is_empty() {
+        eprintln!(
+            "Warning: SMB credential cleanup remains deferred during reset on: {}",
+            credential_warnings.join(", ")
+        );
+    }
     for (_, batch) in cleanup_batches(journal, plan) {
         let node = batch.node;
         let node_id = batch

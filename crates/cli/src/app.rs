@@ -8806,6 +8806,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             crate::node_admin::reconcile_local_smb_shares(&config_path, &node)
         }
         Some("smb-keychain" | "smb-master") => crate::smb_credentials::run_internal(&args),
+        Some("smb-cleanup") => crate::smb_credentials::run_cleanup_command(&args[1..]),
         Some("agent-attach") => {
             let node = option_value(args, "--node")?
                 .ok_or_else(|| (2, "agent-attach requires --node ID".into()))?;

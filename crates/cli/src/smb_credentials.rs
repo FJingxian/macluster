@@ -15,6 +15,7 @@ use std::{
 use macluster_controller::smb_credential::CredentialHelperClient;
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, Transport},
+    smb_credential_cleanup::GlobalSmbCredentialCleanup,
     smb_credentials_state::{NodeKeychainState, entry_key, record_generation, remove_endpoint},
     storage_uri::StorageUri,
 };
@@ -650,6 +651,155 @@ pub(crate) fn provision_smb_credentials_for_enrollment<T>(
     )
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CredentialCleanupReport {
+    pub removed_master: bool,
+    pub removed_nodes: Vec<NodeId>,
+    pub deferred: Vec<(String, String)>,
+}
+
+pub(crate) fn cleanup_smb_credential_if_unused(
+    config: &ClusterConfig,
+    key: &SmbCredentialKey,
+) -> Result<CredentialCleanupReport, String> {
+    cleanup_smb_credential_if_unused_with(config, key, &CredentialHelperClient::system())
+}
+
+pub(crate) fn delete_master_credential(key: &SmbCredentialKey) -> Result<bool, String> {
+    CredentialHelperClient::system()
+        .delete(key)
+        .map_err(|error| error.to_string())
+}
+
+fn cleanup_smb_credential_if_unused_with(
+    config: &ClusterConfig,
+    key: &SmbCredentialKey,
+    master: &dyn MasterCredentialStore,
+) -> Result<CredentialCleanupReport, String> {
+    let in_use = config.shares.values().any(|share| {
+        share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
+            && share.server == key.server_id
+            && share.smb_user.as_deref() == Some(key.account.as_str())
+    });
+    if in_use {
+        return Ok(CredentialCleanupReport::default());
+    }
+    Ok(CredentialCleanupReport {
+        removed_master: master.delete(key)?,
+        ..CredentialCleanupReport::default()
+    })
+}
+
+pub(crate) fn queue_global_master_cleanup(key: &SmbCredentialKey) -> Result<(), String> {
+    let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
+    let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
+    state.remember_master(key.clone());
+    state.save(&path).map_err(|error| error.to_string())
+}
+
+pub(crate) fn queue_global_node_cleanup(
+    entry: macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
+) -> Result<(), String> {
+    let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
+    let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
+    state.remember_node(entry);
+    state.save(&path).map_err(|error| error.to_string())
+}
+
+pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupReport, String> {
+    let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
+    let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
+    if state.nodes.is_empty() && state.masters.is_empty() {
+        return Ok(CredentialCleanupReport::default());
+    }
+    let master = CredentialHelperClient::system();
+    let mut report = CredentialCleanupReport::default();
+    let master_keys = state.masters.keys().cloned().collect::<Vec<_>>();
+    for service in master_keys {
+        let Some(key) = state.masters.get(&service).cloned() else {
+            continue;
+        };
+        match master.delete(&key) {
+            Ok(_) => {
+                state.masters.remove(&service);
+                report.removed_master = true;
+            }
+            Err(error) => report.deferred.push((service, error.to_string())),
+        }
+    }
+    let node_ids = state.nodes.keys().cloned().collect::<Vec<_>>();
+    for node_id in node_ids {
+        let Some(entry) = state.nodes.get(&node_id).cloned() else {
+            continue;
+        };
+        if entry.node.transport == Transport::Ssh
+            && !crate::node_admin::node_ssh_endpoint_reachable(&entry.node)
+        {
+            report
+                .deferred
+                .push((node_id, "node remains unreachable".into()));
+            continue;
+        }
+        let mut failed = false;
+        if entry.wait_for_unmount {
+            for share in &entry.shares {
+                if let Err(error) =
+                    crate::node_admin::unmount_smb_share_for_cleanup(&entry.node, share)
+                {
+                    report.deferred.push((node_id.clone(), error));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        for endpoint in &entry.endpoints {
+            if failed {
+                break;
+            }
+            let result = if entry.node.transport == Transport::Local {
+                PtySecurityRunner
+                    .delete(endpoint)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            } else {
+                crate::node_admin::delete_smb_credential_on_node(&entry.node, endpoint)
+            };
+            if let Err(error) = result {
+                failed = true;
+                report.deferred.push((node_id.clone(), error));
+            } else if entry.node.transport == Transport::Local
+                && let Ok(state_dir) = default_state_dir()
+            {
+                let _ = remove_endpoint(&state_dir, endpoint);
+            }
+        }
+        if !failed {
+            state.nodes.remove(&node_id);
+            if let Ok(id) = NodeId::new(node_id.clone()) {
+                report.removed_nodes.push(id);
+            }
+        }
+    }
+    state.save(&path).map_err(|error| error.to_string())?;
+    Ok(report)
+}
+
+pub(crate) fn run_cleanup_command(args: &[String]) -> AppResult<()> {
+    if args != ["retry"] {
+        return Err((2, "internal smb-cleanup only supports retry".into()));
+    }
+    let report = retry_global_smb_credential_cleanup().map_err(|error| (1, error))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "removed_master": report.removed_master,
+            "removed_nodes": report.removed_nodes,
+            "deferred": report.deferred,
+        })
+    );
+    Ok(())
+}
+
 fn validate_mount_with_io(
     mount: impl FnOnce(&str, &Path) -> Result<(), SmbAuthError>,
     unmount: impl FnOnce(&Path) -> Result<(), SmbAuthError>,
@@ -1090,8 +1240,9 @@ mod tests {
         CredentialDistributor, CredentialPlan, CredentialWorkflowError, DistributionError,
         MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, NodeKeychainState,
         PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError, SmbAuthenticator,
-        ensure_smb_mount_credential_with, provision_before_commit_with,
-        rollback_smb_credential_plan, security_command, store_from_reader, validate_mount_with_io,
+        cleanup_smb_credential_if_unused_with, ensure_smb_mount_credential_with,
+        provision_before_commit_with, rollback_smb_credential_plan, security_command,
+        store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -1579,6 +1730,60 @@ mod tests {
         };
         rollback_smb_credential_plan(&rotated, &nodes, &master, &distributor).unwrap();
         assert!(distributor.deleted.lock().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn smb_credential_cleanup_removes_master_only_after_last_share() {
+        let master = FakeMaster::default();
+        let key = SmbCredentialKey {
+            cluster_uuid: Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            server_id: NodeId::new("nas-01").unwrap(),
+            server_host: "192.0.2.20".into(),
+            account: "smb-user".into(),
+        };
+        *master.credential.lock().unwrap() = Some(StoredSmbCredential {
+            generation: 1,
+            password: SecretString::new("test-secret"),
+        });
+        let mut config = workflow_config();
+        config.shares.insert(
+            "one".into(),
+            macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: key.server_id.clone(),
+                source_root: "/one".into(),
+                mount_root: "/Users/Shared/one".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                smb_user: Some(key.account.clone()),
+                allow_existing_contents: false,
+            },
+        );
+        config.shares.insert(
+            "two".into(),
+            macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: key.server_id.clone(),
+                source_root: "/two".into(),
+                mount_root: "/Users/Shared/two".into(),
+                share_uuid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc".into(),
+                smb_user: Some(key.account.clone()),
+                allow_existing_contents: false,
+            },
+        );
+
+        let report = cleanup_smb_credential_if_unused_with(&config, &key, &master).unwrap();
+        assert!(!report.removed_master);
+        assert!(master.credential.lock().unwrap().is_some());
+
+        config.shares.remove("one");
+        let report = cleanup_smb_credential_if_unused_with(&config, &key, &master).unwrap();
+        assert!(!report.removed_master);
+        assert!(master.credential.lock().unwrap().is_some());
+
+        config.shares.remove("two");
+        let report = cleanup_smb_credential_if_unused_with(&config, &key, &master).unwrap();
+        assert!(report.removed_master);
+        assert!(master.credential.lock().unwrap().is_none());
     }
 
     #[test]

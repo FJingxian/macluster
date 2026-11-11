@@ -314,14 +314,16 @@ fn handle_operation_with_config_path(
             })?;
             let cluster_uuid = Id128::parse(&config.share_uuid)
                 .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+            let smb_state_dir = default_smb_credentials_state_dir();
+            let smb_runner = ChildSmbKeychainRunner {
+                config_path: config_path.to_path_buf(),
+            };
             reconcile_smb_credentials_with(
-                &default_smb_credentials_state_dir(),
+                &smb_state_dir,
                 cluster_uuid,
                 &smb_credentials,
-                &obsolete_smb_credentials,
-                &ChildSmbKeychainRunner {
-                    config_path: config_path.to_path_buf(),
-                },
+                &[],
+                &smb_runner,
             )?;
             reconcile_nfs(
                 controller,
@@ -334,6 +336,13 @@ fn handle_operation_with_config_path(
                 state_dir,
                 local_node_id,
                 config_path,
+            )?;
+            reconcile_smb_credentials_with(
+                &smb_state_dir,
+                cluster_uuid,
+                &[],
+                &obsolete_smb_credentials,
+                &smb_runner,
             )?;
             Ok(ResponseBody::Ack)
         }

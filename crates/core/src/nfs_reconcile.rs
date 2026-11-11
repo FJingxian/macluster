@@ -54,6 +54,7 @@ pub struct DeferredSmbCredentialCleanup {
     pub node_id: String,
     pub machine_uuid: Option<String>,
     pub node: crate::config::NodeConfig,
+    pub shares: Vec<crate::config::ShareConfig>,
     pub endpoints: Vec<SmbKeychainEndpoint>,
     pub wait_for_unmount: bool,
 }
@@ -319,6 +320,15 @@ mod tests {
                     machine_uuid: Some("machine-a".into()),
                     execution_uid: Some(501),
                 },
+                shares: vec![crate::config::ShareConfig {
+                    protocol: crate::storage_uri::StorageProtocol::Smb,
+                    server: macluster_protocol::identifiers::NodeId::new("nas-01").unwrap(),
+                    source_root: "/data".into(),
+                    mount_root: "/Users/Shared/data".into(),
+                    share_uuid: "00000000-0000-4000-8000-000000000123".into(),
+                    smb_user: Some("smb-user".into()),
+                    allow_existing_contents: false,
+                }],
                 endpoints: vec![macluster_protocol::smb_credential::SmbKeychainEndpoint {
                     server: "192.0.2.20".into(),
                     account: "smb-user".into(),

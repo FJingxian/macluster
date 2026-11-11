@@ -14770,14 +14770,15 @@ fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppR
 fn smb_share_parts(share: &ShareConfig) -> AppResult<(String, String)> {
     let path = share.source_root.to_string_lossy();
     let path = path.trim_start_matches('/');
-    path.split_once('/')
-        .map(|(share_name, _)| (share_name.to_owned(), path.to_owned()))
-        .ok_or_else(|| {
-            (
-                2,
-                "SMB source must contain at least /SHARE and may include /SHARE/SUBPATH".into(),
-            )
-        })
+    let share_name = path.split('/').next().unwrap_or_default();
+    if share_name.is_empty() {
+        Err((
+            2,
+            "SMB source must contain at least /SHARE and may include /SHARE/SUBPATH".into(),
+        ))
+    } else {
+        Ok((share_name.to_owned(), path.to_owned()))
+    }
 }
 
 fn smb_backing_path(share_uuid: &str) -> PathBuf {
@@ -22051,6 +22052,34 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(script.contains("/Library/LaunchDaemons/org.macluster.smb."));
         assert!(script.contains("launchctl bootstrap system"));
         assert!(!script.to_ascii_lowercase().contains("password="));
+    }
+
+    #[test]
+    fn smb_mount_script_accepts_a_share_without_a_subpath() {
+        let server = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("nas".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Volumes/data".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+        };
+
+        let script = super::smb_mount_script(&share, &server).unwrap();
+
+        assert!(script.contains("//192.0.2.20/data"), "{script}");
+        assert!(script.contains("/Volumes/data"), "{script}");
     }
 
     #[test]

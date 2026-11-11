@@ -11868,7 +11868,7 @@ fn deferred_share_cleanup_offline_nodes(
     ))
 }
 
-fn node_ssh_endpoint_reachable(node: &NodeConfig) -> bool {
+pub(crate) fn node_ssh_endpoint_reachable(node: &NodeConfig) -> bool {
     if node.transport == Transport::Local {
         return true;
     }
@@ -15316,6 +15316,104 @@ fn smb_client_nodes<'a>(
         .collect()
 }
 
+pub(crate) fn smb_credential_nodes(
+    config: &ClusterConfig,
+    server_id: &str,
+) -> Vec<(NodeId, NodeConfig)> {
+    config
+        .nodes
+        .iter()
+        .filter(|(node_id, node)| {
+            node_id.as_str() != server_id && node.transport != Transport::Storage
+        })
+        .map(|(node_id, node)| {
+            (
+                NodeId::new(node_id.clone()).expect("configured node id is valid"),
+                node.clone(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn provision_smb_credential_on_node(
+    node: &NodeConfig,
+    provision: &macluster_protocol::smb_credential::SmbCredentialProvision,
+) -> Result<(), String> {
+    let mut parts = vec![node.remote_binary.clone()];
+    if let Some(config) = &node.remote_config {
+        parts.push("--config".into());
+        parts.push(config.clone());
+    }
+    parts.extend([
+        "internal".into(),
+        "smb-keychain".into(),
+        "store".into(),
+        "--cluster".into(),
+        provision.key.cluster_uuid.to_string(),
+        "--server".into(),
+        provision.key.server_host.clone(),
+        "--account".into(),
+        provision.key.account.clone(),
+        "--generation".into(),
+        provision.credential.generation.to_string(),
+    ]);
+    let command = parts
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = ssh_output_with_timeout(
+        node,
+        &command,
+        Some(provision.credential.password.as_secret().as_bytes()),
+        Duration::from_secs(30),
+    )
+    .map_err(|(_, error)| error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote SMB Keychain update exited with status {:?}",
+            output.status.code()
+        ))
+    }
+}
+
+pub(crate) fn delete_smb_credential_on_node(
+    node: &NodeConfig,
+    endpoint: &macluster_protocol::smb_credential::SmbKeychainEndpoint,
+) -> Result<(), String> {
+    let mut parts = vec![node.remote_binary.clone()];
+    if let Some(config) = &node.remote_config {
+        parts.push("--config".into());
+        parts.push(config.clone());
+    }
+    parts.extend([
+        "internal".into(),
+        "smb-keychain".into(),
+        "delete".into(),
+        "--server".into(),
+        endpoint.server.clone(),
+        "--account".into(),
+        endpoint.account.clone(),
+    ]);
+    let command = parts
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = ssh_output_with_timeout(node, &command, None, Duration::from_secs(30))
+        .map_err(|(_, error)| error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote SMB Keychain deletion exited with status {:?}",
+            output.status.code()
+        ))
+    }
+}
+
 pub(crate) fn cleanup_smb_shares_for_reset(config: &ClusterConfig) -> AppResult<Vec<String>> {
     let mut deferred = Vec::new();
     for share in config
@@ -15353,13 +15451,13 @@ fn register_smb_share(
     uri: &StorageUri,
     options: &StorageMountOptions,
 ) -> AppResult<()> {
-    let _credential_rotation_requested = options.update_credential;
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
         state_dir,
         "SMB share setup",
         MaintenanceScope::Cluster,
     )?;
+    let mut credential_plan = None;
     let result = (|| -> AppResult<()> {
         MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
             (
@@ -15424,6 +15522,17 @@ fn register_smb_share(
         let candidate = append_share_config(&source, share_id, &share)?;
         let candidate_config =
             ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let plan = crate::smb_credentials::ensure_smb_mount_credential(
+            &config_path,
+            state_dir,
+            uri,
+            options,
+        )?;
+        let _credential_generation = plan.credential.generation;
+        for (node_id, error) in &plan.report.deferred {
+            eprintln!("Warning: SMB credential update on {node_id} was deferred: {error}");
+        }
+        credential_plan = Some(plan);
         let mount_script = smb_mount_script(&share, server)?;
         let mut mounted_nodes: Vec<String> = Vec::new();
         for (node_id, node) in smb_client_nodes(&config, uri.server.as_str()) {
@@ -15482,6 +15591,26 @@ fn register_smb_share(
         }
         Ok(())
     })();
+    if result.is_err()
+        && let Some(plan) = &credential_plan
+    {
+        let still_committed = fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|source| ClusterConfig::parse(&source).ok())
+            .is_some_and(|config| {
+                config.shares.values().any(|share| {
+                    share.protocol == StorageProtocol::Smb
+                        && share.server == plan.key.server_id
+                        && share.smb_user.as_deref() == Some(plan.key.account.as_str())
+                })
+            });
+        if !still_committed
+            && let Err(error) =
+                crate::smb_credentials::rollback_smb_credential_plan_for_config(&config_path, plan)
+        {
+            eprintln!("Warning: SMB credential rollback was incomplete: {error}");
+        }
+    }
     finish_node_maintenance(maintenance, result)
 }
 

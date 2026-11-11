@@ -654,6 +654,10 @@ pub enum Operation {
         obsolete_markers: Vec<NfsShareMarker>,
         #[serde(default)]
         obsolete_exports: Vec<NfsExportCleanup>,
+        #[serde(default)]
+        smb_credentials: Vec<crate::smb_credential::SmbCredentialProvision>,
+        #[serde(default)]
+        obsolete_smb_credentials: Vec<crate::smb_credential::SmbKeychainEndpoint>,
     },
     Fence {
         controller: ControllerEpoch,
@@ -809,6 +813,8 @@ mod interactive_job_compatibility_tests {
                 share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
                 node_id: "worker-008".into(),
             }],
+            smb_credentials: Vec::new(),
+            obsolete_smb_credentials: Vec::new(),
         };
 
         let encoded = serde_json::to_value(&operation).unwrap();

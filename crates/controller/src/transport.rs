@@ -1427,6 +1427,8 @@ mod tests {
             obsolete_aliases: Vec::new(),
             obsolete_markers: Vec::new(),
             obsolete_exports: Vec::new(),
+            smb_credentials: Vec::new(),
+            obsolete_smb_credentials: Vec::new(),
         };
         assert_eq!(
             operation_timeout(&reconcile, Duration::from_secs(5)),

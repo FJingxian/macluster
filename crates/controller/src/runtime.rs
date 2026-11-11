@@ -1558,6 +1558,8 @@ impl RuntimeState {
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
+            smb_credentials: Vec::new(),
+            obsolete_smb_credentials: Vec::new(),
         };
         let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
         let node_config = node_config.clone();

@@ -8,6 +8,7 @@ pub mod types;
 
 pub mod nfs_admin;
 pub mod resources;
+pub mod smb_credential;
 
 /// Stable identity of the source build shared by the CLI, controller, and
 /// Agents across target architectures.

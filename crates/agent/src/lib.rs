@@ -300,6 +300,8 @@ fn handle_operation_with_config_path(
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
+            smb_credentials: _,
+            obsolete_smb_credentials: _,
         } => {
             let config_path = config_path.ok_or_else(|| {
                 ProtocolError::Failed("NFS reconciliation requires a config path".into())

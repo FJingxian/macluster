@@ -2264,7 +2264,7 @@ impl RuntimeState {
                 .find(|share| !service.config.shares.contains_key(*share))
             {
                 Some(format!(
-                    "required NFS share '{removed_share}' is no longer configured; cancel the job with mkill and resubmit after choosing an active shared path"
+                    "required storage share '{removed_share}' is no longer configured; cancel the job with mkill and resubmit after choosing an active shared path"
                 ))
             } else if let Some(reason) =
                 crate::share_waiting_reason(&head, &queue_config, &availability)

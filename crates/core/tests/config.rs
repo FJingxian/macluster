@@ -92,6 +92,52 @@ fn config_rejects_a_second_explicit_controller_role() {
 }
 
 #[test]
+fn external_storage_transport_needs_no_agent_identity_and_derives_storage_role() {
+    let source = format!(
+        "{}\n[nodes.nas-01]\nhost = \"192.0.2.5\"\ntransport = \"storage\"\n\n[shares.nas-data]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/data\"\nmount_root = \"/Users/Shared/nas-data\"\nshare_uuid = \"00000000-0000-4000-8000-000000000007\"\n",
+        extended_config()
+    );
+
+    let config = ClusterConfig::parse(&source).unwrap();
+
+    assert_eq!(format!("{:?}", config.nodes["nas-01"].transport), "Storage");
+    assert!(config.node_roles("nas-01").contains(&NodeRole::Storage));
+    assert!(!config.is_compute_node("nas-01"));
+}
+
+#[test]
+fn external_storage_transport_rejects_compute_capability_and_agent_settings() {
+    let base = format!(
+        "{}\n[nodes.nas-01]\nhost = \"192.0.2.5\"\ntransport = \"storage\"\n",
+        extended_config()
+    );
+    let queued = format!(
+        "{}\n[queues.external]\nnodes = [\"nas-01\"]\nscheduler = \"fifo\"\n",
+        base
+    );
+    let queued = ClusterConfig::parse(&queued).unwrap();
+    assert!(!queued.is_compute_node("nas-01"));
+
+    let explicit_compute = base.replace(
+        "transport = \"storage\"",
+        "transport = \"storage\"\nroles = [\"compute\"]",
+    );
+    assert!(matches!(
+        ClusterConfig::parse(&explicit_compute),
+        Err(ConfigError::InvalidNodeRole(message)) if message.contains("compute")
+    ));
+
+    let ssh_settings = base.replace(
+        "transport = \"storage\"",
+        "transport = \"storage\"\nssh_user = \"operator\"",
+    );
+    assert!(matches!(
+        ClusterConfig::parse(&ssh_settings),
+        Err(ConfigError::InvalidStorageTransportSettings)
+    ));
+}
+
+#[test]
 fn legacy_controller_queue_membership_is_not_implicit_compute() {
     let source = extended_config()
         .replace(

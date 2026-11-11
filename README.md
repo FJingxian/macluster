@@ -4,7 +4,7 @@ Turn your Macs into a personal compute cluster. Submit commands from one Mac, ru
 
 English · [简体中文](doc/README.zh-CN.md) · [Agent skill](skills/macluster/SKILL.md)
 
-Written in Rust. One binary to distribute. SSH connects nodes; NFS shares projects, software, and results.
+Written in Rust. One binary to distribute. SSH connects nodes; NFS or SMB shares projects, software, and external storage.
 
 ![Live terminal dashboard: node resources and CPU/memory process sorting](doc/assets/mtop.gif)
 
@@ -24,7 +24,7 @@ This is an early-stage project for personal and lab clusters. It uses macOS acco
 
 ## Install
 
-Requirements: macOS 12+, Remote Login enabled on compute Macs, and SSH access from the login Mac. Building requires Rust 1.90+.
+Requirements: macOS 12+, Remote Login enabled on compute Macs, and SSH access from the login Mac. The checked-in `rust-toolchain.toml` installs the stable compiler, clippy, rustfmt, and rust-analyzer for source builds.
 
 On Apple silicon, install the latest release with Homebrew:
 
@@ -170,6 +170,15 @@ Environment variables are stored with jobs: avoid exporting secrets. Avoid concu
 
 Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected folders and external volumes may require Full Disk Access for `/sbin/nfsd` on the **storage Mac**. After granting it, restart nfsd there and retry enrollment.
 
+For a NAS or another external SMB provider, register it without SSH or an Agent:
+
+```sh
+macluster node -a storage:nas-01@192.0.2.5
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data
+```
+
+The NAS becomes a `STORAGE` node only after it serves a share. SMB credentials stay in the macOS Keychain or `nsmb.conf`; macluster never writes them to the cluster config, logs, or job environment. Persistent mounts run as the logged-in user, so the mount process can access that user's Keychain. Offline compute nodes receive the new share table when they reconnect and reconcile their SMB mounts automatically.
+
 ## Monitor
 
 ```sh
@@ -189,7 +198,7 @@ The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an 
 
 | Command | Purpose |
 | --- | --- |
-| `macluster node -l` | Registered nodes and common NFS mappings |
+| `macluster node -l` | Registered nodes and common NFS/SMB mappings |
 | `macluster node --failed` | Unfinished enrollment/share/removal errors |
 | `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
@@ -201,7 +210,7 @@ The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an 
 | `macluster --init` | Confirm reset, archive old state, and configure a new cluster |
 | `macluster --init --force` | Allow dropping pending output sync for finished jobs; active jobs still block reset |
 
-Reset cleans managed NFS mounts/exports and preserves shared data files. Read its confirmation carefully. Fan control uses a private AppleSMC interface and depends on the Mac model; unsupported nodes remain under system control.
+Reset cleans managed NFS and SMB mounts/exports and preserves shared data files. Read its confirmation carefully. Fan control uses a private AppleSMC interface and depends on the Mac model; unsupported nodes remain under system control.
 
 Local initialization installs the power sampler. Interactive `mtop` can separately request authorization to install or repair it; declining still allows monitoring other resources. Brief power-read failures retain the last valid reading with its age and error, for at most the existing 60-second validity window. Apple Silicon MacBook Air models have no fan, so fan speed is N/A.
 

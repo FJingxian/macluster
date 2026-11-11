@@ -854,7 +854,7 @@ pub(crate) fn share_waiting_reason(
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "waiting for required NFS share(s) {} on {}; automatic mount recovery is retrying",
+        "waiting for required storage share(s) {} on {}; automatic mount recovery is retrying",
         missing.join(", "),
         nodes
     ))

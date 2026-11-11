@@ -4,7 +4,7 @@
 
 [English](../README.md) · 简体中文 · [Agent skill](../skills/macluster/SKILL.md)
 
-使用 Rust 编写，只需分发一个二进制。SSH 连接节点，NFS 共享项目、软件和结果。
+使用 Rust 编写，只需分发一个二进制。SSH 连接节点，NFS 或 SMB 用来共享项目、软件和外部存储。
 
 ![mtop 实时资源监控与进程 CPU、内存排序](assets/mtop.gif)
 
@@ -24,7 +24,7 @@
 
 ## 安装
 
-要求：macOS 12 或更新版本；计算节点开启“远程登录”，登录 Mac 可以通过 SSH 连接。源码编译需要 Rust 1.90 或更新版本。
+要求：macOS 12 或更新版本；计算节点开启“远程登录”，登录 Mac 可以通过 SSH 连接。仓库中的 `rust-toolchain.toml` 会为源码编译自动安装 stable 编译器、clippy、rustfmt 和 rust-analyzer。
 
 Apple silicon 用户可以通过 Homebrew 安装最新版本：
 
@@ -172,6 +172,15 @@ macluster submit -Is pip install -e .
 
 共享卷需要支持 NFS 导出，例如 APFS；ExFAT 无法导出。受保护目录和外接卷可能需要在**存储 Mac** 上为 `/sbin/nfsd` 开启“完整磁盘访问权限”，授权后在该机重启 nfsd，再重试加入节点。
 
+NAS 或其他外部 SMB 存储不需要 SSH 和 Agent，可直接注册为外部存储节点：
+
+```sh
+macluster node -a storage:nas-01@192.0.2.5
+macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data
+```
+
+只有成功托管共享后，NAS 才显示 `STORAGE` 角色。SMB 密码只保存在 macOS 钥匙串或 `nsmb.conf`，不会写进集群配置、日志或任务环境。持久挂载由当前登录用户运行，因此能够读取该用户的钥匙串；离线计算节点重连并同步配置后，会自动补齐挂载。
+
 ## 查看资源
 
 ```sh
@@ -191,7 +200,7 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 
 | 命令 | 用途 |
 | --- | --- |
-| `macluster node -l` | 查看正式节点（READY / OFFLINE）和通用 NFS 映射 |
+| `macluster node -l` | 查看正式节点（READY / OFFLINE）和通用 NFS/SMB 映射 |
 | `macluster node --failed` | 查看未完成的节点或共享操作及错误原因 |
 | `macluster node -rm NODE_ID` | 移除空闲计算节点；托管共享的节点需先迁移存储 |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | 使用新地址连接并核实原机器身份后移除 |
@@ -203,7 +212,7 @@ CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。G
 | `macluster --init` | 确认重置，归档旧状态，然后重新配置 |
 | `macluster --init --force` | 允许放弃已结束任务的待同步输出；活动任务仍阻止重置 |
 
-重置清理托管的 NFS 挂载/导出，并保留共享数据文件；请阅读确认提示。风扇控制使用 AppleSMC 私有接口，支持情况取决于机型，不支持的机器维持系统控制。
+重置清理托管的 NFS/SMB 挂载和导出，并保留共享数据文件；请阅读确认提示。风扇控制使用 AppleSMC 私有接口，支持情况取决于机型，不支持的机器维持系统控制。
 
 本机初始化时会安装功耗采样服务，交互式 `mtop` 也可以单独请求授权来安装或修复；拒绝授权后仍可查看其他资源。功耗读取短暂失败时保留上一笔有效读数，并显示年龄和错误，最长沿用原有的 60 秒有效期。M 系列 MacBook Air 没有风扇，因此风扇转速显示 N/A。
 

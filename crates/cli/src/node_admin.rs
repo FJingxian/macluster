@@ -1869,6 +1869,10 @@ struct AddOptions {
 enum Action {
     Add(AddOptions),
     AddCompute(NodeId),
+    AddStorage {
+        node_id: NodeId,
+        host: Ipv4Addr,
+    },
     Mount {
         uri: StorageUri,
         mount_root: PathBuf,
@@ -1983,6 +1987,7 @@ const REQUIRED_AGENT_FEATURES: &[&str] = &[
     "agent.node-health.v1",
     "config.execution-digest.v1",
     "config.primary-storage-source.v1",
+    "config.smb-user-mounts.v1",
     macluster_protocol::types::NAMESPACED_JOBS_FEATURE,
     "metrics.cpu-temperature.v1",
     METRICS_FAN_SPEED_FEATURE,
@@ -2010,6 +2015,9 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::Add(options) => add_node(&config_path, &state_dir, options),
         Action::AddCompute(node_id) => {
             mutate_compute_role(&config_path, &state_dir, &node_id, true)
+        }
+        Action::AddStorage { node_id, host } => {
+            add_storage_node(&config_path, &state_dir, &node_id, host)
         }
         Action::Mount {
             uri,
@@ -2800,7 +2808,9 @@ fn bounded_agent_feature_probes(
         config
             .nodes
             .iter()
-            .filter(|(node_id, _)| !confirmed_offline.contains(*node_id))
+            .filter(|(node_id, node)| {
+                node.transport != Transport::Storage && !confirmed_offline.contains(*node_id)
+            })
             .map(|(node_id, node)| (node_id.clone(), node.clone()))
             .collect::<VecDeque<_>>(),
     );
@@ -2843,6 +2853,9 @@ fn agent_validation_cache_key_with_offline(
         file_identity_fingerprint(&executable)
     );
     for (node_id, node) in &config.nodes {
+        if node.transport == Transport::Storage {
+            continue;
+        }
         if node.transport == Transport::Local {
             identity.push_str(&format!(
                 ";local={node_id}:{}",
@@ -3007,6 +3020,9 @@ fn classify_configured_agents(
 ) -> AgentBuildCompatibility {
     let mut compatibility = AgentBuildCompatibility::default();
     for (node_id, node) in &config.nodes {
+        if node.transport == Transport::Storage {
+            continue;
+        }
         compatibility.record(node_id.clone(), inspect(node_id, node));
     }
     compatibility
@@ -3703,6 +3719,29 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
                 ));
             }
+            if let Some(storage) = endpoint.strip_prefix("storage:") {
+                if inline.is_some() || args.len() != 2 {
+                    return Err((
+                        2,
+                        "storage node add accepts only storage:NODE_ID@IPv4".into(),
+                    ));
+                }
+                let (node_id, host) = storage.split_once('@').ok_or_else(|| {
+                    (
+                        2,
+                        "storage node add requires storage:NODE_ID@IPv4".to_string(),
+                    )
+                })?;
+                let node_id =
+                    NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?;
+                let host = host
+                    .parse::<Ipv4Addr>()
+                    .map_err(|_| (2, "storage node host must be an IPv4 address".into()))?;
+                if host.is_unspecified() || host.is_multicast() || host == Ipv4Addr::BROADCAST {
+                    return Err((2, "storage node must use a unicast IPv4 address".into()));
+                }
+                return Ok(Action::AddStorage { node_id, host });
+            }
             let mut queue = None;
             let mut share_id = None;
             let mut mount_root = None;
@@ -3937,6 +3976,7 @@ fn node_help(full: bool) -> &'static str {
         return r#"Usage
   mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
   mnode -a compute:NODE_ID
+  mnode -a storage:NODE_ID@IPv4
   mnode -mount URI --mount-root PATH
   mnode -umount URI
   mnode -migrate controller:NODE_ID
@@ -3952,6 +3992,7 @@ OPTIONS
 EXAMPLES
   mnode -a user@192.0.2.10
   mnode -a compute:default-001
+  mnode -a storage:nas-01@192.0.2.5
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
   mnode -umount nfs://login-01/Users/Shared/tools
 
@@ -3963,6 +4004,7 @@ Use --help for scan, SSH, and migration details."#;
     r#"Usage
   mnode -a|--add USER@IPv4[:PORT][:SOURCE_PATH] [OPTIONS]
   mnode -a compute:NODE_ID
+  mnode -a storage:NODE_ID@IPv4
   mnode -a local[:SOURCE_PATH] [OPTIONS]
   mnode -mount nfs://NODE/PATH --mount-root PATH [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH [--overlay-existing]
@@ -3987,6 +4029,7 @@ OPTIONS
 EXAMPLES
   mnode -a user@192.0.2.10
   mnode -a compute:default-001
+  mnode -a storage:nas-01@192.0.2.5
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
   mnode -mount smb://nas-01/data/project --mount-root /Volumes/project
   mnode -umount smb://nas-01/data/project
@@ -4012,6 +4055,8 @@ ADD NODES
   separately on each Mac. The configured login Mac stays outside compute queues.
   `mnode -a compute:NODE_ID` adds the compute capability to an existing node.
   `mnode -rm compute:NODE_ID` drains it before removing that capability.
+  `mnode -a storage:NODE_ID@IPv4` registers an external NAS/provider without
+  SSH or an Agent. Its STORAGE role becomes active when it serves a mounted share.
 
 SHARES
   `local` enrolls this Mac without SSH. Add `:SOURCE_PATH` to share a directory;
@@ -4944,6 +4989,93 @@ fn mutate_compute_role(
         } else {
             println!("Node {node_id} no longer has the compute role.");
         }
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
+}
+
+fn external_storage_config_candidate(
+    config: &ClusterConfig,
+    source: &str,
+    node_id: &NodeId,
+    host: Ipv4Addr,
+) -> AppResult<String> {
+    if let Some(existing) = config.nodes.get(node_id.as_str()) {
+        if existing.transport == Transport::Storage && existing.host == host.to_string() {
+            return Ok(source.to_owned());
+        }
+        return Err((
+            2,
+            format!("node '{node_id}' is already configured with a different transport or host"),
+        ));
+    }
+    let entry = format!("[nodes.{node_id}]\nhost = \"{host}\"\ntransport = \"storage\"\n");
+    let candidate = replace_or_append_table(source, &format!("[nodes.{node_id}]"), &entry);
+    ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+    Ok(candidate)
+}
+
+fn add_storage_node(
+    config_path: &Path,
+    state_dir: &Path,
+    node_id: &NodeId,
+    host: Ipv4Addr,
+) -> AppResult<()> {
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "external storage registration",
+        MaintenanceScope::Cluster,
+    )?;
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let candidate = external_storage_config_candidate(&config, &source, node_id, host)?;
+        if candidate == source {
+            println!("External storage node {node_id} is already registered at {host}.");
+            return Ok(());
+        }
+        let reachable = [445_u16, 2049].into_iter().any(|port| {
+            TcpStream::connect_timeout(&SocketAddr::from((host, port)), Duration::from_secs(2))
+                .is_ok()
+        });
+        if !reachable {
+            return Err((
+                1,
+                format!(
+                    "external storage node {node_id} at {host} is unreachable on SMB (445) and NFS (2049); no configuration was changed"
+                ),
+            ));
+        }
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let operation_id = Id128::random().to_string();
+        backup_config(&config_path, &operation_id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        sync_remote_configs_online_nodes(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation_id,
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "external storage node {node_id} was registered locally, but peer config sync failed: {error}"
+                ),
+            )
+        })?;
+        println!(
+            "Added external storage node {node_id} at {host}. Mount a share to activate its STORAGE role."
+        );
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
@@ -8274,6 +8406,9 @@ fn sync_remote_configs_inner(
         {
             continue;
         }
+        if node.transport == Transport::Storage {
+            continue;
+        }
         if node.transport == Transport::Local {
             continue;
         }
@@ -10143,6 +10278,7 @@ fn nfs_admin_peer_uid(node: &NodeConfig) -> Result<u32, String> {
                 .map(|facts| facts.uid)
                 .map_err(|(_, error)| error),
         },
+        Transport::Storage => Err("external storage nodes do not run the NFS admin helper".into()),
     }
 }
 
@@ -10267,6 +10403,7 @@ impl AdminAuthorizationAnnouncer {
                 .ssh_user
                 .clone()
                 .unwrap_or_else(|| "default SSH account".into()),
+            Transport::Storage => "storage provider".into(),
         };
         let mut messages = Vec::new();
         if !self.guidance_printed {
@@ -10333,6 +10470,9 @@ fn nfs_exports_permission_failure_guidance(node: &NodeConfig, error: &str) -> Op
             "macOS denied the NFS export write on remote NFS server {}. Its TCC log identifies /Library/PrivilegedHelperTools/org.macluster.power as the responsible process. On that Mac, grant this exact executable Full Disk Access in System Settings > Privacy & Security > Full Disk Access (or use an equivalent MDM privacy policy), then rerun the same mnode command. Full Disk Access for /sbin/nfsd is a separate permission for nfsd to read/check exports; it does not authorize this write. SSH or sudo authorization alone cannot grant this macOS privacy permission.",
             node.host
         ),
+        Transport::Storage => {
+            "external storage providers manage their own server-side export permissions".into()
+        }
     };
     Some(format!(
         "{error}; {action} The NFS transaction files were preserved for retry."
@@ -11624,7 +11764,10 @@ fn unavailable_share_client_nodes(
         .nodes
         .iter()
         .filter_map(|(node_id, node)| {
-            (node_id != server_id && !endpoint_reachable(node)).then(|| node_id.clone())
+            (node_id != server_id
+                && node.transport != Transport::Storage
+                && !endpoint_reachable(node))
+            .then(|| node_id.clone())
         })
         .collect()
 }
@@ -13342,7 +13485,7 @@ fn remove_node(
             return Err((
                 1,
                 format!(
-                    "cannot remove node {node_id}; it serves additional NFS share(s): {}",
+                    "cannot remove node {node_id}; it serves storage share(s): {}",
                     served_shares.join(", ")
                 ),
             ));
@@ -13352,6 +13495,51 @@ fn remove_node(
             .get(node_id)
             .cloned()
             .ok_or_else(|| (2, format!("node '{node_id}' is not configured")))?;
+        if node.transport == Transport::Storage {
+            let candidate = remove_node_from_config(&config_source, &config, node_id)?;
+            let operation_id = Id128::random().to_string();
+            backup_config(&config_path, &operation_id)?;
+            atomic_write(&config_path, candidate.as_bytes())?;
+            let candidate_config =
+                ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+            sync_remote_configs_online_nodes(
+                &candidate_config,
+                &candidate,
+                state_dir,
+                &operation_id,
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!(
+                        "external storage node {node_id} was removed locally, but peer config sync failed: {error}"
+                    ),
+                )
+            })?;
+            state.operations.insert(
+                operation_key,
+                NodeOperation {
+                    id: operation_id,
+                    action: "remove".into(),
+                    connection_endpoint: None,
+                    remote_config_path: None,
+                    node_id: node_id.to_owned(),
+                    endpoint: format!("storage:{}@{}", node_id, node.host),
+                    machine_uuid: None,
+                    phase: "REMOVED".into(),
+                    old_config_sha256: sha256_hex(config_source.as_bytes()).ok(),
+                    candidate_config_sha256: sha256_hex(candidate.as_bytes()).ok(),
+                    managed_export: false,
+                    managed_shares: BTreeSet::new(),
+                    client_setup_attempted: Some(false),
+                    detail: None,
+                },
+            );
+            state.reserved_node_ids.insert(node_id.to_owned());
+            save_admin_state(&journal_path, &state)?;
+            println!("Removed external storage node {node_id} at {}.", node.host);
+            return Ok(());
+        }
         let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
         let blockers = storage
             .jobs_preventing_node_removal(node_id)
@@ -13792,6 +13980,12 @@ pub(crate) fn remote_execution_status(
     node_id: &str,
     local_config_path: &Path,
 ) -> AppResult<Option<ExecutionStatus>> {
+    if node.transport == Transport::Storage {
+        return Err((
+            2,
+            "external storage nodes do not run a macluster Agent".into(),
+        ));
+    }
     let id = NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?;
     let config_path = match node.transport {
         Transport::Local => local_config_path.to_path_buf(),
@@ -13800,6 +13994,7 @@ pub(crate) fn remote_execution_status(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/dev/null")),
+        Transport::Storage => unreachable!("storage transport returned above"),
     };
     let namespace = read_config(local_config_path)
         .map(|config| config.share_uuid)
@@ -14189,6 +14384,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                     .all(|share_id| health.shares.get(share_id).copied().unwrap_or(false))
         });
         let login_node = config.is_login_node(id);
+        let storage_node = node.transport == Transport::Storage;
         let known_online = login_node
             || cached.is_some_and(|record| {
                 record.unreachable_since_unix_ms.is_none()
@@ -14197,32 +14393,51 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                     })
             });
         let probe_inconclusive = probe_results.get(id).is_some_and(Option::is_none);
-        let Some(state_name) = cached_node_list_state(
-            login_node,
-            known_online,
-            cached.map_or(0, |record| record.consecutive_failures),
-            confirmed_offline,
-            agent_responding,
-            digest_matches,
-            all_shares_ready,
-            show_all,
-            probe_inconclusive,
-        ) else {
-            hidden_unreachable += 1;
-            continue;
+        let state_name = if storage_node {
+            let reachable = probe_results
+                .get(id)
+                .and_then(|reachable| *reachable)
+                .unwrap_or(false);
+            if !reachable && !show_all {
+                hidden_unreachable += 1;
+                continue;
+            }
+            if reachable { "ONLINE" } else { "OFFLINE" }
+        } else {
+            let Some(state_name) = cached_node_list_state(
+                login_node,
+                known_online,
+                cached.map_or(0, |record| record.consecutive_failures),
+                confirmed_offline,
+                agent_responding,
+                digest_matches,
+                all_shares_ready,
+                show_all,
+                probe_inconclusive,
+            ) else {
+                hidden_unreachable += 1;
+                continue;
+            };
+            state_name
         };
-        let user = if node.transport == Transport::Local {
+        let user = if storage_node {
+            "-"
+        } else if node.transport == Transport::Local {
             "local"
         } else {
             node.ssh_user.as_deref().unwrap_or("OpenSSH")
         };
-        let port = node.ssh_port.unwrap_or(22);
+        let port = if storage_node {
+            "-".into()
+        } else {
+            node.ssh_port.unwrap_or(22).to_string()
+        };
         rows.push(NodeListRow {
             columns: [
                 id.clone(),
                 node.host.clone(),
                 user.to_owned(),
-                port.to_string(),
+                port,
                 if roles.is_empty() { "-".into() } else { roles },
                 if queue_names.is_empty() {
                     "-".into()
@@ -14231,7 +14446,11 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                 },
                 state_name.to_owned(),
             ],
-            mappings: node_nfs_mappings(&config, id, health.as_ref()),
+            mappings: if storage_node {
+                Vec::new()
+            } else {
+                node_nfs_mappings(&config, id, health.as_ref())
+            },
         });
     }
     let drafts = state
@@ -14307,7 +14526,12 @@ fn refresh_node_liveness_for_list(
                         };
                         let reachable = match endpoint_reachable {
                             Some(true) => Some(true),
-                            Some(false) | None if node.transport == Transport::Ssh => {
+                            Some(false) | None
+                                if matches!(
+                                    node.transport,
+                                    Transport::Ssh | Transport::Storage
+                                ) =>
+                            {
                                 transport.host_reachable(&node, NODE_LIST_HOST_TIMEOUT)
                             }
                             None => None,
@@ -14839,18 +15063,22 @@ fn smb_mount_script(share: &ShareConfig, server: &NodeConfig) -> AppResult<Strin
     let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
     let source = shell_quote(&source);
     let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
-    let helper = format!("/Library/PrivilegedHelperTools/{label}.sh");
-    let plist = format!("/Library/LaunchDaemons/{label}.plist");
+    let state_file = format!("\"$HOME/Library/Application Support/macluster/smb/{label}.state\"");
+    let state_body = format!(
+        "{}\n{}\n{}\n",
+        share.share_uuid.trim(),
+        share.source_root.display(),
+        share.mount_root.display()
+    );
     let body = format!(
-        "#!/bin/sh\nset -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); [ \"$actual\" = \"$alias\" ] || {{ echo 'SMB logical path is an unrelated symlink' >&2; exit 1; }}; elif [ -e \"$logical\" ]; then [ -d \"$logical\" ] || {{ echo 'SMB logical path is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A \"$logical\") || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical path is not empty' >&2; exit 1; }}; /bin/rmdir \"$logical\"; fi\nif ! /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /bin/mkdir -p \"$physical\"; /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source} \"$physical\"; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$logical\")\"\nif [ ! -L \"$logical\" ]; then /bin/ln -s \"$alias\" \"$logical\"; fi\n"
+        "#!/bin/sh\nset -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nstate={state_file}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); [ \"$actual\" = \"$alias\" ] || {{ echo 'SMB logical path is an unrelated symlink' >&2; exit 1; }}; elif [ -e \"$logical\" ]; then [ -d \"$logical\" ] || {{ echo 'SMB logical path is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A \"$logical\") || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical path is not empty' >&2; exit 1; }}; /bin/rmdir \"$logical\"; fi\nif ! /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /bin/mkdir -p \"$physical\"; /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source} \"$physical\"; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$logical\")\" \"$(/usr/bin/dirname \"$state\")\"\nif [ ! -L \"$logical\" ]; then /bin/ln -s \"$alias\" \"$logical\"; fi\nprintf '%s' {state_text} > \"$state.next\"\n/bin/chmod 600 \"$state.next\"\n/bin/mv -f \"$state.next\" \"$state\"\n",
+        state_text = shell_quote(&state_body),
     );
     let plist_body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{helper}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>30</integer><key>ProcessType</key><string>Background</string></dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>$helper</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>30</integer><key>ProcessType</key><string>Background</string><key>LimitLoadToSessionType</key><string>Aqua</string></dict></plist>\n"
     );
     Ok(format!(
-        "set -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\n/bin/mkdir -p /Library/PrivilegedHelperTools\n/bin/cat > {helper}.next <<'MACLUSTER_SMB_HELPER'\n{body}MACLUSTER_SMB_HELPER\n/usr/sbin/chown root:wheel {helper}.next\n/bin/chmod 700 {helper}.next\n/bin/mv -f {helper}.next {helper}\n/bin/cat > {plist}.next <<'MACLUSTER_SMB_PLIST'\n{plist_body}MACLUSTER_SMB_PLIST\n/usr/sbin/chown root:wheel {plist}.next\n/bin/chmod 644 {plist}.next\n/bin/mv -f {plist}.next {plist}\n/bin/launchctl bootstrap system {plist}\n/bin/sh {helper}\n",
-        helper = shell_quote(&helper),
-        plist = shell_quote(&plist),
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts must run in the logged-in user session' >&2; exit 1; }}\nlaunch_agents=\"$HOME/Library/LaunchAgents\"\nsupport=\"$HOME/Library/Application Support/macluster/smb\"\nhelper=\"$support/{label}.sh\"\nplist=\"$launch_agents/{label}.plist\"\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\n/bin/mkdir -p \"$launch_agents\" \"$support\"\n/bin/cat > \"$helper.next\" <<'MACLUSTER_SMB_HELPER'\n{body}MACLUSTER_SMB_HELPER\n/bin/chmod 700 \"$helper.next\"\n/bin/mv -f \"$helper.next\" \"$helper\"\n/bin/cat > \"$plist.next\" <<MACLUSTER_SMB_PLIST\n{plist_body}MACLUSTER_SMB_PLIST\n/usr/bin/plutil -lint \"$plist.next\" >/dev/null\n/bin/chmod 600 \"$plist.next\"\n/bin/mv -f \"$plist.next\" \"$plist\"\n/bin/launchctl bootstrap \"gui/$uid\" \"$plist\"\n/bin/sh \"$helper\"\n",
     ))
 }
 
@@ -14859,11 +15087,139 @@ fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
     let logical = shell_quote(&share.mount_root.to_string_lossy());
     let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
     let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
-    let helper = shell_quote(&format!("/Library/PrivilegedHelperTools/{label}.sh"));
-    let plist = shell_quote(&format!("/Library/LaunchDaemons/{label}.plist"));
     Ok(format!(
-        "set -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ]; then /bin/rm -f \"$logical\"; fi\nif /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$physical\"; fi\n/bin/rm -f {helper} {plist}\n"
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ]; then /bin/rm -f \"$logical\"; fi\nif /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$physical\"; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n"
     ))
+}
+
+fn run_smb_user_script(node: &NodeConfig, script: &str) -> Result<(), String> {
+    let output = ssh_output_with_timeout(node, script, None, Duration::from_secs(90))
+        .map_err(|(_, error)| error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(
+            "SMB user-session mount command failed",
+            &output,
+        ))
+    }
+}
+
+pub(crate) fn reconcile_local_smb_shares(config_path: &Path, local_node_id: &str) -> AppResult<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or_else(|| {
+            (
+                1,
+                "HOME is not an absolute path for SMB reconciliation".into(),
+            )
+        })?;
+    reconcile_local_smb_shares_with_home(config_path, local_node_id, &home)
+}
+
+fn reconcile_local_smb_shares_with_home(
+    config_path: &Path,
+    local_node_id: &str,
+    home: &Path,
+) -> AppResult<()> {
+    let config = read_config(config_path)?;
+    if !config.nodes.contains_key(local_node_id) {
+        return Err((2, format!("node '{local_node_id}' is not configured")));
+    }
+    let desired = config
+        .shares
+        .values()
+        .filter(|share| {
+            share.protocol == StorageProtocol::Smb && share.server.as_str() != local_node_id
+        })
+        .map(|share| (share.share_uuid.to_ascii_lowercase(), share))
+        .collect::<BTreeMap<_, _>>();
+    let state_dir = home.join("Library/Application Support/macluster/smb");
+    match fs::read_dir(&state_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(io_error)?;
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("state") {
+                    continue;
+                }
+                let contents = fs::read_to_string(&path).map_err(io_error)?;
+                let mut lines = contents.lines();
+                let (Some(share_uuid), Some(source_root), Some(mount_root), None) =
+                    (lines.next(), lines.next(), lines.next(), lines.next())
+                else {
+                    return Err((
+                        1,
+                        format!("managed SMB state {} is malformed", path.display()),
+                    ));
+                };
+                Id128::parse(share_uuid).map_err(|error| (1, error.to_string()))?;
+                if desired.contains_key(&share_uuid.to_ascii_lowercase()) {
+                    continue;
+                }
+                if !safe_absolute_remote_path(source_root) || !safe_absolute_remote_path(mount_root)
+                {
+                    return Err((
+                        1,
+                        format!("managed SMB state {} has an unsafe path", path.display()),
+                    ));
+                }
+                let stale = ShareConfig {
+                    protocol: StorageProtocol::Smb,
+                    server: NodeId::new("stale").expect("static node ID is valid"),
+                    source_root: PathBuf::from(source_root),
+                    mount_root: PathBuf::from(mount_root),
+                    share_uuid: share_uuid.to_owned(),
+                    allow_existing_contents: false,
+                };
+                let script = smb_unmount_script(&stale)?;
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", &script]);
+                command.env("HOME", home);
+                let output = run_child(command, None, Duration::from_secs(90))
+                    .map_err(|(_, error)| (1, error))?;
+                if !output.status.success() {
+                    return Err((
+                        1,
+                        command_error(&format!("remove stale SMB share {share_uuid}"), &output),
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err((1, format!("cannot inspect SMB state: {error}"))),
+    }
+    for (share_id, share) in &config.shares {
+        if share.protocol != StorageProtocol::Smb || share.server.as_str() == local_node_id {
+            continue;
+        }
+        let server = config.nodes.get(share.server.as_str()).ok_or_else(|| {
+            (
+                1,
+                format!(
+                    "SMB server '{}' for share {share_id} is missing",
+                    share.server
+                ),
+            )
+        })?;
+        let script = smb_mount_script(share, server).map_err(|error| error)?;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        command.env("HOME", home);
+        let output =
+            run_child(command, None, Duration::from_secs(90)).map_err(|(_, error)| (1, error))?;
+        if !output.status.success() {
+            return Err((
+                1,
+                command_error(
+                    &format!("reconcile SMB share {share_id} for {local_node_id}"),
+                    &output,
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn smb_client_nodes<'a>(
@@ -14875,9 +15231,40 @@ fn smb_client_nodes<'a>(
         .iter()
         .filter(|(node_id, node)| {
             node_id.as_str() != server_id
+                && node.transport != Transport::Storage
                 && (node.transport == Transport::Local || node_ssh_endpoint_reachable(node))
         })
         .collect()
+}
+
+pub(crate) fn cleanup_smb_shares_for_reset(config: &ClusterConfig) -> AppResult<Vec<String>> {
+    let mut deferred = Vec::new();
+    for share in config
+        .shares
+        .values()
+        .filter(|share| share.protocol == StorageProtocol::Smb)
+    {
+        smb_share_parts(share)?;
+        let script = smb_unmount_script(share)?;
+        let unavailable = unavailable_share_client_nodes(
+            config,
+            share.server.as_str(),
+            node_ssh_endpoint_reachable,
+        );
+        for (node_id, node) in smb_client_nodes(config, share.server.as_str()) {
+            if let Err(error) = run_smb_user_script(node, &script) {
+                deferred.push(format!("{node_id} ({error})"));
+            }
+        }
+        deferred.extend(
+            unavailable
+                .into_iter()
+                .map(|node_id| format!("{node_id} (offline)")),
+        );
+    }
+    deferred.sort();
+    deferred.dedup();
+    Ok(deferred)
 }
 
 fn register_smb_share(
@@ -14910,20 +15297,11 @@ fn register_smb_share(
                 format!("storage server '{}' is not a registered node", uri.server),
             )
         })?;
-        let unavailable = unavailable_share_client_nodes(
+        let deferred_clients = unavailable_share_client_nodes(
             &config,
             uri.server.as_str(),
             node_ssh_endpoint_reachable,
         );
-        if !unavailable.is_empty() {
-            return Err((
-                1,
-                format!(
-                    "cannot configure SMB share {uri} until all clients are reachable; reconnect {} and retry. No configuration was changed",
-                    unavailable.into_iter().collect::<Vec<_>>().join(", ")
-                ),
-            ));
-        }
         let existing = config.shares.get(share_id);
         let repairing = existing.is_some();
         let share = if let Some(existing) = existing {
@@ -14957,24 +15335,19 @@ fn register_smb_share(
         let mount_script = smb_mount_script(&share, server)?;
         let mut mounted_nodes: Vec<String> = Vec::new();
         for (node_id, node) in smb_client_nodes(&config, uri.server.as_str()) {
-            if let Err(error) = run_interactive_admin_with_reason(
-                node,
-                &format!("mount SMB share {uri} at {}", mount_root.display()),
-                &mount_script,
-            ) {
+            if let Err(error) = run_smb_user_script(node, &mount_script) {
                 let cleanup = smb_unmount_script(&share)?;
                 for mounted_id in mounted_nodes {
                     if let Some(mounted) = config.nodes.get(&mounted_id) {
-                        let _ = run_interactive_admin_with_reason(
-                            mounted,
-                            "roll back SMB share mount",
-                            &cleanup,
-                        );
+                        let _ = run_smb_user_script(mounted, &cleanup);
                     }
                 }
                 return Err((
                     1,
-                    format!("cannot mount SMB share {uri} on {node_id}: {error}"),
+                    format!(
+                        "cannot mount SMB share {uri} on {node_id}: {error}. Verify {node_id} can reach {}:445 and that macOS Keychain or nsmb.conf has credentials for that server",
+                        server.host
+                    ),
                 ));
             }
             mounted_nodes.push(node_id.clone());
@@ -15007,6 +15380,12 @@ fn register_smb_share(
             println!(
                 "Mounted SMB share {uri} at {} and added it to the cluster.",
                 mount_root.display()
+            );
+        }
+        if !deferred_clients.is_empty() {
+            println!(
+                "SMB mount is deferred until reconnect on: {}.",
+                deferred_clients.into_iter().collect::<Vec<_>>().join(", ")
             );
         }
         Ok(())
@@ -15060,30 +15439,13 @@ fn unregister_smb_share(
             share.server.as_str(),
             node_ssh_endpoint_reachable,
         );
-        if !unavailable.is_empty() {
-            return Err((
-                1,
-                format!(
-                    "cannot unmount SMB share {share_id} until all clients are reachable; reconnect {} and retry. No configuration was changed",
-                    unavailable.into_iter().collect::<Vec<_>>().join(", ")
-                ),
-            ));
-        }
+        let mut deferred_cleanup = unavailable;
         let unmount_script = smb_unmount_script(&share)?;
         for (node_id, node) in smb_client_nodes(&config, share.server.as_str()) {
-            run_interactive_admin_with_reason(
-                node,
-                &format!("unmount SMB share {share_id} from {node_id}"),
-                &unmount_script,
-            )
-            .map_err(|error| {
-                (
-                    1,
-                    format!(
-                        "cannot unmount SMB share {share_id} from {node_id}: {error}. The cluster configuration was not changed; rerun the umount after resolving the client error"
-                    ),
-                )
-            })?;
+            if let Err(error) = run_smb_user_script(node, &unmount_script) {
+                eprintln!("Warning: SMB cleanup on {node_id} was deferred: {error}");
+                deferred_cleanup.insert(node_id.clone());
+            }
         }
         let candidate = remove_share_sections(&source, &BTreeSet::from([share_id.to_owned()]));
         let candidate_config =
@@ -15104,6 +15466,12 @@ fn unregister_smb_share(
             "Unmounted SMB share {share_id} from {}.",
             mount_root.display()
         );
+        if !deferred_cleanup.is_empty() {
+            println!(
+                "SMB cleanup is deferred until reconnect on: {}.",
+                deferred_cleanup.into_iter().collect::<Vec<_>>().join(", ")
+            );
+        }
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
@@ -22063,6 +22431,51 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
+    fn external_storage_selector_parses_without_ssh_credentials() {
+        let args = ["-a", "storage:nas-01@192.0.2.5"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::AddStorage { node_id, host })
+                if node_id.as_str() == "nas-01"
+                    && host == "192.0.2.5".parse::<std::net::Ipv4Addr>().unwrap()
+        ));
+
+        assert!(parse_action(&["-a", "storage:nas-01"].map(str::to_owned)).is_err());
+        assert!(parse_action(&["-a", "storage:nas-01@not-an-ip"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn external_storage_candidate_is_idempotent_and_agentless() {
+        let source = "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        let node_id = NodeId::new("nas-01").unwrap();
+        let host = "192.0.2.5".parse().unwrap();
+
+        let candidate =
+            super::external_storage_config_candidate(&config, source, &node_id, host).unwrap();
+        let candidate_config = ClusterConfig::parse(&candidate).unwrap();
+
+        assert_eq!(
+            candidate_config.nodes["nas-01"].transport,
+            Transport::Storage
+        );
+        assert_eq!(
+            super::external_storage_config_candidate(&candidate_config, &candidate, &node_id, host)
+                .unwrap(),
+            candidate
+        );
+        assert!(
+            super::external_storage_config_candidate(
+                &candidate_config,
+                &candidate,
+                &node_id,
+                "192.0.2.6".parse().unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn mount_requires_a_normalized_absolute_mount_root() {
         let args = [
             "-mount",
@@ -22138,8 +22551,9 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(script.contains("project"));
         assert!(script.contains("mount_smbfs"));
         assert!(script.contains("nopassprompt"));
-        assert!(script.contains("/Library/LaunchDaemons/org.macluster.smb."));
-        assert!(script.contains("launchctl bootstrap system"));
+        assert!(script.contains("Library/LaunchAgents"));
+        assert!(script.contains("org.macluster.smb."));
+        assert!(script.contains("launchctl bootstrap \"gui/$uid\""));
         assert!(!script.to_ascii_lowercase().contains("password="));
     }
 
@@ -22169,6 +22583,84 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
 
         assert!(script.contains("//192.0.2.20/data"), "{script}");
         assert!(script.contains("/Volumes/data"), "{script}");
+    }
+
+    #[test]
+    fn smb_helpers_run_as_the_user_who_owns_the_keychain_credentials() {
+        let server = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("nas-user".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: Some(501),
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Users/Shared/nas-data".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+        };
+
+        let mount = super::smb_mount_script(&share, &server).unwrap();
+        let unmount = super::smb_unmount_script(&share).unwrap();
+
+        for script in [mount, unmount] {
+            let syntax = Command::new("/bin/sh")
+                .args(["-n", "-c", &script])
+                .output()
+                .unwrap();
+            assert!(
+                syntax.status.success(),
+                "{}",
+                String::from_utf8_lossy(&syntax.stderr)
+            );
+            assert!(script.contains("gui/"), "{script}");
+            assert!(script.contains("Library/LaunchAgents"), "{script}");
+            assert!(!script.contains("/Library/LaunchDaemons"), "{script}");
+            assert!(!script.contains("sudo"), "{script}");
+        }
+    }
+
+    #[test]
+    fn smb_reconciliation_removes_helpers_missing_from_the_committed_share_table() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-smb-reconcile-{}", Id128::random()));
+        let home = root.join("home");
+        let support = home.join("Library/Application Support/macluster/smb");
+        let agents = home.join("Library/LaunchAgents");
+        fs::create_dir_all(&support).unwrap();
+        fs::create_dir_all(&agents).unwrap();
+        let uuid = "928e8976-c946-509d-9e62-a3ef787664b7";
+        let label = format!("org.macluster.smb.{uuid}");
+        fs::write(
+            support.join(format!("{label}.state")),
+            format!("{uuid}\n/data\n/Users/Shared/nas-data\n"),
+        )
+        .unwrap();
+        fs::write(support.join(format!("{label}.sh")), "#!/bin/sh\n").unwrap();
+        fs::write(agents.join(format!("{label}.plist")), "plist").unwrap();
+        let logical = root.join("logical");
+        std::os::unix::fs::symlink(format!("/Users/Shared/.macluster-mounts/{uuid}"), &logical)
+            .unwrap();
+        let config = root.join("config.toml");
+        fs::write(
+            &config,
+            "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n",
+        )
+        .unwrap();
+
+        super::reconcile_local_smb_shares_with_home(&config, "login", &home).unwrap();
+
+        assert!(!support.join(format!("{label}.state")).exists());
+        assert!(!support.join(format!("{label}.sh")).exists());
+        assert!(!agents.join(format!("{label}.plist")).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

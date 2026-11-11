@@ -1,6 +1,6 @@
 ---
 name: macluster
-description: Operate a macluster macOS cluster to submit jobs, profile task CPU and memory, inspect nodes and NFS shares, use shared toolchains, and diagnose scheduling or environment failures. Use when the user names macluster or its msub/mjob/mqueue/mtop workflow on Macs; not for Slurm clusters or similarly named Linux schedulers.
+description: Operate a macluster macOS cluster to submit jobs, profile task CPU and memory, inspect nodes and NFS/SMB shares, use shared toolchains, and diagnose scheduling or environment failures. Use when the user names macluster or its msub/mjob/mqueue/mtop workflow on Macs; not for Slurm clusters or similarly named Linux schedulers.
 ---
 
 # macluster
@@ -107,7 +107,8 @@ Multiple viewers share roughly one five-second sample per watched task. Repeated
 - `macluster top --once` is suitable for noninteractive resource inspection; `top` opens the TUI. Enter toggles process details, `c`/`m` sort descending. Initial process previews use ps average CPU and RSS; later samples show interval usage. Do not treat preview numbers as instantaneous CPU.
 - CPU totals can exceed 100% (eight logical CPUs allow 800%). Hardware/helper-dependent power, GPU, temperature, and fan values can be unavailable.
 - `controller run --web` opens the read-only localhost browser monitor; `--no-open` prints its link. Do not expose its authenticated link or change its network binding without a request.
-- `node -a USER@IP[:PORT]` enrolls a compute node. `node -a local:PATH --share-id ID --mount-root PATH` registers a local share; `local` itself is the login node, not a compute queue member.
+- `node -a USER@IP[:PORT]` enrolls a compute node. `node -a storage:ID@IP` registers an external NFS/SMB provider without SSH or an Agent. `node -a local:PATH --share-id ID --mount-root PATH` registers a local share; `local` itself is the login node, not a compute queue member.
+- After registering an external provider, use `mnode -mount smb://ID/SHARE --mount-root /absolute/path` or the equivalent NFS URI. SMB credentials must already be available in the submitting user's macOS Keychain or `nsmb.conf`; never place them in config, job environment, logs, or shell history.
 - `node -rm NODE_ID --connect USER@IP[:PORT]` can remove a moved node after identity verification. `node -rm share:ID` removes a configured named share or cancels incomplete setup. If a client mount is busy, mnode lists the holding processes and asks before a forced detach; non-interactive callers can pass `--force`, accepting that those processes may see I/O errors. Active jobs/output sync or hosted storage can still block removal.
 - Preserve strict SSH host-key checks. A matching MAC address alone does not establish identity. Never remove trusted keys or accept replacement fingerprints without verification.
 - Initial privileged setup or helper upgrades/repair may ask once per affected Mac. SSH login and administrator passwords serve different purposes. Do not store passwords in shell scripts, files, or job environments; let the user enter authorization at the prompt.
@@ -115,3 +116,5 @@ Multiple viewers share roughly one five-second sample per watched task. Repeated
 - `init` resets an existing cluster after confirmation and preserves shared data files. `init --force` may abandon pending output from finished jobs; active jobs still block it. Neither is a routine repair command.
 
 For NFS failures, distinguish export filesystem support, server-side nfsd privacy permission, exact mount source, and path collisions. Protected folders/external volumes may require Full Disk Access for `/sbin/nfsd` on the storage Mac. A service restart does not grant that permission. Prefer resuming the original operation after its actual cause is addressed.
+
+SMB persistence uses a user LaunchAgent so `mount_smbfs -N` can access that user's Keychain. Offline compute nodes defer SMB setup or cleanup and reconcile it after reconnect.

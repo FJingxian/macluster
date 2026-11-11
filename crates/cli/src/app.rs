@@ -8741,6 +8741,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "agent.node-health.v1",
                         "config.execution-digest.v1",
                         "config.primary-storage-source.v1",
+                        "config.smb-user-mounts.v1",
                         "metrics.cpu-temperature.v1",
                         "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,
@@ -8774,6 +8775,12 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 &config_path,
             )
             .map_err(|error| (1, error.to_string()))
+        }
+        Some("smb-reconcile") => {
+            let node = option_value(args, "--node")?
+                .ok_or_else(|| (2, "smb-reconcile requires --node ID".into()))?;
+            let config_path = resolved_config_path(global.config.as_deref());
+            crate::node_admin::reconcile_local_smb_shares(&config_path, &node)
         }
         Some("agent-attach") => {
             let node = option_value(args, "--node")?

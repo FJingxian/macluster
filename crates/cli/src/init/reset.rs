@@ -843,8 +843,18 @@ impl ResetPlan {
         })?;
         let config_digest = sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
         let mut plan = Self {
-            nodes: config.nodes.clone(),
-            active_nodes: config.nodes.keys().cloned().collect(),
+            nodes: config
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.transport != Transport::Storage)
+                .map(|(id, node)| (id.clone(), node.clone()))
+                .collect(),
+            active_nodes: config
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.transport != Transport::Storage)
+                .map(|(id, _)| id.clone())
+                .collect(),
             known_uuids: known_uuids.clone(),
             mounts: Vec::new(),
             exports: BTreeMap::new(),
@@ -869,6 +879,9 @@ impl ResetPlan {
             "primary",
         );
         for (share_id, share) in &config.shares {
+            if share.protocol != macluster_core::storage_uri::StorageProtocol::Nfs {
+                continue;
+            }
             let server = config.nodes.get(share.server.as_str()).ok_or_else(|| {
                 (
                     1,
@@ -1319,6 +1332,9 @@ impl ResetPlan {
             label: "primary".into(),
         });
         for (share_id, share) in &config.shares {
+            if share.protocol != macluster_core::storage_uri::StorageProtocol::Nfs {
+                continue;
+            }
             let server = config
                 .nodes
                 .get(share.server.as_str())
@@ -1947,6 +1963,7 @@ fn cleanup_batch_key(node: &NodeConfig) -> String {
             node.host,
             node.ssh_port.unwrap_or(22)
         ),
+        Transport::Storage => format!("storage:{}", node.host),
     }
 }
 
@@ -2029,6 +2046,21 @@ fn cleanup_resources(journal: &mut ResetJournal, plan: &ResetPlan, path: &Path) 
     let old_config =
         ClusterConfig::parse(&journal.old_config).map_err(|error| (1, error.to_string()))?;
     let cluster_id = old_config.share_uuid.clone();
+    match node_admin::cleanup_smb_shares_for_reset(&old_config) {
+        Ok(deferred) if !deferred.is_empty() => {
+            eprintln!(
+                "Warning: SMB cleanup remains deferred during reset on: {}",
+                deferred.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err((_, error)) => {
+            return Err((
+                1,
+                format!("cannot clean managed SMB shares during reset: {error}"),
+            ));
+        }
+    }
     for (_, batch) in cleanup_batches(journal, plan) {
         let node = batch.node;
         let node_id = batch
@@ -4010,7 +4042,7 @@ mod tests {
             committed: true,
         };
 
-        fs::set_permissions(&protected, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o0)).unwrap();
         let result = super::alias_is_exact(&alias);
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -4033,7 +4065,7 @@ mod tests {
         let marker_path = protected.join(".macluster-share-id");
         let share_uuid = "00000000-0000-4000-8000-000000000001";
         fs::write(&marker_path, share_uuid).unwrap();
-        fs::set_permissions(&protected, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o0)).unwrap();
         let peer_uid = unsafe { libc::geteuid() as u32 };
         let result = crate::node_admin::apply_privileged_nfs_remove_marker(
             &protected.to_string_lossy(),

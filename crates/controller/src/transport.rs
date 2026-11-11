@@ -571,6 +571,9 @@ impl ClusterTransport {
                 command.args(["internal", "agent-stdio", "--node", node_id.as_str()]);
                 Ok(command)
             }
+            Transport::Storage => Err(TransportError::Io(
+                "external storage nodes do not provide an Agent transport".into(),
+            )),
         }
     }
 
@@ -653,6 +656,9 @@ impl ClusterTransport {
                     .arg(start_token.to_string());
                 Ok(command)
             }
+            Transport::Storage => Err(TransportError::Io(
+                "external storage nodes cannot host interactive jobs".into(),
+            )),
         }
     }
 
@@ -712,6 +718,17 @@ impl NodeTransport for ClusterTransport {
                     Err(error) => endpoint_probe_error(&error),
                 }
             }
+            Transport::Storage => {
+                let address = node.host.parse::<Ipv4Addr>().ok()?;
+                for port in [445, 2049] {
+                    match TcpStream::connect_timeout(&SocketAddr::from((address, port)), timeout) {
+                        Ok(_) => return Some(true),
+                        Err(error) if endpoint_probe_error(&error) == Some(false) => {}
+                        Err(_) => return None,
+                    }
+                }
+                Some(false)
+            }
         }
     }
 
@@ -725,6 +742,17 @@ impl NodeTransport for ClusterTransport {
                     && is_explicit_host_unreachable(&error)
                 {
                     return Some(false);
+                }
+                ping_host(node, timeout)
+            }
+            Transport::Storage => {
+                let address = node.host.parse::<Ipv4Addr>().ok()?;
+                for port in [445, 2049] {
+                    match TcpStream::connect_timeout(&SocketAddr::from((address, port)), timeout) {
+                        Ok(_) => return Some(true),
+                        Err(error) if endpoint_probe_error(&error) == Some(false) => {}
+                        Err(_) => return None,
+                    }
                 }
                 ping_host(node, timeout)
             }

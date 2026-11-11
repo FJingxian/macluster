@@ -403,6 +403,9 @@ fn desired_client_nfs_mounts(
         });
     }
     for share in config.shares.values() {
+        if share.protocol != macluster_core::storage_uri::StorageProtocol::Nfs {
+            continue;
+        }
         if share.server.as_str() == local_node_id {
             continue;
         }
@@ -646,9 +649,45 @@ fn reconcile_nfs(
     }
 
     atomic_replace_config(config_path, config_toml).map_err(protocol_failed)?;
+    if desired_config.shares.values().any(|share| {
+        share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
+            && share.server.as_str() != local_node_id
+    }) {
+        reconcile_smb_user_mounts(config_path, local_node_id)?;
+    }
     store.controller = Some(controller);
     write_store(state_dir, &store).map_err(protocol_failed)?;
     Ok(())
+}
+
+fn reconcile_smb_user_mounts(config_path: &Path, local_node_id: &str) -> Result<(), ProtocolError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        ProtocolError::Failed(format!(
+            "cannot locate macluster for SMB reconciliation: {error}"
+        ))
+    })?;
+    let output = Command::new(executable)
+        .arg("--config")
+        .arg(config_path)
+        .args(["internal", "smb-reconcile", "--node", local_node_id])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            ProtocolError::Failed(format!("cannot run SMB reconciliation: {error}"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    Err(ProtocolError::Failed(format!(
+        "SMB reconciliation failed for {local_node_id}: {}",
+        detail
+            .trim()
+            .to_string()
+            .chars()
+            .take(1024)
+            .collect::<String>()
+    )))
 }
 
 fn call_nfs_admin_helper(request: NfsAdminRequest) -> Result<(), ProtocolError> {
@@ -923,6 +962,7 @@ fn node_health_with_mount_provider(
             macluster_protocol::resources::TASK_RESOURCE_FEATURE.to_owned(),
             INTERACTIVE_PTY_FEATURE.to_owned(),
             macluster_protocol::types::NAMESPACED_JOBS_FEATURE.to_owned(),
+            "config.smb-user-mounts.v1".to_owned(),
         ],
     })
 }
@@ -2413,7 +2453,18 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
 
     #[test]
     fn nfs_reconciliation_mount_plan_includes_primary_and_remote_named_shares_only() {
-        let config = nfs_reconcile_config();
+        let mut config = nfs_reconcile_config();
+        config.shares.insert(
+            "smb".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: "storage".parse().unwrap(),
+                source_root: "/smb/data".into(),
+                mount_root: "/mnt/smb-data".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000006".into(),
+                allow_existing_contents: false,
+            },
+        );
         let mounts = desired_client_nfs_mounts(&config, "worker").unwrap();
 
         assert_eq!(mounts.len(), 2);

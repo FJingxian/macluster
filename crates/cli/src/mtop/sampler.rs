@@ -19,6 +19,7 @@ const REMOTE_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Clone, Debug)]
 pub enum SampleTarget {
     Local,
+    Unsupported,
     Node {
         node_id: String,
         namespace: String,
@@ -35,6 +36,7 @@ impl SampleTarget {
                 namespace: namespace.to_owned(),
                 node: node.clone(),
             },
+            Transport::Storage => Self::Unsupported,
         }
     }
 }
@@ -203,6 +205,9 @@ fn sample_initial_target(
     }
     match target {
         SampleTarget::Local => Ok((macluster_metrics::sample_local_fast(), true)),
+        SampleTarget::Unsupported => {
+            Err("external storage nodes do not expose resource metrics".into())
+        }
         SampleTarget::Node {
             node_id,
             namespace,
@@ -217,6 +222,9 @@ fn sample_target(target: &SampleTarget, stop: &AtomicBool) -> Result<MetricSnaps
     }
     match target {
         SampleTarget::Local => Ok(macluster_metrics::sample_local()),
+        SampleTarget::Unsupported => {
+            Err("external storage nodes do not expose resource metrics".into())
+        }
         SampleTarget::Node {
             node_id,
             namespace,

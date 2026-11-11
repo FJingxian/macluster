@@ -175,6 +175,7 @@ impl ProcessCache {
 #[derive(Clone, Debug)]
 pub(super) enum ProcessTarget {
     Local,
+    Unsupported,
     Ssh {
         node_id: String,
         namespace: String,
@@ -191,6 +192,7 @@ impl ProcessTarget {
                 namespace: namespace.to_owned(),
                 node: node.clone(),
             },
+            Transport::Storage => Self::Unsupported,
         }
     }
 }
@@ -444,6 +446,9 @@ fn sample_output(
     }
     let output = match target {
         ProcessTarget::Local => run_local(stop, command)?,
+        ProcessTarget::Unsupported => {
+            return Err("external storage nodes do not expose process metrics".into());
+        }
         ProcessTarget::Ssh {
             node_id,
             namespace,

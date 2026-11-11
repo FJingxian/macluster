@@ -197,6 +197,7 @@ fn add_trusted_node_ssh_args(
 pub enum Transport {
     Ssh,
     Local,
+    Storage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -237,6 +238,8 @@ pub enum ConfigError {
     UnsupportedScheduler(String),
     #[error("unsupported transport '{0}'")]
     UnsupportedTransport(String),
+    #[error("storage transport cannot use SSH or Agent identity settings")]
+    InvalidStorageTransportSettings,
     #[error("node address is empty or unsafe for SSH")]
     InvalidHost,
     #[error("SSH user is empty or contains characters unsupported by mnode")]
@@ -345,6 +348,10 @@ impl ClusterConfig {
         }
         if configured.is_none()
             && controller != Some(node_id)
+            && self
+                .nodes
+                .get(node_id)
+                .is_none_or(|node| node.transport != Transport::Storage)
             && self
                 .queues
                 .values()
@@ -493,6 +500,7 @@ impl ClusterConfig {
                 let transport = match transport_raw.as_str() {
                     "ssh" => Transport::Ssh,
                     "local" => Transport::Local,
+                    "storage" => Transport::Storage,
                     _ => return Err(ConfigError::UnsupportedTransport(transport_raw)),
                 };
                 let remote_binary = take_optional_string(&mut table, &section, "remote_binary")?
@@ -548,6 +556,16 @@ impl ClusterConfig {
                 let execution_uid = take_optional_integer(&mut table, &section, "execution_uid")?
                     .map(|uid| u32::try_from(uid).map_err(|_| ConfigError::InvalidExecutionUid))
                     .transpose()?;
+                if transport == Transport::Storage
+                    && (ssh_user.is_some()
+                        || ssh_port.is_some()
+                        || ssh_identity_file.is_some()
+                        || remote_config.is_some()
+                        || machine_uuid.is_some()
+                        || execution_uid.is_some())
+                {
+                    return Err(ConfigError::InvalidStorageTransportSettings);
+                }
                 let configured_roles = take_optional_strings(&mut table, &section, "roles")?
                     .unwrap_or_default()
                     .into_iter()
@@ -763,7 +781,14 @@ impl ClusterConfig {
             if controller_id.as_deref() == Some(name.as_str()) {
                 node_roles.insert(NodeRole::Controller);
             }
-            if controller_id.as_deref() != Some(name.as_str())
+            let compute_capable = nodes[name].transport != Transport::Storage;
+            if node_roles.contains(&NodeRole::Compute) && !compute_capable {
+                return Err(ConfigError::InvalidNodeRole(format!(
+                    "compute role is unavailable for storage transport node {name}"
+                )));
+            }
+            if compute_capable
+                && controller_id.as_deref() != Some(name.as_str())
                 && queues
                     .values()
                     .any(|queue| queue.nodes.iter().any(|node| node == name))

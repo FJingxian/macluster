@@ -247,6 +247,7 @@ pub fn run_interactive(
         };
         let process_target = match &target {
             SampleTarget::Local => ProcessTarget::Local,
+            SampleTarget::Unsupported => ProcessTarget::Unsupported,
             SampleTarget::Node {
                 node_id,
                 namespace,

@@ -10980,6 +10980,32 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
+    fn submitter_environment_is_snapshotted_per_invoking_mac() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-submitter-env-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let mount_root = root.join("mounted-mamba");
+        let (config, _, _) = environment_fixture(&root, &mount_root);
+        let inherited_a = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("SUBMITTER_PROBE".into(), "mac-mini".into()),
+        ]);
+        let inherited_b = BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("SUBMITTER_PROBE".into(), "login-mac".into()),
+        ]);
+
+        let env_a = prepare_task_environment(&config, inherited_a, BTreeMap::new()).unwrap();
+        let env_b = prepare_task_environment(&config, inherited_b, BTreeMap::new()).unwrap();
+
+        assert_eq!(env_a["SUBMITTER_PROBE"], "mac-mini");
+        assert_eq!(env_b["SUBMITTER_PROBE"], "login-mac");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn msub_preserves_explicit_shell_parsing_for_remapped_cc_flags() {
         let root = std::env::temp_dir().join(format!(
             "macluster-cc-flags-{}-{}",
@@ -12029,8 +12055,9 @@ WORKING DIRECTORY
   Flags after COMMAND belong to the task; use --wrap for shell syntax.
 
 ENVIRONMENT
-  Exported variables from the submitting shell are forwarded; --env overrides
-  individual values. An active VIRTUAL_ENV or CONDA_PREFIX must be shared at
+  The exported environment is snapshotted from the Mac that runs msub; controller
+  and compute-daemon environments do not replace it. --env overrides individual
+  values. An active VIRTUAL_ENV or CONDA_PREFIX must be shared at
   the same absolute path on every node. Its bin directory takes priority in
   PATH. An unshared or relocated active environment fails instead of falling
   back to compute-local tools. Unshared login-only PATH entries are omitted;

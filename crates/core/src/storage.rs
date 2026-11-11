@@ -2134,7 +2134,10 @@ mod read_only_tests {
 
 #[cfg(test)]
 mod schema_migration_tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use macluster_protocol::{
         identifiers::{Id128, NodeId, QueueName, RequestId},
@@ -2164,7 +2167,7 @@ mod schema_migration_tests {
         }
     }
 
-    fn set_schema_v2(root: &PathBuf) {
+    fn set_schema_v2(root: &Path) {
         let connection = Connection::open(&root.join("controller.sqlite3")).unwrap();
         connection
             .exec(
@@ -2180,7 +2183,7 @@ mod schema_migration_tests {
             .unwrap();
     }
 
-    fn set_schema_v3(root: &PathBuf) {
+    fn set_schema_v3(root: &Path) {
         let connection = Connection::open(&root.join("controller.sqlite3")).unwrap();
         connection
             .exec(

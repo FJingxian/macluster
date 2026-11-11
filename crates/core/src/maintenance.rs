@@ -457,21 +457,19 @@ mod tests {
             &state,
             serde_json::json!({"discard_terminal_sync": true}),
         );
-        assert_eq!(
+        assert!(
             read_reset_barrier_policy(&barrier, &config, &state)
                 .unwrap()
                 .unwrap()
-                .discard_terminal_sync,
-            true
+                .discard_terminal_sync
         );
 
         write_reset_policy(&barrier, &config, &state, serde_json::json!({}));
-        assert_eq!(
-            read_reset_barrier_policy(&barrier, &config, &state)
+        assert!(
+            !read_reset_barrier_policy(&barrier, &config, &state)
                 .unwrap()
                 .unwrap()
-                .discard_terminal_sync,
-            false
+                .discard_terminal_sync
         );
         fs::remove_dir_all(root).unwrap();
     }

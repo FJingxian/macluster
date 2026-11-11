@@ -967,7 +967,7 @@ mod macos {
         let mut busy = 0_u64;
         let mut total = 0_u64;
         let mut per_logical_cpu = Vec::with_capacity(cpu_count as usize);
-        for cpu in states.chunks_exact(CPU_STATES) {
+        for cpu in states.as_chunks::<CPU_STATES>().0 {
             let mut core_total = 0_u64;
             for state in cpu {
                 core_total += *state as u32 as u64;

@@ -6,7 +6,6 @@
 /.superpowers/
 /config/
 /.cargo/
-rust-toolchain.toml
 /macos/
 .DS_Store
 *.p12

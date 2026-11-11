@@ -32,7 +32,7 @@ impl Id128 {
                 hex.push(byte);
             }
         }
-        for (index, pair) in hex.chunks_exact(2).enumerate() {
+        for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
             let high = (pair[0] as char)
                 .to_digit(16)
                 .ok_or(IdentifierError::InvalidUuid)?;

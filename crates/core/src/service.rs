@@ -427,9 +427,9 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 mod tests {
     use super::{ServiceBinding, ServiceIntent, ServiceIntentStore, append_binding_part};
     use macluster_protocol::identifiers::Id128;
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
-    fn config_text(shared: &PathBuf) -> String {
+    fn config_text(shared: &Path) -> String {
         format!(
             "[cluster]\nname=\"service-test\"\ndefault_queue=\"q\"\nshared_root=\"{}\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"ssh\"\n",
             shared.display()

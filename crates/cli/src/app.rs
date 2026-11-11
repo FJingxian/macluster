@@ -7636,6 +7636,8 @@ impl Drop for ControllerSignalGuard {
 struct NodeMetricRow {
     id: String,
     host: String,
+    #[serde(skip)]
+    compute: bool,
     reachable: bool,
     metrics: Option<MetricSnapshot>,
     error: Option<String>,
@@ -7704,12 +7706,16 @@ fn sample_cluster(
     let mut rows = Vec::new();
     let mut missing_nodes = unreachable_nodes.len();
     for (id, node, result) in samples {
+        if !sampled_node_belongs_in_cluster_rows(config, &id) {
+            continue;
+        }
         let Ok(mut metrics) = result else {
             missing_nodes = missing_nodes.saturating_add(1);
             continue;
         };
         explain_legacy_power_agent(&mut metrics);
         rows.push(NodeMetricRow {
+            compute: config.is_compute_node(&id),
             id,
             host: node.host,
             reachable: true,
@@ -7735,6 +7741,10 @@ fn sample_cluster(
     }
 }
 
+fn sampled_node_belongs_in_cluster_rows(config: &ClusterConfig, node_id: &str) -> bool {
+    !config.is_login_node(node_id) || config.is_compute_node(node_id)
+}
+
 fn selected_local_node_id(
     config: &ClusterConfig,
     selected_queue: Option<&QueueName>,
@@ -7755,7 +7765,7 @@ fn selected_local_node_id(
                     .queue_for_dispatch(queue.as_str())
                     .is_some_and(|queue| queue.nodes.iter().any(|member| member == *id))
             });
-            is_local && selected && config.is_operational_node(id)
+            is_local && selected && config.is_operational_node(id) && config.is_compute_node(id)
         })
         .map(|(id, _)| id.clone())
 }
@@ -7976,7 +7986,7 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
     }
     let total_compute_nodes = view.nodes.len().saturating_add(view.missing_nodes);
     println!(
-        "Refresh: 2s  |  compute pool: {}/{} nodes unreachable",
+        "Refresh: 2s  |  managed pool: {}/{} nodes unreachable",
         view.missing_nodes, total_compute_nodes
     );
 
@@ -7990,11 +8000,8 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
         ));
     }
     for node in &view.nodes {
-        let task_count = view
-            .task_counts_by_node
-            .as_ref()
-            .and_then(|counts| counts.get(&node.id))
-            .map(|(running, waiting)| format!("{running}/{waiting}"));
+        let task_count =
+            one_shot_task_count(node.compute, &node.id, view.task_counts_by_node.as_ref());
         rows.push(metric_cells(
             &node.id,
             node.metrics.as_ref(),
@@ -8065,6 +8072,19 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
     if continuous {
         println!("\nPress Ctrl-C to exit");
     }
+}
+
+fn one_shot_task_count(
+    compute: bool,
+    node_id: &str,
+    counts: Option<&BTreeMap<String, (usize, usize)>>,
+) -> Option<String> {
+    if !compute {
+        return Some("0/0".into());
+    }
+    counts
+        .and_then(|counts| counts.get(node_id))
+        .map(|(running, waiting)| format!("{running}/{waiting}"))
 }
 
 fn metric_cells(
@@ -9352,11 +9372,12 @@ mod tests {
         explain_legacy_power_agent, format_fan_control_table, format_job_details,
         format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
         is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
-        prepare_task_environment, promote_inline_command, prune_submission_cache,
-        required_named_shares, selected_local_node_id,
-        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
-        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
+        one_shot_task_count, prepare_task_environment, promote_inline_command,
+        prune_submission_cache, required_named_shares, sampled_node_belongs_in_cluster_rows,
+        selected_local_node_id, should_block_agent_update_for_pending_node_recovery,
+        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
+        should_preflight_agent_update, submission_must_wait_for_agent_update,
+        visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -11765,17 +11786,17 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn local_login_identity_is_selected_without_compute_role() {
+    fn noncompute_login_stays_separate_from_sampled_node_rows() {
         let config = ClusterConfig::parse(
             "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"default\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n",
         )
         .unwrap();
 
         assert_eq!(
-            selected_local_node_id(&config, None, Some("01234567-89ab-cdef-0123-456789abcdef"))
-                .as_deref(),
-            Some("login")
+            selected_local_node_id(&config, None, Some("01234567-89ab-cdef-0123-456789abcdef")),
+            None
         );
+        assert!(!sampled_node_belongs_in_cluster_rows(&config, "login"));
         assert_eq!(
             selected_local_node_id(
                 &config,
@@ -11783,6 +11804,24 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
                 Some("01234567-89ab-cdef-0123-456789abcdef")
             ),
             None
+        );
+    }
+
+    #[test]
+    fn managed_noncompute_nodes_show_zero_tasks_without_task_state() {
+        assert_eq!(
+            one_shot_task_count(false, "storage-mac", None).as_deref(),
+            Some("0/0")
+        );
+        assert_eq!(one_shot_task_count(true, "worker", None), None);
+        assert_eq!(
+            one_shot_task_count(
+                true,
+                "worker",
+                Some(&BTreeMap::from([("worker".into(), (2, 3))]))
+            )
+            .as_deref(),
+            Some("2/3")
         );
     }
 
@@ -11815,6 +11854,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             NodeMetricRow {
                 id: "mini01-a".into(),
                 host: "192.0.2.1".into(),
+                compute: true,
                 reachable: true,
                 metrics: Some(first),
                 error: None,
@@ -11822,6 +11862,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             NodeMetricRow {
                 id: "mini01-b".into(),
                 host: "192.0.2.2".into(),
+                compute: true,
                 reachable: true,
                 metrics: Some(second),
                 error: None,

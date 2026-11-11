@@ -797,7 +797,7 @@ fn fetch_bootstrap(
             ));
         }
     };
-    let all_nodes = configured_web_nodes(&config);
+    let all_nodes = configured_web_nodes(config);
     let truncated_nodes = all_nodes.len() > MAX_WEB_NODES || monitor.total_pages > 1;
     Ok(BootstrapResponse {
         cluster_name: config.name.clone(),

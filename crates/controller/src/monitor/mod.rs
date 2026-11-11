@@ -165,11 +165,18 @@ impl MonitorHub {
     /// Existing callers can keep using `with_samplers`; this method lets
     /// production and deterministic tests publish fast initial data.
     pub fn with_progressive_samplers(
-        config: ClusterConfig,
+        mut config: ClusterConfig,
         metric_sample: Arc<MetricSampleFn>,
         initial_metric_sample: Arc<InitialMetricSampleFn>,
         process_sample: Arc<ProcessSampleFn>,
     ) -> Self {
+        let operational_nodes = config
+            .nodes
+            .keys()
+            .filter(|id| config.is_operational_node(id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        config.nodes.retain(|id, _| operational_nodes.contains(id));
         let metric_cache = config
             .nodes
             .keys()
@@ -652,7 +659,10 @@ fn advance_cursor_after_batch(start: usize, len: usize, last_scheduled: Option<u
 
 #[cfg(test)]
 mod tests {
-    use super::advance_cursor_after_batch;
+    use super::{MonitorHub, advance_cursor_after_batch};
+    use macluster_core::config::ClusterConfig;
+    use macluster_protocol::types::MetricSnapshot;
+    use std::{sync::Arc, time::Instant};
 
     #[test]
     fn cursor_advances_past_the_last_scheduled_node_in_a_rotated_batch() {
@@ -664,6 +674,33 @@ mod tests {
     fn cursor_advances_one_position_when_no_node_was_scheduled() {
         assert_eq!(advance_cursor_after_batch(2, 5, None), 3);
         assert_eq!(advance_cursor_after_batch(0, 0, None), 0);
+    }
+
+    #[test]
+    fn monitor_snapshot_excludes_external_storage_transport_nodes() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"default\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\n[nodes.nas-01]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n",
+        )
+        .unwrap();
+        let metric_sample = Arc::new(
+            |_node_id: &macluster_protocol::identifiers::NodeId,
+             _node: &macluster_core::config::NodeConfig|
+             -> Result<MetricSnapshot, String> { Err("not sampled".into()) },
+        );
+        let process_sample = Arc::new(
+            |_node_id: &macluster_protocol::identifiers::NodeId,
+             _node: &macluster_core::config::NodeConfig| { Err("not sampled".into()) },
+        );
+        let mut monitor = MonitorHub::with_samplers(config, metric_sample, process_sample);
+
+        let snapshot = monitor.snapshot(1, 0, Instant::now());
+        let ids = snapshot
+            .nodes
+            .into_iter()
+            .map(|row| row.node_id.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["login", "worker"]);
     }
 }
 

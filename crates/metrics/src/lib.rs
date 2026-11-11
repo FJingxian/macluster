@@ -450,18 +450,32 @@ mod macos {
     }
 
     pub(super) fn filesystem_capacity(path: &Path) -> Option<DiskCapacity> {
-        mounted_filesystems()
+        let mounted = mounted_filesystems()
             .into_iter()
             .filter_map(|filesystem| {
                 let mount_point = statfs_mount_point(&filesystem);
-                let mounted_path = Path::new(&mount_point);
-                path.starts_with(mounted_path).then(|| {
-                    let length = mount_point.len();
-                    (length, disk_capacity_from_statfs(&filesystem, mount_point))
-                })
+                let capacity = disk_capacity_from_statfs(&filesystem, mount_point.clone());
+                (!mount_point.is_empty()).then_some((mount_point, capacity))
+            })
+            .collect::<Vec<_>>();
+        capacity_for_path_from_mounts(path, &mounted)
+    }
+
+    pub(super) fn capacity_for_path_from_mounts(
+        path: &Path,
+        mounted: &[(String, Option<DiskCapacity>)],
+    ) -> Option<DiskCapacity> {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        mounted
+            .iter()
+            .filter_map(|(mount_point, capacity)| {
+                let mount_path = std::fs::canonicalize(mount_point).ok()?;
+                resolved
+                    .starts_with(mount_path)
+                    .then_some((mount_point.len(), capacity))
             })
             .max_by_key(|(length, _)| *length)
-            .and_then(|(_, capacity)| capacity)
+            .and_then(|(_, capacity)| capacity.clone())
     }
 
     fn disk_capacity_from_statfs(
@@ -1375,6 +1389,55 @@ mod tests {
         assert_eq!(disk.mount_point, "/");
         assert!(disk.total_bytes > 0);
         assert!(disk.used_bytes <= disk.total_bytes);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn filesystem_capacity_follows_symlinked_mount_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("macluster-capacity-alias-{}", std::process::id()));
+        let real = root.join("real");
+        let alias = root.join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_file(&alias);
+        symlink(&real, &alias).unwrap();
+        let root_capacity = super::DiskCapacity {
+            mount_point: "/".into(),
+            used_bytes: 10,
+            total_bytes: 100,
+        };
+        let target_capacity = super::DiskCapacity {
+            mount_point: real.to_string_lossy().into_owned(),
+            used_bytes: 20,
+            total_bytes: 200,
+        };
+        let mounted = vec![
+            ("/".to_owned(), Some(root_capacity)),
+            (
+                real.to_string_lossy().into_owned(),
+                Some(target_capacity.clone()),
+            ),
+        ];
+
+        assert_eq!(
+            super::macos::capacity_for_path_from_mounts(&alias, &mounted),
+            Some(target_capacity)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn filesystem_capacity_does_not_fall_back_to_root_for_missing_paths() {
+        let missing = std::env::temp_dir().join(format!(
+            "macluster-missing-capacity-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+
+        assert_eq!(super::filesystem_capacity(&missing), None);
     }
 
     #[test]

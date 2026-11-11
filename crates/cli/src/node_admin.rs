@@ -56,8 +56,8 @@ use macluster_protocol::{
     },
     types::{
         ControllerEpoch, DiskCapacity, ExecutionStatus, INTERACTIVE_PTY_FEATURE,
-        METRICS_FAN_SPEED_FEATURE, NodeHealth, Operation, ProtocolError, ResponseBody,
-        RuntimePhase,
+        METRICS_FAN_SPEED_FEATURE, MetricSnapshot, NodeHealth, Operation, ProtocolError,
+        ResponseBody, RuntimePhase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -14523,6 +14523,23 @@ impl NodeStorageInventory {
         }
     }
 
+    fn from_metrics(metrics: &MetricSnapshot, observed_unix_ms: u64) -> Self {
+        Self {
+            observed_unix_ms: Some(
+                (metrics.sampled_unix_ms != 0)
+                    .then_some(metrics.sampled_unix_ms)
+                    .unwrap_or(observed_unix_ms),
+            ),
+            system_disk: metrics.system_disk_capacity.clone(),
+            external_disks: metrics.external_disk_capacities.clone(),
+            shares: Vec::new(),
+        }
+    }
+
+    fn has_node_capacity(&self) -> bool {
+        self.system_disk.is_some() || !self.external_disks.is_empty()
+    }
+
     fn is_empty(&self) -> bool {
         self.system_disk.is_none() && self.external_disks.is_empty() && self.shares.is_empty()
     }
@@ -14560,22 +14577,34 @@ fn provider_storage_inventory(
 ) -> NodeStorageInventory {
     let mut shares = Vec::new();
     if config.storage_server.as_str() == node_id {
+        let share_capacity = capacity(&config.shared_root);
         shares.push(NodeShareCapacity {
             name: "primary".into(),
             protocol: StorageProtocol::Nfs,
             mount_root: config.shared_root.clone(),
-            capacity: capacity(&config.shared_root),
+            capacity: validated_provider_capacity(
+                config,
+                config.storage_server.as_str(),
+                &config.shared_root,
+                share_capacity,
+            ),
         });
     }
     for (name, share) in &config.shares {
         if share.server.as_str() != node_id || name == "primary" {
             continue;
         }
+        let share_capacity = capacity(&share.mount_root);
         shares.push(NodeShareCapacity {
             name: name.clone(),
             protocol: share.protocol,
             mount_root: share.mount_root.clone(),
-            capacity: capacity(&share.mount_root),
+            capacity: validated_provider_capacity(
+                config,
+                share.server.as_str(),
+                &share.mount_root,
+                share_capacity,
+            ),
         });
     }
     shares.sort_by(|left, right| left.name.cmp(&right.name));
@@ -14584,6 +14613,25 @@ fn provider_storage_inventory(
         shares,
         ..Default::default()
     }
+}
+
+fn validated_provider_capacity(
+    config: &ClusterConfig,
+    server_id: &str,
+    mount_root: &Path,
+    capacity: Option<DiskCapacity>,
+) -> Option<DiskCapacity> {
+    if config
+        .nodes
+        .get(server_id)
+        .is_some_and(|node| node.transport == Transport::Local)
+    {
+        return capacity;
+    }
+    let mount_root = fs::canonicalize(mount_root).ok()?;
+    capacity.filter(|disk| {
+        fs::canonicalize(&disk.mount_point).is_ok_and(|mount_point| mount_point == mount_root)
+    })
 }
 
 fn detailed_capacity(disk: &DiskCapacity) -> String {
@@ -14724,7 +14772,6 @@ fn list_nodes(
     show_all: bool,
     show_storage: bool,
 ) -> AppResult<()> {
-    let _ = show_storage;
     if !config_path.is_file() {
         return Err((
             1,
@@ -14803,6 +14850,9 @@ fn list_nodes(
             })
             .and_then(|record| record.health.as_ref());
         let health = cached_health.cloned();
+        let health_observed_unix_ms = cached
+            .and_then(|record| record.health_sampled_unix_ms)
+            .unwrap_or_else(validation_now_ms);
         let digest_matches = verified_node_health(&config, id, health.as_ref()).is_some();
         let all_shares_ready = health.as_ref().is_some_and(|health| {
             health.primary_share_ready
@@ -14863,7 +14913,7 @@ fn list_nodes(
         let mut storage = storage_inventories.remove(id).unwrap_or_else(|| {
             let mut inventory = health
                 .as_ref()
-                .map(|health| NodeStorageInventory::from_health(health, validation_now_ms()))
+                .map(|health| NodeStorageInventory::from_health(health, health_observed_unix_ms))
                 .unwrap_or_default();
             if node.transport == Transport::Local {
                 let (system_disk, external_disks) = macluster_metrics::sample_disk_capacities();
@@ -14907,10 +14957,10 @@ fn list_nodes(
             "{drafts} enrollment attempt(s) did not complete; those nodes are not registered. Use `mnode --failed` to find their IDs, rerun `mnode -a ...` to resume, or `mnode -rm NODE_ID` to cancel an attempt."
         );
     }
-    if hidden_unreachable > 0 {
-        if let Some(notice) = hidden_node_notice(hidden_unreachable) {
-            eprintln!("{notice}");
-        }
+    if hidden_unreachable > 0
+        && let Some(notice) = hidden_node_notice(hidden_unreachable)
+    {
+        eprintln!("{notice}");
     }
     print!("{}", format_node_list(&rows, show_storage));
     Ok(())
@@ -14930,7 +14980,7 @@ fn refresh_storage_inventories_for_list(
         .nodes
         .iter()
         .filter(|(_, node)| node.transport == Transport::Ssh)
-        .filter(|(id, _)| probe_results.get(*id).and_then(|value| *value) != Some(false))
+        .filter(|(id, _)| probe_results.get(*id).and_then(|value| *value) == Some(true))
         .map(|(id, node)| (id.clone(), node.clone()))
         .collect::<Vec<_>>();
     let tasks = Mutex::new(VecDeque::from_iter(targets));
@@ -14948,12 +14998,9 @@ fn refresh_storage_inventories_for_list(
                 let transport = transport.clone();
                 scope.spawn(move || {
                     let mut results = Vec::new();
-                    loop {
-                        let Some((node_id, node)) =
-                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
-                        else {
-                            break;
-                        };
+                    while let Some((node_id, node)) =
+                        tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                    {
                         let Ok(id) = NodeId::new(node_id.clone()) else {
                             continue;
                         };
@@ -14990,6 +15037,26 @@ fn refresh_storage_inventories_for_list(
                     shares: Vec::new(),
                 },
             );
+        }
+    }
+    if config.nodes.iter().any(|(id, node)| {
+        node.transport == Transport::Ssh
+            && !inventories
+                .get(id)
+                .is_some_and(NodeStorageInventory::has_node_capacity)
+    }) {
+        let mut metric_config = config.clone();
+        metric_config
+            .nodes
+            .retain(|id, _| probe_results.get(id).and_then(|reachable| *reachable) == Some(true));
+        let (_, samples) = crate::mtop::sample_one_shot(&metric_config, None);
+        for (node_id, _, result) in samples {
+            if let Ok(metrics) = result {
+                inventories.insert(
+                    node_id,
+                    NodeStorageInventory::from_metrics(&metrics, observed_unix_ms),
+                );
+            }
         }
     }
     inventories
@@ -22604,6 +22671,16 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert_eq!(inventory.system_disk, health.system_disk_capacity);
         assert_eq!(inventory.external_disks, health.external_disk_capacities);
 
+        let mut metrics = macluster_metrics::unavailable(1_000, "fixture");
+        metrics.system_disk_capacity = Some(capacity("/", 60, 100));
+        metrics.external_disk_capacities = vec![capacity("/Volumes/archive", 30, 100)];
+        let metric_inventory = NodeStorageInventory::from_metrics(&metrics, 1_000);
+        assert_eq!(metric_inventory.system_disk, metrics.system_disk_capacity);
+        assert_eq!(
+            metric_inventory.external_disks,
+            metrics.external_disk_capacities
+        );
+
         let mut config = parse_build_test_config();
         config.shares.insert(
             "project".into(),
@@ -22632,6 +22709,36 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             provider.shares[1].capacity,
             Some(capacity("/Users/Shared/project", 40, 100))
         );
+
+        config.nodes.insert(
+            "nas-01".into(),
+            NodeConfig {
+                host: "192.0.2.20".into(),
+                transport: Transport::Storage,
+                remote_binary: "/usr/local/bin/macluster".into(),
+                ssh_user: None,
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
+        config.shares.insert(
+            "remote".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: NodeId::new("nas-01").unwrap(),
+                source_root: "/export/remote".into(),
+                mount_root: "/Users/Shared/remote".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000004".into(),
+                smb_user: None,
+                allow_existing_contents: false,
+            },
+        );
+        let unavailable =
+            provider_storage_inventory(&config, "nas-01", |_| Some(capacity("/", 40, 100)));
+        assert_eq!(unavailable.shares[0].capacity, None);
     }
 
     #[test]

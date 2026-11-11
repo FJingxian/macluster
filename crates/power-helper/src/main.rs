@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 mod fan;
 mod helper_update;
 mod nfs_admin;
+mod smb_credential;
 
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
 const POWER_CACHE_TTL: Duration = Duration::from_millis(POWER_SAMPLE_CACHE_TTL_MS);
@@ -375,6 +376,7 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
     if peer_uid == 0 {
         return Err("peer UID must be a non-root account".into());
     }
+    smb_credential::start(peer_uid)?;
     nfs_admin::start(peer_uid)?;
     let path = Path::new(POWER_SOCKET);
     match std::fs::symlink_metadata(path) {

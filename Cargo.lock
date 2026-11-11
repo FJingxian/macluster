@@ -765,6 +765,7 @@ name = "macluster-power-helper"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "macluster-core",
  "macluster-protocol",
  "macmon",
  "serde",

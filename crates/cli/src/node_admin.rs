@@ -78,8 +78,9 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
 const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-12";
-const POWER_HELPER_REVISION: &str = "power-2";
+const POWER_HELPER_REVISION: &str = "power-3";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
+const SMB_CREDENTIAL_SOCKET_PATH: &str = "/var/run/org.macluster.smb-credential.sock";
 const POWER_LAUNCHD_PATH: &str = "/Library/LaunchDaemons/org.macluster.power.plist";
 const POWER_LAUNCHD_LABEL: &str = "org.macluster.power";
 const SSH_OPTIONS: &[&str] = &[
@@ -6462,7 +6463,7 @@ while /bin/launchctl print system/{POWER_LAUNCHD_LABEL} >/dev/null 2>&1; do
   if [ "$attempt" -ge 20 ]; then echo 'old privileged helper did not stop' >&2; exit 1; fi
   /bin/sleep 0.25
 done
-for socket in /var/run/org.macluster.power.sock {NFS_ADMIN_SOCKET_PATH}; do
+for socket in /var/run/org.macluster.power.sock {NFS_ADMIN_SOCKET_PATH} {SMB_CREDENTIAL_SOCKET_PATH}; do
   if [ -S "$socket" ]; then /bin/rm "$socket"; elif [ -e "$socket" ]; then echo "refusing to replace non-socket $socket" >&2; exit 1; fi
 done
 /bin/mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons
@@ -6482,7 +6483,7 @@ while ! bootstrap_error=$(/bin/launchctl bootstrap system {POWER_LAUNCHD_PATH} 2
 done
 /bin/launchctl kickstart -k system/{POWER_LAUNCHD_LABEL}
 attempt=0
-while [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S {NFS_ADMIN_SOCKET_PATH} ]; do
+while [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S {NFS_ADMIN_SOCKET_PATH} ] || [ ! -S {SMB_CREDENTIAL_SOCKET_PATH} ]; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 20 ]; then echo 'privileged helper sockets did not become ready' >&2; exit 1; fi
   /bin/sleep 0.25
@@ -24933,6 +24934,27 @@ ssh_port = 22
             syntax.status.success(),
             "{}",
             String::from_utf8_lossy(&syntax.stderr)
+        );
+    }
+
+    #[test]
+    fn power_helper_install_replaces_stale_smb_socket_and_waits_for_all_three_services() {
+        assert_eq!(super::POWER_HELPER_REVISION, "power-3");
+        let script = super::power_helper_install_script_with_updater(
+            "/tmp/power.bin",
+            "/tmp/nfs-admin.bin",
+            "/tmp/power.plist",
+            "power-digest",
+            "admin-digest",
+            super::NFS_ADMIN_CLI_REVISION,
+            None,
+        );
+        assert!(script.contains("/var/run/org.macluster.smb-credential.sock"));
+        assert!(
+            script.contains(
+                "while [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S /var/run/org.macluster.nfs-admin.sock ] || [ ! -S /var/run/org.macluster.smb-credential.sock ]"
+            ),
+            "installer must not report readiness until every helper service socket exists"
         );
     }
 

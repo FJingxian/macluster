@@ -228,6 +228,7 @@ impl SmbCredentialRequest {
 pub enum SmbCredentialReplyBody {
     Pong,
     Credential(StoredSmbCredential),
+    Missing,
     Deleted(bool),
 }
 

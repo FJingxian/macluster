@@ -15,16 +15,65 @@ fn source_is_client_local(source_host: &str, client_ip: &str) -> bool {
     source_host == client_ip
 }
 
-fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<(String, String)> {
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ClientMount {
+    protocol: String,
+    source: String,
+    physical_target: String,
+    logical_target: String,
+    alias_suffix: Option<String>,
+    share_uuid: String,
+}
+
+impl ClientMount {
+    fn is_nfs(&self) -> bool {
+        self.protocol == "nfs"
+    }
+
+    fn is_smb(&self) -> bool {
+        self.protocol == "smb"
+    }
+
+    fn backing_alias(&self) -> String {
+        match self.alias_suffix.as_deref() {
+            Some(suffix) if !suffix.is_empty() => {
+                format!("{}/{}", self.physical_target.trim_end_matches('/'), suffix)
+            }
+            _ => self.physical_target.clone(),
+        }
+    }
+}
+
+fn smb_mount(share: &macluster_protocol::control::ClientShareDescriptor) -> ClientMount {
+    let path = share.source_root.trim_start_matches('/');
+    let (share_name, subpath) = path.split_once('/').unwrap_or((path, ""));
+    ClientMount {
+        protocol: "smb".into(),
+        source: format!("//{}/{}", share.server_host, share_name),
+        physical_target: format!(
+            "/Users/Shared/.macluster-mounts/{}",
+            share.share_uuid.trim()
+        ),
+        logical_target: share.mount_root.clone(),
+        alias_suffix: (!subpath.is_empty()).then(|| subpath.to_owned()),
+        share_uuid: share.share_uuid.clone(),
+    }
+}
+
+fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<ClientMount> {
     let mut mounts = Vec::new();
     if !source_is_client_local(&descriptor.primary_source_host, client_ip) {
-        mounts.push((
-            format!(
+        mounts.push(ClientMount {
+            protocol: "nfs".into(),
+            source: format!(
                 "{}:{}",
                 descriptor.primary_source_host, descriptor.primary_source_root
             ),
-            descriptor.primary_mount_root.clone(),
-        ));
+            physical_target: descriptor.primary_mount_root.clone(),
+            logical_target: descriptor.primary_mount_root.clone(),
+            alias_suffix: None,
+            share_uuid: descriptor.cluster_uuid.clone(),
+        });
     }
     mounts.extend(
         descriptor
@@ -32,10 +81,18 @@ fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<(String, String
             .iter()
             .filter(|share| !source_is_client_local(&share.server_host, client_ip))
             .map(|share| {
-                (
-                    format!("{}:{}", share.server_host, share.source_root),
-                    share.mount_root.clone(),
-                )
+                if share.protocol == "smb" {
+                    smb_mount(share)
+                } else {
+                    ClientMount {
+                        protocol: "nfs".into(),
+                        source: format!("{}:{}", share.server_host, share.source_root),
+                        physical_target: share.mount_root.clone(),
+                        logical_target: share.mount_root.clone(),
+                        alias_suffix: None,
+                        share_uuid: share.share_uuid.clone(),
+                    }
+                }
             }),
     );
     mounts
@@ -72,7 +129,7 @@ fn retired_mounts(
     previous: &ClientDescriptor,
     next: &ClientDescriptor,
     client_ip: &str,
-) -> Vec<(String, String)> {
+) -> Vec<ClientMount> {
     let retained = mounts(next, client_ip).into_iter().collect::<BTreeSet<_>>();
     let mut seen = BTreeSet::new();
     mounts(previous, client_ip)
@@ -95,26 +152,51 @@ fn client_mount_script(
     let helper = format!("{HELPER_ROOT}/{label}.sh");
     let plist = format!("{DAEMON_ROOT}/{label}.plist");
     let mut body = "#!/bin/sh\nset -eu\n".to_owned();
-    for (source, target) in mounts(descriptor, client_ip) {
-        let source_arg = shell_quote(&source);
-        let target_arg = shell_quote(&target);
-        let mounted_target = shell_quote(&format!(" on {target} ("));
-        let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
-        body.push_str(&format!(
-            "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    echo 'macluster client mount target is already mounted from a different source; refusing to replace it' >&2\n    exit 1\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /sbin/mount_nfs -o resvport {source_arg} {target_arg}\nfi\n"
-        ));
+    for mount in mounts(descriptor, client_ip) {
+        let source_arg = shell_quote(&mount.source);
+        let target_arg = shell_quote(&mount.physical_target);
+        if mount.is_nfs() {
+            let mounted_target = shell_quote(&format!(" on {} (", mount.physical_target));
+            let expected_mount = shell_quote(&format!(
+                "{} on {} (nfs",
+                mount.source, mount.physical_target
+            ));
+            body.push_str(&format!(
+                "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    echo 'macluster client mount target is already mounted from a different source; refusing to replace it' >&2\n    exit 1\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /sbin/mount_nfs -o resvport {source_arg} {target_arg}\nfi\n"
+            ));
+        } else if mount.is_smb() {
+            let logical = shell_quote(&mount.logical_target);
+            let backing_alias = shell_quote(&mount.backing_alias());
+            let physical = shell_quote(&mount.physical_target);
+            let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
+            body.push_str(&format!(
+                "if [ -L {logical} ]; then actual=$(/usr/bin/readlink {logical}); [ \"$actual\" = {backing_alias} ] || {{ echo 'SMB logical mount target points elsewhere' >&2; exit 1; }}; elif [ -e {logical} ]; then [ -d {logical} ] || {{ echo 'SMB logical mount target is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A {logical}) || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical mount target is not empty' >&2; exit 1; }}; /bin/rmdir {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then :; else\n  /bin/mkdir -p {physical}\n  /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source_arg} {physical}\nfi\n/bin/mkdir -p \"$(/usr/bin/dirname {logical})\"\nif [ ! -L {logical} ]; then /bin/ln -s {backing_alias} {logical}; fi\n"
+            ));
+        }
     }
     let plist_body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{helper}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>5</integer><key>ProcessType</key><string>Background</string></dict></plist>\n"
     );
     let mut retired = String::new();
     if let Some(previous) = previous {
-        for (source, target) in retired_mounts(previous, descriptor, client_ip) {
-            let target_arg = shell_quote(&target);
-            let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
-            retired.push_str(&format!(
-                "if /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
-            ));
+        for mount in retired_mounts(previous, descriptor, client_ip) {
+            let target_arg = shell_quote(&mount.physical_target);
+            if mount.is_nfs() {
+                let expected_mount = shell_quote(&format!(
+                    "{} on {} (nfs",
+                    mount.source, mount.physical_target
+                ));
+                retired.push_str(&format!(
+                    "if /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+                ));
+            } else {
+                let logical = shell_quote(&mount.logical_target);
+                let alias = shell_quote(&mount.backing_alias());
+                let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
+                retired.push_str(&format!(
+                    "if [ -L {logical} ] && [ \"$(/usr/bin/readlink {logical})\" = {alias} ]; then /bin/rm -f {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+                ));
+            }
         }
     }
     format!(
@@ -135,12 +217,24 @@ fn client_remove_script(
     let mut script = format!(
         "#!/bin/sh\nset -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\n"
     );
-    for (source, target) in mounts(descriptor, client_ip) {
-        let target_arg = shell_quote(&target);
-        let expected_mount = shell_quote(&format!("{source} on {target} (nfs"));
-        script.push_str(&format!(
-            "if /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
-        ));
+    for mount in mounts(descriptor, client_ip) {
+        let target_arg = shell_quote(&mount.physical_target);
+        if mount.is_nfs() {
+            let expected_mount = shell_quote(&format!(
+                "{} on {} (nfs",
+                mount.source, mount.physical_target
+            ));
+            script.push_str(&format!(
+                "if /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+            ));
+        } else {
+            let logical = shell_quote(&mount.logical_target);
+            let alias = shell_quote(&mount.backing_alias());
+            let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
+            script.push_str(&format!(
+                "if [ -L {logical} ] && [ \"$(/usr/bin/readlink {logical})\" = {alias} ]; then /bin/rm -f {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+            ));
+        }
     }
     script.push_str(&format!(
         "/bin/rm -f {} {}\n",
@@ -162,9 +256,13 @@ fn overlay_targets(descriptor: &ClientDescriptor, client_ip: &str) -> Result<Vec
     }
     let mount_table = String::from_utf8_lossy(&mount_table.stdout);
     let mut overlays = Vec::new();
-    for (source, target) in mounts(descriptor, client_ip) {
-        let path = PathBuf::from(&target);
-        if mount_table_has_exact(&mount_table, &source, &target) {
+    for mount in mounts(descriptor, client_ip) {
+        let path = PathBuf::from(if mount.is_smb() {
+            &mount.logical_target
+        } else {
+            &mount.physical_target
+        });
+        if mount_table_has_exact(&mount_table, &mount) {
             continue;
         }
         let metadata = match std::fs::symlink_metadata(&path) {
@@ -206,7 +304,7 @@ fn overlay_targets(descriptor: &ClientDescriptor, client_ip: &str) -> Result<Vec
     Ok(overlays)
 }
 
-fn mount_table_has_exact(mount_table: &str, source: &str, target: &str) -> bool {
+fn mount_table_has_exact(mount_table: &str, mount: &ClientMount) -> bool {
     mount_table.lines().any(|line| {
         let Some((actual_source, destination)) = line.split_once(" on ") else {
             return false;
@@ -214,9 +312,14 @@ fn mount_table_has_exact(mount_table: &str, source: &str, target: &str) -> bool 
         let Some((actual_target, filesystem)) = destination.split_once(" (") else {
             return false;
         };
-        actual_source == source
-            && actual_target == target
-            && filesystem.trim_end_matches(')').split(',').next() == Some("nfs")
+        let filesystem = filesystem.trim_end_matches(')').split(',').next();
+        if mount.is_nfs() {
+            actual_source == mount.source
+                && actual_target == mount.physical_target
+                && filesystem == Some("nfs")
+        } else {
+            actual_target == mount.physical_target && filesystem == Some("smbfs")
+        }
     })
 }
 
@@ -224,34 +327,21 @@ fn required_mounts(
     descriptor: &ClientDescriptor,
     required_shares: Option<&[String]>,
     client_ip: &str,
-) -> Vec<(String, String)> {
-    let mut required = Vec::new();
-    if !source_is_client_local(&descriptor.primary_source_host, client_ip) {
-        required.push((
-            format!(
-                "{}:{}",
-                descriptor.primary_source_host, descriptor.primary_source_root
-            ),
-            descriptor.primary_mount_root.clone(),
-        ));
-    }
-    required.extend(
-        descriptor
-            .shares
-            .iter()
-            .filter(|share| {
-                !source_is_client_local(&share.server_host, client_ip)
-                    && required_shares
-                        .is_none_or(|required| required.iter().any(|id| id == &share.id))
+) -> Vec<ClientMount> {
+    mounts(descriptor, client_ip)
+        .into_iter()
+        .filter(|mount| {
+            if mount.share_uuid == descriptor.cluster_uuid {
+                return true;
+            }
+            required_shares.is_none_or(|required| {
+                descriptor.shares.iter().any(|share| {
+                    share.share_uuid == mount.share_uuid
+                        && required.iter().any(|id| id == &share.id)
+                })
             })
-            .map(|share| {
-                (
-                    format!("{}:{}", share.server_host, share.source_root),
-                    share.mount_root.clone(),
-                )
-            }),
-    );
-    required
+        })
+        .collect()
 }
 
 fn missing_mounts(
@@ -259,10 +349,11 @@ fn missing_mounts(
     mount_table: &str,
     required_shares: Option<&[String]>,
     client_ip: &str,
-) -> Vec<(String, String)> {
+) -> Vec<String> {
     required_mounts(descriptor, required_shares, client_ip)
         .into_iter()
-        .filter(|(source, target)| !mount_table_has_exact(mount_table, source, target))
+        .filter(|mount| !mount_table_has_exact(mount_table, mount))
+        .map(|mount| mount.logical_target)
         .collect()
 }
 
@@ -293,7 +384,7 @@ pub(crate) fn verify_client_mounts(
             "client storage is not mounted from {}; wait for the client mount service to reconnect, or rerun `--join`",
             missing
                 .iter()
-                .map(|(_, target)| target.as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -506,6 +597,42 @@ mod tests {
     }
 
     #[test]
+    fn smb_share_mounts_its_share_and_exposes_the_requested_subpath() {
+        let mut descriptor = descriptor();
+        descriptor.shares.push(ClientShareDescriptor {
+            id: "smb-project".into(),
+            server: "nas".parse().unwrap(),
+            protocol: "smb".into(),
+            server_host: "192.0.2.20".into(),
+            source_root: "/data/project".into(),
+            mount_root: "/Volumes/project".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+        });
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor,
+            None,
+            "192.0.2.10",
+        );
+
+        assert!(script.contains("mount_smbfs"));
+        assert!(script.contains("//192.0.2.20/data"));
+        assert!(script.contains("/Volumes/project"));
+        assert!(script.contains("ln -s"));
+        assert!(!script.contains("password"));
+        assert_eq!(
+            missing_mounts(
+                &descriptor,
+                "192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n",
+                None,
+                "192.0.2.10",
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
     fn remove_script_unloads_only_its_cluster_daemon() {
         let script = client_remove_script(
             "f779bcf5-ea85-5caa-9579-74b395f3cce5",
@@ -625,15 +752,14 @@ mod tests {
         let old = descriptor();
         let mut next = old.clone();
         next.shares[0].source_root = "/opt/homebrew-next".into();
-        assert_eq!(
-            retired_mounts(&old, &next, "192.0.2.10"),
-            vec![("192.0.2.1:/opt/homebrew".into(), "/opt/homebrew".into())]
-        );
+        let retired = retired_mounts(&old, &next, "192.0.2.10");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].source, "192.0.2.1:/opt/homebrew");
+        assert_eq!(retired[0].logical_target, "/opt/homebrew");
         next.shares.clear();
-        assert_eq!(
-            retired_mounts(&old, &next, "192.0.2.10"),
-            vec![("192.0.2.1:/opt/homebrew".into(), "/opt/homebrew".into())]
-        );
+        let retired = retired_mounts(&old, &next, "192.0.2.10");
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].logical_target, "/opt/homebrew");
     }
 
     #[test]
@@ -645,10 +771,7 @@ mod tests {
         let wrong = "198.51.100.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
         assert_eq!(
             missing_mounts(&descriptor, wrong, None, "192.0.2.10"),
-            vec![(
-                "192.0.2.1:/Users/Shared/macluster".into(),
-                "/Users/Shared/macluster".into()
-            )]
+            vec!["/Users/Shared/macluster".to_owned()]
         );
         let prefix_collision = "x192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew-old (nfs)\n";
         assert_eq!(

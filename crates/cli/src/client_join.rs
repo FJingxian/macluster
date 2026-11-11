@@ -127,6 +127,7 @@ pub fn profile_from_bootstrap(
         || !std::path::Path::new(&bootstrap.descriptor.primary_mount_root).is_absolute()
         || bootstrap.descriptor.shares.iter().any(|share| {
             share.server_host.is_empty()
+                || !matches!(share.protocol.as_str(), "nfs" | "smb")
                 || !std::path::Path::new(&share.source_root).is_absolute()
                 || !std::path::Path::new(&share.mount_root).is_absolute()
         })

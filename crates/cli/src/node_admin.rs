@@ -14102,12 +14102,6 @@ fn mount_storage(
     mount_root: PathBuf,
     overlay_existing: bool,
 ) -> AppResult<()> {
-    if uri.protocol != StorageProtocol::Nfs {
-        return Err((
-            1,
-            "SMB mounting is added by the SMB provider implementation".into(),
-        ));
-    }
     let config = read_config(config_path)?;
     if !config.nodes.contains_key(uri.server.as_str()) {
         return Err((
@@ -14172,6 +14166,16 @@ fn mount_storage(
         ));
     }
     let share_id = managed_storage_share_id(&uri);
+    if uri.protocol == StorageProtocol::Smb {
+        return register_smb_share(
+            config_path,
+            state_dir,
+            &share_id,
+            &uri,
+            &mount_root,
+            overlay_existing,
+        );
+    }
     register_named_share(
         config_path,
         state_dir,
@@ -14187,7 +14191,7 @@ fn mount_storage(
 
 fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppResult<()> {
     let config = read_config(config_path)?;
-    let share_id = config
+    let (share_id, protocol, mount_root) = config
         .shares
         .iter()
         .find(|(_, share)| {
@@ -14195,9 +14199,259 @@ fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppR
                 && share.server == uri.server
                 && share.source_root == Path::new(&uri.source)
         })
-        .map(|(id, _)| id.clone())
+        .map(|(id, share)| (id.clone(), share.protocol, share.mount_root.clone()))
         .ok_or_else(|| (2, format!("storage URI {uri} is not mounted")))?;
+    if protocol == StorageProtocol::Smb {
+        return unregister_smb_share(config_path, state_dir, &share_id, &mount_root);
+    }
     remove_share(config_path, state_dir, &share_id, false)
+}
+
+fn smb_share_parts(share: &ShareConfig) -> AppResult<(String, String)> {
+    let path = share.source_root.to_string_lossy();
+    let path = path.trim_start_matches('/');
+    path.split_once('/')
+        .map(|(share_name, _)| (share_name.to_owned(), path.to_owned()))
+        .ok_or_else(|| {
+            (
+                2,
+                "SMB source must contain at least /SHARE and may include /SHARE/SUBPATH".into(),
+            )
+        })
+}
+
+fn smb_backing_path(share_uuid: &str) -> PathBuf {
+    PathBuf::from("/Users/Shared/.macluster-mounts").join(share_uuid.trim())
+}
+
+fn smb_alias_path(share: &ShareConfig) -> AppResult<PathBuf> {
+    let (_, full) = smb_share_parts(share)?;
+    let (_, subpath) = full.split_once('/').unwrap_or((full.as_str(), ""));
+    let backing = smb_backing_path(&share.share_uuid);
+    Ok(if subpath.is_empty() {
+        backing
+    } else {
+        backing.join(subpath)
+    })
+}
+
+fn smb_mount_script(share: &ShareConfig, server: &NodeConfig) -> AppResult<String> {
+    let (share_name, _) = smb_share_parts(share)?;
+    let source = format!("//{}/{}", server.host, share_name);
+    let physical = shell_quote(&smb_backing_path(&share.share_uuid).to_string_lossy());
+    let logical = shell_quote(&share.mount_root.to_string_lossy());
+    let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
+    let source = shell_quote(&source);
+    Ok(format!(
+        "set -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); [ \"$actual\" = \"$alias\" ] || {{ echo 'SMB logical path is an unrelated symlink' >&2; exit 1; }}; elif [ -e \"$logical\" ]; then [ -d \"$logical\" ] || {{ echo 'SMB logical path is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A \"$logical\") || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical path is not empty' >&2; exit 1; }}; /bin/rmdir \"$logical\"; fi\nif ! /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /bin/mkdir -p \"$physical\"; /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source} \"$physical\"; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$logical\")\"\nif [ ! -L \"$logical\" ]; then /bin/ln -s \"$alias\" \"$logical\"; fi\n"
+    ))
+}
+
+fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
+    let physical = shell_quote(&smb_backing_path(&share.share_uuid).to_string_lossy());
+    let logical = shell_quote(&share.mount_root.to_string_lossy());
+    let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
+    Ok(format!(
+        "set -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ]; then /bin/rm -f \"$logical\"; fi\nif /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$physical\"; fi\n"
+    ))
+}
+
+fn smb_client_nodes<'a>(
+    config: &'a ClusterConfig,
+    server_id: &str,
+) -> Vec<(&'a String, &'a NodeConfig)> {
+    config
+        .nodes
+        .iter()
+        .filter(|(node_id, node)| {
+            node_id.as_str() != server_id
+                && (node.transport == Transport::Local || node_ssh_endpoint_reachable(node))
+        })
+        .collect()
+}
+
+fn register_smb_share(
+    config_path: &Path,
+    state_dir: &Path,
+    share_id: &str,
+    uri: &StorageUri,
+    mount_root: &Path,
+    _overlay_existing: bool,
+) -> AppResult<()> {
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "SMB share setup",
+        MaintenanceScope::Cluster,
+    )?;
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let server = config.nodes.get(uri.server.as_str()).ok_or_else(|| {
+            (
+                2,
+                format!("storage server '{}' is not a registered node", uri.server),
+            )
+        })?;
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: uri.server.clone(),
+            source_root: PathBuf::from(&uri.source),
+            mount_root: mount_root.to_path_buf(),
+            share_uuid: Id128::random().to_string(),
+            allow_existing_contents: false,
+        };
+        smb_share_parts(&share)?;
+        let candidate = append_share_config(&source, share_id, &share)?;
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let mount_script = smb_mount_script(&share, server)?;
+        let mut mounted_nodes: Vec<String> = Vec::new();
+        for (node_id, node) in smb_client_nodes(&config, uri.server.as_str()) {
+            if let Err(error) = run_interactive_admin_with_reason(
+                node,
+                &format!("mount SMB share {uri} at {}", mount_root.display()),
+                &mount_script,
+            ) {
+                let cleanup = smb_unmount_script(&share)?;
+                for mounted_id in mounted_nodes {
+                    if let Some(mounted) = config.nodes.get(&mounted_id) {
+                        let _ = run_interactive_admin_with_reason(
+                            mounted,
+                            "roll back SMB share mount",
+                            &cleanup,
+                        );
+                    }
+                }
+                return Err((
+                    1,
+                    format!("cannot mount SMB share {uri} on {node_id}: {error}"),
+                ));
+            }
+            mounted_nodes.push(node_id.clone());
+        }
+        let operation_id = Id128::random().to_string();
+        backup_config(&config_path, &operation_id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation_id,
+            None,
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "SMB share {share_id} was mounted locally, but peer config sync failed: {error}"
+                ),
+            )
+        })?;
+        println!(
+            "Mounted SMB share {uri} at {} and added it to the cluster.",
+            mount_root.display()
+        );
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
+}
+
+fn unregister_smb_share(
+    config_path: &Path,
+    state_dir: &Path,
+    share_id: &str,
+    mount_root: &Path,
+) -> AppResult<()> {
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        "SMB share removal",
+        MaintenanceScope::Cluster,
+    )?;
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        let share = config
+            .shares
+            .get(share_id)
+            .cloned()
+            .ok_or_else(|| (2, format!("SMB share {share_id} is not configured")))?;
+        let active = ReadOnlyJobStore::open(state_dir)
+            .map_err(|error| (1, error.to_string()))?
+            .list_active_jobs()
+            .map_err(|error| (1, error.to_string()))?;
+        let blockers = active
+            .iter()
+            .filter(|job| {
+                job.spec
+                    .required_shares
+                    .as_ref()
+                    .is_some_and(|required| required.iter().any(|id| id == share_id))
+            })
+            .map(|job| job.id.to_string())
+            .collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            return Err((
+                1,
+                format!(
+                    "cannot unmount SMB share {share_id} while jobs still require it: {}",
+                    blockers.join(", ")
+                ),
+            ));
+        }
+        let unmount_script = smb_unmount_script(&share)?;
+        for (node_id, node) in smb_client_nodes(&config, share.server.as_str()) {
+            if let Err(error) = run_interactive_admin_with_reason(
+                node,
+                &format!("unmount SMB share {share_id} from {node_id}"),
+                &unmount_script,
+            ) {
+                eprintln!("Warning: SMB cleanup on {node_id} failed: {error}");
+            }
+        }
+        let candidate = remove_share_sections(&source, &BTreeSet::from([share_id.to_owned()]));
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let operation_id = Id128::random().to_string();
+        backup_config(&config_path, &operation_id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation_id,
+            None,
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "SMB share {share_id} was removed locally, but peer config sync failed: {error}"
+                ),
+            )
+        })?;
+        println!(
+            "Unmounted SMB share {share_id} from {}.",
+            mount_root.display()
+        );
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn register_named_share(
@@ -15283,7 +15537,8 @@ fn append_share_config(
         candidate.push('\n');
     }
     candidate.push_str(&format!(
-        "\n[shares.{share_id}]\nserver = \"{}\"\nsource_root = \"{}\"\nmount_root = \"{}\"\nshare_uuid = \"{}\"\n",
+        "\n[shares.{share_id}]\nprotocol = \"{}\"\nserver = \"{}\"\nsource_root = \"{}\"\nmount_root = \"{}\"\nshare_uuid = \"{}\"\n",
+        share.protocol,
         share.server,
         share.source_root.display(),
         share.mount_root.display(),
@@ -17887,7 +18142,7 @@ mod tests {
     use macluster_core::maintenance::MaintenanceLock;
     use macluster_core::nfs_reconcile::DeferredShareCleanupState;
     use macluster_core::storage::{ReadOnlyJobStore, Storage};
-    use macluster_core::storage_uri::StorageUri;
+    use macluster_core::storage_uri::{StorageProtocol, StorageUri};
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
     use macluster_protocol::nfs_admin::NfsAdminOperation;
@@ -21117,6 +21372,37 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             super::managed_storage_share_id(&first),
             super::managed_storage_share_id(&second)
         );
+    }
+
+    #[test]
+    fn smb_mount_script_maps_subpath_without_embedding_credentials() {
+        let server = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("nas".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data/project".into(),
+            mount_root: "/Volumes/project".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+        };
+        let script = super::smb_mount_script(&share, &server).unwrap();
+
+        assert!(script.contains("//192.0.2.20/data"));
+        assert!(script.contains("/Volumes/project"));
+        assert!(script.contains("project"));
+        assert!(script.contains("mount_smbfs"));
+        assert!(script.contains("nopassprompt"));
+        assert!(!script.to_ascii_lowercase().contains("password="));
     }
 
     #[test]

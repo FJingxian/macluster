@@ -933,6 +933,18 @@ fn verify_named_share_with_mount_output(
     share: &macluster_core::config::ShareConfig,
     mount_output: &str,
 ) -> Result<(), AgentError> {
+    if share.protocol == macluster_core::storage_uri::StorageProtocol::Smb {
+        let backing = format!(
+            "/Users/Shared/.macluster-mounts/{}",
+            share.share_uuid.trim()
+        );
+        let expected = format!(" on {backing} (smbfs");
+        return if mount_output.lines().any(|line| line.contains(&expected)) {
+            Ok(())
+        } else {
+            Err(AgentError::SharedStorage)
+        };
+    }
     let Some(server) = config.nodes.get(share.server.as_str()) else {
         return Err(AgentError::SharedStorage);
     };
@@ -3083,6 +3095,41 @@ execution_uid = 501
         assert!(
             result.is_ok(),
             "mount health must not open the NFS path: {result:?}"
+        );
+    }
+
+    #[test]
+    fn smb_client_health_uses_the_protocol_backing_mount() {
+        use macluster_core::storage_uri::StorageProtocol;
+
+        let mut config = status_config(Path::new("/tmp/macluster-health-primary"));
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        let share_uuid = "00000000-0000-4000-8000-000000000098";
+        config.shares.insert(
+            "project".into(),
+            macluster_core::config::ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: NodeId::new("mini01-a").unwrap(),
+                source_root: PathBuf::from("/data/project"),
+                mount_root: PathBuf::from("/Volumes/project"),
+                share_uuid: share_uuid.into(),
+                allow_existing_contents: false,
+            },
+        );
+        let mount_output = format!(
+            "//192.0.2.2/data on /Users/Shared/.macluster-mounts/{share_uuid} (smbfs, nodev, nosuid)\n"
+        );
+
+        let result = verify_named_share_with_mount_output(
+            &config,
+            "login-01",
+            config.shares.get("project").unwrap(),
+            &mount_output,
+        );
+
+        assert!(
+            result.is_ok(),
+            "SMB backing mount was not recognized: {result:?}"
         );
     }
 

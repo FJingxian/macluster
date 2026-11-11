@@ -13014,7 +13014,7 @@ pub(crate) fn remote_execution_status(
 }
 
 struct NodeListRow {
-    columns: [String; 6],
+    columns: [String; 7],
     mappings: Vec<NodeNfsMapping>,
 }
 
@@ -13138,15 +13138,15 @@ fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
 }
 
 fn format_node_list(rows: &[NodeListRow]) -> String {
-    let headers = ["ID", "HOST", "SSH USER", "PORT", "QUEUE", "STATE"];
-    let widths = std::array::from_fn::<_, 6, _>(|index| {
+    let headers = ["ID", "HOST", "SSH USER", "PORT", "ROLES", "QUEUE", "STATE"];
+    let widths = std::array::from_fn::<_, 7, _>(|index| {
         rows.iter()
             .map(|row| row.columns[index].chars().count())
             .max()
             .unwrap_or(0)
             .max(headers[index].len())
     });
-    let line = |cells: [&str; 6]| {
+    let line = |cells: [&str; 7]| {
         cells
             .iter()
             .enumerate()
@@ -13321,9 +13321,15 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             .queues
             .iter()
             .filter(|(_, queue)| {
-                queue.nodes.iter().any(|member| member == id) && !config.is_login_node(id)
+                queue.nodes.iter().any(|member| member == id) && config.is_compute_node(id)
             })
             .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let roles = config
+            .node_roles(id)
+            .into_iter()
+            .map(|role| role.as_str().to_ascii_uppercase())
             .collect::<Vec<_>>()
             .join(",");
         let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
@@ -13393,6 +13399,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
                 node.host.clone(),
                 user.to_owned(),
                 port.to_string(),
+                if roles.is_empty() { "-".into() } else { roles },
                 if queue_names.is_empty() {
                     "-".into()
                 } else {
@@ -21566,28 +21573,42 @@ remote_binary = "/usr/local/bin/macluster"
 
     #[test]
     fn node_list_shows_common_nfs_mappings_once_after_all_node_rows() {
-        let row = |id: &str, host: &str, state: &'static str, target: &str| -> NodeListRow {
-            NodeListRow {
-                columns: [
-                    id.into(),
-                    host.into(),
-                    "local".into(),
-                    "22".into(),
-                    "-".into(),
-                    "READY".into(),
-                ],
-                mappings: vec![NodeNfsMapping {
-                    name: "primary".into(),
-                    state,
-                    kind: "MOUNT",
-                    source_node: "login-01".into(),
-                    target: target.into(),
-                }],
-            }
-        };
+        let row =
+            |id: &str, host: &str, roles: &str, state: &'static str, target: &str| -> NodeListRow {
+                NodeListRow {
+                    columns: [
+                        id.into(),
+                        host.into(),
+                        "local".into(),
+                        "22".into(),
+                        roles.into(),
+                        "-".into(),
+                        "READY".into(),
+                    ],
+                    mappings: vec![NodeNfsMapping {
+                        name: "primary".into(),
+                        state,
+                        kind: "MOUNT",
+                        source_node: "login-01".into(),
+                        target: target.into(),
+                    }],
+                }
+            };
         let output = format_node_list(&[
-            row("login-01", "192.0.2.1", "READY", "/Users/Shared/macluster"),
-            row("arm-a", "192.0.2.2", "READY", "/Users/Shared/macluster"),
+            row(
+                "login-01",
+                "192.0.2.1",
+                "CONTROLLER",
+                "READY",
+                "/Users/Shared/macluster",
+            ),
+            row(
+                "arm-a",
+                "192.0.2.2",
+                "COMPUTE",
+                "READY",
+                "/Users/Shared/macluster",
+            ),
         ]);
 
         let login_row = output.find("login-01").unwrap();
@@ -21610,6 +21631,9 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(!output.contains("PHASE"));
         assert!(!output.contains("SOURCE"));
         assert!(!output.contains("TARGET"));
+        assert!(output.contains("ROLES"), "{output}");
+        assert!(output.contains("CONTROLLER"), "{output}");
+        assert!(output.contains("COMPUTE"), "{output}");
     }
 
     #[test]

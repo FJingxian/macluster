@@ -1,4 +1,4 @@
-use macluster_core::config::{ClusterConfig, ConfigError};
+use macluster_core::config::{ClusterConfig, ConfigError, NodeRole};
 
 const VALID: &str = r#"
 [cluster]
@@ -32,6 +32,46 @@ fn documented_config_resolves_queue_members_and_storage_role() {
     assert_eq!(config.queues["mini01"].nodes, ["mini01-a"]);
     assert_eq!(config.storage_server.as_str(), "mini01-a");
     assert_eq!(config.protocol_version, 1);
+}
+
+#[test]
+fn explicit_node_roles_can_overlap() {
+    let source = extended_config()
+        .replace(
+            "storage_server = \"mini01-a\"",
+            "storage_server = \"mini01-a\"\nlogin_node = \"login\"",
+        )
+        .replace(
+            "[nodes.login]\nhost = \"192.0.2.3\"\ntransport = \"local\"",
+            "[nodes.login]\nhost = \"192.0.2.3\"\ntransport = \"local\"\nroles = [\"controller\", \"compute\", \"storage\"]",
+        );
+    let config = ClusterConfig::parse(&source).unwrap();
+
+    let roles = config.node_roles("login");
+    assert!(roles.contains(&NodeRole::Controller));
+    assert!(roles.contains(&NodeRole::Compute));
+    assert!(roles.contains(&NodeRole::Storage));
+    assert!(config.is_compute_node("login"));
+}
+
+#[test]
+fn legacy_controller_queue_membership_is_not_implicit_compute() {
+    let source = extended_config()
+        .replace(
+            "storage_server = \"mini01-a\"",
+            "storage_server = \"mini01-a\"\nlogin_node = \"login\"",
+        )
+        .replace(
+            "[queues.mini01]\nnodes = [\"mini01-a\"]",
+            "[queues.mini01]\nnodes = [\"mini01-a\", \"login\"]",
+        );
+    let config = ClusterConfig::parse(&source).unwrap();
+
+    assert!(!config.is_compute_node("login"));
+    assert_eq!(
+        config.queue_for_dispatch("mini01").unwrap().nodes,
+        vec!["mini01-a"]
+    );
 }
 
 #[test]

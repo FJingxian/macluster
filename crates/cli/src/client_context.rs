@@ -184,6 +184,27 @@ impl RemoteContext {
                 },
             );
         }
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            controller.to_string(),
+            [macluster_core::config::NodeRole::Controller]
+                .into_iter()
+                .collect(),
+        );
+        for queue in queues.values() {
+            for node in &queue.nodes {
+                roles
+                    .entry(node.clone())
+                    .or_insert_with(std::collections::BTreeSet::new)
+                    .insert(macluster_core::config::NodeRole::Compute);
+            }
+        }
+        for share in shares.values() {
+            roles
+                .entry(share.server.to_string())
+                .or_insert_with(std::collections::BTreeSet::new)
+                .insert(macluster_core::config::NodeRole::Storage);
+        }
         ClusterConfig {
             name: self.descriptor.cluster_name.clone(),
             login_node: Some(controller.clone()),
@@ -196,6 +217,7 @@ impl RemoteContext {
             queues,
             nodes,
             shares,
+            roles,
         }
     }
 }

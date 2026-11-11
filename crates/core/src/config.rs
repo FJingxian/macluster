@@ -25,6 +25,37 @@ pub struct ClusterConfig {
     pub queues: BTreeMap<String, QueueConfig>,
     pub nodes: BTreeMap<String, NodeConfig>,
     pub shares: BTreeMap<String, ShareConfig>,
+    pub roles: BTreeMap<String, BTreeSet<NodeRole>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum NodeRole {
+    Controller,
+    Compute,
+    Storage,
+}
+
+impl NodeRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Compute => "compute",
+            Self::Storage => "storage",
+        }
+    }
+}
+
+impl std::str::FromStr for NodeRole {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "controller" => Ok(Self::Controller),
+            "compute" => Ok(Self::Compute),
+            "storage" => Ok(Self::Storage),
+            _ => Err(ConfigError::InvalidNodeRole(value.to_owned())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -193,6 +224,8 @@ pub enum ConfigError {
     InvalidStorageSourceRoot,
     #[error("login_node must use the local transport")]
     LoginNodeMustBeLocal,
+    #[error("unknown node role '{0}'")]
+    InvalidNodeRole(String),
     #[error("share_uuid must be a canonical UUID")]
     InvalidShareUuid,
     #[error("protocol version {0} is incompatible with this binary")]
@@ -280,11 +313,52 @@ impl ClusterConfig {
         )
     }
 
+    pub fn node_roles(&self, node_id: &str) -> BTreeSet<NodeRole> {
+        if let Some(roles) = self.roles.get(node_id) {
+            return roles.clone();
+        }
+        let controller = self
+            .login_node
+            .as_ref()
+            .map(|node| node.as_str())
+            .or_else(|| {
+                self.nodes
+                    .get(node_id)
+                    .filter(|node| node.transport == Transport::Local)
+                    .map(|_| node_id)
+            });
+        let mut roles = BTreeSet::new();
+        if controller == Some(node_id) {
+            roles.insert(NodeRole::Controller);
+        }
+        if self.storage_server.as_str() == node_id
+            || self
+                .shares
+                .values()
+                .any(|share| share.server.as_str() == node_id)
+        {
+            roles.insert(NodeRole::Storage);
+        }
+        if controller != Some(node_id)
+            && self
+                .queues
+                .values()
+                .any(|queue| queue.nodes.iter().any(|node| node == node_id))
+        {
+            roles.insert(NodeRole::Compute);
+        }
+        roles
+    }
+
+    pub fn is_compute_node(&self, node_id: &str) -> bool {
+        self.node_roles(node_id).contains(&NodeRole::Compute)
+    }
+
     /// Return a queue view suitable for dispatch while preserving raw
     /// membership in the parsed config for compatibility with existing files.
     pub fn queue_for_dispatch(&self, queue_name: &str) -> Option<QueueConfig> {
         let mut queue = self.queues.get(queue_name)?.clone();
-        queue.nodes.retain(|node_id| !self.is_login_node(node_id));
+        queue.nodes.retain(|node_id| self.is_compute_node(node_id));
         Some(queue)
     }
 
@@ -351,6 +425,7 @@ impl ClusterConfig {
         let mut queues = BTreeMap::new();
         let mut nodes = BTreeMap::new();
         let mut shares = BTreeMap::new();
+        let mut explicit_roles: BTreeMap<String, BTreeSet<NodeRole>> = BTreeMap::new();
         for (section, mut table) in document {
             if section == "cluster" {
                 continue;
@@ -468,6 +543,11 @@ impl ClusterConfig {
                 let execution_uid = take_optional_integer(&mut table, &section, "execution_uid")?
                     .map(|uid| u32::try_from(uid).map_err(|_| ConfigError::InvalidExecutionUid))
                     .transpose()?;
+                let configured_roles = take_optional_strings(&mut table, &section, "roles")?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|value| value.parse())
+                    .collect::<Result<BTreeSet<_>, _>>()?;
                 if transport == Transport::Local
                     && (machine_uuid.is_none() || execution_uid.is_none())
                 {
@@ -482,7 +562,7 @@ impl ClusterConfig {
                     return Err(ConfigError::MultipleLocalNodes);
                 }
                 nodes.insert(
-                    name,
+                    name.clone(),
                     NodeConfig {
                         host,
                         transport,
@@ -495,6 +575,9 @@ impl ClusterConfig {
                         execution_uid,
                     },
                 );
+                if !configured_roles.is_empty() {
+                    explicit_roles.insert(name, configured_roles);
+                }
                 continue;
             }
             if let Some(name) = section.strip_prefix("shares.") {
@@ -640,6 +723,48 @@ impl ClusterConfig {
             }
         }
 
+        let controller_id = login_node
+            .as_ref()
+            .map(|node| node.as_str().to_owned())
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .find(|(_, node)| node.transport == Transport::Local)
+                    .map(|(id, _)| id.clone())
+            });
+        let mut roles = BTreeMap::new();
+        for name in nodes.keys() {
+            let mut node_roles = explicit_roles.remove(name).unwrap_or_default();
+            if node_roles.contains(&NodeRole::Controller)
+                && controller_id.as_deref() != Some(name.as_str())
+            {
+                return Err(ConfigError::InvalidNodeRole(format!(
+                    "controller role is reserved for {}",
+                    controller_id
+                        .as_deref()
+                        .unwrap_or("no configured controller")
+                )));
+            }
+            if controller_id.as_deref() == Some(name.as_str()) {
+                node_roles.insert(NodeRole::Controller);
+            }
+            if storage_server.as_str() == name
+                || shares
+                    .values()
+                    .any(|share| share.server.as_str() == name.as_str())
+            {
+                node_roles.insert(NodeRole::Storage);
+            }
+            if controller_id.as_deref() != Some(name.as_str())
+                && queues
+                    .values()
+                    .any(|queue| queue.nodes.iter().any(|node| node == name))
+            {
+                node_roles.insert(NodeRole::Compute);
+            }
+            roles.insert(name.clone(), node_roles);
+        }
+
         Ok(Self {
             name,
             login_node,
@@ -652,6 +777,7 @@ impl ClusterConfig {
             queues,
             nodes,
             shares,
+            roles,
         })
     }
 
@@ -982,6 +1108,21 @@ fn take_strings(table: &mut Table, section: &str, key: &str) -> Result<Vec<Strin
             section: section.to_owned(),
             key: key.to_owned(),
         }),
+    }
+}
+
+fn take_optional_strings(
+    table: &mut Table,
+    section: &str,
+    key: &str,
+) -> Result<Option<Vec<String>>, ConfigError> {
+    match table.remove(key) {
+        Some(Value::Strings(value)) => Ok(Some(value)),
+        Some(_) => Err(parse_error(
+            0,
+            &format!("[{section}] key '{key}' must be a string array"),
+        )),
+        None => Ok(None),
     }
 }
 

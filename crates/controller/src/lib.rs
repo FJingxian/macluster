@@ -427,10 +427,10 @@ impl<T: NodeTransport> ControllerService<T> {
                     .spec
                     .node
                     .as_ref()
-                    .filter(|node| self.config.is_login_node(node.as_str()))
+                    .filter(|node| !self.config.is_compute_node(node.as_str()))
                 {
                     Some(format!(
-                        "job is pinned to login node '{}', which is excluded from compute jobs; cancel it with mkill and resubmit on a compute node",
+                        "job is pinned to node '{}', which does not have the compute role; cancel it with mkill and resubmit on a compute node",
                         pinned
                     ))
                 } else if let Some(reason) =

@@ -3147,11 +3147,8 @@ fn build_submission(
         .queue_for_dispatch(queue.as_str())
         .ok_or_else(|| (2, format!("queue '{queue}' is not configured")))?;
     if let Some(node) = &merged.node {
-        if config.is_login_node(node.as_str()) {
-            return Err((
-                2,
-                format!("login node '{node}' cannot accept jobs; select a compute node"),
-            ));
+        if !config.is_compute_node(node.as_str()) {
+            return Err((2, format!("node '{node}' does not have the compute role")));
         }
         if !queue_config
             .nodes
@@ -10154,7 +10151,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn submission_rejects_login_node_even_if_legacy_queue_lists_it() {
+    fn submission_rejects_controller_without_compute_role_even_if_legacy_queue_lists_it() {
         use macluster_core::{config::ClusterConfig, storage::Storage};
         use std::fs;
 
@@ -10181,7 +10178,9 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             .expect_err("login node must not run submitted jobs");
 
         assert!(
-            error.1.contains("login node 'login' cannot accept jobs"),
+            error
+                .1
+                .contains("node 'login' does not have the compute role"),
             "{error:?}"
         );
         drop(storage);

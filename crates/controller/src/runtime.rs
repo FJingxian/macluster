@@ -2241,10 +2241,10 @@ impl RuntimeState {
                 .spec
                 .node
                 .as_ref()
-                .filter(|node| service.config.is_login_node(node.as_str()))
+                .filter(|node| !service.config.is_compute_node(node.as_str()))
             {
                 Some(format!(
-                    "job is pinned to login node '{}', which is excluded from compute jobs; cancel it with mkill and resubmit on a compute node",
+                    "job is pinned to node '{}', which does not have the compute role; cancel it with mkill and resubmit on a compute node",
                     pinned
                 ))
             } else if let Some(reason) =
@@ -4819,7 +4819,7 @@ scheduler = "fifo"
             stored
                 .waiting_reason
                 .unwrap()
-                .contains("pinned to login node 'login'")
+                .contains("pinned to node 'login', which does not have the compute role")
         );
         assert!(started_on.lock().unwrap().is_empty());
         drop(service);
@@ -4881,7 +4881,7 @@ scheduler = "fifo"
             stored
                 .waiting_reason
                 .unwrap()
-                .contains("pinned to login node 'login'")
+                .contains("pinned to node 'login', which does not have the compute role")
         );
         drop(runtime);
         drop(service);

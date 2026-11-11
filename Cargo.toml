@@ -23,6 +23,7 @@ serde_json = "1.0.151"
 thiserror = "1.0.69"
 ed25519-dalek = "2.2.0"
 zeroize = "1.9.1"
+security-framework = "3.7.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 crossterm = "0.29.0"
 unicode-width = "0.2.2"

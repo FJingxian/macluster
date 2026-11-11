@@ -11,3 +11,4 @@ macluster-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+security-framework.workspace = true

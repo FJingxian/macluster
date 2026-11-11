@@ -4493,6 +4493,37 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     if facts.os != "macos" {
         return Err((1, "controller target must be a macOS node".into()));
     }
+    let target_home = PathBuf::from(checked_remote_path(&facts.home)?);
+    let target_config = target_home.join(".config/macluster/config.toml");
+    let target_state = target_home.join("Library/Application Support/macluster/controller");
+    let local_binary = std::env::current_exe().map_err(io_error)?;
+    let local_hash = local_sha256(&local_binary)?;
+    let preflight = format!(
+        "test -d {} && test ! -e {} && test ! -e {}/controller.sqlite3 && /usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}'",
+        shell_quote(&config.shared_root.to_string_lossy()),
+        shell_quote(&target_config.to_string_lossy()),
+        shell_quote(&target_state.to_string_lossy()),
+        shell_quote(&target.remote_binary),
+    );
+    let preflight = ssh_output(&target, &preflight, None).map_err(|(_, error)| (1, error))?;
+    if !preflight.status.success() {
+        return Err((
+            1,
+            format!(
+                "controller migration preflight failed: {}",
+                command_error("verify target storage, state, and binary", &preflight)
+            ),
+        ));
+    }
+    if String::from_utf8_lossy(&preflight.stdout).trim() != local_hash {
+        return Err((
+            1,
+            format!(
+                "controller target {} has a different macluster build",
+                target_id
+            ),
+        ));
+    }
     let source = fs::read_to_string(&config_path).map_err(io_error)?;
     let candidate =
         controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
@@ -4530,7 +4561,6 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     }
     let operation_id = Id128::random().to_string();
     let archive = controller_migration_archive(candidate.as_bytes(), state_dir)?;
-    let target_home = PathBuf::from(checked_remote_path(&facts.home)?);
     let script = controller_migration_target_script(&target, &target_home, &operation_id);
     let output =
         ssh_output_with_timeout(&target, &script, Some(&archive), Duration::from_secs(120))

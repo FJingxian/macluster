@@ -4625,6 +4625,93 @@ fn controller_migration_target_cleanup_script(
     )
 }
 
+fn run_target_smb_master_command(
+    target: &NodeConfig,
+    operation: &str,
+    provision: &macluster_protocol::smb_credential::SmbCredentialProvision,
+    include_password: bool,
+) -> Result<(), String> {
+    let mut parts = vec![target.remote_binary.clone()];
+    if let Some(config) = &target.remote_config {
+        parts.push("--config".into());
+        parts.push(config.clone());
+    }
+    parts.extend([
+        "internal".into(),
+        "smb-master".into(),
+        operation.into(),
+        "--cluster".into(),
+        provision.key.cluster_uuid.to_string(),
+        "--server-id".into(),
+        provision.key.server_id.to_string(),
+        "--server".into(),
+        provision.key.server_host.clone(),
+        "--account".into(),
+        provision.key.account.clone(),
+    ]);
+    if include_password {
+        parts.push("--generation".into());
+        parts.push(provision.credential.generation.to_string());
+    }
+    let command = parts
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let input = include_password.then(|| provision.credential.password.as_secret().as_bytes());
+    let output = ssh_output_with_timeout(target, &command, input, Duration::from_secs(45))
+        .map_err(|(_, error)| error)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "target SMB master {operation} exited with status {:?}",
+            output.status.code()
+        ))
+    }
+}
+
+fn cleanup_target_smb_masters(
+    target: &NodeConfig,
+    provisions: &[macluster_protocol::smb_credential::SmbCredentialProvision],
+) {
+    for provision in provisions {
+        let _ = run_target_smb_master_command(target, "delete", provision, false);
+    }
+}
+
+fn stage_target_smb_masters(
+    provisions: &[macluster_protocol::smb_credential::SmbCredentialProvision],
+    mut import: impl FnMut(
+        &macluster_protocol::smb_credential::SmbCredentialProvision,
+    ) -> Result<(), String>,
+    mut verify: impl FnMut(
+        &macluster_protocol::smb_credential::SmbCredentialProvision,
+    ) -> Result<(), String>,
+    mut cleanup: impl FnMut(&macluster_protocol::smb_credential::SmbCredentialProvision),
+) -> Result<(), String> {
+    let mut imported = Vec::new();
+    for provision in provisions {
+        if let Err(error) = import(provision) {
+            cleanup(provision);
+            for imported in &imported {
+                cleanup(imported);
+            }
+            return Err(error);
+        }
+        imported.push(provision.clone());
+    }
+    for provision in &imported {
+        if let Err(error) = verify(provision) {
+            for imported in &imported {
+                cleanup(imported);
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn controller_migration_may_restart_old(was_running: bool, target_cleanup_ok: bool) -> bool {
     was_running && target_cleanup_ok
 }
@@ -4771,6 +4858,34 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let source = fs::read_to_string(&config_path).map_err(io_error)?;
     let candidate =
         controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
+    let smb_masters = macluster_controller::smb_credential::export_smb_masters(
+        &config,
+        &macluster_controller::smb_credential::CredentialHelperClient::system(),
+    )
+    .map_err(|error| {
+        (
+            1,
+            format!(
+                "controller migration could not export SMB master credentials; no controller was stopped: {error}"
+            ),
+        )
+    })?;
+    stage_target_smb_masters(
+        &smb_masters,
+        |provision| run_target_smb_master_command(&target, "import", provision, true),
+        |provision| run_target_smb_master_command(&target, "verify", provision, true),
+        |provision| {
+            let _ = run_target_smb_master_command(&target, "delete", provision, false);
+        },
+    )
+    .map_err(|error| {
+        (
+            1,
+            format!(
+                "controller migration could not import and verify SMB master credentials on the target; no controller was stopped: {error}"
+            ),
+        )
+    })?;
     let was_running = manager
         .intent()
         .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
@@ -4830,6 +4945,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         }
     };
     let target_failure = |detail: String| -> AppResult<()> {
+        cleanup_target_smb_masters(&target, &smb_masters);
         let cleanup_script =
             controller_migration_target_cleanup_script(&target, &target_home, &operation_id);
         let cleanup =
@@ -4915,6 +5031,13 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         Err(error) => return target_failure(error),
     };
     drop(verified);
+    let old_helper = macluster_controller::smb_credential::CredentialHelperClient::system();
+    for provision in &smb_masters {
+        if let Err(error) = old_helper.delete(&provision.key) {
+            eprintln!("Warning: old controller SMB master cleanup is deferred: {error}");
+            let _ = crate::smb_credentials::queue_global_master_cleanup(&provision.key);
+        }
+    }
     println!(
         "Controller migrated to {target_id}. Existing login clients may need to rejoin through mDNS or `--join`."
     );
@@ -19715,6 +19838,7 @@ mod tests {
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::{Command, Stdio},
+        sync::{Arc, Mutex},
         thread,
         time::Duration,
     };
@@ -23071,6 +23195,35 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         ClusterConfig::parse(&source).unwrap()
     }
 
+    fn smb_test_provision(
+        generation: u64,
+    ) -> macluster_protocol::smb_credential::SmbCredentialProvision {
+        smb_test_provision_for_server(generation, "nas-01")
+    }
+
+    fn smb_test_provision_for_server(
+        generation: u64,
+        server_id: &str,
+    ) -> macluster_protocol::smb_credential::SmbCredentialProvision {
+        macluster_protocol::smb_credential::SmbCredentialProvision {
+            key: macluster_protocol::smb_credential::SmbCredentialKey {
+                cluster_uuid: Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+                server_id: NodeId::new(server_id).unwrap(),
+                server_host: if server_id == "nas-01" {
+                    "192.0.2.20"
+                } else {
+                    "192.0.2.21"
+                }
+                .into(),
+                account: "smb-user".into(),
+            },
+            credential: macluster_protocol::smb_credential::StoredSmbCredential {
+                generation,
+                password: macluster_protocol::smb_credential::SecretString::new("test-secret"),
+            },
+        }
+    }
+
     #[test]
     fn smb_user_resolution_prefers_request_then_a_single_configured_account() {
         let server = NodeId::new("nas-01").unwrap();
@@ -23399,6 +23552,98 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(!super::controller_migration_may_restart_old(true, false));
         assert!(!super::controller_migration_may_restart_old(false, true));
         assert!(!super::controller_migration_may_restart_old(false, false));
+    }
+
+    #[test]
+    fn controller_migration_smb_credential_b_import_verify_and_cleanup_order() {
+        let provisions = [
+            smb_test_provision(1),
+            smb_test_provision_for_server(2, "nas-02"),
+        ];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        super::stage_target_smb_masters(
+            &provisions,
+            {
+                let events = Arc::clone(&events);
+                move |provision| {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push(format!("import:{}", provision.key.server_id));
+                    Ok(())
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                move |provision| {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push(format!("verify:{}", provision.key.server_id));
+                    Ok(())
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        events.lock().unwrap().push("fence".into());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [
+                "import:nas-01",
+                "import:nas-02",
+                "verify:nas-01",
+                "verify:nas-02",
+                "fence"
+            ]
+        );
+    }
+
+    #[test]
+    fn controller_migration_smb_credential_import_failure_cleans_only_imported_items() {
+        let provisions = [
+            smb_test_provision(1),
+            smb_test_provision_for_server(2, "nas-02"),
+        ];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = super::stage_target_smb_masters(
+            &provisions,
+            {
+                let events = Arc::clone(&events);
+                move |provision| {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push(format!("import:{}", provision.key.server_id));
+                    if provision.key.server_id.as_str() == "nas-02" {
+                        Err("target helper unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_| panic!("verification must not run after import failure"),
+            {
+                let events = Arc::clone(&events);
+                move |provision| {
+                    events
+                        .lock()
+                        .unwrap()
+                        .push(format!("cleanup:{}", provision.key.server_id));
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("unavailable"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [
+                "import:nas-01",
+                "import:nas-02",
+                "cleanup:nas-02",
+                "cleanup:nas-01"
+            ]
+        );
     }
 
     #[test]

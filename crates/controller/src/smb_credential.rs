@@ -162,6 +162,13 @@ pub fn load_smb_credential_provisions(
         .collect()
 }
 
+pub fn export_smb_masters(
+    config: &ClusterConfig,
+    helper: &dyn MasterCredentialReader,
+) -> Result<Vec<macluster_protocol::smb_credential::SmbCredentialProvision>, String> {
+    load_smb_credential_provisions(config, helper)
+}
+
 pub fn put_smb_credential(
     key: &SmbCredentialKey,
     password: &SecretString,
@@ -511,5 +518,14 @@ mod tests {
         assert_eq!(provisions[0].key, key);
         assert_eq!(provisions[0].credential, stored);
         assert!(!format!("{provisions:?}").contains("test-secret"));
+
+        let missing = MapReader {
+            credentials: BTreeMap::new(),
+        };
+        let error = super::export_smb_masters(&config, &missing)
+            .err()
+            .expect("missing master must fail export");
+        assert!(error.contains("missing"));
+        assert!(!error.contains("test-secret"));
     }
 }

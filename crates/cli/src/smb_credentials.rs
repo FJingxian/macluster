@@ -143,6 +143,44 @@ fn run_master_keychain(args: &[String]) -> AppResult<()> {
             );
             Ok(())
         }
+        Some("verify") => {
+            let options = parse_options(
+                &args[1..],
+                &[
+                    "--cluster",
+                    "--server-id",
+                    "--server",
+                    "--account",
+                    "--generation",
+                ],
+            )?;
+            let key = key_from_options(&options)?;
+            let generation = parse_generation(required(&options, "--generation")?)?;
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(MAX_SMB_CREDENTIAL_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| (1, format!("cannot read SMB password: {error}")))?;
+            if bytes.len() > MAX_SMB_CREDENTIAL_BYTES {
+                return Err((
+                    2,
+                    format!("SMB password exceeds the {MAX_SMB_CREDENTIAL_BYTES}-byte limit"),
+                ));
+            }
+            let expected =
+                SecretString::from_bytes(bytes).map_err(|error| (2, error.to_string()))?;
+            let stored = CredentialHelperClient::system()
+                .get(&key)
+                .map_err(|error| (1, error.to_string()))?
+                .ok_or_else(|| (1, "SMB master credential is missing".into()))?;
+            if stored.generation != generation
+                || stored.password.as_secret() != expected.as_secret()
+            {
+                return Err((1, "SMB master credential verification failed".into()));
+            }
+            println!("{}", serde_json::json!({ "verified": true }));
+            Ok(())
+        }
         Some("delete") => {
             let options = parse_options(
                 &args[1..],

@@ -3683,6 +3683,7 @@ mod tests {
                         primary_share_ready: true,
                         shares: Default::default(),
                         features: vec![macluster_protocol::types::INTERACTIVE_PTY_FEATURE.into()],
+                        ..Default::default()
                     },
                 )),
                 Operation::Status => Err(crate::transport::TransportError::Remote(
@@ -3731,6 +3732,7 @@ mod tests {
                     primary_share_ready: true,
                     shares: Default::default(),
                     features: vec![],
+                    ..Default::default()
                 })),
                 Operation::Status => Err(crate::transport::TransportError::Remote(
                     ProtocolError::NotFound,
@@ -3786,6 +3788,7 @@ mod tests {
                     primary_share_ready: true,
                     shares: BTreeMap::new(),
                     features: Vec::new(),
+                    ..Default::default()
                 })),
                 _ => Err(crate::transport::TransportError::Protocol(
                     "unexpected test operation".into(),

@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeMap,
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -15,6 +16,31 @@ pub fn sample_local() -> MetricSnapshot {
 /// for its initial paint, then replaces it with a full-rate sample.
 pub fn sample_local_fast() -> MetricSnapshot {
     macos::sample_local_fast()
+}
+
+/// Return capacity for the filesystem containing `path`. This includes network
+/// mounts, which lets the controller inventory a NAS through mounted shares.
+pub fn filesystem_capacity(path: &Path) -> Option<DiskCapacity> {
+    #[cfg(target_vendor = "apple")]
+    {
+        macos::filesystem_capacity(path)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+pub fn sample_disk_capacities() -> (Option<DiskCapacity>, Vec<DiskCapacity>) {
+    #[cfg(target_vendor = "apple")]
+    {
+        macos::disk_capacity_sample()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        (None, Vec::new())
+    }
 }
 
 pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
@@ -69,7 +95,7 @@ fn now_ms() -> u64 {
 
 #[cfg(target_vendor = "apple")]
 mod macos {
-    use super::{DiskCapacity, FanReading, MetricSnapshot, average_fan_speed_rpm, now_ms};
+    use super::{DiskCapacity, FanReading, MetricSnapshot, Path, average_fan_speed_rpm, now_ms};
     use std::{
         collections::BTreeMap,
         ffi::CStr,
@@ -363,10 +389,10 @@ mod macos {
 
     /// `MNT_NOWAIT` reads the kernel's mounted-filesystem table without asking
     /// an unresponsive NFS server to refresh its statistics.
-    pub(super) fn disk_capacity_sample() -> (Option<DiskCapacity>, Vec<DiskCapacity>) {
+    fn mounted_filesystems() -> Vec<libc::statfs> {
         let filesystem_count = unsafe { libc::getfsstat(ptr::null_mut(), 0, libc::MNT_NOWAIT) };
         if filesystem_count <= 0 {
-            return (None, Vec::new());
+            return Vec::new();
         }
 
         let capacity = (filesystem_count as usize).min(MAX_FILESYSTEMS_TO_INSPECT);
@@ -374,7 +400,7 @@ mod macos {
             .checked_mul(std::mem::size_of::<libc::statfs>())
             .filter(|size| *size <= libc::c_int::MAX as usize)
         else {
-            return (None, Vec::new());
+            return Vec::new();
         };
         let mut filesystems = Vec::<MaybeUninit<libc::statfs>>::with_capacity(capacity);
         // SAFETY: `MaybeUninit<statfs>` can be left uninitialized until the
@@ -388,17 +414,23 @@ mod macos {
             )
         };
         if mounted < 0 {
-            return (None, Vec::new());
+            return Vec::new();
         }
-
-        let mut system_disk = None;
-        let mut external_disks = Vec::new();
-        for filesystem in filesystems
+        filesystems
             .into_iter()
             .take((mounted as usize).min(capacity))
-        {
-            // SAFETY: `getfsstat` initialized each entry counted in `mounted`.
-            let filesystem = unsafe { filesystem.assume_init() };
+            .map(|filesystem| {
+                // SAFETY: `getfsstat` initialized each entry counted in
+                // `mounted`, and the iterator is bounded by that count.
+                unsafe { filesystem.assume_init() }
+            })
+            .collect()
+    }
+
+    pub(super) fn disk_capacity_sample() -> (Option<DiskCapacity>, Vec<DiskCapacity>) {
+        let mut system_disk = None;
+        let mut external_disks = Vec::new();
+        for filesystem in mounted_filesystems() {
             if filesystem.f_flags & libc::MNT_LOCAL as u32 == 0 {
                 continue;
             }
@@ -415,6 +447,21 @@ mod macos {
         external_disks.sort_by(|left, right| left.mount_point.cmp(&right.mount_point));
         external_disks.truncate(MAX_EXTERNAL_DISKS);
         (system_disk, external_disks)
+    }
+
+    pub(super) fn filesystem_capacity(path: &Path) -> Option<DiskCapacity> {
+        mounted_filesystems()
+            .into_iter()
+            .filter_map(|filesystem| {
+                let mount_point = statfs_mount_point(&filesystem);
+                let mounted_path = Path::new(&mount_point);
+                path.starts_with(mounted_path).then(|| {
+                    let length = mount_point.len();
+                    (length, disk_capacity_from_statfs(&filesystem, mount_point))
+                })
+            })
+            .max_by_key(|(length, _)| *length)
+            .and_then(|(_, capacity)| capacity)
     }
 
     fn disk_capacity_from_statfs(
@@ -1317,6 +1364,17 @@ mod tests {
         assert!(!super::macos::is_external_volume_mount(
             "/Volumes/data/nested"
         ));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn filesystem_capacity_resolves_the_mount_containing_a_path() {
+        let disk = super::filesystem_capacity(std::path::Path::new("/"))
+            .expect("the root filesystem should expose capacity");
+
+        assert_eq!(disk.mount_point, "/");
+        assert!(disk.total_bytes > 0);
+        assert!(disk.used_bytes <= disk.total_bytes);
     }
 
     #[test]

@@ -55,8 +55,9 @@ use macluster_protocol::{
         NfsExportCleanup, NfsMount,
     },
     types::{
-        ControllerEpoch, ExecutionStatus, INTERACTIVE_PTY_FEATURE, METRICS_FAN_SPEED_FEATURE,
-        NodeHealth, Operation, ProtocolError, ResponseBody, RuntimePhase,
+        ControllerEpoch, DiskCapacity, ExecutionStatus, INTERACTIVE_PTY_FEATURE,
+        METRICS_FAN_SPEED_FEATURE, NodeHealth, Operation, ProtocolError, ResponseBody,
+        RuntimePhase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1890,6 +1891,7 @@ enum Action {
     MigrateController(NodeId),
     List {
         all: bool,
+        storage: bool,
     },
     Scan,
     Failures,
@@ -2016,7 +2018,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
     }
     let action = parse_action(args)?;
     match action {
-        Action::List { all } => list_nodes(&config_path, &state_dir, all),
+        Action::List { all, storage } => list_nodes(&config_path, &state_dir, all, storage),
         Action::Scan => {
             let config = read_config(&config_path)?;
             scan::scan_nodes(&config)
@@ -3620,11 +3622,25 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         return Ok(Action::Failures);
     }
     if key == "-l" || key == "--list" {
-        let all = args.get(1).is_some_and(|value| value == "--all");
-        if args.len() != (if all { 2 } else { 1 }) || inline.is_some() {
-            return Err((2, "use `mnode -l [--all]`".into()));
+        if inline.is_some() {
+            return Err((2, "use `mnode -l [--all] [--storage]`".into()));
         }
-        return Ok(Action::List { all });
+        let mut all = false;
+        let mut storage = false;
+        for option in &args[1..] {
+            match option.as_str() {
+                "--all" if !all => all = true,
+                "--storage" if !storage => storage = true,
+                "--all" | "--storage" => {
+                    return Err((
+                        2,
+                        format!("mnode list option '{option}' may only appear once"),
+                    ));
+                }
+                _ => return Err((2, "use `mnode -l [--all] [--storage]`".into())),
+            }
+        }
+        return Ok(Action::List { all, storage });
     }
     if key == "--scan" {
         if inline.is_some() || args.len() != 1 {
@@ -14262,6 +14278,23 @@ pub(crate) fn remote_execution_status(
 struct NodeListRow {
     columns: [String; 7],
     mappings: Vec<NodeNfsMapping>,
+    storage: NodeStorageInventory,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NodeStorageInventory {
+    observed_unix_ms: Option<u64>,
+    system_disk: Option<DiskCapacity>,
+    external_disks: Vec<DiskCapacity>,
+    shares: Vec<NodeShareCapacity>,
+}
+
+#[derive(Clone, Debug)]
+struct NodeShareCapacity {
+    name: String,
+    protocol: StorageProtocol,
+    mount_root: PathBuf,
+    capacity: Option<DiskCapacity>,
 }
 
 #[derive(Debug, Clone)]
@@ -14389,16 +14422,23 @@ fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
     mappings
 }
 
-fn format_node_list(rows: &[NodeListRow]) -> String {
-    let headers = ["ID", "HOST", "SSH USER", "PORT", "ROLES", "QUEUE", "STATE"];
-    let widths = std::array::from_fn::<_, 7, _>(|index| {
+fn format_node_list(rows: &[NodeListRow], detailed_storage: bool) -> String {
+    let headers = [
+        "ID", "HOST", "SSH USER", "PORT", "ROLES", "QUEUE", "STATE", "STORAGE",
+    ];
+    let row_cells = |row: &NodeListRow| {
+        let mut cells = row.columns.to_vec();
+        cells.push(row.storage.compact_summary());
+        cells
+    };
+    let widths = std::array::from_fn::<_, 8, _>(|index| {
         rows.iter()
-            .map(|row| row.columns[index].chars().count())
+            .map(|row| row_cells(row)[index].chars().count())
             .max()
             .unwrap_or(0)
             .max(headers[index].len())
     });
-    let line = |cells: [&str; 7]| {
+    let line = |cells: Vec<String>| {
         cells
             .iter()
             .enumerate()
@@ -14408,13 +14448,42 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
             .trim_end()
             .to_owned()
     };
-    let mut output = line(headers);
+    let mut output = line(headers.iter().map(|cell| (*cell).to_owned()).collect());
     output.push('\n');
     for row in rows {
-        output.push_str(&line(std::array::from_fn(|index| {
-            row.columns[index].as_str()
-        })));
+        output.push_str(&line(row_cells(row)));
         output.push('\n');
+    }
+    if detailed_storage {
+        let storage_rows = rows
+            .iter()
+            .filter(|row| !row.storage.is_empty())
+            .collect::<Vec<_>>();
+        if !storage_rows.is_empty() {
+            output.push_str("\nSTORAGE\n");
+            for row in storage_rows {
+                output.push_str(&format!("  {}\n", row.columns[0]));
+                if let Some(disk) = &row.storage.system_disk {
+                    output.push_str(&format!("    SYS   {}\n", detailed_capacity(disk)));
+                }
+                for disk in &row.storage.external_disks {
+                    output.push_str(&format!("    EXT   {}\n", detailed_capacity(disk)));
+                }
+                for share in &row.storage.shares {
+                    let capacity = share
+                        .capacity
+                        .as_ref()
+                        .map(detailed_capacity)
+                        .unwrap_or_else(|| format!("{}  UNKNOWN", share.mount_root.display()));
+                    output.push_str(&format!(
+                        "    {:<5} {:<24} {}\n",
+                        share.protocol.to_string().to_ascii_uppercase(),
+                        share.name,
+                        capacity
+                    ));
+                }
+            }
+        }
     }
     let mappings = aggregate_nfs_mappings(rows);
     if !mappings.is_empty() {
@@ -14436,6 +14505,111 @@ fn format_node_list(rows: &[NodeListRow]) -> String {
         }
     }
     output
+}
+
+impl NodeStorageInventory {
+    fn from_health(health: &NodeHealth, observed_unix_ms: u64) -> Self {
+        Self {
+            observed_unix_ms: Some(observed_unix_ms),
+            system_disk: health.system_disk_capacity.clone(),
+            external_disks: health.external_disk_capacities.clone(),
+            shares: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.system_disk.is_none() && self.external_disks.is_empty() && self.shares.is_empty()
+    }
+
+    fn compact_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(disk) = &self.system_disk {
+            parts.push(format!("SYS {}%", capacity_percent(disk)));
+        }
+        if !self.external_disks.is_empty() {
+            parts.push(format!("EXT {}", self.external_disks.len()));
+        }
+        if !self.shares.is_empty() {
+            parts.push(format!("SHARES {}", self.shares.len()));
+        }
+        let now = validation_now_ms();
+        if self
+            .observed_unix_ms
+            .is_some_and(|observed| now.saturating_sub(observed) > 120_000)
+        {
+            parts.push("STALE".into());
+        }
+        if parts.is_empty() {
+            "-".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+fn provider_storage_inventory(
+    config: &ClusterConfig,
+    node_id: &str,
+    capacity: impl Fn(&Path) -> Option<DiskCapacity>,
+) -> NodeStorageInventory {
+    let mut shares = Vec::new();
+    if config.storage_server.as_str() == node_id {
+        shares.push(NodeShareCapacity {
+            name: "primary".into(),
+            protocol: StorageProtocol::Nfs,
+            mount_root: config.shared_root.clone(),
+            capacity: capacity(&config.shared_root),
+        });
+    }
+    for (name, share) in &config.shares {
+        if share.server.as_str() != node_id || name == "primary" {
+            continue;
+        }
+        shares.push(NodeShareCapacity {
+            name: name.clone(),
+            protocol: share.protocol,
+            mount_root: share.mount_root.clone(),
+            capacity: capacity(&share.mount_root),
+        });
+    }
+    shares.sort_by(|left, right| left.name.cmp(&right.name));
+    NodeStorageInventory {
+        observed_unix_ms: Some(validation_now_ms()),
+        shares,
+        ..Default::default()
+    }
+}
+
+fn detailed_capacity(disk: &DiskCapacity) -> String {
+    format!(
+        "{:<28} {}/{}  {}% used",
+        disk.mount_point,
+        format_bytes(disk.used_bytes),
+        format_bytes(disk.total_bytes),
+        capacity_percent(disk)
+    )
+}
+
+fn capacity_percent(disk: &DiskCapacity) -> u8 {
+    if disk.total_bytes == 0 {
+        return 0;
+    }
+    ((disk.used_bytes.min(disk.total_bytes) as f64 / disk.total_bytes as f64) * 100.0).round() as u8
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 const MAX_NODE_LIST_PROBES: usize = 64;
@@ -14538,7 +14712,13 @@ fn probe_node_list(
     }
 }
 
-fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult<()> {
+fn list_nodes(
+    config_path: &Path,
+    state_dir: &Path,
+    show_all: bool,
+    show_storage: bool,
+) -> AppResult<()> {
+    let _ = show_storage;
     if !config_path.is_file() {
         return Err((
             1,
@@ -14570,6 +14750,11 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
     };
     let (liveness, probe_results) =
         refresh_node_liveness_for_list(&canonical, state_dir, &config, liveness);
+    let mut storage_inventories = if show_storage {
+        refresh_storage_inventories_for_list(&canonical, &config, &probe_results)
+    } else {
+        BTreeMap::new()
+    };
     let mut rows = Vec::new();
     let mut hidden_unreachable = 0usize;
     for (id, node) in &config.nodes {
@@ -14669,6 +14854,21 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
         } else {
             node.ssh_port.unwrap_or(22).to_string()
         };
+        let mut storage = storage_inventories.remove(id).unwrap_or_else(|| {
+            let mut inventory = health
+                .as_ref()
+                .map(|health| NodeStorageInventory::from_health(health, validation_now_ms()))
+                .unwrap_or_default();
+            if node.transport == Transport::Local {
+                let (system_disk, external_disks) = macluster_metrics::sample_disk_capacities();
+                inventory.system_disk = system_disk;
+                inventory.external_disks = external_disks;
+                inventory.observed_unix_ms = Some(validation_now_ms());
+            }
+            inventory
+        });
+        storage.shares =
+            provider_storage_inventory(&config, id, macluster_metrics::filesystem_capacity).shares;
         rows.push(NodeListRow {
             columns: [
                 id.clone(),
@@ -14688,6 +14888,7 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             } else {
                 node_nfs_mappings(&config, id, health.as_ref())
             },
+            storage,
         });
     }
     let drafts = state
@@ -14705,8 +14906,87 @@ fn list_nodes(config_path: &Path, state_dir: &Path, show_all: bool) -> AppResult
             eprintln!("{notice}");
         }
     }
-    print!("{}", format_node_list(&rows));
+    print!("{}", format_node_list(&rows, show_storage));
     Ok(())
+}
+
+const MAX_STORAGE_LIST_PROBES: usize = 16;
+const STORAGE_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn refresh_storage_inventories_for_list(
+    config_path: &Path,
+    config: &ClusterConfig,
+    probe_results: &BTreeMap<String, Option<bool>>,
+) -> BTreeMap<String, NodeStorageInventory> {
+    let observed_unix_ms = validation_now_ms();
+    let mut inventories = BTreeMap::new();
+    let targets = config
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.transport == Transport::Ssh)
+        .filter(|(id, _)| probe_results.get(*id).and_then(|value| *value) != Some(false))
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect::<Vec<_>>();
+    let tasks = Mutex::new(VecDeque::from_iter(targets));
+    let worker_count = tasks
+        .lock()
+        .map(|tasks| tasks.len().min(MAX_STORAGE_LIST_PROBES))
+        .unwrap_or(0);
+    let mut transport =
+        ClusterTransport::new_with_namespace(config_path.to_path_buf(), config.share_uuid.clone());
+    transport.timeout = STORAGE_LIST_RPC_TIMEOUT;
+    let health = std::thread::scope(|scope| {
+        let handles = (0..worker_count)
+            .map(|_| {
+                let tasks = &tasks;
+                let transport = transport.clone();
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        let Some((node_id, node)) =
+                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                        else {
+                            break;
+                        };
+                        let Ok(id) = NodeId::new(node_id.clone()) else {
+                            continue;
+                        };
+                        if let Ok(ResponseBody::Health(health)) =
+                            transport.call(&id, &node, Operation::Health)
+                        {
+                            results.push((node_id, health));
+                        }
+                    }
+                    results
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+    for (node_id, health) in health {
+        inventories.insert(
+            node_id,
+            NodeStorageInventory::from_health(&health, observed_unix_ms),
+        );
+    }
+    for (node_id, node) in &config.nodes {
+        if node.transport == Transport::Local {
+            let (system_disk, external_disks) = macluster_metrics::sample_disk_capacities();
+            inventories.insert(
+                node_id.clone(),
+                NodeStorageInventory {
+                    observed_unix_ms: Some(observed_unix_ms),
+                    system_disk,
+                    external_disks,
+                    shares: Vec::new(),
+                },
+            );
+        }
+    }
+    inventories
 }
 
 fn refresh_node_liveness_for_list(
@@ -19853,10 +20133,10 @@ mod tests {
         Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
         ClientMountRequest, ClientUnmountRequest, ClusterConfig, ConfigError, NFS_DAEMON_PATH,
         NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
-        ShareConfig, UpdateRecovery, abort_duplicate_pristine_adds,
-        acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
-        acquire_node_maintenance_with_confirmation_using, admin_shell_command,
-        agent_update_completion_summary, agent_update_maintenance_scope,
+        NodeShareCapacity, NodeStorageInventory, ShareConfig, UpdateRecovery,
+        abort_duplicate_pristine_adds, acquire_maintenance_client_lock, acquire_node_maintenance,
+        acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
+        admin_shell_command, agent_update_completion_summary, agent_update_maintenance_scope,
         agent_update_recovery_pending, cached_node_list_state, candidate_admin_script,
         classify_configured_agents, cleanup_node_from_endpoint, client_mount_admin_request,
         client_mount_batch_script, client_mount_status_awk_script, client_nfs_cleanup_batch_script,
@@ -19876,11 +20156,12 @@ mod tests {
         pending_combined_ssh_add, pending_local_share_retry_node,
         pending_managed_export_cleanup_plan, plan_ensure_nfs_exports, plan_remove_nfs_exports,
         power_helper_install_script, power_launch_daemon_plist, preferred_local_host,
-        queue_candidate_with_node, reachable_configured_node_ids, read_admin_state,
-        remote_execution_status, reset_admin_operations, reset_node_from_endpoint,
-        resume_existing_ssh_add_sync, save_admin_state, should_resume_add_operation,
-        shutdown_confirmation_accepted, unavailable_share_client_nodes, update_recovery,
-        validate_pending_node_identity, validate_storage_root_access,
+        provider_storage_inventory, queue_candidate_with_node, reachable_configured_node_ids,
+        read_admin_state, remote_execution_status, reset_admin_operations,
+        reset_node_from_endpoint, resume_existing_ssh_add_sync, save_admin_state,
+        should_resume_add_operation, shutdown_confirmation_accepted,
+        unavailable_share_client_nodes, update_recovery, validate_pending_node_identity,
+        validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -22152,6 +22433,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             primary_share_ready: true,
             shares: BTreeMap::from([("JanusX".into(), false)]),
             features: Vec::new(),
+            ..Default::default()
         };
         let server = node_nfs_mappings(&config, "login", Some(&health));
         assert_eq!(server[0].name, "primary");
@@ -22219,8 +22501,9 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 "READY".into(),
             ],
             mappings: node_nfs_mappings(&config, "login", None),
+            storage: NodeStorageInventory::default(),
         };
-        let output = format_node_list(&[row]);
+        let output = format_node_list(&[row], false);
 
         assert!(output.contains("STORAGE MAPPINGS"), "{output}");
         assert!(
@@ -22230,6 +22513,118 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(
             output.contains("project  SMB  ALIAS    login → /Volumes/project"),
             "{output}"
+        );
+    }
+
+    #[test]
+    fn node_list_shows_compact_and_detailed_storage_capacities() {
+        let capacity =
+            |mount_point: &str, used: u64, total: u64| macluster_protocol::types::DiskCapacity {
+                mount_point: mount_point.into(),
+                used_bytes: used,
+                total_bytes: total,
+            };
+        let rows = vec![
+            NodeListRow {
+                columns: [
+                    "default-001".into(),
+                    "192.0.2.2".into(),
+                    "worker".into(),
+                    "22".into(),
+                    "COMPUTE".into(),
+                    "default".into(),
+                    "READY".into(),
+                ],
+                mappings: Vec::new(),
+                storage: NodeStorageInventory {
+                    observed_unix_ms: Some(1_000),
+                    system_disk: Some(capacity("/", 50, 100)),
+                    external_disks: vec![capacity("/Volumes/data", 25, 100)],
+                    shares: Vec::new(),
+                },
+            },
+            NodeListRow {
+                columns: [
+                    "nas-01".into(),
+                    "192.0.2.20".into(),
+                    "-".into(),
+                    "-".into(),
+                    "STORAGE".into(),
+                    "-".into(),
+                    "ONLINE".into(),
+                ],
+                mappings: Vec::new(),
+                storage: NodeStorageInventory {
+                    observed_unix_ms: Some(1_000),
+                    system_disk: None,
+                    external_disks: Vec::new(),
+                    shares: vec![NodeShareCapacity {
+                        name: "project".into(),
+                        protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
+                        mount_root: "/Users/Shared/project".into(),
+                        capacity: Some(capacity("/Users/Shared/project", 40, 100)),
+                    }],
+                },
+            },
+        ];
+
+        let compact = format_node_list(&rows, false);
+        assert!(compact.contains("STORAGE"), "{compact}");
+        assert!(compact.contains("SYS 50% · EXT 1"), "{compact}");
+        assert!(compact.contains("SHARES 1"), "{compact}");
+
+        let detailed = format_node_list(&rows, true);
+        assert!(detailed.contains("STORAGE\n  default-001"), "{detailed}");
+        assert!(detailed.contains("SYS   /"), "{detailed}");
+        assert!(detailed.contains("EXT   /Volumes/data"), "{detailed}");
+        assert!(detailed.contains("NFS   project"), "{detailed}");
+        assert!(detailed.contains("/Users/Shared/project"), "{detailed}");
+    }
+
+    #[test]
+    fn storage_inventory_uses_agent_capacity_and_provider_mounts() {
+        let capacity =
+            |mount_point: &str, used: u64, total: u64| macluster_protocol::types::DiskCapacity {
+                mount_point: mount_point.into(),
+                used_bytes: used,
+                total_bytes: total,
+            };
+        let health = macluster_protocol::types::NodeHealth {
+            system_disk_capacity: Some(capacity("/", 50, 100)),
+            external_disk_capacities: vec![capacity("/Volumes/data", 25, 100)],
+            ..Default::default()
+        };
+        let inventory = NodeStorageInventory::from_health(&health, 1_000);
+        assert_eq!(inventory.system_disk, health.system_disk_capacity);
+        assert_eq!(inventory.external_disks, health.external_disk_capacities);
+
+        let mut config = parse_build_test_config();
+        config.shares.insert(
+            "project".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
+                server: NodeId::new("login").unwrap(),
+                source_root: "/srv/project".into(),
+                mount_root: "/Users/Shared/project".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000003".into(),
+                smb_user: None,
+                allow_existing_contents: false,
+            },
+        );
+        let provider = provider_storage_inventory(&config, "login", |path| {
+            Some(capacity(&path.to_string_lossy(), 40, 100))
+        });
+
+        assert_eq!(provider.shares.len(), 2);
+        assert_eq!(provider.shares[0].name, "primary");
+        assert_eq!(provider.shares[1].name, "project");
+        assert_eq!(
+            provider.shares[1].protocol,
+            macluster_core::storage_uri::StorageProtocol::Nfs
+        );
+        assert_eq!(
+            provider.shares[1].capacity,
+            Some(capacity("/Users/Shared/project", 40, 100))
         );
     }
 
@@ -23855,14 +24250,40 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         let args = ["-l", "--all"].map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::List { all: true })
+            Ok(Action::List {
+                all: true,
+                storage: false
+            })
         ));
 
         let args = ["--list"].map(str::to_owned);
         assert!(matches!(
             parse_action(&args),
-            Ok(Action::List { all: false })
+            Ok(Action::List {
+                all: false,
+                storage: false
+            })
         ));
+    }
+
+    #[test]
+    fn list_action_accepts_storage_inventory_alongside_all() {
+        for (args, expected_all) in [
+            (vec!["-l", "--storage"], false),
+            (vec!["-l", "--all", "--storage"], true),
+            (vec!["-l", "--storage", "--all"], true),
+        ] {
+            assert!(
+                matches!(
+                    parse_action(&args.iter().copied().map(str::to_owned).collect::<Vec<_>>()),
+                    Ok(Action::List {
+                        all,
+                        storage: true
+                    }) if all == expected_all
+                ),
+                "args: {args:?}"
+            );
+        }
     }
 
     #[test]
@@ -24528,6 +24949,7 @@ remote_binary = "/usr/local/bin/macluster"
             primary_share_ready: true,
             shares: BTreeMap::new(),
             features: Vec::new(),
+            ..Default::default()
         };
         let encoded_health =
             serde_json::to_string(&serde_json::to_string(&health).unwrap()).unwrap();
@@ -24640,7 +25062,12 @@ remote_binary = "/usr/local/bin/macluster"
         let root =
             std::env::temp_dir().join(format!("macluster-uninitialized-{}", Id128::random()));
         fs::create_dir_all(&root).expect("create test root");
-        let result = list_nodes(&root.join("config.toml"), &root.join("controller"), false);
+        let result = list_nodes(
+            &root.join("config.toml"),
+            &root.join("controller"),
+            false,
+            false,
+        );
         let error = result.expect_err("listing requires an active cluster config");
         let _ = fs::remove_dir_all(&root);
 
@@ -24669,24 +25096,28 @@ remote_binary = "/usr/local/bin/macluster"
                         source_node: "login-01".into(),
                         target: target.into(),
                     }],
+                    storage: NodeStorageInventory::default(),
                 }
             };
-        let output = format_node_list(&[
-            row(
-                "login-01",
-                "192.0.2.1",
-                "CONTROLLER",
-                "READY",
-                "/Users/Shared/macluster",
-            ),
-            row(
-                "arm-a",
-                "192.0.2.2",
-                "COMPUTE",
-                "READY",
-                "/Users/Shared/macluster",
-            ),
-        ]);
+        let output = format_node_list(
+            &[
+                row(
+                    "login-01",
+                    "192.0.2.1",
+                    "CONTROLLER",
+                    "READY",
+                    "/Users/Shared/macluster",
+                ),
+                row(
+                    "arm-a",
+                    "192.0.2.2",
+                    "COMPUTE",
+                    "READY",
+                    "/Users/Shared/macluster",
+                ),
+            ],
+            false,
+        );
 
         let login_row = output.find("login-01").unwrap();
         let worker_row = output.find("arm-a").unwrap();

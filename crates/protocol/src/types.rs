@@ -326,7 +326,7 @@ pub struct MetricSnapshot {
 
 #[cfg(test)]
 mod metric_snapshot_tests {
-    use super::{DiskCapacity, MetricSnapshot};
+    use super::{DiskCapacity, MetricSnapshot, NodeHealth};
 
     #[test]
     fn metric_snapshot_round_trips_cpu_temperature() {
@@ -486,6 +486,23 @@ mod metric_snapshot_tests {
     }
 
     #[test]
+    fn node_health_accepts_legacy_json_without_storage_capacity() {
+        let legacy = serde_json::json!({
+            "machine_uuid": "01234567-89ab-cdef-0123-456789abcdef",
+            "execution_uid": 501,
+            "execution_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "primary_share_ready": true,
+            "shares": {},
+            "features": []
+        });
+
+        let health: NodeHealth = serde_json::from_value(legacy).unwrap();
+
+        assert!(health.system_disk_capacity.is_none());
+        assert!(health.external_disk_capacities.is_empty());
+    }
+
+    #[test]
     fn metric_snapshot_accepts_legacy_json_without_power_age() {
         let legacy = serde_json::json!({
             "sampled_unix_ms": 1,
@@ -517,7 +534,7 @@ mod metric_snapshot_tests {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeHealth {
     pub machine_uuid: String,
     pub execution_uid: u32,
@@ -534,6 +551,10 @@ pub struct NodeHealth {
     pub shares: BTreeMap<String, bool>,
     #[serde(default)]
     pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_disk_capacity: Option<DiskCapacity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_disk_capacities: Vec<DiskCapacity>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

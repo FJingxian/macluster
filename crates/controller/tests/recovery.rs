@@ -175,6 +175,7 @@ impl NodeTransport for FakeTransport {
                     primary_share_ready: true,
                     shares: BTreeMap::new(),
                     features: state.features.clone(),
+                    ..Default::default()
                 },
             )),
             Operation::QueryFanPolicy => Ok(ResponseBody::FanControl(

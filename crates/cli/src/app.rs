@@ -7632,8 +7632,7 @@ impl Drop for ControllerSignalGuard {
     }
 }
 
-#[derive(Serialize)]
-#[derive(Clone)]
+#[derive(Serialize, Clone)]
 struct NodeMetricRow {
     id: String,
     host: String,
@@ -9346,10 +9345,10 @@ mod tests {
         format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
         is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
         prepare_task_environment, promote_inline_command, prune_submission_cache,
-        required_named_shares,
-        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
-        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
+        required_named_shares, should_block_agent_update_for_pending_node_recovery,
+        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
+        should_preflight_agent_update, submission_must_wait_for_agent_update,
+        visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -10154,8 +10153,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             ),
         ]);
 
-        let unassigned =
-            visible_unassigned_operational_nodes(&config, &liveness, 1_001);
+        let unassigned = visible_unassigned_operational_nodes(&config, &liveness, 1_001);
         assert_eq!(unassigned, ["login", "spare"]);
 
         let rendered = format_queue_output(

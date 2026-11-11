@@ -1151,16 +1151,43 @@ fn node_health(config: &ClusterConfig, local_node_id: &str) -> Result<NodeHealth
     let machine_uuid = local_machine_uuid().map_err(|message| {
         AgentError::State(format!("could not read local identity: {message}"))
     })?;
-    node_health_with_mount_provider(config, local_node_id, machine_uuid, current_mount_output)
+    node_health_with_providers(
+        config,
+        local_node_id,
+        machine_uuid,
+        current_mount_output,
+        macluster_metrics::sample_disk_capacities,
+    )
 }
 
+#[cfg(test)]
 fn node_health_with_mount_provider(
     config: &ClusterConfig,
     local_node_id: &str,
     machine_uuid: String,
     mount_provider: impl FnOnce() -> Result<String, AgentError>,
 ) -> Result<NodeHealth, AgentError> {
+    node_health_with_providers(
+        config,
+        local_node_id,
+        machine_uuid,
+        mount_provider,
+        macluster_metrics::sample_disk_capacities,
+    )
+}
+
+fn node_health_with_providers(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    machine_uuid: String,
+    mount_provider: impl FnOnce() -> Result<String, AgentError>,
+    disk_provider: impl FnOnce() -> (
+        Option<macluster_protocol::types::DiskCapacity>,
+        Vec<macluster_protocol::types::DiskCapacity>,
+    ),
+) -> Result<NodeHealth, AgentError> {
     let mount_output = mount_provider()?;
+    let (system_disk_capacity, external_disk_capacities) = disk_provider();
     let shares = config
         .shares
         .iter()
@@ -1192,6 +1219,8 @@ fn node_health_with_mount_provider(
             "config.smb-user-mounts.v1".to_owned(),
             "config.smb-keychain.v1".to_owned(),
         ],
+        system_disk_capacity,
+        external_disk_capacities,
     })
 }
 
@@ -3633,6 +3662,36 @@ execution_uid = 501
                 .ok()
                 .and_then(|count| u32::try_from(count.get()).ok())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn node_health_embeds_injected_disk_capacity_inventory() {
+        let (root, _state_dir, _token, shared) =
+            status_fixture("health-storage-inventory", &boot_id(), None, false);
+        let config = status_config(&shared);
+        let system = macluster_protocol::types::DiskCapacity {
+            mount_point: "/".into(),
+            used_bytes: 50,
+            total_bytes: 100,
+        };
+        let external = macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/data".into(),
+            used_bytes: 25,
+            total_bytes: 100,
+        };
+
+        let health = node_health_with_providers(
+            &config,
+            "mini01-a",
+            "00000000-0000-4000-8000-000000000010".into(),
+            || Ok(String::new()),
+            || (Some(system.clone()), vec![external.clone()]),
+        )
+        .unwrap();
+
+        assert_eq!(health.system_disk_capacity, Some(system));
+        assert_eq!(health.external_disk_capacities, vec![external]);
         fs::remove_dir_all(root).unwrap();
     }
 

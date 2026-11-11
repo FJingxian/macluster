@@ -1498,6 +1498,7 @@ mod tests {
             primary_share_ready: true,
             shares: Default::default(),
             features: Vec::new(),
+            ..Default::default()
         });
         assert!(response_requires_agent_refresh(
             &Operation::Health,
@@ -1513,6 +1514,7 @@ mod tests {
             primary_share_ready: true,
             shares: Default::default(),
             features: Vec::new(),
+            ..Default::default()
         });
         assert!(!response_requires_agent_refresh(
             &Operation::Health,

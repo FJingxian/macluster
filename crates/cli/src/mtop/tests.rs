@@ -218,7 +218,10 @@ fn one_shot_monitor_returns_managed_login_and_excludes_storage_transport() {
     let (_, nodes) = super::sample_one_shot(&config, None);
 
     assert_eq!(
-        nodes.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(),
+        nodes
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>(),
         ["login"]
     );
 }

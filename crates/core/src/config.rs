@@ -12,6 +12,8 @@ use macluster_protocol::{
 };
 use thiserror::Error;
 
+use crate::storage_uri::StorageProtocol;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterConfig {
     pub name: String,
@@ -79,6 +81,7 @@ pub struct NodeConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShareConfig {
+    pub protocol: StorageProtocol,
     pub server: NodeId,
     pub source_root: PathBuf,
     pub mount_root: PathBuf,
@@ -587,6 +590,14 @@ impl ClusterConfig {
                         value: name.to_owned(),
                     })?;
                 let name = share.to_string();
+                let protocol = take_optional_string(&mut table, &section, "protocol")?
+                    .map(|value| {
+                        value.parse().map_err(|error| {
+                            parse_error(0, &format!("[{section}] protocol: {error}"))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(StorageProtocol::Nfs);
                 let server_raw = take_string(&mut table, &section, "server")?;
                 let server = NodeId::new(server_raw.clone()).map_err(|_| {
                     ConfigError::InvalidIdentifier {
@@ -614,6 +625,7 @@ impl ClusterConfig {
                 shares.insert(
                     name,
                     ShareConfig {
+                        protocol,
                         server,
                         source_root: PathBuf::from(source_raw),
                         mount_root: PathBuf::from(mount_raw),
@@ -832,6 +844,9 @@ impl ClusterConfig {
             // the new opt-in field is absent or false.
             if share.allow_existing_contents {
                 rows.push(format!("share-overlay\0{id}\0true"));
+            }
+            if share.protocol != StorageProtocol::Nfs {
+                rows.push(format!("share-protocol\0{id}\0{}", share.protocol));
             }
         }
         if let Some(login_node) = &self.login_node {

@@ -431,6 +431,7 @@ mod tests {
             shares: vec![ClientShareDescriptor {
                 id: "tools".into(),
                 server: "login".parse().unwrap(),
+                protocol: "nfs".into(),
                 server_host: "192.0.2.1".into(),
                 source_root: "/opt/homebrew".into(),
                 mount_root: "/opt/homebrew".into(),
@@ -487,6 +488,7 @@ mod tests {
         descriptor.shares.push(ClientShareDescriptor {
             id: "local-disk".into(),
             server: "worker".parse().unwrap(),
+            protocol: "nfs".into(),
             server_host: "192.0.2.10".into(),
             source_root: "/Volumes/data".into(),
             mount_root: "/Volumes/data".into(),

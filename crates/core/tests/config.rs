@@ -1,4 +1,5 @@
 use macluster_core::config::{ClusterConfig, ConfigError, NodeRole};
+use macluster_core::storage_uri::StorageProtocol;
 
 const VALID: &str = r#"
 [cluster]
@@ -272,6 +273,17 @@ fn named_share_can_be_mounted_at_its_source_path() {
         config.shares["analysis"].source_root,
         config.shares["analysis"].mount_root
     );
+    assert_eq!(config.shares["analysis"].protocol, StorageProtocol::Nfs);
+}
+
+#[test]
+fn named_share_protocol_defaults_to_nfs_and_accepts_smb() {
+    let smb = format!(
+        "{VALID}\n[shares.smb]\nprotocol = \"smb\"\nserver = \"mini01-a\"\nsource_root = \"/data/project\"\nmount_root = \"/Volumes/project\"\nshare_uuid = \"00000000-0000-4000-8000-000000000005\"\n"
+    );
+    let config = ClusterConfig::parse(&smb).unwrap();
+
+    assert_eq!(config.shares["smb"].protocol, StorageProtocol::Smb);
 }
 
 #[test]

@@ -3062,6 +3062,7 @@ execution_uid = 501
         config.shares.insert(
             "external-disk".into(),
             macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: server_id,
                 source_root: PathBuf::from("/Volumes/archive"),
                 mount_root: PathBuf::from("/definitely/missing/archive"),
@@ -3116,6 +3117,7 @@ execution_uid = 501
         config.shares.insert(
             "named".into(),
             macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("mini01-a").unwrap(),
                 source_root: named.clone(),
                 mount_root: named,
@@ -3168,6 +3170,7 @@ execution_uid = 501
         config.shares.insert(
             "data".into(),
             macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("mini01-a").unwrap(),
                 source_root: PathBuf::from("/srv/data"),
                 mount_root: PathBuf::from("/mnt/data"),

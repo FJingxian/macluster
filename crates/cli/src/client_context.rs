@@ -176,6 +176,10 @@ impl RemoteContext {
             shares.insert(
                 share.id.clone(),
                 ShareConfig {
+                    protocol: share
+                        .protocol
+                        .parse()
+                        .unwrap_or(macluster_core::storage_uri::StorageProtocol::Nfs),
                     server: share.server.clone(),
                     source_root: PathBuf::from(&share.source_root),
                     mount_root: PathBuf::from(&share.mount_root),

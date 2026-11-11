@@ -913,6 +913,7 @@ mod tests {
         named_share_change.shares.insert(
             "datasets".into(),
             ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("arm-a").unwrap(),
                 source_root: PathBuf::from("/Volumes/datasets"),
                 mount_root: PathBuf::from("/Volumes/datasets"),

@@ -4673,6 +4673,7 @@ mod tests {
         config.shares.insert(
             "tools".into(),
             macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("login-01").unwrap(),
                 source_root: std::path::PathBuf::from("/Volumes/Tools"),
                 mount_root: std::path::PathBuf::from("/Users/Shared/tools"),

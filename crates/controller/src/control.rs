@@ -674,6 +674,7 @@ impl ControlApi {
                 .map(|(id, share)| ClientShareDescriptor {
                     id: id.clone(),
                     server: share.server.clone(),
+                    protocol: share.protocol.to_string(),
                     source_root: share.source_root.display().to_string(),
                     server_host: self
                         .config

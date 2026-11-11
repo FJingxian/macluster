@@ -39,10 +39,16 @@ pub struct ClientDescriptor {
 pub struct ClientShareDescriptor {
     pub id: String,
     pub server: NodeId,
+    #[serde(default = "default_storage_protocol")]
+    pub protocol: String,
     pub source_root: String,
     pub server_host: String,
     pub mount_root: String,
     pub share_uuid: String,
+}
+
+fn default_storage_protocol() -> String {
+    "nfs".into()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -500,6 +506,7 @@ mod client_descriptor_tests {
             shares: vec![super::ClientShareDescriptor {
                 id: "tools".into(),
                 server: "login".parse().unwrap(),
+                protocol: "nfs".into(),
                 source_root: "/opt/homebrew".into(),
                 server_host: "192.0.2.1".into(),
                 mount_root: "/opt/homebrew".into(),

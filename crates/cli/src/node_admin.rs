@@ -10372,6 +10372,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             )
         })?;
         let pending_share = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
             source_root: source_root.clone(),
             mount_root: mount_root.clone(),
@@ -11501,6 +11502,7 @@ fn remove_registered_share(
         let share = match configured_share {
             Some(share) => share,
             None => ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new(server_id.clone()).map_err(|error| (1, error.to_string()))?,
                 source_root: source_root.clone(),
                 mount_root: mount_root.clone(),
@@ -14158,6 +14160,7 @@ fn register_named_share(
             None => Id128::random().to_string(),
         };
         let share = macluster_core::config::ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new(server_id.clone()).map_err(|error| (2, error.to_string()))?,
             source_root: source_root.clone(),
             mount_root: mount_root.clone(),
@@ -17730,6 +17733,7 @@ mod tests {
         ))
         .unwrap();
         let share = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new("storage").unwrap(),
             source_root: source.clone(),
             mount_root: mount.clone(),
@@ -19768,6 +19772,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         config.shares.insert(
             "tools".into(),
             ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("login").unwrap(),
                 source_root: "/Users/shared/tools".into(),
                 mount_root: "/Users/shared/tools".into(),
@@ -19922,6 +19927,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         config.shares.insert(
             "JanusX".into(),
             ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
                 server: NodeId::new("login").unwrap(),
                 source_root: "/Users/example/script/JanusX".into(),
                 mount_root: "/Users/Shared/JanusX".into(),
@@ -20670,6 +20676,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         client.host = "192.0.2.2".into();
         config.nodes.insert("worker".into(), client.clone());
         let share = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new("storage").unwrap(),
             source_root: source.clone(),
             mount_root: source.clone(),
@@ -22306,6 +22313,7 @@ ssh_port = 22
     fn named_share_request_matches_requires_same_mount_root() {
         let server = NodeId::new("login").unwrap();
         let existing = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: server.clone(),
             source_root: PathBuf::from("/Users/Shared/tools"),
             mount_root: PathBuf::from("/Users/Shared/macluster-shares/tools"),
@@ -22326,6 +22334,7 @@ ssh_port = 22
     fn named_share_request_matches_same_server_source_and_mount() {
         let server = NodeId::new("login").unwrap();
         let existing = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server,
             source_root: PathBuf::from("/Users/Shared/tools"),
             mount_root: PathBuf::from("/Users/Shared/macluster-shares/tools"),
@@ -23635,6 +23644,7 @@ execution_uid = 501
         fs::create_dir_all(source.join("python")).unwrap();
         fs::write(source.join("python/user.py"), "keep").unwrap();
         let parent = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new("server").unwrap(),
             source_root: source.clone(),
             mount_root: mount.clone(),
@@ -23754,6 +23764,7 @@ mount_root="/mount/JanusX/python"
 share_uuid="00000000-0000-4000-8000-000000000002"
 "#;
         let parent = ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
             server: NodeId::new("login").unwrap(),
             source_root: "/source/JanusX".into(),
             mount_root: "/mount/JanusX".into(),

@@ -4524,6 +4524,27 @@ fn controller_migration_target_script(
     )
 }
 
+fn controller_migration_target_cleanup_script(
+    target: &NodeConfig,
+    target_home: &Path,
+    operation_id: &str,
+) -> String {
+    let config_path = target_home.join(".config/macluster/config.toml");
+    let state_dir = target_home.join("Library/Application Support/macluster/controller");
+    let staging = target_home.join(format!(".macluster-controller-migration-{operation_id}"));
+    format!(
+        "set -eu\nconfig={config}\nstate={state}\nstaging={staging}\nif [ -f \"$config\" ]; then {bin} --config \"$config\" --state-dir \"$state\" controller stop >/dev/null; fi\n/bin/rm -f \"$config\"\n/bin/rm -rf \"$state\" \"$staging\"\n/bin/test ! -e \"$config\"\n/bin/test ! -e \"$state/controller.sqlite3\"\n",
+        config = shell_quote(&config_path.to_string_lossy()),
+        state = shell_quote(&state_dir.to_string_lossy()),
+        staging = shell_quote(&staging.to_string_lossy()),
+        bin = shell_quote(&target.remote_binary),
+    )
+}
+
+fn controller_migration_may_restart_old(was_running: bool, target_cleanup_ok: bool) -> bool {
+    was_running && target_cleanup_ok
+}
+
 fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) -> AppResult<()> {
     let config_path = config_path.canonicalize().map_err(io_error)?;
     let config = read_config(&config_path)?;
@@ -4691,21 +4712,66 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let operation_id = Id128::random().to_string();
     let archive = controller_migration_archive(candidate.as_bytes(), state_dir)?;
     let script = controller_migration_target_script(&target, &target_home, &operation_id);
-    let output =
-        ssh_output_with_timeout(&target, &script, Some(&archive), Duration::from_secs(120))
-            .map_err(|(_, error)| (1, error))?;
-    if !output.status.success() {
-        if was_running {
-            let _ = manager.start(Duration::from_secs(30));
+    let target_failure = |detail: String| -> AppResult<()> {
+        let cleanup_script =
+            controller_migration_target_cleanup_script(&target, &target_home, &operation_id);
+        let cleanup = ssh_output_with_timeout(
+            &target,
+            &cleanup_script,
+            None,
+            Duration::from_secs(30),
+        );
+        let cleanup_error = match cleanup {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(command_error(
+                "stop and remove the failed target controller",
+                &output,
+            )),
+            Err((_, error)) => Some(error),
+        };
+        let restart = if controller_migration_may_restart_old(
+            was_running,
+            cleanup_error.is_none(),
+        ) {
+            manager
+                .start(Duration::from_secs(30))
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        let controller_state = match (was_running, cleanup_error.as_deref(), restart.as_ref()) {
+            (false, _, _) => "No old controller was running.",
+            (true, None, Ok(())) => "The old controller was restarted after target cleanup.",
+            (true, Some(_), _) => {
+                "The old controller remains stopped because target cleanup could not be verified; do not start another controller before inspecting the target."
+            }
+            (true, None, Err(_)) => {
+                "The target was cleaned, but the old controller could not be restarted."
+            }
+        };
+        let mut message = format!("controller migration failed: {detail}. {controller_state}");
+        if let Some(error) = cleanup_error {
+            message.push_str(&format!(" Target cleanup failed: {error}."));
         }
-        return Err((
-            1,
-            format!(
-                "controller migration target activation failed: {}",
+        if let Err(error) = restart {
+            message.push_str(&format!(" Old controller restart failed: {error}."));
+        }
+        Err((1, message))
+    };
+    let activation =
+        ssh_output_with_timeout(&target, &script, Some(&archive), Duration::from_secs(120));
+    let activation = match activation {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return target_failure(format!(
+                "target activation failed: {}",
                 command_error("activate controller target", &output)
-            ),
-        ));
-    }
+            ));
+        }
+        Err((_, error)) => return target_failure(format!("target activation failed: {error}")),
+    };
+    drop(activation);
     let config_path_text = target_home
         .join(".config/macluster/config.toml")
         .to_string_lossy()
@@ -4721,28 +4787,22 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         shell_quote(&state_dir_text),
     );
     let verified = ssh_output_with_timeout(&target, &verify, None, Duration::from_secs(30))
-        .map_err(|(_, error)| (1, error))?;
-    if !verified.status.success() || !String::from_utf8_lossy(&verified.stdout).contains("Ready") {
-        let cleanup = format!(
-            "{} --config {} --state-dir {} controller stop >/dev/null 2>&1 || true; /bin/rm -f {}; /bin/rm -rf {}",
-            shell_quote(&target.remote_binary),
-            shell_quote(&config_path_text),
-            shell_quote(&state_dir_text),
-            shell_quote(&config_path_text),
-            shell_quote(&state_dir_text),
-        );
-        let _ = ssh_output_with_timeout(&target, &cleanup, None, Duration::from_secs(30));
-        if was_running {
-            let _ = manager.start(Duration::from_secs(30));
-        }
-        return Err((
-            1,
-            format!(
-                "controller target did not become Ready: {}",
-                String::from_utf8_lossy(&verified.stderr).trim()
-            ),
-        ));
-    }
+        .map_err(|(_, error)| error)
+        .and_then(|output| {
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("Ready") {
+                Ok(output)
+            } else {
+                Err(format!(
+                    "target did not become Ready: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        });
+    let verified = match verified {
+        Ok(output) => output,
+        Err(error) => return target_failure(error),
+    };
+    drop(verified);
     println!(
         "Controller migrated to {target_id}. Existing login clients may need to rejoin through mDNS or `--join`."
     );
@@ -22134,6 +22194,14 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             .unwrap()
             .success());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn controller_migration_restarts_the_old_controller_only_after_target_cleanup() {
+        assert!(super::controller_migration_may_restart_old(true, true));
+        assert!(!super::controller_migration_may_restart_old(true, false));
+        assert!(!super::controller_migration_may_restart_old(false, true));
+        assert!(!super::controller_migration_may_restart_old(false, false));
     }
 
     #[test]

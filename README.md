@@ -64,6 +64,8 @@ macluster node -l
 
 Nodes enter the cluster after enrollment verifies the Agent and shared storage. `node -l` lists registered nodes as READY or OFFLINE; failed enrollment attempts are kept separately for retry. Inspect them with `macluster node --failed`. Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
 
+All Agent-managed Macs appear in `mtop`, `mqueue`, `mfans`, and the browser monitor, including a controller, login client, or storage Mac that has no compute role. External NFS/SMB providers have no compatible Agent and appear only in `mnode`. Queue rows continue to evaluate scheduling eligibility separately. `mnode -l --storage` refreshes system, external-volume, and mounted-share capacity in a bounded pass; plain `mnode -l` uses cached capacity where available.
+
 Initialization installs a per-user background LaunchAgent. Closing Terminal does not stop the controller; logging out of that macOS user session does. Scheduling needs the controller. Job and queue queries can read persisted state while it is stopped.
 
 ```sh

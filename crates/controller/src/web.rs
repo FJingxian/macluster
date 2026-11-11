@@ -641,6 +641,33 @@ fn web_node_role(config: &ClusterConfig, node_id: &str) -> String {
     }
 }
 
+fn web_monitor_target(config: &ClusterConfig, node_id: &str) -> bool {
+    config.is_operational_node(node_id)
+}
+
+fn configured_web_nodes(config: &ClusterConfig) -> Vec<WebNodeInfo> {
+    config
+        .nodes
+        .keys()
+        .filter(|id| web_monitor_target(config, id))
+        .map(|id| {
+            let queues = config
+                .queues
+                .iter()
+                .filter(|(_, queue)| {
+                    config.is_compute_node(id) && queue.nodes.iter().any(|node| node == id)
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            WebNodeInfo {
+                id: id.clone(),
+                role: web_node_role(config, id),
+                queues,
+            }
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 struct WebJob {
     id: u64,
@@ -770,25 +797,7 @@ fn fetch_bootstrap(
             ));
         }
     };
-    let all_nodes = config
-        .nodes
-        .keys()
-        .map(|id| {
-            let queues = config
-                .queues
-                .iter()
-                .filter(|(_, queue)| {
-                    config.is_compute_node(id) && queue.nodes.iter().any(|node| node == id)
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            WebNodeInfo {
-                id: id.clone(),
-                role: web_node_role(&config, id),
-                queues,
-            }
-        })
-        .collect::<Vec<_>>();
+    let all_nodes = configured_web_nodes(&config);
     let truncated_nodes = all_nodes.len() > MAX_WEB_NODES || monitor.total_pages > 1;
     Ok(BootstrapResponse {
         cluster_name: config.name.clone(),
@@ -839,8 +848,10 @@ async fn update_view(
     for node_id in update.visible_nodes {
         let node = NodeId::new(node_id.clone())
             .map_err(|_| ApiError::bad_request("View contains an invalid node ID."))?;
-        if !config.nodes.contains_key(node.as_str()) {
-            return Err(ApiError::bad_request("View contains an unknown node."));
+        if !web_monitor_target(&config, node.as_str()) {
+            return Err(ApiError::bad_request(
+                "View contains a node without a compatible monitor Agent.",
+            ));
         }
         if !seen.insert(node_id.clone()) {
             return Err(ApiError::bad_request("View contains a duplicate node."));
@@ -850,9 +861,9 @@ async fn update_view(
     let detail_node = if let Some(node_id) = update.detail_node {
         let node = NodeId::new(node_id.clone())
             .map_err(|_| ApiError::bad_request("Detail view contains an invalid node ID."))?;
-        if !config.nodes.contains_key(node.as_str()) {
+        if !web_monitor_target(&config, node.as_str()) {
             return Err(ApiError::bad_request(
-                "Detail view contains an unknown node.",
+                "Detail view contains a node without a compatible monitor Agent.",
             ));
         }
         if !seen.contains(&node_id) {
@@ -1840,6 +1851,24 @@ mod blocker_tests {
             "controller, compute, storage"
         );
         assert_eq!(web_node_role(&config, "worker"), "compute");
+    }
+
+    #[test]
+    fn web_monitor_inventory_includes_all_managed_macs_and_excludes_storage() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\nlogin_node=\"controller\"\ndefault_queue=\"cpu\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"nas-01\"\nprotocol_version=1\n[queues.cpu]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.controller]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\n[nodes.storage-mac]\nhost=\"192.0.2.21\"\ntransport=\"ssh\"\n[nodes.nas-01]\nhost=\"192.0.2.22\"\ntransport=\"storage\"\n",
+        )
+        .unwrap();
+
+        let ids = configured_web_nodes(&config)
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["controller", "storage-mac", "worker"]);
+        assert!(web_monitor_target(&config, "controller"));
+        assert!(web_monitor_target(&config, "storage-mac"));
+        assert!(!web_monitor_target(&config, "nas-01"));
     }
 
     #[test]

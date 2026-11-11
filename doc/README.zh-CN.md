@@ -64,6 +64,8 @@ macluster node -l
 
 节点通过 Agent 和共享存储验证后才会进入正式集群。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
 
+所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller、login client 或存储 Mac。无法接入统一 Agent 的外部 NFS/SMB 节点只显示在 `mnode` 中。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
+
 加入节点时会安装 Agent、配置共享空间。若没有 SSH 密钥登录，可在核对指纹并输入远程账户登录密码后安装密钥。NFS 和特权 helper 的配置还可能需要每台相关 Mac 的管理员授权，两者用途不同。
 
 初始化会安装用户级后台 LaunchAgent。关闭终端不影响 controller，注销该 macOS 用户会使服务停止。任务调度需要 controller；查看任务、队列可在它停止时读取已保存的状态。

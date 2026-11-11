@@ -4038,7 +4038,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -mount URI --mount-root PATH
   mnode -umount URI
   mnode -migrate controller:NODE_ID
-  mnode -l|--list [--all]
+  mnode -l|--list [--all] [--storage]
   mnode -rm|--remove NODE_ID|compute:NODE_ID|share:SHARE_ID
 
 OPTIONS
@@ -4046,6 +4046,7 @@ OPTIONS
   --mount-root PATH   Required client mount path.
   --overlay-existing  Confirm covering existing files.
   --force             Force-detach a busy share.
+  --storage           Show detailed disk and share capacity.
 
 EXAMPLES
   mnode -a user@192.0.2.10
@@ -4053,6 +4054,7 @@ EXAMPLES
   mnode -a storage:nas-01@192.0.2.5
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
   mnode -umount nfs://login-01/Users/Shared/tools
+  mnode -l --storage
 
 Use `mnode -l --all` to include unreachable compute nodes.
 
@@ -4069,7 +4071,7 @@ Use --help for scan, SSH, and migration details."#;
         [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
   mnode -umount URI
   mnode -migrate controller:NODE_ID
-  mnode -l|--list [--all]
+  mnode -l|--list [--all] [--storage]
   mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
@@ -4086,6 +4088,7 @@ OPTIONS
   --overlay-existing  Keep client files underneath the NFS mount.
   --connect USER@IP   Reach a moved node at its current address.
   --force             Force-detach a named share whose client mount is in use.
+  --storage           Show per-node system, external and share capacity.
 
 EXAMPLES
   mnode -a user@192.0.2.10
@@ -4099,8 +4102,11 @@ EXAMPLES
   mnode -a local
   mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
   mnode -rm default-001
+  mnode -l --storage
 
-`mnode -l` lists compute nodes only after recent successful reachability checks.
+`mnode -l` lists managed Macs and external storage providers. Default output
+uses cached capacity; `--storage` refreshes system, external-volume and mounted
+share capacity in a bounded parallel pass.
 Missed or inconclusive probes show `RECONNECTING` during the recovery grace;
 three confirmed failures hide the node. Stale or unverified nodes stay hidden;
 use `mnode -l --all` to inspect them.
@@ -24284,6 +24290,17 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 "args: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn node_help_documents_storage_inventory_mode() {
+        let help = super::node_help(false);
+
+        assert!(
+            help.contains("mnode -l|--list [--all] [--storage]"),
+            "{help}"
+        );
+        assert!(help.contains("--storage"), "{help}");
     }
 
     #[test]

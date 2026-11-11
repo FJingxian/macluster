@@ -7649,7 +7649,7 @@ struct ClusterMetricView {
     missing_nodes: usize,
     pool_total: MetricSnapshot,
     #[serde(skip)]
-    login_compute_node_id: Option<String>,
+    login_node_in_rows: Option<String>,
     #[serde(skip)]
     task_counts_by_node: Option<BTreeMap<String, (usize, usize)>>,
 }
@@ -7695,24 +7695,7 @@ fn sample_cluster(
     };
     let sample_config = sample_config.as_ref().unwrap_or(config);
     let local_uuid = local_machine_uuid().ok();
-    let login_compute_node_id = config
-        .nodes
-        .iter()
-        .find(|(id, node)| {
-            let is_local = node.transport == Transport::Local
-                || local_uuid.as_ref().is_some_and(|uuid| {
-                    node.machine_uuid
-                        .as_ref()
-                        .is_some_and(|node_uuid| node_uuid.eq_ignore_ascii_case(uuid))
-                });
-            let selected = selected_queue.is_none_or(|queue| {
-                config
-                    .queue_for_dispatch(queue.as_str())
-                    .is_some_and(|queue| queue.nodes.iter().any(|member| member == *id))
-            });
-            is_local && selected && config.is_compute_node(id)
-        })
-        .map(|(id, _)| id.clone());
+    let login_node_in_rows = selected_local_node_id(config, selected_queue, local_uuid.as_deref());
     let (login, samples) =
         cached_monitor_samples(sample_config, config_path, state_dir, selected_queue)
             .unwrap_or_else(|| {
@@ -7747,9 +7730,34 @@ fn sample_cluster(
         nodes: rows,
         missing_nodes,
         pool_total,
-        login_compute_node_id,
+        login_node_in_rows,
         task_counts_by_node: one_shot_task_counts(config, state_dir),
     }
+}
+
+fn selected_local_node_id(
+    config: &ClusterConfig,
+    selected_queue: Option<&QueueName>,
+    local_uuid: Option<&str>,
+) -> Option<String> {
+    config
+        .nodes
+        .iter()
+        .find(|(id, node)| {
+            let is_local = node.transport == Transport::Local
+                || local_uuid.is_some_and(|uuid| {
+                    node.machine_uuid
+                        .as_ref()
+                        .is_some_and(|node_uuid| node_uuid.eq_ignore_ascii_case(uuid))
+                });
+            let selected = selected_queue.is_none_or(|queue| {
+                config
+                    .queue_for_dispatch(queue.as_str())
+                    .is_some_and(|queue| queue.nodes.iter().any(|member| member == *id))
+            });
+            is_local && selected && config.is_operational_node(id)
+        })
+        .map(|(id, _)| id.clone())
 }
 
 fn cached_monitor_samples(
@@ -7973,7 +7981,7 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
     );
 
     let mut rows = Vec::with_capacity(view.nodes.len() + 2);
-    if view.login_compute_node_id.is_none() {
+    if view.login_node_in_rows.is_none() {
         rows.push(metric_cells(
             "login",
             Some(&view.login),
@@ -8040,7 +8048,7 @@ fn print_cluster_metrics(view: &ClusterMetricView, color: bool, continuous: bool
         }
     }
     let mut power_errors = Vec::new();
-    if view.login_compute_node_id.is_none()
+    if view.login_node_in_rows.is_none()
         && let Some(reason) = view.login.errors.get("power")
     {
         power_errors.push(("login", reason));
@@ -9345,10 +9353,10 @@ mod tests {
         format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
         is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
         prepare_task_environment, promote_inline_command, prune_submission_cache,
-        required_named_shares, should_block_agent_update_for_pending_node_recovery,
-        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
-        should_preflight_agent_update, submission_must_wait_for_agent_update,
-        visible_unassigned_operational_nodes,
+        required_named_shares, selected_local_node_id,
+        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
+        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
+        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -11757,6 +11765,28 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
+    fn local_login_identity_is_selected_without_compute_role() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"default\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            selected_local_node_id(&config, None, Some("01234567-89ab-cdef-0123-456789abcdef"))
+                .as_deref(),
+            Some("login")
+        );
+        assert_eq!(
+            selected_local_node_id(
+                &config,
+                Some(&QueueName::new("default").unwrap()),
+                Some("01234567-89ab-cdef-0123-456789abcdef")
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn legacy_remote_power_error_explains_how_to_update_the_node() {
         let mut snapshot = macluster_metrics::unavailable(1, "test");
         snapshot.errors.insert(
@@ -11805,7 +11835,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             missing_nodes: 0,
             nodes,
             pool_total,
-            login_compute_node_id: None,
+            login_node_in_rows: None,
             task_counts_by_node: None,
         };
         let encoded = serde_json::to_value(view).unwrap();

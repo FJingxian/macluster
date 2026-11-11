@@ -4676,12 +4676,11 @@ fn mutate_compute_role(
         let operation_id = Id128::random().to_string();
         backup_config(&config_path, &operation_id)?;
         atomic_write(&config_path, candidate.as_bytes())?;
-        sync_remote_configs(
+        sync_remote_configs_online_nodes(
             &candidate_config,
             &candidate,
             state_dir,
             &operation_id,
-            None,
         )
         .map_err(|error| {
             (
@@ -10798,9 +10797,14 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             )
         })?;
 
-        // Validate every endpoint before removing any share resource. A pending
-        // share is cluster-wide, so its clients must still be the registered Macs.
+        // Validate reachable endpoints before removing any share resource.
+        // Confirmed offline clients keep exact cleanup tombstones and must not
+        // block cancellation of an otherwise reachable pending share.
+        let offline_nodes = share_removal_unavailable_nodes(&config);
         for (node_id, node) in &config.nodes {
+            if offline_nodes.contains(node_id) {
+                continue;
+            }
             verify_registered_node_identity(node_id, node, &state)?;
             check_remote_idle(node, node_id, &config_path)?;
         }
@@ -10808,7 +10812,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
         let source = format!("{}:{}", server.host, source_root.display());
         let mut clients = Vec::new();
         for (node_id, node) in &config.nodes {
-            if node_id == &server_id {
+            if node_id == &server_id || offline_nodes.contains(node_id) {
                 continue;
             }
             let mounts = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| {
@@ -14661,14 +14665,8 @@ fn register_smb_share(
         let operation_id = Id128::random().to_string();
         backup_config(&config_path, &operation_id)?;
         atomic_write(&config_path, candidate.as_bytes())?;
-        sync_remote_configs(
-            &candidate_config,
-            &candidate,
-            state_dir,
-            &operation_id,
-            None,
-        )
-        .map_err(|error| {
+        sync_remote_configs_online_nodes(&candidate_config, &candidate, state_dir, &operation_id)
+            .map_err(|error| {
             (
                 1,
                 format!(
@@ -14751,14 +14749,8 @@ fn unregister_smb_share(
         let operation_id = Id128::random().to_string();
         backup_config(&config_path, &operation_id)?;
         atomic_write(&config_path, candidate.as_bytes())?;
-        sync_remote_configs(
-            &candidate_config,
-            &candidate,
-            state_dir,
-            &operation_id,
-            None,
-        )
-        .map_err(|error| {
+        sync_remote_configs_online_nodes(&candidate_config, &candidate, state_dir, &operation_id)
+            .map_err(|error| {
             (
                 1,
                 format!(

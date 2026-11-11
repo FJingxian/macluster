@@ -782,7 +782,7 @@ impl SmbNodeKeychainRunner for ChildSmbKeychainRunner {
         self.run(
             &[
                 "store",
-                "--cluster",
+                "--cluster-uuid",
                 &cluster_uuid.to_string(),
                 "--server",
                 &endpoint.server,

@@ -51,9 +51,9 @@ fn run_node_keychain(args: &[String]) -> AppResult<()> {
         Some("store") => {
             let options = parse_options(
                 &args[1..],
-                &["--cluster", "--server", "--account", "--generation"],
+                &["--cluster-uuid", "--server", "--account", "--generation"],
             )?;
-            let cluster = parse_cluster(required(&options, "--cluster")?)?;
+            let cluster = parse_cluster(required(&options, "--cluster-uuid")?)?;
             let endpoint = endpoint_from_options(&options)?;
             let generation = parse_generation(required(&options, "--generation")?)?;
             let run = PtySecurityRunner;
@@ -109,7 +109,7 @@ fn run_master_keychain(args: &[String]) -> AppResult<()> {
             let options = parse_options(
                 &args[1..],
                 &[
-                    "--cluster",
+                    "--cluster-uuid",
                     "--server-id",
                     "--server",
                     "--account",
@@ -147,7 +147,7 @@ fn run_master_keychain(args: &[String]) -> AppResult<()> {
             let options = parse_options(
                 &args[1..],
                 &[
-                    "--cluster",
+                    "--cluster-uuid",
                     "--server-id",
                     "--server",
                     "--account",
@@ -184,7 +184,7 @@ fn run_master_keychain(args: &[String]) -> AppResult<()> {
         Some("delete") => {
             let options = parse_options(
                 &args[1..],
-                &["--cluster", "--server-id", "--server", "--account"],
+                &["--cluster-uuid", "--server-id", "--server", "--account"],
             )?;
             let key = key_from_options(&options)?;
             let deleted = CredentialHelperClient::system()
@@ -269,7 +269,7 @@ fn endpoint_from_options(
 fn key_from_options(options: &BTreeMap<String, String>) -> Result<SmbCredentialKey, (i32, String)> {
     let endpoint = endpoint_from_options(options)?;
     let key = SmbCredentialKey {
-        cluster_uuid: parse_cluster(required(options, "--cluster")?)?,
+        cluster_uuid: parse_cluster(required(options, "--cluster-uuid")?)?,
         server_id: NodeId::new(required(options, "--server-id")?.to_owned())
             .map_err(|error| (2, error.to_string()))?,
         server_host: endpoint.server,
@@ -1041,11 +1041,10 @@ fn security_command(endpoint: &SmbKeychainEndpoint, action: &str) -> SecurityCom
         endpoint.account.clone(),
         "-s".into(),
         endpoint.server.clone(),
-        "-r".into(),
-        "smb ".into(),
-        "-t".into(),
-        "dflt".into(),
     ];
+    if action != "delete" {
+        args.extend(["-r".into(), "smb ".into(), "-t".into(), "dflt".into()]);
+    }
     if action == "store" {
         args.extend([
             "-T".into(),
@@ -1495,11 +1494,21 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "-w")
         );
+        let delete = security_command(&endpoint(), "delete");
+        assert!(!delete.args.iter().any(|arg| arg == "-w"));
         assert!(
-            !security_command(&endpoint(), "delete")
+            !delete.args.iter().any(|arg| arg == "-r" || arg == "-t"),
+            "macOS delete-internet-password does not match -r/-t filters reliably"
+        );
+        assert!(
+            delete
                 .args
                 .iter()
-                .any(|arg| arg == "-w")
+                .any(|arg| arg == "--server" || delete.args.windows(2).any(|pair| pair[0] == "-s"))
+        );
+        assert!(
+            delete.args.windows(2).any(|pair| pair[0] == "--account")
+                || delete.args.windows(2).any(|pair| pair[0] == "-a")
         );
     }
 

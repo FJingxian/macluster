@@ -4049,7 +4049,8 @@ Use --help for scan, SSH, and migration details."#;
   mnode -a storage:NODE_ID@IPv4
   mnode -a local[:SOURCE_PATH] [OPTIONS]
   mnode -mount nfs://NODE/PATH --mount-root PATH [--overlay-existing]
-  mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH [--overlay-existing]
+  mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH
+        [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
   mnode -umount URI
   mnode -migrate controller:NODE_ID
   mnode -l|--list [--all]
@@ -4064,6 +4065,8 @@ OPTIONS
   --host IPv4         Select the login Mac's cluster address.
   --share-id ID       Name an additional NFS share.
   --mount-root PATH   Choose its client mount path.
+  --smb-user ACCOUNT  Choose the SMB account. The password is prompted once.
+  --update-credential Replace the validated SMB password and fan it out.
   --overlay-existing  Keep client files underneath the NFS mount.
   --connect USER@IP   Reach a moved node at its current address.
   --force             Force-detach a named share whose client mount is in use.
@@ -4073,7 +4076,8 @@ EXAMPLES
   mnode -a compute:default-001
   mnode -a storage:nas-01@192.0.2.5
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
-  mnode -mount smb://nas-01/data/project --mount-root /Volumes/project
+  mnode -mount smb://nas-01/data/project --mount-root /Volumes/project \
+    --smb-user smb-user
   mnode -umount smb://nas-01/data/project
   mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
@@ -4110,6 +4114,18 @@ SHARES
   setup. Use it for Homebrew only when the login Mac's copy should take priority.
   `mnode -a local` without SOURCE_PATH enrolls this Mac as the login node and
   mounts the configured primary share.
+
+SMB CREDENTIALS
+  The first new SMB server/account asks once with hidden input. The controller
+  stores the validated master password in the macOS System Keychain and each
+  enrolled Mac stores an Internet Password in that user's login Keychain.
+  Passwords never enter cluster config, SQLite, journals, job environment,
+  command arguments, temporary files, or logs. Use --update-credential to
+  validate and rotate a password before replacing the old master.
+  Shares created before smb_user existed migrate in place by rerunning
+  mnode -mount with the same URI and --mount-root plus --smb-user.
+  Offline nodes receive the credential automatically before their SMB mounts
+  are restored. Removing the last share for a server/account schedules cleanup.
 
 REMOVE NODES
   `mnode -rm NODE_ID --connect USER@IPv4[:PORT]` reaches a moved node, verifies
@@ -4640,7 +4656,7 @@ fn run_target_smb_master_command(
         "internal".into(),
         "smb-master".into(),
         operation.into(),
-        "--cluster".into(),
+        "--cluster-uuid".into(),
         provision.key.cluster_uuid.to_string(),
         "--server-id".into(),
         provision.key.server_id.to_string(),
@@ -15495,7 +15511,7 @@ pub(crate) fn provision_smb_credential_on_node(
         "internal".into(),
         "smb-keychain".into(),
         "store".into(),
-        "--cluster".into(),
+        "--cluster-uuid".into(),
         provision.key.cluster_uuid.to_string(),
         "--server".into(),
         provision.key.server_host.clone(),

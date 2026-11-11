@@ -628,6 +628,19 @@ struct WebNodeInfo {
     queues: Vec<String>,
 }
 
+fn web_node_role(config: &ClusterConfig, node_id: &str) -> String {
+    let roles = config
+        .node_roles(node_id)
+        .into_iter()
+        .map(|role| role.as_str())
+        .collect::<Vec<_>>();
+    if roles.is_empty() {
+        "unassigned".into()
+    } else {
+        roles.join(", ")
+    }
+}
+
 #[derive(Serialize)]
 struct WebJob {
     id: u64,
@@ -764,17 +777,14 @@ fn fetch_bootstrap(
             let queues = config
                 .queues
                 .iter()
-                .filter(|(_, queue)| queue.nodes.iter().any(|node| node == id))
+                .filter(|(_, queue)| {
+                    config.is_compute_node(id) && queue.nodes.iter().any(|node| node == id)
+                })
                 .map(|(name, _)| name.clone())
                 .collect();
             WebNodeInfo {
                 id: id.clone(),
-                role: if config.is_login_node(id) {
-                    "login"
-                } else {
-                    "compute"
-                }
-                .into(),
+                role: web_node_role(&config, id),
                 queues,
             }
         })
@@ -1817,6 +1827,20 @@ fn now_unix_ms() -> u64 {
 mod blocker_tests {
     use super::*;
     use macluster_protocol::control::NodeMonitorRow;
+
+    #[test]
+    fn web_nodes_show_composable_roles_instead_of_binary_login_labels() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\nlogin_node=\"controller\"\ndefault_queue=\"cpu\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"controller\"\nprotocol_version=1\n[queues.cpu]\nnodes=[\"controller\", \"worker\"]\nscheduler=\"fifo\"\n[nodes.controller]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nmachine_uuid=\"4c0f4722-1130-50cf-ae36-55ff1abb5146\"\nexecution_uid=501\nroles=[\"controller\", \"compute\"]\n[nodes.worker]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            web_node_role(&config, "controller"),
+            "controller, compute, storage"
+        );
+        assert_eq!(web_node_role(&config, "worker"), "compute");
+    }
 
     #[test]
     fn changing_browser_view_closes_and_clears_the_old_event_source_before_reconnecting() {

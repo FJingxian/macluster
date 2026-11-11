@@ -357,7 +357,7 @@
     if (!card.querySelector(".node-card-heading")) {
       const head = element("div", "node-card-heading"), identity = element("div", "node-identity");
       const icon = element("span", "mac-icon"); icon.setAttribute("aria-hidden", "true"); icon.append(iconSvg("nodes"));
-      const label = element("div"); label.append(element("h3", "", node.id), element("span", "muted small", `${nodeRole(node.id)} · ${(node.queues || []).join(", ") || "login"}`));
+      const label = element("div"); label.append(element("h3", "", node.id), element("span", "muted small", `${nodeRole(node.id)} · ${(node.queues || []).join(", ") || "unassigned"}`));
       identity.append(icon, label);
       head.append(identity, element("span", "node-health"));
       const gauges = element("div", "node-gauges");

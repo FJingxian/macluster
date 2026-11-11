@@ -4217,7 +4217,7 @@ fn queue_candidate_with_node(
     queue_name: &str,
     node_id: &str,
 ) -> AppResult<String> {
-    if config.is_login_node(node_id) {
+    if config.is_login_node(node_id) && !config.is_compute_node(node_id) {
         let mut candidate = source.to_owned();
         for (name, queue) in &config.queues {
             let members = queue
@@ -23171,6 +23171,22 @@ ssh_port = 22
 
         assert_eq!(updated.queues["mini01"].nodes, vec!["worker"]);
         assert!(updated.queues["analysis"].nodes.is_empty());
+    }
+
+    #[test]
+    fn local_share_registration_preserves_controller_with_compute_role() {
+        let source = "[cluster]\nname = \"test\"\nlogin_node = \"login\"\ndefault_queue = \"mini01\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.mini01]\nnodes = [\"login\", \"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nremote_binary = \"/usr/local/bin/macluster\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\nroles = [\"controller\", \"compute\"]\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nremote_binary = \"/usr/local/bin/macluster\"\n";
+        let config = ClusterConfig::parse(source).expect("parse controller compute role");
+
+        let candidate = queue_candidate_with_node(&config, source, "mini01", "login")
+            .expect("build local share candidate");
+        let updated = ClusterConfig::parse(&candidate).expect("parse updated share candidate");
+
+        assert_eq!(
+            updated.queues["mini01"].nodes,
+            vec!["login".to_owned(), "worker".to_owned()]
+        );
+        assert!(updated.is_compute_node("login"));
     }
 
     #[test]

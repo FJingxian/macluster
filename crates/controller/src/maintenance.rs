@@ -918,6 +918,7 @@ mod tests {
                 source_root: PathBuf::from("/Volumes/datasets"),
                 mount_root: PathBuf::from("/Volumes/datasets"),
                 share_uuid: "share-id".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );

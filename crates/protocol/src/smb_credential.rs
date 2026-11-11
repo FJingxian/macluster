@@ -132,7 +132,7 @@ impl StoredSmbCredential {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SmbKeychainEndpoint {
     pub server: String,
     pub account: String,

@@ -18,7 +18,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use macluster_core::config::{ClusterConfig, NodeConfig, ShareConfig};
+use macluster_core::{
+    config::{ClusterConfig, NodeConfig, ShareConfig},
+    smb_credentials_state::{
+        NodeKeychainState, credential_needs_store, entry_key, record_generation, remove_endpoint,
+    },
+};
 use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, read_frame, sha256_hex, write_frame},
     identifiers::{Id128, StartToken},
@@ -26,6 +31,7 @@ use macluster_protocol::{
         MAX_NFS_ADMIN_REQUEST_BYTES, NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply,
         NfsAdminRequest, NfsAlias, NfsExportCleanup, NfsMount,
     },
+    smb_credential::{SecretString, SmbCredentialProvision, SmbKeychainEndpoint},
     types::{
         ControllerEpoch, ExecutionStatus, FanControlStatus, FanHelperCommand, FanHelperResponse,
         INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState, NfsShareMarker, NodeHealth, Operation,
@@ -300,12 +306,23 @@ fn handle_operation_with_config_path(
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
-            smb_credentials: _,
-            obsolete_smb_credentials: _,
+            smb_credentials,
+            obsolete_smb_credentials,
         } => {
             let config_path = config_path.ok_or_else(|| {
                 ProtocolError::Failed("NFS reconciliation requires a config path".into())
             })?;
+            let cluster_uuid = Id128::parse(&config.share_uuid)
+                .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+            reconcile_smb_credentials_with(
+                &default_smb_credentials_state_dir(),
+                cluster_uuid,
+                &smb_credentials,
+                &obsolete_smb_credentials,
+                &ChildSmbKeychainRunner {
+                    config_path: config_path.to_path_buf(),
+                },
+            )?;
             reconcile_nfs(
                 controller,
                 &config_toml,
@@ -662,6 +679,205 @@ fn reconcile_nfs(
     Ok(())
 }
 
+trait SmbNodeKeychainRunner: Send + Sync {
+    fn has(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String>;
+    fn store(
+        &self,
+        endpoint: &SmbKeychainEndpoint,
+        cluster_uuid: Id128,
+        generation: u64,
+        password: &SecretString,
+    ) -> Result<(), String>;
+    fn delete(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String>;
+}
+
+struct ChildSmbKeychainRunner {
+    config_path: PathBuf,
+}
+
+impl ChildSmbKeychainRunner {
+    fn command(&self, args: &[&str]) -> Command {
+        let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("macluster"));
+        let mut command = Command::new(executable);
+        command
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg("internal")
+            .arg("smb-keychain")
+            .args(args);
+        command
+    }
+
+    fn run(&self, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output, String> {
+        let mut command = self.command(args);
+        command
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cannot start SMB Keychain helper: {error}"))?;
+        if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "SMB Keychain helper stdin is unavailable".to_owned())?
+                .write_all(input)
+                .map_err(|error| format!("cannot send SMB Keychain request: {error}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("SMB Keychain helper failed: {error}"))?;
+        if output.status.success() {
+            Ok(output)
+        } else {
+            Err(format!(
+                "SMB Keychain helper exited with status {:?}",
+                output.status.code()
+            ))
+        }
+    }
+}
+
+impl SmbNodeKeychainRunner for ChildSmbKeychainRunner {
+    fn has(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String> {
+        let output = self.run(
+            &[
+                "has",
+                "--server",
+                &endpoint.server,
+                "--account",
+                &endpoint.account,
+            ],
+            None,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "SMB Keychain helper returned invalid status".to_owned())?;
+        value
+            .get("present")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| "SMB Keychain status is missing present".to_owned())
+    }
+
+    fn store(
+        &self,
+        endpoint: &SmbKeychainEndpoint,
+        cluster_uuid: Id128,
+        generation: u64,
+        password: &SecretString,
+    ) -> Result<(), String> {
+        self.run(
+            &[
+                "store",
+                "--cluster",
+                &cluster_uuid.to_string(),
+                "--server",
+                &endpoint.server,
+                "--account",
+                &endpoint.account,
+                "--generation",
+                &generation.to_string(),
+            ],
+            Some(password.as_secret().as_bytes()),
+        )
+        .map(|_| ())
+    }
+
+    fn delete(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String> {
+        self.run(
+            &[
+                "delete",
+                "--server",
+                &endpoint.server,
+                "--account",
+                &endpoint.account,
+            ],
+            None,
+        )
+        .map(|_| true)
+    }
+}
+
+fn reconcile_smb_credentials_with(
+    state_dir: &Path,
+    expected_cluster: Id128,
+    provisions: &[SmbCredentialProvision],
+    obsolete: &[SmbKeychainEndpoint],
+    runner: &dyn SmbNodeKeychainRunner,
+) -> Result<(), ProtocolError> {
+    for endpoint in obsolete {
+        endpoint
+            .validate()
+            .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+        runner.delete(endpoint).map_err(ProtocolError::Failed)?;
+        remove_endpoint(state_dir, endpoint)
+            .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+    }
+
+    let mut unique = std::collections::BTreeMap::<String, SmbCredentialProvision>::new();
+    for provision in provisions {
+        provision
+            .validate()
+            .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+        if provision.key.cluster_uuid != expected_cluster {
+            return Err(ProtocolError::Failed(
+                "SMB credential belongs to a different cluster".into(),
+            ));
+        }
+        unique
+            .entry(provision.key.service_name())
+            .and_modify(|current| {
+                if provision.credential.generation > current.credential.generation {
+                    *current = provision.clone();
+                }
+            })
+            .or_insert_with(|| provision.clone());
+    }
+    let mut state = NodeKeychainState::load(state_dir)
+        .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+    for provision in unique.into_values() {
+        let endpoint = provision.key.endpoint();
+        let state_generation = state
+            .entries
+            .get(&entry_key(&endpoint))
+            .filter(|entry| entry.cluster_uuid == provision.key.cluster_uuid)
+            .map(|entry| entry.generation);
+        let present = runner.has(&endpoint).map_err(ProtocolError::Failed)?;
+        if !credential_needs_store(state_generation, provision.credential.generation, present) {
+            continue;
+        }
+        runner
+            .store(
+                &endpoint,
+                provision.key.cluster_uuid,
+                provision.credential.generation,
+                &provision.credential.password,
+            )
+            .map_err(ProtocolError::Failed)?;
+        record_generation(
+            state_dir,
+            provision.key.cluster_uuid,
+            &endpoint,
+            provision.credential.generation,
+        )
+        .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+        state = NodeKeychainState::load(state_dir)
+            .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn default_smb_credentials_state_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/Users/unknown"))
+        .join("Library/Application Support/macluster")
+}
+
 fn reconcile_smb_user_mounts(config_path: &Path, local_node_id: &str) -> Result<(), ProtocolError> {
     let executable = std::env::current_exe().map_err(|error| {
         ProtocolError::Failed(format!(
@@ -965,6 +1181,7 @@ fn node_health_with_mount_provider(
             INTERACTIVE_PTY_FEATURE.to_owned(),
             macluster_protocol::types::NAMESPACED_JOBS_FEATURE.to_owned(),
             "config.smb-user-mounts.v1".to_owned(),
+            "config.smb-keychain.v1".to_owned(),
         ],
     })
 }
@@ -2333,6 +2550,10 @@ mod tests {
     use super::*;
     use macluster_protocol::{
         identifiers::{ControllerUuid, NodeId, QueueName},
+        smb_credential::{
+            SecretString, SmbCredentialKey, SmbCredentialProvision, SmbKeychainEndpoint,
+            StoredSmbCredential,
+        },
         types::FanPolicy,
     };
     use std::collections::BTreeMap;
@@ -2342,6 +2563,158 @@ mod tests {
     const TEST_SHARE_UUID: &str = "00000000-0000-4000-8000-000000000001";
     const TEST_STORAGE_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000002";
     const TEST_WORKER_MACHINE_UUID: &str = "00000000-0000-4000-8000-000000000003";
+
+    #[derive(Default)]
+    struct FakeSmbKeychain {
+        present: std::sync::Mutex<std::collections::BTreeSet<SmbKeychainEndpoint>>,
+        stores: std::sync::Mutex<Vec<(SmbKeychainEndpoint, u64)>>,
+        deletes: std::sync::Mutex<Vec<SmbKeychainEndpoint>>,
+    }
+
+    impl SmbNodeKeychainRunner for FakeSmbKeychain {
+        fn has(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String> {
+            Ok(self.present.lock().unwrap().contains(endpoint))
+        }
+
+        fn store(
+            &self,
+            endpoint: &SmbKeychainEndpoint,
+            _cluster_uuid: Id128,
+            generation: u64,
+            _password: &SecretString,
+        ) -> Result<(), String> {
+            self.stores
+                .lock()
+                .unwrap()
+                .push((endpoint.clone(), generation));
+            self.present.lock().unwrap().insert(endpoint.clone());
+            Ok(())
+        }
+
+        fn delete(&self, endpoint: &SmbKeychainEndpoint) -> Result<bool, String> {
+            self.deletes.lock().unwrap().push(endpoint.clone());
+            Ok(self.present.lock().unwrap().remove(endpoint))
+        }
+    }
+
+    fn smb_test_endpoint() -> SmbKeychainEndpoint {
+        SmbKeychainEndpoint {
+            server: "192.0.2.20".into(),
+            account: "smb-user".into(),
+        }
+    }
+
+    fn smb_test_provision(generation: u64) -> SmbCredentialProvision {
+        SmbCredentialProvision {
+            key: SmbCredentialKey {
+                cluster_uuid: Id128::random(),
+                server_id: NodeId::new("nas-01").unwrap(),
+                server_host: "192.0.2.20".into(),
+                account: "smb-user".into(),
+            },
+            credential: StoredSmbCredential {
+                generation,
+                password: SecretString::new("test-secret"),
+            },
+        }
+    }
+
+    fn smb_test_state() -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-agent-smb-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let state = root.join("smb-state");
+        std::fs::create_dir_all(&state).unwrap();
+        (root, state)
+    }
+
+    #[test]
+    fn smb_credential_missing_remote_item_is_injected_and_creates_state() {
+        let (root, state) = smb_test_state();
+        let runner = FakeSmbKeychain::default();
+        let provision = smb_test_provision(3);
+
+        reconcile_smb_credentials_with(
+            &state,
+            provision.key.cluster_uuid,
+            &[provision.clone()],
+            &[],
+            &runner,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runner.stores.lock().unwrap().as_slice(),
+            [(smb_test_endpoint(), 3)]
+        );
+        let saved = macluster_core::smb_credentials_state::NodeKeychainState::load(&state).unwrap();
+        assert_eq!(
+            saved.entries[&macluster_core::smb_credentials_state::entry_key(&smb_test_endpoint())]
+                .generation,
+            3
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smb_credential_same_generation_present_item_does_not_rewrite_the_keychain() {
+        let (root, state) = smb_test_state();
+        let runner = FakeSmbKeychain::default();
+        let provision = smb_test_provision(4);
+        runner.present.lock().unwrap().insert(smb_test_endpoint());
+        macluster_core::smb_credentials_state::record_generation(
+            &state,
+            provision.key.cluster_uuid,
+            &smb_test_endpoint(),
+            4,
+        )
+        .unwrap();
+
+        reconcile_smb_credentials_with(
+            &state,
+            provision.key.cluster_uuid,
+            &[provision],
+            &[],
+            &runner,
+        )
+        .unwrap();
+        assert!(runner.stores.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smb_credential_higher_generation_replaces_and_obsolete_endpoint_is_deleted() {
+        let (root, state) = smb_test_state();
+        let runner = FakeSmbKeychain::default();
+        let provision = smb_test_provision(5);
+        runner.present.lock().unwrap().insert(smb_test_endpoint());
+        macluster_core::smb_credentials_state::record_generation(
+            &state,
+            provision.key.cluster_uuid,
+            &smb_test_endpoint(),
+            4,
+        )
+        .unwrap();
+        let obsolete = SmbKeychainEndpoint {
+            server: "192.0.2.21".into(),
+            account: "old".into(),
+        };
+        runner.present.lock().unwrap().insert(obsolete.clone());
+
+        reconcile_smb_credentials_with(
+            &state,
+            provision.key.cluster_uuid,
+            &[provision],
+            &[obsolete.clone()],
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(runner.stores.lock().unwrap().len(), 1);
+        assert_eq!(runner.deletes.lock().unwrap().as_slice(), [obsolete]);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn unsupported_fan_policy_is_reported_as_capability_not_agent_error() {
@@ -2464,6 +2837,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
                 source_root: "/smb/data".into(),
                 mount_root: "/mnt/smb-data".into(),
                 share_uuid: "00000000-0000-4000-8000-000000000006".into(),
+                smb_user: Some("smb-user".into()),
                 allow_existing_contents: false,
             },
         );
@@ -3132,6 +3506,7 @@ execution_uid = 501
                 source_root: PathBuf::from("/Volumes/archive"),
                 mount_root: PathBuf::from("/definitely/missing/archive"),
                 share_uuid: "00000000-0000-4000-8000-000000000099".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );
@@ -3166,6 +3541,7 @@ execution_uid = 501
                 source_root: PathBuf::from("/data/project"),
                 mount_root: PathBuf::from("/Volumes/project"),
                 share_uuid: share_uuid.into(),
+                smb_user: Some("smb-user".into()),
                 allow_existing_contents: false,
             },
         );
@@ -3222,6 +3598,7 @@ execution_uid = 501
                 source_root: named.clone(),
                 mount_root: named,
                 share_uuid: "00000000-0000-4000-8000-000000000002".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );
@@ -3275,6 +3652,7 @@ execution_uid = 501
                 source_root: PathBuf::from("/srv/data"),
                 mount_root: PathBuf::from("/mnt/data"),
                 share_uuid: "00000000-0000-4000-8000-000000000004".into(),
+                smb_user: None,
                 allow_existing_contents: false,
             },
         );

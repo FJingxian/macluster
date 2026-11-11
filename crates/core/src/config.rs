@@ -10,6 +10,7 @@ use macluster_protocol::{
     identifiers::{Id128, IdentifierError, NodeId, QueueName},
     types::{PROTOCOL_VERSION, SchedulerKind},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::storage_uri::StorageProtocol;
@@ -66,7 +67,7 @@ pub struct QueueConfig {
     pub scheduler: SchedulerKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeConfig {
     pub host: String,
     pub transport: Transport,
@@ -194,7 +195,8 @@ fn add_trusted_node_ssh_args(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Transport {
     Ssh,
     Local,

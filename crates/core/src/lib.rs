@@ -6,6 +6,7 @@ pub mod maintenance;
 pub mod nfs_reconcile;
 pub mod scheduler;
 pub mod service;
+pub mod smb_credentials_state;
 pub mod smb_keychain;
 pub mod storage;
 pub mod storage_uri;

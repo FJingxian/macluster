@@ -8764,6 +8764,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "config.execution-digest.v1",
                         "config.primary-storage-source.v1",
                         "config.smb-user-mounts.v1",
+                        "config.smb-keychain.v1",
                         "metrics.cpu-temperature.v1",
                         "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,

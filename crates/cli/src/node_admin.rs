@@ -1996,6 +1996,7 @@ const REQUIRED_AGENT_FEATURES: &[&str] = &[
     "config.execution-digest.v1",
     "config.primary-storage-source.v1",
     "config.smb-user-mounts.v1",
+    "config.smb-keychain.v1",
     macluster_protocol::types::NAMESPACED_JOBS_FEATURE,
     "metrics.cpu-temperature.v1",
     METRICS_FAN_SPEED_FEATURE,
@@ -19031,13 +19032,29 @@ fn add_ssh_node(
             .operations
             .insert(operation_key.clone(), operation.clone());
         save_admin_state(&state_dir.join("node-admin.json"), &state)?;
-        ensure_remote_config(
-            &node_config,
-            &remote_config,
-            &candidate_source,
-            &operation.id,
-            state_dir,
-        )?;
+        let enrollment_node_id =
+            NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
+        let (smb_warnings, remote_config_result) =
+            crate::smb_credentials::provision_smb_credentials_for_enrollment(
+                &config,
+                &enrollment_node_id,
+                &node_config,
+                || {
+                    ensure_remote_config(
+                        &node_config,
+                        &remote_config,
+                        &candidate_source,
+                        &operation.id,
+                        state_dir,
+                    )
+                },
+            );
+        for warning in smb_warnings {
+            eprintln!(
+                "Warning: SMB credential provisioning during enrollment of {node_id} was deferred: {warning}"
+            );
+        }
+        remote_config_result?;
         let candidate_config =
             ClusterConfig::parse(&candidate_source).map_err(|error| (2, error.to_string()))?;
         let candidate_node_id =

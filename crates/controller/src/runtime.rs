@@ -16,7 +16,7 @@ use macluster_core::{
     maintenance::ResetBarrierPolicy,
     nfs_reconcile::{
         DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
-        DeferredShareMarkerCleanup,
+        DeferredShareMarkerCleanup, DeferredSmbCredentialCleanup,
     },
     scheduler::{NodeEligibility, next_dispatch},
     storage::{ReadOnlyJobStore, Storage, SubmitError},
@@ -35,6 +35,7 @@ use macluster_protocol::{
 use crate::{
     ControllerError, ControllerService,
     events::RuntimeSignal,
+    smb_credential::{CredentialHelperClient, load_smb_credential_provisions},
     transport::{NodeTransport, TransportError},
     wake::{ControllerWake, WakeError, notify_controller},
 };
@@ -183,6 +184,7 @@ struct NfsCleanupAck {
     clients: Vec<DeferredShareClientCleanup>,
     markers: Vec<DeferredShareMarkerCleanup>,
     exports: Vec<DeferredShareExportCleanup>,
+    credentials: Vec<DeferredSmbCredentialCleanup>,
 }
 
 struct ProbeResult {
@@ -1412,6 +1414,16 @@ impl RuntimeState {
                 return Ok(());
             }
         };
+        let smb_credentials = match load_smb_credential_provisions(
+            &service.config,
+            &CredentialHelperClient::system(),
+        ) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.defer_nfs_reconciliation(node_id, error, now);
+                return Ok(());
+            }
+        };
         let has_deferred_cleanup = cleanup_state
             .entries
             .values()
@@ -1422,6 +1434,10 @@ impl RuntimeState {
                 .any(|entry| entry.node_id == node_id)
             || cleanup_state
                 .exports
+                .values()
+                .any(|entry| entry.node_id == node_id)
+            || cleanup_state
+                .credential_entries
                 .values()
                 .any(|entry| entry.node_id == node_id);
         if has_deferred_cleanup && health_ready {
@@ -1497,6 +1513,23 @@ impl RuntimeState {
             }
             cleanup.exports.push(entry.clone());
         }
+        for entry in cleanup_state
+            .credential_entries
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+        {
+            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
+                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
+            }) {
+                self.defer_nfs_reconciliation(
+                    node_id,
+                    "deferred SMB credential cleanup identity does not match this node".into(),
+                    now,
+                );
+                return Ok(());
+            }
+            cleanup.credentials.push(entry.clone());
+        }
 
         let obsolete_mounts = cleanup
             .clients
@@ -1551,6 +1584,11 @@ impl RuntimeState {
                 node_id: entry.client_node_id.clone(),
             })
             .collect::<Vec<_>>();
+        let obsolete_smb_credentials = cleanup
+            .credentials
+            .iter()
+            .flat_map(|entry| entry.endpoints.clone())
+            .collect::<Vec<_>>();
         let operation = Operation::ReconcileNfs {
             controller: service.epoch,
             config_toml,
@@ -1558,8 +1596,8 @@ impl RuntimeState {
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
-            smb_credentials: Vec::new(),
-            obsolete_smb_credentials: Vec::new(),
+            smb_credentials,
+            obsolete_smb_credentials,
         };
         let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
         let node_config = node_config.clone();
@@ -3097,6 +3135,7 @@ fn remove_acknowledged_nfs_cleanup(
     if acknowledged.clients.is_empty()
         && acknowledged.markers.is_empty()
         && acknowledged.exports.is_empty()
+        && acknowledged.credentials.is_empty()
     {
         return Ok(());
     }
@@ -3109,6 +3148,9 @@ fn remove_acknowledged_nfs_cleanup(
     }
     for entry in &acknowledged.exports {
         state.remove_export_cleanup_exact(entry);
+    }
+    for entry in &acknowledged.credentials {
+        state.remove_credential_cleanup_exact(entry);
     }
     state.save_to_dir(state_dir)
 }

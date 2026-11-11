@@ -2,9 +2,9 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs,
     io::{Cursor, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, mpsc},
@@ -15,6 +15,7 @@ use std::{
 use macluster_controller::smb_credential::CredentialHelperClient;
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, Transport},
+    smb_credentials_state::{NodeKeychainState, entry_key, record_generation, remove_endpoint},
     storage_uri::StorageUri,
 };
 use macluster_protocol::{
@@ -25,13 +26,11 @@ use macluster_protocol::{
     },
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::node_admin::AppResult;
 
-const STATE_FILE: &str = "smb-credentials.json";
 const SECURITY_BINARY: &str = "/usr/bin/security";
 const MOUNT_SMBFS_BINARY: &str = "/sbin/mount_smbfs";
 const PTY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -89,6 +88,10 @@ fn run_node_keychain(args: &[String]) -> AppResult<()> {
             let deleted = PtySecurityRunner
                 .delete(&endpoint)
                 .map_err(|error| (1, error.to_string()))?;
+            if deleted {
+                remove_endpoint(&default_state_dir()?, &endpoint)
+                    .map_err(|error| (1, error.to_string()))?;
+            }
             println!("{}", serde_json::json!({ "deleted": deleted }));
             Ok(())
         }
@@ -281,106 +284,7 @@ fn record_node_generation(
     endpoint: &SmbKeychainEndpoint,
     generation: u64,
 ) -> std::io::Result<()> {
-    let mut state = NodeKeychainState::load(state_dir)
-        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
-    state.entries.insert(
-        entry_key(endpoint),
-        NodeCredentialEntry {
-            server: endpoint.server.clone(),
-            account: endpoint.account.clone(),
-            generation,
-            cluster_uuid,
-        },
-    );
-    state.save(state_dir)
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct NodeCredentialEntry {
-    server: String,
-    account: String,
-    generation: u64,
-    cluster_uuid: Id128,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct NodeKeychainState {
-    version: u32,
-    #[serde(default)]
-    entries: BTreeMap<String, NodeCredentialEntry>,
-}
-
-impl Default for NodeKeychainState {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            entries: BTreeMap::new(),
-        }
-    }
-}
-
-impl NodeKeychainState {
-    fn load(state_dir: &Path) -> std::io::Result<Self> {
-        let path = state_dir.join(STATE_FILE);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error),
-        };
-        let state: Self = serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if state.version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported SMB keychain state version",
-            ));
-        }
-        for (key, entry) in &state.entries {
-            let endpoint = SmbKeychainEndpoint {
-                server: entry.server.clone(),
-                account: entry.account.clone(),
-            };
-            endpoint
-                .validate()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            if key != &entry_key(&endpoint) || entry.generation == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid SMB keychain state entry",
-                ));
-            }
-        }
-        Ok(state)
-    }
-
-    fn save(&self, state_dir: &Path) -> std::io::Result<()> {
-        fs::create_dir_all(state_dir)?;
-        let path = state_dir.join(STATE_FILE);
-        let temporary = state_dir.join(format!(".{STATE_FILE}.{}.tmp", Id128::random()));
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &path)?;
-            OpenOptions::new().read(true).open(state_dir)?.sync_all()
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-}
-
-fn entry_key(endpoint: &SmbKeychainEndpoint) -> String {
-    format!("{}/{}", endpoint.server, endpoint.account)
+    record_generation(state_dir, cluster_uuid, endpoint, generation)
 }
 
 trait PasswordPrompt {
@@ -703,6 +607,47 @@ pub(crate) fn rollback_smb_credential_plan_for_config(
         &SshCredentialDistributor,
     )
     .map_err(|error| error.to_string())
+}
+
+fn provision_before_commit_with<T>(
+    config: &ClusterConfig,
+    node_id: &NodeId,
+    node: &NodeConfig,
+    reader: &dyn macluster_controller::smb_credential::MasterCredentialReader,
+    distributor: &dyn CredentialDistributor,
+    commit: impl FnOnce() -> T,
+) -> (Vec<String>, T) {
+    let mut warnings = Vec::new();
+    match macluster_controller::smb_credential::load_smb_credential_provisions(config, reader) {
+        Ok(provisions) => {
+            for provision in provisions {
+                match distributor.ensure_node(node_id, node, &provision) {
+                    Ok(ProvisionState::Provisioned | ProvisionState::Current) => {}
+                    Ok(ProvisionState::Deferred(error)) => warnings.push(error),
+                    Err(error) => warnings.push(error.to_string()),
+                }
+            }
+        }
+        Err(error) => warnings.push(error),
+    }
+    let committed = commit();
+    (warnings, committed)
+}
+
+pub(crate) fn provision_smb_credentials_for_enrollment<T>(
+    config: &ClusterConfig,
+    node_id: &NodeId,
+    node: &NodeConfig,
+    commit: impl FnOnce() -> T,
+) -> (Vec<String>, T) {
+    provision_before_commit_with(
+        config,
+        node_id,
+        node,
+        &CredentialHelperClient::system(),
+        &SshCredentialDistributor,
+        commit,
+    )
 }
 
 fn validate_mount_with_io(
@@ -1145,8 +1090,8 @@ mod tests {
         CredentialDistributor, CredentialPlan, CredentialWorkflowError, DistributionError,
         MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, NodeKeychainState,
         PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError, SmbAuthenticator,
-        ensure_smb_mount_credential_with, rollback_smb_credential_plan, security_command,
-        store_from_reader, validate_mount_with_io,
+        ensure_smb_mount_credential_with, provision_before_commit_with,
+        rollback_smb_credential_plan, security_command, store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -1677,6 +1622,75 @@ mod tests {
         assert!(report.current.is_empty());
         assert!(report.deferred.is_empty());
         assert!(!format!("{report:?}").contains("test-secret"));
+    }
+
+    #[test]
+    fn new_enrollment_provisions_credentials_before_committing_smb_config() {
+        struct Reader(StoredSmbCredential);
+        impl macluster_controller::smb_credential::MasterCredentialReader for Reader {
+            fn get(&self, _key: &SmbCredentialKey) -> Result<Option<StoredSmbCredential>, String> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        struct Distributor {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl CredentialDistributor for Distributor {
+            fn ensure_node(
+                &self,
+                _node_id: &NodeId,
+                _node: &NodeConfig,
+                _provision: &SmbCredentialProvision,
+            ) -> Result<ProvisionState, DistributionError> {
+                self.events.lock().unwrap().push("store");
+                Ok(ProvisionState::Provisioned)
+            }
+
+            fn delete_node(
+                &self,
+                _node_id: &NodeId,
+                _node: &NodeConfig,
+                _endpoint: &SmbKeychainEndpoint,
+            ) -> Result<(), DistributionError> {
+                Ok(())
+            }
+        }
+
+        let mut config = workflow_config();
+        config.shares.insert(
+            "data".into(),
+            macluster_core::config::ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+                server: NodeId::new("nas-01").unwrap(),
+                source_root: "/data".into(),
+                mount_root: "/Users/Shared/data".into(),
+                share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+                smb_user: Some("smb-user".into()),
+                allow_existing_contents: false,
+            },
+        );
+        let reader = Reader(StoredSmbCredential {
+            generation: 2,
+            password: SecretString::new("test-secret"),
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let distributor = Distributor {
+            events: Arc::clone(&events),
+        };
+        let (_warnings, committed) = provision_before_commit_with(
+            &config,
+            &NodeId::new("worker-a").unwrap(),
+            &workflow_nodes()[0].1,
+            &reader,
+            &distributor,
+            || {
+                events.lock().unwrap().push("commit");
+                true
+            },
+        );
+
+        assert!(committed);
+        assert_eq!(events.lock().unwrap().as_slice(), ["store", "commit"]);
     }
 
     #[test]

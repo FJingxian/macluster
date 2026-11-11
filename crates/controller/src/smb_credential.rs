@@ -12,6 +12,8 @@ use macluster_protocol::smb_credential::{
 };
 use thiserror::Error;
 
+use macluster_core::config::ClusterConfig;
+
 pub const SMB_CREDENTIAL_SOCKET_PATH: &str = "/var/run/org.macluster.smb-credential.sock";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -107,6 +109,57 @@ impl CredentialHelperClient {
     ) -> Result<SmbCredentialReplyBody, SmbCredentialClientError> {
         call_at(&self.socket, self.timeout, operation)
     }
+}
+
+pub trait MasterCredentialReader {
+    fn get(&self, key: &SmbCredentialKey) -> Result<Option<StoredSmbCredential>, String>;
+}
+
+impl MasterCredentialReader for CredentialHelperClient {
+    fn get(&self, key: &SmbCredentialKey) -> Result<Option<StoredSmbCredential>, String> {
+        CredentialHelperClient::get(self, key).map_err(|error| error.to_string())
+    }
+}
+
+pub fn load_smb_credential_provisions(
+    config: &ClusterConfig,
+    reader: &dyn MasterCredentialReader,
+) -> Result<Vec<macluster_protocol::smb_credential::SmbCredentialProvision>, String> {
+    let cluster_uuid = macluster_protocol::identifiers::Id128::parse(&config.share_uuid)
+        .map_err(|error| error.to_string())?;
+    let mut keys = std::collections::BTreeMap::new();
+    for share in config
+        .shares
+        .values()
+        .filter(|share| share.protocol == macluster_core::storage_uri::StorageProtocol::Smb)
+    {
+        let account = share.smb_user.as_deref().ok_or_else(|| {
+            format!(
+                "SMB share on server '{}' has no configured account",
+                share.server
+            )
+        })?;
+        let server = config
+            .nodes
+            .get(share.server.as_str())
+            .ok_or_else(|| format!("SMB server '{}' is not configured", share.server))?;
+        let key = SmbCredentialKey {
+            cluster_uuid,
+            server_id: share.server.clone(),
+            server_host: server.host.clone(),
+            account: account.to_owned(),
+        };
+        key.validate().map_err(|error| error.to_string())?;
+        keys.insert(key.service_name(), key);
+    }
+    keys.into_values()
+        .map(|key| {
+            let credential = reader
+                .get(&key)?
+                .ok_or_else(|| format!("master credential is missing for {}", key.server_id))?;
+            Ok(macluster_protocol::smb_credential::SmbCredentialProvision { key, credential })
+        })
+        .collect()
 }
 
 pub fn put_smb_credential(
@@ -229,12 +282,14 @@ pub enum SmbCredentialClientError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         io::{Read, Write},
         os::unix::net::UnixListener,
         path::PathBuf,
         time::Duration,
     };
 
+    use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
         identifiers::{Id128, NodeId},
         smb_credential::{
@@ -244,7 +299,10 @@ mod tests {
         },
     };
 
-    use super::{CredentialHelperClient, SmbCredentialClientError};
+    use super::{
+        CredentialHelperClient, MasterCredentialReader, SmbCredentialClientError,
+        load_smb_credential_provisions,
+    };
 
     fn socket_path() -> (PathBuf, PathBuf) {
         let root = PathBuf::from("/tmp").join(format!(
@@ -416,5 +474,42 @@ mod tests {
         client.ping().unwrap();
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct MapReader {
+        credentials: BTreeMap<String, StoredSmbCredential>,
+    }
+
+    impl MasterCredentialReader for MapReader {
+        fn get(&self, key: &SmbCredentialKey) -> Result<Option<StoredSmbCredential>, String> {
+            Ok(self.credentials.get(&key.service_name()).cloned())
+        }
+    }
+
+    #[test]
+    fn reconnect_provisions_are_loaded_by_unique_scoped_master_key() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nlogin_node = \"login\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\"\nstorage_server = \"nas-01\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = [\"login\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n\n[shares.one]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/data\"\nmount_root = \"/Users/Shared/data\"\nshare_uuid = \"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\"\nsmb_user = \"smb-user\"\n\n[shares.two]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/cluster-user\"\nmount_root = \"/Users/Shared/cluster-user\"\nshare_uuid = \"cccccccc-cccc-4ccc-8ccc-cccccccccccc\"\nsmb_user = \"smb-user\"\n",
+        )
+        .unwrap();
+        let key = SmbCredentialKey {
+            cluster_uuid: Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            server_id: NodeId::new("nas-01").unwrap(),
+            server_host: "192.0.2.20".into(),
+            account: "smb-user".into(),
+        };
+        let stored = StoredSmbCredential {
+            generation: 8,
+            password: SecretString::new("test-secret"),
+        };
+        let reader = MapReader {
+            credentials: BTreeMap::from([(key.service_name(), stored.clone())]),
+        };
+
+        let provisions = load_smb_credential_provisions(&config, &reader).unwrap();
+        assert_eq!(provisions.len(), 1);
+        assert_eq!(provisions[0].key, key);
+        assert_eq!(provisions[0].credential, stored);
+        assert!(!format!("{provisions:?}").contains("test-secret"));
     }
 }

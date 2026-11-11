@@ -8,7 +8,9 @@ use std::{
     path::Path,
 };
 
-use macluster_protocol::{identifiers::Id128, nfs_admin::NfsExportCleanup};
+use macluster_protocol::{
+    identifiers::Id128, nfs_admin::NfsExportCleanup, smb_credential::SmbKeychainEndpoint,
+};
 use serde::{Deserialize, Serialize};
 
 pub const DEFERRED_SHARE_CLEANUP_FILE: &str = "deferred-share-cleanup.json";
@@ -47,6 +49,15 @@ pub struct DeferredShareExportCleanup {
     pub machine_uuid: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeferredSmbCredentialCleanup {
+    pub node_id: String,
+    pub machine_uuid: Option<String>,
+    pub node: crate::config::NodeConfig,
+    pub endpoints: Vec<SmbKeychainEndpoint>,
+    pub wait_for_unmount: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeferredShareCleanupState {
     #[serde(default)]
@@ -57,6 +68,8 @@ pub struct DeferredShareCleanupState {
     pub marker_entries: BTreeMap<String, DeferredShareMarkerCleanup>,
     #[serde(default)]
     pub exports: BTreeMap<String, DeferredShareExportCleanup>,
+    #[serde(default)]
+    pub credential_entries: BTreeMap<String, DeferredSmbCredentialCleanup>,
 }
 
 pub fn client_cleanup_key(share_id: &str, node_id: &str, share_uuid: &str) -> String {
@@ -125,6 +138,25 @@ impl DeferredShareCleanupState {
                 node_id: entry.client_node_id.clone(),
             })
             .collect()
+    }
+
+    pub fn smb_credential_requests_for_node(&self, node_id: &str) -> Vec<SmbKeychainEndpoint> {
+        self.credential_entries
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+            .flat_map(|entry| entry.endpoints.clone())
+            .collect()
+    }
+
+    pub fn remove_credential_cleanup_exact(
+        &mut self,
+        expected: &DeferredSmbCredentialCleanup,
+    ) -> bool {
+        let key = &expected.node_id;
+        if self.credential_entries.get(key) == Some(expected) {
+            return self.credential_entries.remove(key).is_some();
+        }
+        false
     }
 
     pub fn remove_client_cleanup(
@@ -264,9 +296,42 @@ fn atomic_write_journal(path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::{
         DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
-        DeferredShareExportCleanup, DeferredShareMarkerCleanup, client_cleanup_key,
-        export_cleanup_key, marker_cleanup_key,
+        DeferredShareExportCleanup, DeferredShareMarkerCleanup, DeferredSmbCredentialCleanup,
+        client_cleanup_key, export_cleanup_key, marker_cleanup_key,
     };
+
+    #[test]
+    fn deferred_smb_credential_cleanup_round_trips_without_a_secret() {
+        let mut state = DeferredShareCleanupState::default();
+        state.credential_entries.insert(
+            "worker-a".into(),
+            DeferredSmbCredentialCleanup {
+                node_id: "worker-a".into(),
+                machine_uuid: Some("machine-a".into()),
+                node: crate::config::NodeConfig {
+                    host: "192.0.2.20".into(),
+                    transport: crate::config::Transport::Ssh,
+                    remote_binary: "/usr/local/bin/macluster".into(),
+                    ssh_user: Some("worker".into()),
+                    ssh_port: Some(22),
+                    ssh_identity_file: None,
+                    remote_config: None,
+                    machine_uuid: Some("machine-a".into()),
+                    execution_uid: Some(501),
+                },
+                endpoints: vec![macluster_protocol::smb_credential::SmbKeychainEndpoint {
+                    server: "192.0.2.20".into(),
+                    account: "smb-user".into(),
+                }],
+                wait_for_unmount: true,
+            },
+        );
+
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: DeferredShareCleanupState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, state);
+        assert!(!String::from_utf8(encoded).unwrap().contains("password"));
+    }
 
     #[test]
     fn exact_export_cleanup_ack_leaves_other_clients_and_share_generations() {
@@ -364,6 +429,7 @@ mod tests {
             .into_iter()
             .collect(),
             exports: Default::default(),
+            credential_entries: Default::default(),
         };
 
         assert!(state.remove_client_cleanup("data", "worker", "uuid-old"));

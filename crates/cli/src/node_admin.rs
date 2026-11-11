@@ -44,7 +44,7 @@ use macluster_core::{
 use macluster_protocol::{
     control::{
         ControlCommand, ControlErrorCode, ControlPayload, MaintenancePhase, MaintenanceScope,
-        MaintenanceTicket,
+        MaintenanceStatus, MaintenanceTicket,
     },
     framing::{FrameError, sha256_hex},
     helper_update::{HelperArtifact, HelperComponent, HelperUpdateManifest},
@@ -4308,6 +4308,15 @@ fn controller_migration_idle_error(
         })
 }
 
+fn controller_migration_maintenance_error(status: Option<&MaintenanceStatus>) -> Option<String> {
+    status.map(|status| {
+        format!(
+            "controller migration requires no active maintenance; controller maintenance {} is {:?} for {:?}",
+            status.ticket.operation_id, status.phase, status.scope
+        )
+    })
+}
+
 fn controller_migration_candidate(
     config: &ClusterConfig,
     source: &str,
@@ -4372,6 +4381,17 @@ fn controller_migration_candidate(
     candidate = replace_or_append_table(&candidate, &format!("[nodes.{target_id}]"), &target_entry);
     ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
     Ok(candidate)
+}
+
+fn controller_migration_primary_marker_check(
+    shared_root: &Path,
+    cluster_uuid: &str,
+) -> String {
+    let marker = shell_quote(&shared_root.join(".macluster-share-id").to_string_lossy());
+    format!(
+        "/bin/test -f {marker} && /bin/test ! -L {marker} && /usr/bin/grep -Fqx {} {marker}",
+        shell_quote(cluster_uuid)
+    )
 }
 
 fn copy_controller_state_selection(source: &Path, destination: &Path) -> AppResult<()> {
@@ -4490,6 +4510,87 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     if let Some(error) = controller_migration_idle_error(&active) {
         return Err((1, error));
     }
+    ensure_no_node_maintenance_in_progress(&config_path, state_dir)
+        .map_err(|error| (1, error))?;
+    if node_admin_recovery_pending(&config_path, state_dir).map_err(|error| (1, error))? {
+        return Err((
+            1,
+            "controller migration requires all node administration recovery to be complete".into(),
+        ));
+    }
+    if peer_config_sync_pending(&config_path, state_dir).map_err(|error| (1, error))? {
+        return Err((
+            1,
+            "controller migration requires all peer configuration synchronization to complete"
+                .into(),
+        ));
+    }
+    if agent_update_recovery_pending(&config_path, state_dir).map_err(|error| (1, error))? {
+        return Err((
+            1,
+            "controller migration requires all Agent update recovery to complete".into(),
+        ));
+    }
+    if !agent_helper_refresh_pending_nodes(state_dir, &config)
+        .map_err(|error| (1, error))?
+        .is_empty()
+    {
+        return Err((
+            1,
+            "controller migration requires all privileged helper refresh work to complete".into(),
+        ));
+    }
+    let binding = ServiceBinding::load(&config_path, state_dir).map_err(|error| {
+        (
+            1,
+            format!("cannot resolve current controller binding: {error}"),
+        )
+    })?;
+    let manager = crate::service::ServiceManager::current(binding.clone()).map_err(|error| {
+        (
+            1,
+            format!("cannot manage current controller service: {error}"),
+        )
+    })?;
+    let inspection = manager
+        .inspect(Duration::from_secs(2))
+        .map_err(|error| (1, format!("cannot inspect current controller: {error}")))?;
+    if inspection.loaded && inspection.hello.is_none() {
+        return Err((
+            1,
+            "controller migration cannot verify the running controller's maintenance state"
+                .into(),
+        ));
+    }
+    if inspection.hello.is_some() {
+        if !matches!(
+            inspection.hello.as_ref().map(|hello| hello.lifecycle),
+            Some(macluster_protocol::control::ControllerLifecycle::Ready)
+        ) {
+            return Err((
+                1,
+                "controller migration requires a Ready controller or a fully stopped controller"
+                    .into(),
+            ));
+        }
+        let mut client = ControlClient::connect(&binding, MAINTENANCE_CONTROL_TIMEOUT)
+            .map_err(control_client_error)?;
+        let maintenance = match client
+            .request(ControlCommand::InspectMaintenance)
+            .map_err(control_client_error)?
+        {
+            ControlPayload::Maintenance(status) => status,
+            _ => {
+                return Err((
+                    1,
+                    "controller returned an invalid maintenance status before migration".into(),
+                ));
+            }
+        };
+        if let Some(error) = controller_migration_maintenance_error(maintenance.as_ref()) {
+            return Err((1, error));
+        }
+    }
     let facts = read_remote_facts(&target).map_err(|(_, error)| (1, error))?;
     if facts.os != "macos" {
         return Err((1, "controller target must be a macOS node".into()));
@@ -4499,8 +4600,10 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let target_state = target_home.join("Library/Application Support/macluster/controller");
     let local_binary = std::env::current_exe().map_err(io_error)?;
     let local_hash = local_sha256(&local_binary)?;
+    let marker_check =
+        controller_migration_primary_marker_check(&config.shared_root, &config.share_uuid);
     let preflight = format!(
-        "test -d {} && test ! -e {} && test ! -e {}/controller.sqlite3 && /usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}'",
+        "test -d {} && {marker_check} && test ! -e {} && test ! -e {}/controller.sqlite3 && /usr/bin/shasum -a 256 {} | /usr/bin/awk '{{print $1}}'",
         shell_quote(&config.shared_root.to_string_lossy()),
         shell_quote(&target_config.to_string_lossy()),
         shell_quote(&target_state.to_string_lossy()),
@@ -4528,18 +4631,6 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let source = fs::read_to_string(&config_path).map_err(io_error)?;
     let candidate =
         controller_migration_candidate(&config, &source, target_id.as_str(), facts.uid)?;
-    let binding = ServiceBinding::load(&config_path, state_dir).map_err(|error| {
-        (
-            1,
-            format!("cannot resolve current controller binding: {error}"),
-        )
-    })?;
-    let manager = crate::service::ServiceManager::current(binding).map_err(|error| {
-        (
-            1,
-            format!("cannot manage current controller service: {error}"),
-        )
-    })?;
     let was_running = manager
         .intent()
         .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
@@ -21885,6 +21976,48 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         };
         assert!(super::controller_migration_idle_error(std::slice::from_ref(&record)).is_some());
         assert!(super::controller_migration_idle_error(&[]).is_none());
+    }
+
+    #[test]
+    fn controller_migration_rejects_active_controller_maintenance() {
+        let status = macluster_protocol::control::MaintenanceStatus {
+            ticket: macluster_protocol::control::MaintenanceTicket {
+                operation_id: Id128::random(),
+                token: Id128::random(),
+                generation: 3,
+            },
+            scope: macluster_protocol::control::MaintenanceScope::Cluster,
+            phase: macluster_protocol::control::MaintenancePhase::Draining,
+            blockers: Vec::new(),
+        };
+
+        let error = super::controller_migration_maintenance_error(Some(&status))
+            .expect("an active controller maintenance ticket must block migration");
+        assert!(error.contains(&status.ticket.operation_id.to_string()));
+        assert!(super::controller_migration_maintenance_error(None).is_none());
+    }
+
+    #[test]
+    fn controller_migration_target_must_expose_the_primary_share_marker() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-migration-marker-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let uuid = "f779bcf5-ea85-5caa-9579-74b395f3cce5";
+        fs::write(root.join(".macluster-share-id"), uuid).unwrap();
+        let script = super::controller_migration_primary_marker_check(&root, uuid);
+
+        assert!(Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".macluster-share-id"), "wrong").unwrap();
+        assert!(!Command::new("/bin/sh")
+            .args(["-c", &script])
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

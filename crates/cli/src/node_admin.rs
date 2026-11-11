@@ -1867,6 +1867,7 @@ struct AddOptions {
 #[derive(Debug)]
 enum Action {
     Add(AddOptions),
+    AddCompute(NodeId),
     List {
         all: bool,
     },
@@ -1877,6 +1878,7 @@ enum Action {
         connect: Option<NodeEndpoint>,
         force: bool,
     },
+    RemoveCompute(NodeId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1998,6 +2000,9 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         }
         Action::Failures => list_failed_operations(&config_path, &state_dir),
         Action::Add(options) => add_node(&config_path, &state_dir, options),
+        Action::AddCompute(node_id) => {
+            mutate_compute_role(&config_path, &state_dir, &node_id, true)
+        }
         Action::Remove {
             target,
             connect,
@@ -2008,6 +2013,9 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
             } else {
                 remove_node(&config_path, &state_dir, &target, connect.as_ref())
             }
+        }
+        Action::RemoveCompute(node_id) => {
+            mutate_compute_role(&config_path, &state_dir, &node_id, false)
         }
     }
 }
@@ -3594,6 +3602,14 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     .cloned()
                     .ok_or_else(|| (2, format!("{key} requires an endpoint")))?
             };
+            if let Some(node_id) = endpoint.strip_prefix("compute:") {
+                if inline.is_some() || args.len() != 2 {
+                    return Err((2, "compute role add accepts only compute:NODE_ID".into()));
+                }
+                return Ok(Action::AddCompute(
+                    NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
+                ));
+            }
             let mut queue = None;
             let mut share_id = None;
             let mut mount_root = None;
@@ -3736,6 +3752,17 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                 ));
             }
             let value = args[1].clone();
+            if let Some(node_id) = value.strip_prefix("compute:") {
+                if args.len() != 2 {
+                    return Err((
+                        2,
+                        "compute role removal accepts only compute:NODE_ID".into(),
+                    ));
+                }
+                return Ok(Action::RemoveCompute(
+                    NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
+                ));
+            }
             let identifier = value.strip_prefix("share:").unwrap_or(&value);
             NodeId::new(identifier.to_owned()).map_err(|error| (2, error.to_string()))?;
             let is_share = value.starts_with("share:");
@@ -4109,6 +4136,56 @@ fn queue_candidate_with_node(
     replace_queue_members(source, queue_name, &members)
 }
 
+fn compute_role_candidate(
+    config: &ClusterConfig,
+    source: &str,
+    node_id: &str,
+    include: bool,
+) -> AppResult<String> {
+    if !config.nodes.contains_key(node_id) {
+        return Err((2, format!("node '{node_id}' is not configured")));
+    }
+    let mut roles = config.node_roles(node_id);
+    if include {
+        roles.insert(macluster_core::config::NodeRole::Compute);
+    } else {
+        roles.remove(&macluster_core::config::NodeRole::Compute);
+    }
+    let mut candidate = source.to_owned();
+    for (queue_name, queue) in &config.queues {
+        let mut members = queue.nodes.clone();
+        if include {
+            if queue_name == config.default_queue.as_str()
+                && !members.iter().any(|member| member == node_id)
+            {
+                members.push(node_id.to_owned());
+            }
+        } else {
+            members.retain(|member| member != node_id);
+        }
+        candidate = replace_queue_members(&candidate, queue_name, &members)?;
+    }
+    let role_value = roles
+        .iter()
+        .map(|role| format!("\"{}\"", role.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    candidate = replace_section_key(
+        &candidate,
+        &format!("[nodes.{node_id}]"),
+        "roles",
+        &format!("[{role_value}]"),
+    )?;
+    let parsed = ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+    if parsed.is_compute_node(node_id) != include {
+        return Err((
+            1,
+            format!("compute role update for {node_id} did not produce the requested role state"),
+        ));
+    }
+    Ok(candidate)
+}
+
 fn remove_node_from_config(
     source: &str,
     config: &ClusterConfig,
@@ -4140,6 +4217,89 @@ fn remove_node_from_config(
     }
     ClusterConfig::parse(&result).map_err(|error| (2, error.to_string()))?;
     Ok(result)
+}
+
+fn mutate_compute_role(
+    config_path: &Path,
+    state_dir: &Path,
+    node_id: &NodeId,
+    include: bool,
+) -> AppResult<()> {
+    let operation_name = if include {
+        "compute-role add"
+    } else {
+        "compute-role remove"
+    };
+    let maintenance = acquire_node_maintenance_scoped(
+        config_path,
+        state_dir,
+        operation_name,
+        MaintenanceScope::Cluster,
+    )?;
+    let result = (|| -> AppResult<()> {
+        MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
+            (
+                1,
+                format!("cluster config/state directory binding failed: {error}"),
+            )
+        })?;
+        let config_path = config_path.canonicalize().map_err(io_error)?;
+        let source = fs::read_to_string(&config_path).map_err(io_error)?;
+        let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+        if !config.nodes.contains_key(node_id.as_str()) {
+            return Err((2, format!("node '{node_id}' is not configured")));
+        }
+        if !include {
+            let storage = Storage::open(state_dir).map_err(|error| (1, error.to_string()))?;
+            let blockers = storage
+                .jobs_preventing_node_removal(node_id.as_str())
+                .map_err(|error| (1, error.to_string()))?;
+            if !blockers.is_empty() {
+                return Err((
+                    1,
+                    format!(
+                        "cannot remove the compute role from {node_id} while jobs remain: {}",
+                        blockers
+                            .iter()
+                            .map(|job| job.id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        }
+        let candidate = compute_role_candidate(&config, &source, node_id.as_str(), include)?;
+        let candidate_config =
+            ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+        let operation_id = Id128::random().to_string();
+        backup_config(&config_path, &operation_id)?;
+        atomic_write(&config_path, candidate.as_bytes())?;
+        sync_remote_configs(
+            &candidate_config,
+            &candidate,
+            state_dir,
+            &operation_id,
+            None,
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "compute role was changed locally for {node_id}, but peer config sync failed: {error}"
+                ),
+            )
+        })?;
+        if include {
+            println!(
+                "Node {node_id} now has the compute role and belongs to queue {}.",
+                candidate_config.default_queue
+            );
+        } else {
+            println!("Node {node_id} no longer has the compute role.");
+        }
+        Ok(())
+    })();
+    finish_node_maintenance(maintenance, result)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -20681,6 +20841,54 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 force: false
             }) if target == "share:volumes_data"
         ));
+    }
+
+    #[test]
+    fn compute_role_selectors_are_parsed_separately_from_node_enrollment() {
+        let add = ["-a", "compute:login"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&add),
+            Ok(Action::AddCompute(node)) if node.as_str() == "login"
+        ));
+
+        let remove = ["-rm", "compute:login"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&remove),
+            Ok(Action::RemoveCompute(node)) if node.as_str() == "login"
+        ));
+    }
+
+    #[test]
+    fn compute_role_candidate_adds_controller_to_default_queue() {
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n\n[queues.compute]\nnodes=[\"arm-a\"]\nscheduler=\"fifo\"\n\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n\n[nodes.arm-a]\nhost=\"192.0.2.10\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        let candidate = super::compute_role_candidate(&config, source, "login", true).unwrap();
+        let updated = ClusterConfig::parse(&candidate).unwrap();
+
+        assert!(updated.is_compute_node("login"));
+        assert!(updated.queues["compute"].nodes.contains(&"login".into()));
+        assert!(candidate.contains("roles = [\"controller\", \"compute\", \"storage\"]"));
+    }
+
+    #[test]
+    fn compute_role_candidate_preserves_other_roles_on_removal() {
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/tmp/macluster-shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"storage\"\nprotocol_version=1\n\n[queues.compute]\nnodes=[\"arm-a\"]\nscheduler=\"fifo\"\n\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n\n[nodes.storage]\nhost=\"192.0.2.9\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\nroles=[\"compute\",\"storage\"]\n\n[nodes.arm-a]\nhost=\"192.0.2.10\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        let candidate = super::compute_role_candidate(&config, source, "storage", false).unwrap();
+        let updated = ClusterConfig::parse(&candidate).unwrap();
+
+        assert!(!updated.is_compute_node("storage"));
+        assert!(
+            updated
+                .node_roles("storage")
+                .contains(&macluster_core::config::NodeRole::Storage)
+        );
+        assert!(
+            updated
+                .queues
+                .values()
+                .all(|queue| !queue.nodes.iter().any(|node| node == "storage"))
+        );
     }
 
     #[test]

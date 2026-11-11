@@ -14567,8 +14567,19 @@ fn smb_mount_script(share: &ShareConfig, server: &NodeConfig) -> AppResult<Strin
     let logical = shell_quote(&share.mount_root.to_string_lossy());
     let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
     let source = shell_quote(&source);
+    let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
+    let helper = format!("/Library/PrivilegedHelperTools/{label}.sh");
+    let plist = format!("/Library/LaunchDaemons/{label}.plist");
+    let body = format!(
+        "#!/bin/sh\nset -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); [ \"$actual\" = \"$alias\" ] || {{ echo 'SMB logical path is an unrelated symlink' >&2; exit 1; }}; elif [ -e \"$logical\" ]; then [ -d \"$logical\" ] || {{ echo 'SMB logical path is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A \"$logical\") || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical path is not empty' >&2; exit 1; }}; /bin/rmdir \"$logical\"; fi\nif ! /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /bin/mkdir -p \"$physical\"; /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source} \"$physical\"; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$logical\")\"\nif [ ! -L \"$logical\" ]; then /bin/ln -s \"$alias\" \"$logical\"; fi\n"
+    );
+    let plist_body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{helper}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>30</integer><key>ProcessType</key><string>Background</string></dict></plist>\n"
+    );
     Ok(format!(
-        "set -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); [ \"$actual\" = \"$alias\" ] || {{ echo 'SMB logical path is an unrelated symlink' >&2; exit 1; }}; elif [ -e \"$logical\" ]; then [ -d \"$logical\" ] || {{ echo 'SMB logical path is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A \"$logical\") || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical path is not empty' >&2; exit 1; }}; /bin/rmdir \"$logical\"; fi\nif ! /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /bin/mkdir -p \"$physical\"; /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source} \"$physical\"; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$logical\")\"\nif [ ! -L \"$logical\" ]; then /bin/ln -s \"$alias\" \"$logical\"; fi\n"
+        "set -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\n/bin/mkdir -p /Library/PrivilegedHelperTools\n/bin/cat > {helper}.next <<'MACLUSTER_SMB_HELPER'\n{body}MACLUSTER_SMB_HELPER\n/usr/sbin/chown root:wheel {helper}.next\n/bin/chmod 700 {helper}.next\n/bin/mv -f {helper}.next {helper}\n/bin/cat > {plist}.next <<'MACLUSTER_SMB_PLIST'\n{plist_body}MACLUSTER_SMB_PLIST\n/usr/sbin/chown root:wheel {plist}.next\n/bin/chmod 644 {plist}.next\n/bin/mv -f {plist}.next {plist}\n/bin/launchctl bootstrap system {plist}\n/bin/sh {helper}\n",
+        helper = shell_quote(&helper),
+        plist = shell_quote(&plist),
     ))
 }
 
@@ -14576,8 +14587,11 @@ fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
     let physical = shell_quote(&smb_backing_path(&share.share_uuid).to_string_lossy());
     let logical = shell_quote(&share.mount_root.to_string_lossy());
     let alias = shell_quote(&smb_alias_path(share)?.to_string_lossy());
+    let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
+    let helper = shell_quote(&format!("/Library/PrivilegedHelperTools/{label}.sh"));
+    let plist = shell_quote(&format!("/Library/LaunchDaemons/{label}.plist"));
     Ok(format!(
-        "set -eu\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ]; then /bin/rm -f \"$logical\"; fi\nif /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$physical\"; fi\n"
+        "set -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nalias={alias}\nif [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ]; then /bin/rm -f \"$logical\"; fi\nif /sbin/mount | /usr/bin/grep -F \" on $physical (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$physical\"; fi\n/bin/rm -f {helper} {plist}\n"
     ))
 }
 
@@ -21715,6 +21729,8 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(script.contains("project"));
         assert!(script.contains("mount_smbfs"));
         assert!(script.contains("nopassprompt"));
+        assert!(script.contains("/Library/LaunchDaemons/org.macluster.smb."));
+        assert!(script.contains("launchctl bootstrap system"));
         assert!(!script.to_ascii_lowercase().contains("password="));
     }
 

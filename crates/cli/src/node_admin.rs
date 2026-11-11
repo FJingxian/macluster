@@ -39,6 +39,7 @@ use macluster_core::{
     },
     service::ServiceBinding,
     storage::{ReadOnlyJobStore, Storage},
+    storage_uri::{StorageProtocol, StorageUri},
 };
 use macluster_protocol::{
     control::{
@@ -1868,6 +1869,11 @@ struct AddOptions {
 enum Action {
     Add(AddOptions),
     AddCompute(NodeId),
+    Mount {
+        uri: StorageUri,
+        mount_root: PathBuf,
+        overlay_existing: bool,
+    },
     List {
         all: bool,
     },
@@ -1879,6 +1885,7 @@ enum Action {
         force: bool,
     },
     RemoveCompute(NodeId),
+    Umount(StorageUri),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2003,6 +2010,11 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::AddCompute(node_id) => {
             mutate_compute_role(&config_path, &state_dir, &node_id, true)
         }
+        Action::Mount {
+            uri,
+            mount_root,
+            overlay_existing,
+        } => mount_storage(&config_path, &state_dir, uri, mount_root, overlay_existing),
         Action::Remove {
             target,
             connect,
@@ -2017,6 +2029,7 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::RemoveCompute(node_id) => {
             mutate_compute_role(&config_path, &state_dir, &node_id, false)
         }
+        Action::Umount(uri) => umount_storage(&config_path, &state_dir, uri),
     }
 }
 
@@ -3593,6 +3606,67 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         }
         return Ok(Action::Scan);
     }
+    if key == "-mount" || key == "--mount" {
+        let uri_text = if let Some(value) = inline {
+            value.to_owned()
+        } else {
+            args.get(1)
+                .cloned()
+                .ok_or_else(|| (2, format!("{key} requires a storage URI")))?
+        };
+        let uri = StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?;
+        let mut mount_root = None;
+        let mut overlay_existing = false;
+        let mut index = if inline.is_some() { 1 } else { 2 };
+        while index < args.len() {
+            match args[index].as_str() {
+                "--overlay-existing" => {
+                    if overlay_existing {
+                        return Err((2, "--overlay-existing may only be specified once".into()));
+                    }
+                    overlay_existing = true;
+                    index += 1;
+                }
+                "--mount-root" => {
+                    if mount_root.is_some() {
+                        return Err((2, "--mount-root may only be specified once".into()));
+                    }
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| (2, "--mount-root requires an absolute path".into()))?
+                        .trim_end_matches('/')
+                        .to_owned();
+                    if !safe_absolute_remote_path(&value) {
+                        return Err((
+                            2,
+                            "--mount-root must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_' or '-'".into(),
+                        ));
+                    }
+                    mount_root = Some(PathBuf::from(value));
+                    index += 2;
+                }
+                option => return Err((2, format!("unknown mnode mount option '{option}'"))),
+            }
+        }
+        return Ok(Action::Mount {
+            uri,
+            mount_root: mount_root
+                .ok_or_else(|| (2, "mnode -mount requires --mount-root".into()))?,
+            overlay_existing,
+        });
+    }
+    if key == "-umount" || key == "--umount" {
+        if args.len() != (if inline.is_some() { 1 } else { 2 }) {
+            return Err((2, format!("{key} requires exactly one storage URI")));
+        }
+        let uri_text = inline
+            .map(str::to_owned)
+            .or_else(|| args.get(1).cloned())
+            .ok_or_else(|| (2, format!("{key} requires a storage URI")))?;
+        return Ok(Action::Umount(
+            StorageUri::parse(&uri_text).map_err(|error| (2, error.to_string()))?,
+        ));
+    }
     match key {
         "-a" | "--add" => {
             let endpoint = if let Some(value) = inline {
@@ -3843,38 +3917,41 @@ fn node_help(full: bool) -> &'static str {
     if !full {
         return r#"Usage
   mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
-  mnode -a local[:SOURCE_PATH] [OPTIONS]
+  mnode -a compute:NODE_ID
+  mnode -mount URI --mount-root PATH
+  mnode -umount URI
   mnode -l|--list [--all]
-  mnode --scan
-  mnode --failed
-  mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
-  mnode -rm share:SHARE_ID [--force]
+  mnode -rm|--remove NODE_ID|compute:NODE_ID|share:SHARE_ID
 
 OPTIONS
   --queue QUEUE       Choose a compute queue.
-  --host IPv4         Select the login Mac's cluster address.
-  --share-id ID       Name an additional NFS share.
-  --mount-root PATH   Choose its client mount path.
-  --overlay-existing  Keep client files under the NFS mount.
-  --force             Force-detach a named share whose NFS mount is in use.
+  --mount-root PATH   Required client mount path.
+  --overlay-existing  Confirm covering existing files.
+  --force             Force-detach a busy share.
 
 EXAMPLES
   mnode -a user@192.0.2.10
-  mnode -a local
-  mnode --scan
+  mnode -a compute:default-001
+  mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
+  mnode -umount nfs://login-01/Users/Shared/tools
 
 Use `mnode -l --all` to include unreachable compute nodes.
 
-Use --help for share, SSH, and removal details."#;
+Use --help for scan, SSH, and migration details."#;
     }
 
     r#"Usage
   mnode -a|--add USER@IPv4[:PORT][:SOURCE_PATH] [OPTIONS]
+  mnode -a compute:NODE_ID
   mnode -a local[:SOURCE_PATH] [OPTIONS]
+  mnode -mount nfs://NODE/PATH --mount-root PATH [--overlay-existing]
+  mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH [--overlay-existing]
+  mnode -umount URI
   mnode -l|--list [--all]
   mnode --scan
   mnode --failed
   mnode -rm|--remove NODE_ID [--connect USER@IPv4[:PORT]]
+  mnode -rm compute:NODE_ID
   mnode -rm share:SHARE_ID [--force]
 
 OPTIONS
@@ -3888,6 +3965,10 @@ OPTIONS
 
 EXAMPLES
   mnode -a user@192.0.2.10
+  mnode -a compute:default-001
+  mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
+  mnode -mount smb://nas-01/data/project --mount-root /Volumes/project
+  mnode -umount smb://nas-01/data/project
   mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
   mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
@@ -13849,6 +13930,7 @@ fn add_node(config_path: &Path, state_dir: &Path, mut options: AddOptions) -> Ap
                     &source_path,
                     options.mount_root.as_deref(),
                     options.overlay_existing,
+                    true,
                 )?;
             }
             Ok(())
@@ -13933,6 +14015,7 @@ fn add_node(config_path: &Path, state_dir: &Path, mut options: AddOptions) -> Ap
                     &source_path,
                     options.mount_root.as_deref(),
                     options.overlay_existing,
+                    true,
                 )?;
             }
             Ok(())
@@ -14003,6 +14086,120 @@ fn confirm_overlay_existing(options: &mut AddOptions) -> AppResult<()> {
     apply_overlay_confirmation(options, &response)
 }
 
+fn managed_storage_share_id(uri: &StorageUri) -> String {
+    let digest = sha256_hex(uri.canonical.as_bytes()).expect("SHA-256 accepts bounded strings");
+    format!("mnt-{}", &digest[..16])
+}
+
+fn managed_paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn mount_storage(
+    config_path: &Path,
+    state_dir: &Path,
+    uri: StorageUri,
+    mount_root: PathBuf,
+    overlay_existing: bool,
+) -> AppResult<()> {
+    if uri.protocol != StorageProtocol::Nfs {
+        return Err((
+            1,
+            "SMB mounting is added by the SMB provider implementation".into(),
+        ));
+    }
+    let config = read_config(config_path)?;
+    if !config.nodes.contains_key(uri.server.as_str()) {
+        return Err((
+            2,
+            format!("storage server '{}' is not a registered node", uri.server),
+        ));
+    }
+    if managed_paths_overlap(&mount_root, &config.shared_root) {
+        return Err((
+            2,
+            format!(
+                "mount root {} overlaps primary share {}",
+                mount_root.display(),
+                config.shared_root.display()
+            ),
+        ));
+    }
+    for (share_id, share) in &config.shares {
+        if share.protocol == uri.protocol
+            && share.server == uri.server
+            && share.source_root == Path::new(&uri.source)
+        {
+            if share.mount_root != mount_root {
+                return Err((
+                    2,
+                    format!(
+                        "storage URI {} is already mounted at {}; run `mnode -umount {}` before changing the mount root",
+                        uri,
+                        share.mount_root.display(),
+                        uri
+                    ),
+                ));
+            }
+            return register_named_share(
+                config_path,
+                state_dir,
+                uri.server.as_str(),
+                None,
+                share_id,
+                &uri.source,
+                Some(&mount_root.to_string_lossy()),
+                overlay_existing,
+                false,
+            );
+        }
+        if managed_paths_overlap(&mount_root, &share.mount_root) {
+            return Err((
+                2,
+                format!(
+                    "mount root {} overlaps managed share {} at {}",
+                    mount_root.display(),
+                    share_id,
+                    share.mount_root.display()
+                ),
+            ));
+        }
+    }
+    if overlay_existing && Path::new(&uri.source) != mount_root {
+        return Err((
+            2,
+            "--overlay-existing requires the URI source path to equal --mount-root".into(),
+        ));
+    }
+    let share_id = managed_storage_share_id(&uri);
+    register_named_share(
+        config_path,
+        state_dir,
+        uri.server.as_str(),
+        None,
+        &share_id,
+        &uri.source,
+        Some(&mount_root.to_string_lossy()),
+        overlay_existing,
+        false,
+    )
+}
+
+fn umount_storage(config_path: &Path, state_dir: &Path, uri: StorageUri) -> AppResult<()> {
+    let config = read_config(config_path)?;
+    let share_id = config
+        .shares
+        .iter()
+        .find(|(_, share)| {
+            share.protocol == uri.protocol
+                && share.server == uri.server
+                && share.source_root == Path::new(&uri.source)
+        })
+        .map(|(id, _)| id.clone())
+        .ok_or_else(|| (2, format!("storage URI {uri} is not mounted")))?;
+    remove_share(config_path, state_dir, &share_id, false)
+}
+
 fn register_named_share(
     config_path: &Path,
     state_dir: &Path,
@@ -14012,6 +14209,7 @@ fn register_named_share(
     requested_source: &str,
     requested_mount_root: Option<&str>,
     allow_existing_contents: bool,
+    queue_server: bool,
 ) -> AppResult<()> {
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
@@ -14167,8 +14365,11 @@ fn register_named_share(
             share_uuid: marker_uuid.clone(),
             allow_existing_contents,
         };
-        let queued_source =
-            queue_candidate_with_node(&config, &source_text, queue_name, &server_id)?;
+        let queued_source = if queue_server {
+            queue_candidate_with_node(&config, &source_text, queue_name, &server_id)?
+        } else {
+            source_text.clone()
+        };
         let candidate = append_share_config(&queued_source, share_id, &share)?;
         let _preliminary_candidate_config =
             ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
@@ -14237,8 +14438,11 @@ fn register_named_share(
             AgentStagePurpose::Share,
             Some(&active_nodes),
         )?;
-        let queued_source =
-            queue_candidate_with_node(&staged_config, &staged_source, queue_name, &server_id)?;
+        let queued_source = if queue_server {
+            queue_candidate_with_node(&staged_config, &staged_source, queue_name, &server_id)?
+        } else {
+            staged_source.clone()
+        };
         let candidate = append_share_config(&queued_source, share_id, &share)?;
         let candidate_config =
             ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
@@ -17683,6 +17887,7 @@ mod tests {
     use macluster_core::maintenance::MaintenanceLock;
     use macluster_core::nfs_reconcile::DeferredShareCleanupState;
     use macluster_core::storage::{ReadOnlyJobStore, Storage};
+    use macluster_core::storage_uri::StorageUri;
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
     use macluster_protocol::nfs_admin::NfsAdminOperation;
@@ -20777,6 +20982,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             source.to_str().unwrap(),
             mount.to_str(),
             false,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -20863,6 +21069,54 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             parse_action(&remove),
             Ok(Action::RemoveCompute(node)) if node.as_str() == "login"
         ));
+    }
+
+    #[test]
+    fn mount_requires_a_normalized_absolute_mount_root() {
+        let args = [
+            "-mount",
+            "nfs://default-001/Volumes/external-disk",
+            "--mount-root",
+            "/Volumes/external-disk",
+        ]
+        .map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Mount { uri, mount_root, overlay_existing: false })
+                if uri.canonical == "nfs://default-001/Volumes/external-disk"
+                    && mount_root == PathBuf::from("/Volumes/external-disk")
+        ));
+
+        let missing = ["-mount", "nfs://default-001/Volumes/external-disk"].map(str::to_owned);
+        assert!(parse_action(&missing).is_err());
+        let relative = [
+            "-mount",
+            "nfs://default-001/Volumes/external-disk",
+            "--mount-root",
+            "Volumes/external-disk",
+        ]
+        .map(str::to_owned);
+        assert!(parse_action(&relative).is_err());
+    }
+
+    #[test]
+    fn umount_uses_the_canonical_uri_without_another_mount_root() {
+        let args = ["-umount", "nfs://default-001/Volumes/external-disk/"].map(str::to_owned);
+        assert!(matches!(
+            parse_action(&args),
+            Ok(Action::Umount(uri))
+                if uri.canonical == "nfs://default-001/Volumes/external-disk"
+        ));
+    }
+
+    #[test]
+    fn managed_share_id_is_stable_for_the_canonical_uri() {
+        let first = StorageUri::parse("nfs://default-001/Volumes/external-disk/").unwrap();
+        let second = StorageUri::parse("nfs://default-001/Volumes/external-disk").unwrap();
+        assert_eq!(
+            super::managed_storage_share_id(&first),
+            super::managed_storage_share_id(&second)
+        );
     }
 
     #[test]

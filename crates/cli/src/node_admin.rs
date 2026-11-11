@@ -4351,25 +4351,37 @@ fn controller_migration_candidate(
         .nodes
         .get(&current_id)
         .expect("configured controller exists");
+    let old_compute = config.is_compute_node(&current_id);
+    let target_compute = config.is_compute_node(target_id);
     let user = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
         .ok_or_else(|| (1, "USER is not set for controller migration".into()))?;
     let old_entry = format!(
-        "[nodes.{current_id}]\nhost = \"{}\"\ntransport = \"ssh\"\nremote_binary = \"{}\"\nssh_user = \"{}\"\nssh_port = {}\nmachine_uuid = \"{}\"\nexecution_uid = {}\n",
+        "[nodes.{current_id}]\nhost = \"{}\"\ntransport = \"ssh\"\nremote_binary = \"{}\"\nssh_user = \"{}\"\nssh_port = {}\nmachine_uuid = \"{}\"\nexecution_uid = {}\n{}\n",
         old.host,
         old.remote_binary,
         old.ssh_user.as_deref().unwrap_or(&user),
         old.ssh_port.unwrap_or(22),
         old.machine_uuid.as_deref().unwrap_or_default(),
         old.execution_uid.unwrap_or_default(),
+        if old_compute {
+            "roles = [\"compute\"]"
+        } else {
+            ""
+        },
     );
     let target_entry = format!(
-        "[nodes.{target_id}]\nhost = \"{}\"\ntransport = \"local\"\nremote_binary = \"{}\"\nmachine_uuid = \"{}\"\nexecution_uid = {}\n",
+        "[nodes.{target_id}]\nhost = \"{}\"\ntransport = \"local\"\nremote_binary = \"{}\"\nmachine_uuid = \"{}\"\nexecution_uid = {}\n{}\n",
         target.host,
         target.remote_binary,
         target.machine_uuid.as_deref().unwrap_or_default(),
         target_uid,
+        if target_compute {
+            "roles = [\"compute\"]"
+        } else {
+            ""
+        },
     );
     let mut candidate = replace_section_key(
         source,
@@ -4377,6 +4389,31 @@ fn controller_migration_candidate(
         "login_node",
         &format!("\"{target_id}\""),
     )?;
+    for (queue_name, queue) in &config.queues {
+        let old_was_member = queue.nodes.iter().any(|node| node == &current_id);
+        let target_was_member = queue.nodes.iter().any(|node| node == &target_id);
+        let mut members = queue
+            .nodes
+            .iter()
+            .filter(|node| node.as_str() != current_id && node.as_str() != target_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if old_compute && old_was_member {
+            members.push(current_id.clone());
+        }
+        if target_compute && target_was_member {
+            members.push(target_id.to_owned());
+        }
+        if queue_name == config.default_queue.as_str() {
+            if old_compute && !members.iter().any(|node| node == &current_id) {
+                members.push(current_id.clone());
+            }
+            if target_compute && !members.iter().any(|node| node == target_id) {
+                members.push(target_id.to_owned());
+            }
+        }
+        candidate = replace_queue_members(&candidate, queue_name, &members)?;
+    }
     candidate = replace_or_append_table(&candidate, &format!("[nodes.{current_id}]"), &old_entry);
     candidate = replace_or_append_table(&candidate, &format!("[nodes.{target_id}]"), &target_entry);
     ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
@@ -21980,7 +22017,7 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
 
     #[test]
     fn controller_migration_candidate_switches_local_transport() {
-        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"default-001\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.default-001]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nssh_user=\"worker\"\nssh_port=22\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdee\"\n";
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"default-001\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.default-001]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nssh_user=\"worker\"\nssh_port=22\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdee\"\nroles=[\"compute\"]\n";
         let config = ClusterConfig::parse(source).unwrap();
         let candidate =
             super::controller_migration_candidate(&config, source, "default-001", 502).unwrap();
@@ -21993,6 +22030,32 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert_eq!(updated.nodes["default-001"].transport, Transport::Local);
         assert_eq!(updated.nodes["default-001"].execution_uid, Some(502));
         assert_eq!(updated.nodes["login"].transport, Transport::Ssh);
+        assert!(updated.is_compute_node("default-001"));
+        assert!(updated.queues["compute"].nodes.contains(&"default-001".into()));
+    }
+
+    #[test]
+    fn controller_migration_does_not_turn_legacy_controller_queue_membership_into_compute() {
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"login\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.default-001]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nssh_user=\"worker\"\nssh_port=22\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdee\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+        assert!(!config.is_compute_node("login"));
+
+        let candidate =
+            super::controller_migration_candidate(&config, source, "default-001", 502).unwrap();
+        let updated = ClusterConfig::parse(&candidate).unwrap();
+
+        assert_eq!(
+            updated.login_node.as_ref().map(NodeId::as_str),
+            Some("default-001")
+        );
+        assert!(!updated.is_compute_node("login"));
+        assert!(!updated.is_compute_node("default-001"));
+        assert!(updated.queues.values().all(|queue| {
+            queue
+                .nodes
+                .iter()
+                .all(|node| node != "login" && node != "default-001")
+        }));
     }
 
     #[test]

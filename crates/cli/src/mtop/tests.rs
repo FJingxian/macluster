@@ -207,17 +207,38 @@ fn login_without_compute_membership_stays_separate_in_full_cluster_view() {
 }
 
 #[test]
-fn one_shot_monitor_does_not_return_login_as_a_compute_node_without_queue_filter() {
+fn one_shot_monitor_returns_managed_login_and_excludes_storage_transport() {
     use macluster_core::config::ClusterConfig;
 
     let config = ClusterConfig::parse(
-        "[cluster]\nname = \"test\"\nlogin_node = \"login\"\ndefault_queue = \"mini01\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.mini01]\nnodes = [\"login\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n",
+        "[cluster]\nname = \"test\"\nlogin_node = \"login\"\ndefault_queue = \"mini01\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.mini01]\nnodes = []\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n",
     )
     .unwrap();
 
-    let (_, compute_nodes) = super::sample_one_shot(&config, None);
+    let (_, nodes) = super::sample_one_shot(&config, None);
 
-    assert!(compute_nodes.is_empty());
+    assert_eq!(
+        nodes.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(),
+        ["login"]
+    );
+}
+
+#[test]
+fn tui_identity_discovery_excludes_storage_transport_nodes() {
+    use macluster_core::config::ClusterConfig;
+
+    let config = ClusterConfig::parse(
+        "[cluster]\nname = \"test\"\nlogin_node = \"login\"\ndefault_queue = \"default\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nroles = [\"compute\"]\n\n[nodes.nas-01]\nhost = \"192.0.2.20\"\ntransport = \"storage\"\n",
+    )
+    .unwrap();
+
+    let identities = super::configured_node_identities(&config);
+    let ids = identities
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, ["login", "worker"]);
 }
 
 #[test]

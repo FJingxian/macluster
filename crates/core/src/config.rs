@@ -373,6 +373,15 @@ impl ClusterConfig {
         self.node_roles(node_id).contains(&NodeRole::Compute)
     }
 
+    /// Nodes managed by this release's macOS Agent. External storage providers
+    /// use the `storage` transport and are inventory-only because they expose
+    /// no compatible Agent metrics or execution interface.
+    pub fn is_operational_node(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .is_some_and(|node| node.transport != Transport::Storage)
+    }
+
     /// Return a queue view suitable for dispatch while preserving raw
     /// membership in the parsed config for compatibility with existing files.
     pub fn queue_for_dispatch(&self, queue_name: &str) -> Option<QueueConfig> {

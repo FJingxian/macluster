@@ -132,7 +132,7 @@ pub(crate) fn sample_one_shot(
         .nodes
         .iter()
         .filter(|(id, _)| {
-            config.is_compute_node(id)
+            config.is_operational_node(id)
                 && allowed
                     .as_ref()
                     .is_none_or(|members| members.iter().any(|member| member == *id))
@@ -768,6 +768,7 @@ fn configured_node_identities(config: &ClusterConfig) -> Vec<ConfiguredNode> {
     config
         .nodes
         .iter()
+        .filter(|(id, _)| config.is_operational_node(id))
         .map(|(id, node)| ConfiguredNode {
             id: id.clone(),
             host: node.host.clone(),

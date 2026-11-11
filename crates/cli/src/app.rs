@@ -7587,6 +7587,7 @@ impl Drop for ControllerSignalGuard {
 }
 
 #[derive(Serialize)]
+#[derive(Clone)]
 struct NodeMetricRow {
     id: String,
     host: String,
@@ -7627,7 +7628,8 @@ fn sample_cluster(
         .filter_map(|(id, record)| {
             let node = config.nodes.get(&id)?;
             let identity_key = node.machine_uuid.as_deref().unwrap_or(node.host.as_str());
-            (record.identity_key.eq_ignore_ascii_case(identity_key)
+            (config.is_operational_node(&id)
+                && record.identity_key.eq_ignore_ascii_case(identity_key)
                 && record.is_confirmed_offline()
                 && !config.is_login_node(&id))
             .then_some(id)
@@ -7688,7 +7690,12 @@ fn sample_cluster(
         });
     }
     rows.sort_by(|left, right| left.id.cmp(&right.id));
-    let pool_total = aggregate_metrics(&rows);
+    let compute_rows = rows
+        .iter()
+        .filter(|row| config.is_compute_node(&row.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let pool_total = aggregate_metrics(&compute_rows);
     ClusterMetricView {
         sampled_unix_ms: now_unix_ms(),
         login,
@@ -7740,7 +7747,7 @@ fn cached_monitor_samples(
         .nodes
         .iter()
         .filter(|(id, _)| {
-            config.is_compute_node(id)
+            config.is_operational_node(id)
                 && allowed
                     .as_ref()
                     .is_none_or(|members| members.iter().any(|member| member == *id))

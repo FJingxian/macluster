@@ -138,6 +138,20 @@ fn external_storage_transport_rejects_compute_capability_and_agent_settings() {
 }
 
 #[test]
+fn operational_nodes_are_local_or_ssh_agent_nodes_and_exclude_storage_transports() {
+    let config = ClusterConfig::parse(&format!(
+        "{}\n[nodes.nas-01]\nhost = \"192.0.2.5\"\ntransport = \"storage\"\n",
+        extended_config()
+    ))
+    .unwrap();
+
+    assert!(config.is_operational_node("mini01-a"));
+    assert!(config.is_operational_node("login"));
+    assert!(!config.is_operational_node("nas-01"));
+    assert!(!config.is_operational_node("missing"));
+}
+
+#[test]
 fn legacy_controller_queue_membership_is_not_implicit_compute() {
     let source = extended_config()
         .replace(

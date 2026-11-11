@@ -892,7 +892,7 @@ fn admission_error(error: AdmissionError) -> ControlError {
         AdmissionError::Storage(_) => ControlErrorCode::Unavailable,
         AdmissionError::StorageNamespace
         | AdmissionError::UnknownQueue(_)
-        | AdmissionError::LoginNode(_)
+        | AdmissionError::NodeNotCompute(_)
         | AdmissionError::UnknownRequiredShare(_)
         | AdmissionError::NodeNotInQueue { .. }
         | AdmissionError::InvalidSharedPath { .. } => ControlErrorCode::InvalidRequest,

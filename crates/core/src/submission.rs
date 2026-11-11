@@ -19,8 +19,8 @@ pub enum AdmissionError {
     StorageNamespace,
     #[error("queue '{0}' is not configured")]
     UnknownQueue(String),
-    #[error("login node '{0}' cannot accept jobs; select a compute node")]
-    LoginNode(String),
+    #[error("node '{0}' cannot accept jobs because it lacks the compute role")]
+    NodeNotCompute(String),
     #[error("node '{node}' is not a member of queue '{queue}'")]
     NodeNotInQueue { node: String, queue: String },
     #[error("job requires unknown named NFS share '{0}'")]
@@ -50,8 +50,8 @@ pub fn admit_submission(
         .queue_for_dispatch(spec.queue.as_str())
         .ok_or_else(|| AdmissionError::UnknownQueue(spec.queue.to_string()))?;
     if let Some(node) = &spec.node {
-        if config.is_login_node(node.as_str()) {
-            return Err(AdmissionError::LoginNode(node.to_string()));
+        if !config.is_compute_node(node.as_str()) {
+            return Err(AdmissionError::NodeNotCompute(node.to_string()));
         }
         if !queue.nodes.iter().any(|member| member == node.as_str()) {
             return Err(AdmissionError::NodeNotInQueue {
@@ -165,7 +165,7 @@ mod tests {
         spec.node = Some(NodeId::new("login").unwrap());
         assert!(matches!(
             admit_submission(&storage, &config, RequestId::random(), spec),
-            Err(AdmissionError::LoginNode(_))
+            Err(AdmissionError::NodeNotCompute(_))
         ));
 
         let mut spec = fixture.spec();
@@ -174,6 +174,32 @@ mod tests {
             admit_submission(&storage, &config, RequestId::random(), spec),
             Err(AdmissionError::StorageNamespace)
         ));
+    }
+
+    #[test]
+    fn admission_accepts_a_controller_with_an_explicit_compute_role() {
+        let fixture = Fixture::new();
+        let config_path = fixture.0.join("config.toml");
+        let source = fs::read_to_string(&config_path).unwrap();
+        let source = source
+            .replace(
+                "[queues.cpu]\nnodes=[\"compute\"]",
+                "[queues.cpu]\nnodes=[\"login\", \"compute\"]",
+            )
+            .replace(
+                "[nodes.login]\nhost=\"127.0.0.1\"",
+                "[nodes.login]\nhost=\"127.0.0.1\"\nroles=[\"controller\", \"compute\", \"storage\"]",
+            );
+        fs::write(&config_path, source).unwrap();
+        let config = fixture.config();
+        let storage = Storage::open(fixture.0.join("state")).unwrap();
+        let mut spec = fixture.spec();
+        spec.node = Some(NodeId::new("login").unwrap());
+
+        let job = admit_submission(&storage, &config, RequestId::random(), spec)
+            .expect("a controller with an explicit compute role must accept pinned jobs");
+
+        assert_eq!(job.spec.node, Some(NodeId::new("login").unwrap()));
     }
 
     #[test]

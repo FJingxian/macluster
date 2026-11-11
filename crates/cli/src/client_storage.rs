@@ -275,7 +275,32 @@ fn overlay_targets(descriptor: &ClientDescriptor, client_ip: &str) -> Result<Vec
                 ));
             }
         };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink() {
+            if mount.is_smb() {
+                let actual = std::fs::read_link(&path).map_err(|error| {
+                    format!(
+                        "cannot inspect SMB logical mount target {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if actual == std::path::Path::new(&mount.backing_alias()) {
+                    // A persisted SMB mount is exposed through this exact
+                    // alias. Re-joining must recognize that managed layout.
+                    continue;
+                }
+                return Err(format!(
+                    "SMB logical mount target {} points to {}, not its managed backing path {}",
+                    path.display(),
+                    actual.display(),
+                    mount.backing_alias()
+                ));
+            }
+            return Err(format!(
+                "client mount target {} must be a real directory",
+                path.display()
+            ));
+        }
+        if !metadata.is_dir() {
             return Err(format!(
                 "client mount target {} must be a real directory",
                 path.display()
@@ -757,6 +782,45 @@ mod tests {
         assert_eq!(
             overlay_targets(&descriptor, "192.0.2.10").unwrap(),
             vec![target.clone()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smb_logical_symlink_is_accepted_only_when_it_points_to_backing_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-client-smb-overlay-{}",
+            Id128::random()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let logical = root.join("project");
+        let share_uuid = "9e2d7ea7-819a-5e02-b530-e133d971c10c";
+        let expected =
+            format!("/Users/Shared/.macluster-mounts/{share_uuid}/project/nested");
+        std::os::unix::fs::symlink(&expected, &logical).unwrap();
+        let mut descriptor = descriptor();
+        descriptor.primary_source_host = "192.0.2.10".into();
+        descriptor.shares = vec![ClientShareDescriptor {
+            id: "smb-project".into(),
+            server: "nas".parse().unwrap(),
+            protocol: "smb".into(),
+            server_host: "192.0.2.20".into(),
+            source_root: "/data/project/nested".into(),
+            mount_root: logical.to_string_lossy().into_owned(),
+            share_uuid: share_uuid.into(),
+        }];
+
+        assert!(
+            overlay_targets(&descriptor, "192.0.2.10")
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_file(&logical).unwrap();
+        std::os::unix::fs::symlink("/tmp/unrelated", &logical).unwrap();
+        assert!(
+            overlay_targets(&descriptor, "192.0.2.10").is_err(),
+            "an unrelated SMB logical symlink must not be replaced"
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -57,7 +57,8 @@ fn explicit_node_roles_can_overlap() {
 
 #[test]
 fn storage_role_is_derived_from_active_share_ownership() {
-    let idle_node = "\n[nodes.idle]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nroles = [\"storage\"]\n";
+    let idle_node =
+        "\n[nodes.idle]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nroles = [\"storage\"]\n";
     let without_share = format!("{}{idle_node}", extended_config());
     let without_share = ClusterConfig::parse(&without_share).unwrap();
     assert!(

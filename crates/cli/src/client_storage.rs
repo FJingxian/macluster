@@ -788,15 +788,12 @@ mod tests {
 
     #[test]
     fn smb_logical_symlink_is_accepted_only_when_it_points_to_backing_storage() {
-        let root = std::env::temp_dir().join(format!(
-            "macluster-client-smb-overlay-{}",
-            Id128::random()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("macluster-client-smb-overlay-{}", Id128::random()));
         fs::create_dir_all(&root).unwrap();
         let logical = root.join("project");
         let share_uuid = "9e2d7ea7-819a-5e02-b530-e133d971c10c";
-        let expected =
-            format!("/Users/Shared/.macluster-mounts/{share_uuid}/project/nested");
+        let expected = format!("/Users/Shared/.macluster-mounts/{share_uuid}/project/nested");
         std::os::unix::fs::symlink(&expected, &logical).unwrap();
         let mut descriptor = descriptor();
         descriptor.primary_source_host = "192.0.2.10".into();

@@ -4420,10 +4420,7 @@ fn controller_migration_candidate(
     Ok(candidate)
 }
 
-fn controller_migration_primary_marker_check(
-    shared_root: &Path,
-    cluster_uuid: &str,
-) -> String {
+fn controller_migration_primary_marker_check(shared_root: &Path, cluster_uuid: &str) -> String {
     let marker = shell_quote(&shared_root.join(".macluster-share-id").to_string_lossy());
     format!(
         "/bin/test -f {marker} && /bin/test ! -L {marker} && /usr/bin/grep -Fqx {} {marker}",
@@ -4568,8 +4565,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     if let Some(error) = controller_migration_idle_error(&active) {
         return Err((1, error));
     }
-    ensure_no_node_maintenance_in_progress(&config_path, state_dir)
-        .map_err(|error| (1, error))?;
+    ensure_no_node_maintenance_in_progress(&config_path, state_dir).map_err(|error| (1, error))?;
     if node_admin_recovery_pending(&config_path, state_dir).map_err(|error| (1, error))? {
         return Err((
             1,
@@ -4616,8 +4612,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     if inspection.loaded && inspection.hello.is_none() {
         return Err((
             1,
-            "controller migration cannot verify the running controller's maintenance state"
-                .into(),
+            "controller migration cannot verify the running controller's maintenance state".into(),
         ));
     }
     if inspection.hello.is_some() {
@@ -4715,12 +4710,8 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let target_failure = |detail: String| -> AppResult<()> {
         let cleanup_script =
             controller_migration_target_cleanup_script(&target, &target_home, &operation_id);
-        let cleanup = ssh_output_with_timeout(
-            &target,
-            &cleanup_script,
-            None,
-            Duration::from_secs(30),
-        );
+        let cleanup =
+            ssh_output_with_timeout(&target, &cleanup_script, None, Duration::from_secs(30));
         let cleanup_error = match cleanup {
             Ok(output) if output.status.success() => None,
             Ok(output) => Some(command_error(
@@ -4729,10 +4720,8 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             )),
             Err((_, error)) => Some(error),
         };
-        let restart = if controller_migration_may_restart_old(
-            was_running,
-            cleanup_error.is_none(),
-        ) {
+        let restart = if controller_migration_may_restart_old(was_running, cleanup_error.is_none())
+        {
             manager
                 .start(Duration::from_secs(30))
                 .map(|_| ())
@@ -4789,7 +4778,8 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let verified = ssh_output_with_timeout(&target, &verify, None, Duration::from_secs(30))
         .map_err(|(_, error)| error)
         .and_then(|output| {
-            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("Ready") {
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("Ready")
+            {
                 Ok(output)
             } else {
                 Err(format!(
@@ -16144,10 +16134,7 @@ fn append_share_config(
                 format!("share ID '{share_id}' is already configured differently"),
             ));
         }
-        candidate = remove_share_sections(
-            &candidate,
-            &BTreeSet::from([share_id.to_owned()]),
-        );
+        candidate = remove_share_sections(&candidate, &BTreeSet::from([share_id.to_owned()]));
     }
     if !candidate.ends_with('\n') {
         candidate.push('\n');
@@ -22091,7 +22078,11 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert_eq!(updated.nodes["default-001"].execution_uid, Some(502));
         assert_eq!(updated.nodes["login"].transport, Transport::Ssh);
         assert!(updated.is_compute_node("default-001"));
-        assert!(updated.queues["compute"].nodes.contains(&"default-001".into()));
+        assert!(
+            updated.queues["compute"]
+                .nodes
+                .contains(&"default-001".into())
+        );
     }
 
     #[test]
@@ -22182,17 +22173,21 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         fs::write(root.join(".macluster-share-id"), uuid).unwrap();
         let script = super::controller_migration_primary_marker_check(&root, uuid);
 
-        assert!(Command::new("/bin/sh")
-            .args(["-c", &script])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(root.join(".macluster-share-id"), "wrong").unwrap();
-        assert!(!Command::new("/bin/sh")
-            .args(["-c", &script])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            !Command::new("/bin/sh")
+                .args(["-c", &script])
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -25160,16 +25155,13 @@ share_uuid="928e8976-c946-509d-9e62-a3ef787664b7"
         let config = ClusterConfig::parse(source).unwrap();
         let share = config.shares["mnt-550edfcc0fe54fa8"].clone();
 
-        let candidate =
-            super::append_share_config(source, "mnt-550edfcc0fe54fa8", &share).unwrap();
+        let candidate = super::append_share_config(source, "mnt-550edfcc0fe54fa8", &share).unwrap();
         let repaired = ClusterConfig::parse(&candidate).unwrap();
 
         assert_eq!(repaired.shares.len(), 1);
         assert_eq!(repaired.shares["mnt-550edfcc0fe54fa8"], share);
         assert_eq!(
-            candidate
-                .matches("[shares.mnt-550edfcc0fe54fa8]")
-                .count(),
+            candidate.matches("[shares.mnt-550edfcc0fe54fa8]").count(),
             1
         );
     }

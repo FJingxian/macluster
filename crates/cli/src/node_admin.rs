@@ -11064,7 +11064,7 @@ fn stale_nfs_admin_reply(
     }
     if !matches!(
         reply.service_version.as_str(),
-        "nfs-admin-2" | "nfs-admin-3"
+        "nfs-admin-2" | "nfs-admin-3" | "nfs-admin-4"
     ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-5"
     {
         return None;
@@ -29669,6 +29669,19 @@ ssh_port = 22
             super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &forget)
                 .unwrap()
                 .is_err()
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-4", true), &ping)
+                .unwrap()
+                .unwrap(),
+            Some(()),
+            "nfs-admin-4 can authenticate the signed upgrade path to protocol 5"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-4", true), &update)
+                .unwrap()
+                .unwrap(),
+            Some(())
         );
         assert!(super::stale_nfs_admin_reply(&reply("nfs-admin-9", true), &ping).is_none());
     }

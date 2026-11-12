@@ -125,6 +125,26 @@ pub fn load_smb_credential_provisions(
     config: &ClusterConfig,
     reader: &dyn MasterCredentialReader,
 ) -> Result<Vec<macluster_protocol::smb_credential::SmbCredentialProvision>, String> {
+    let (provisions, missing) = load_available_smb_credential_provisions(config, reader)?;
+    if let Some(server) = missing.first() {
+        return Err(format!("master credential is missing for {server}"));
+    }
+    Ok(provisions)
+}
+
+/// Controller reconciliation must not let an unavailable SMB secret prevent
+/// unrelated primary/NFS recovery. Consumers still receive an explicit list of
+/// missing servers so SMB-dependent jobs remain unschedulable.
+pub fn load_available_smb_credential_provisions(
+    config: &ClusterConfig,
+    reader: &dyn MasterCredentialReader,
+) -> Result<
+    (
+        Vec<macluster_protocol::smb_credential::SmbCredentialProvision>,
+        Vec<macluster_protocol::identifiers::NodeId>,
+    ),
+    String,
+> {
     let cluster_uuid = macluster_protocol::identifiers::Id128::parse(&config.share_uuid)
         .map_err(|error| error.to_string())?;
     let mut keys = std::collections::BTreeMap::new();
@@ -152,14 +172,20 @@ pub fn load_smb_credential_provisions(
         key.validate().map_err(|error| error.to_string())?;
         keys.insert(key.service_name(), key);
     }
-    keys.into_values()
-        .map(|key| {
-            let credential = reader
-                .get(&key)?
-                .ok_or_else(|| format!("master credential is missing for {}", key.server_id))?;
-            Ok(macluster_protocol::smb_credential::SmbCredentialProvision { key, credential })
-        })
-        .collect()
+    let mut provisions = Vec::new();
+    let mut missing = Vec::new();
+    for key in keys.into_values() {
+        match reader.get(&key)? {
+            Some(credential) => {
+                provisions.push(macluster_protocol::smb_credential::SmbCredentialProvision {
+                    key,
+                    credential,
+                });
+            }
+            None => missing.push(key.server_id),
+        }
+    }
+    Ok((provisions, missing))
 }
 
 pub fn export_smb_masters(
@@ -526,5 +552,11 @@ mod tests {
             .expect_err("missing master must fail export");
         assert!(error.contains("missing"));
         assert!(!error.contains("test-secret"));
+
+        let (provisions, missing_servers) =
+            super::load_available_smb_credential_provisions(&config, &missing).unwrap();
+        assert!(provisions.is_empty());
+        assert_eq!(missing_servers.len(), 1);
+        assert_eq!(missing_servers[0].as_str(), "nas-01");
     }
 }

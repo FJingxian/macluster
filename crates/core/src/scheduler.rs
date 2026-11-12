@@ -14,6 +14,8 @@ pub struct NodeEligibility {
     pub id: NodeId,
     pub logical_cpus: Option<u32>,
     pub idle_since_unix_ms: u64,
+    /// False once the controller has confirmed that a hot-plug node is absent.
+    pub connected: bool,
     pub online: bool,
     pub agent_current: bool,
     /// Primary job storage is available. Named shares are checked per job.
@@ -50,6 +52,7 @@ pub fn next_dispatch(
                 .nodes
                 .iter()
                 .any(|member| member == node.id.as_str())
+                && node.connected
                 && node.online
                 && node.agent_current
                 && node.storage_ready
@@ -145,6 +148,7 @@ mod tests {
             id: NodeId::new(id).unwrap(),
             logical_cpus: Some(8),
             idle_since_unix_ms: 0,
+            connected: online,
             online,
             agent_current: true,
             storage_ready: true,

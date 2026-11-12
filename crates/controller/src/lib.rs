@@ -298,6 +298,7 @@ impl<T: NodeTransport> ControllerService<T> {
                             id: node_id,
                             logical_cpus: None,
                             idle_since_unix_ms: 0,
+                            connected: false,
                             online: false,
                             agent_current: false,
                             storage_ready: false,
@@ -375,6 +376,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     id: node_id,
                     logical_cpus,
                     idle_since_unix_ms: idle_since,
+                    connected: online,
                     online,
                     agent_current,
                     storage_ready: storage_ready && node_storage_ready && cleanup_journal_ready,
@@ -391,6 +393,7 @@ impl<T: NodeTransport> ControllerService<T> {
                     id: node_id,
                     logical_cpus,
                     idle_since_unix_ms: 0,
+                    connected: online,
                     online,
                     agent_current,
                     storage_ready: storage_ready && cleanup_journal_ready,
@@ -440,6 +443,10 @@ impl<T: NodeTransport> ControllerService<T> {
                     Some(reason)
                 } else if let Some(reason) =
                     namespace_waiting_reason(&head, &queue_config, &availability)
+                {
+                    Some(reason)
+                } else if let Some(reason) =
+                    maintenance_waiting_reason(&head, &queue_config, &availability)
                 {
                     Some(reason)
                 } else if head.spec.mode == JobMode::Interactive {
@@ -744,7 +751,8 @@ fn namespace_waiting_reason(
         return None;
     }
     let matching_online = nodes.iter().filter(|node| {
-        node.online
+        node.connected
+            && node.online
             && queue.nodes.iter().any(|id| id == node.id.as_str())
             && job
                 .spec
@@ -777,8 +785,21 @@ fn namespace_waiting_reason(
                     .as_ref()
                     .is_none_or(|pinned| pinned.as_str() == id.as_str())
             })
+            .filter(|id| {
+                nodes
+                    .iter()
+                    .any(|node| node.id.as_str() == id.as_str() && node.connected)
+            })
             .cloned()
             .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Some(match job.spec.node.as_ref() {
+                Some(pinned) => format!(
+                    "waiting for compute node {pinned} to reconnect; this job remains queued"
+                ),
+                None => "waiting for a connected compute node; this job remains queued".to_owned(),
+            });
+        }
         return Some(format!(
             "waiting for compute node(s) {} to reconnect; this job remains queued",
             candidates.join(", ")
@@ -792,6 +813,34 @@ fn namespace_waiting_reason(
         "waiting for a fresh capability report from node(s) {}; this job remains queued",
         candidates.join(", ")
     ))
+}
+
+fn maintenance_waiting_reason(
+    job: &macluster_protocol::types::JobRecord,
+    queue: &macluster_core::config::QueueConfig,
+    nodes: &[NodeEligibility],
+) -> Option<String> {
+    let drained = nodes
+        .iter()
+        .filter(|node| {
+            queue.nodes.iter().any(|id| id == node.id.as_str())
+                && job
+                    .spec
+                    .node
+                    .as_ref()
+                    .is_none_or(|pinned| pinned == &node.id)
+                && node.connected
+                && node.online
+                && node.drain_requested
+        })
+        .map(|node| node.id.to_string())
+        .collect::<Vec<_>>();
+    (!drained.is_empty()).then(|| {
+        format!(
+            "waiting for controller maintenance to clear on node(s) {}; this job remains queued",
+            drained.join(", ")
+        )
+    })
 }
 
 pub(crate) fn share_waiting_reason(
@@ -867,7 +916,8 @@ pub(crate) fn agent_build_waiting_reason(
     nodes: &[NodeEligibility],
 ) -> Option<String> {
     let matches_job = |node: &&NodeEligibility| {
-        queue.nodes.iter().any(|member| member == node.id.as_str())
+        node.connected
+            && queue.nodes.iter().any(|member| member == node.id.as_str())
             && job
                 .spec
                 .node
@@ -922,8 +972,21 @@ pub fn verify_shared_storage(config: &ClusterConfig) -> bool {
             "no"
         },
     ]);
-    crate::transport::run_child_bounded(command, None, Duration::from_secs(6))
-        .is_ok_and(|output| output.status.success())
+    match crate::transport::run_child_bounded(command, None, Duration::from_secs(6)) {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "macluster: shared-storage check failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("macluster: shared-storage check could not run: {error}");
+            false
+        }
+    }
 }
 
 pub fn publish_snapshot_bounded(
@@ -963,30 +1026,57 @@ pub fn verify_primary_share_direct(
     server_host: &str,
     local_server: bool,
 ) -> bool {
+    verify_primary_share_direct_detailed(root, source_root, share_uuid, server_host, local_server)
+        .is_ok()
+}
+
+pub fn verify_primary_share_direct_detailed(
+    root: &Path,
+    source_root: &Path,
+    share_uuid: &str,
+    server_host: &str,
+    local_server: bool,
+) -> Result<(), String> {
     let marker_path = root.join(".macluster-share-id");
-    let Ok(marker_metadata) = fs::symlink_metadata(&marker_path) else {
-        return false;
-    };
+    let marker_metadata = fs::symlink_metadata(&marker_path).map_err(|error| {
+        format!(
+            "cannot inspect share marker {}: {error}",
+            marker_path.display()
+        )
+    })?;
     if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
-        return false;
+        return Err(format!(
+            "share marker {} is not a regular file",
+            marker_path.display()
+        ));
     }
-    let marker = match fs::read_to_string(marker_path) {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
+    let marker = fs::read_to_string(&marker_path).map_err(|error| {
+        format!(
+            "cannot read share marker {}: {error}",
+            marker_path.display()
+        )
+    })?;
     if marker.trim() != share_uuid {
-        return false;
+        return Err(format!(
+            "share marker {} identifies '{}', expected '{}'",
+            marker_path.display(),
+            marker.trim(),
+            share_uuid
+        ));
     }
     if local_server {
         #[cfg(target_vendor = "apple")]
         {
             use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            let Ok(path) = CString::new(root.as_os_str().as_bytes()) else {
-                return false;
-            };
+            let path = CString::new(root.as_os_str().as_bytes())
+                .map_err(|_| "local share path contains a NUL byte".to_owned())?;
             let mut info = std::mem::MaybeUninit::<libc::statfs>::zeroed();
             if unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
-                return false;
+                return Err(format!(
+                    "cannot inspect local share filesystem {}: {}",
+                    root.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
             let info = unsafe { info.assume_init() };
             let filesystem = unsafe {
@@ -994,17 +1084,40 @@ pub fn verify_primary_share_direct(
                     .to_string_lossy()
                     .into_owned()
             };
-            return filesystem != "nfs" && info.f_flags & (libc::MNT_LOCAL as u32) != 0;
+            return (filesystem != "nfs" && info.f_flags & (libc::MNT_LOCAL as u32) != 0)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                        "local share path {} is not on a local filesystem",
+                        root.display()
+                    )
+                });
         }
         #[cfg(not(target_vendor = "apple"))]
-        return false;
+        return Err("local share validation requires macOS".into());
     }
     let mounts = match Command::new("/sbin/mount").output() {
         Ok(output) if output.status.success() => output,
-        _ => return false,
+        Ok(output) => {
+            return Err(format!(
+                "cannot read mount table ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => return Err(format!("cannot run /sbin/mount: {error}")),
     };
     let output = String::from_utf8_lossy(&mounts.stdout);
     primary_nfs_mount_matches(&output, server_host, source_root, root)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "mount table does not contain {}:{} on {} (nfs",
+                server_host,
+                source_root.display(),
+                root.display()
+            )
+        })
 }
 
 fn primary_nfs_mount_matches(
@@ -1097,7 +1210,7 @@ mod status_reconciliation_tests {
     use macluster_protocol::{
         framing::sha256_hex,
         identifiers::{Id128, QueueName, RequestId},
-        types::{JobSpec, SnapshotRef},
+        types::{JobMode, JobRecord, JobSpec, JobState, SchedulerKind, SnapshotRef},
     };
 
     struct UnusedTransport;
@@ -1193,6 +1306,84 @@ mod status_reconciliation_tests {
         assert_eq!(availability, (true, true));
         drop(service);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn namespace_wait_reason_ignores_confirmed_offline_queue_members() {
+        let job: JobRecord = serde_json::from_value(serde_json::json!({
+            "id": 844,
+            "spec": {
+                "storage_namespace": "00000000-0000-4000-8000-000000000001",
+                "required_shares": [],
+                "queue": "default",
+                "node": null,
+                "name": "interactive",
+                "cwd": "/Users/Shared/macluster",
+                "stdout_path": "/Users/Shared/macluster/jobs/844/stdout.log",
+                "stderr_path": "/Users/Shared/macluster/jobs/844/stderr.log",
+                "walltime_secs": null,
+                "env": {},
+                "mode": "interactive",
+                "snapshot": null
+            },
+            "state": "PENDING",
+            "node": null,
+            "created_unix_ms": 1,
+            "started_unix_ms": null,
+            "finished_unix_ms": null,
+            "exit_code": null,
+            "end_reason": null,
+            "snapshot_sync_pending": false,
+            "log_sync_pending": false,
+            "waiting_reason": null
+        }))
+        .unwrap();
+        let queue = macluster_core::config::QueueConfig {
+            nodes: vec!["default-001".into(), "default-003".into()],
+            scheduler: SchedulerKind::Fifo,
+        };
+        let eligible =
+            |id: &str, connected: bool, online: bool| macluster_core::scheduler::NodeEligibility {
+                id: NodeId::new(id).unwrap(),
+                logical_cpus: Some(12),
+                idle_since_unix_ms: 0,
+                connected,
+                online,
+                agent_current: false,
+                storage_ready: false,
+                configured_shares: Default::default(),
+                ready_shares: Default::default(),
+                drain_requested: false,
+                occupied: false,
+                interactive_pty: false,
+                namespaced_jobs: false,
+            };
+        let nodes = vec![
+            eligible("default-001", true, false),
+            eligible("default-003", false, false),
+        ];
+
+        let reason = namespace_waiting_reason(&job, &queue, &nodes).unwrap();
+
+        assert!(reason.contains("default-001"), "{reason}");
+        assert!(!reason.contains("default-003"), "{reason}");
+        let all_disconnected = vec![
+            eligible("default-001", false, false),
+            eligible("default-003", false, false),
+        ];
+        let reason = namespace_waiting_reason(&job, &queue, &all_disconnected).unwrap();
+        assert_eq!(
+            reason,
+            "waiting for a connected compute node; this job remains queued"
+        );
+
+        let mut drained = eligible("default-001", true, true);
+        drained.drain_requested = true;
+        let reason = maintenance_waiting_reason(&job, &queue, &[drained]).unwrap();
+        assert_eq!(
+            reason,
+            "waiting for controller maintenance to clear on node(s) default-001; this job remains queued"
+        );
     }
 }
 

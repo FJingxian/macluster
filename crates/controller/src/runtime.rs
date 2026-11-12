@@ -12,7 +12,7 @@ use std::{
 };
 
 use macluster_core::{
-    config::Transport,
+    config::{ClusterConfig, Transport},
     maintenance::ResetBarrierPolicy,
     nfs_reconcile::{
         DeferredShareCleanupState, DeferredShareClientCleanup, DeferredShareExportCleanup,
@@ -35,7 +35,7 @@ use macluster_protocol::{
 use crate::{
     ControllerError, ControllerService,
     events::RuntimeSignal,
-    smb_credential::{CredentialHelperClient, load_smb_credential_provisions},
+    smb_credential::{CredentialHelperClient, load_available_smb_credential_provisions},
     transport::{NodeTransport, TransportError},
     wake::{ControllerWake, WakeError, notify_controller},
 };
@@ -252,6 +252,7 @@ struct NodeRuntime {
     control_failures: u8,
     nfs_reconcile_attempts: u8,
     next_nfs_reconcile_at: Instant,
+    nfs_reconcile_in_flight: Option<u64>,
     last_nfs_reconcile_log: Option<(String, Instant)>,
     pending_start: Option<JobRecord>,
 }
@@ -273,6 +274,7 @@ impl NodeRuntime {
             control_failures: 0,
             nfs_reconcile_attempts: 0,
             next_nfs_reconcile_at: now,
+            nfs_reconcile_in_flight: None,
             last_nfs_reconcile_log: None,
             pending_start: None,
         }
@@ -455,6 +457,61 @@ fn pending_queue_heads(jobs: &[JobRecord]) -> HashMap<String, usize> {
         }
     }
     heads
+}
+
+fn reconciliation_config_without_unavailable_smb_servers(
+    source: &str,
+    config: &ClusterConfig,
+    unavailable_servers: &[NodeId],
+) -> Result<String, String> {
+    if unavailable_servers.is_empty() {
+        return Ok(source.to_owned());
+    }
+    let unavailable = unavailable_servers
+        .iter()
+        .map(NodeId::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut filtered = String::with_capacity(source.len());
+    let mut skipping_share = false;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping_share = trimmed
+                .strip_prefix("[shares.")
+                .and_then(|section| section.strip_suffix(']'))
+                .map(|share_id| share_id.trim_matches('"'))
+                .and_then(|share_id| config.shares.get(share_id))
+                .is_some_and(|share| {
+                    share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
+                        && unavailable.contains(share.server.as_str())
+                });
+        }
+        if !skipping_share {
+            filtered.push_str(line);
+        }
+    }
+    ClusterConfig::parse(&filtered)
+        .map_err(|error| format!("cannot filter reconciliation SMB shares: {error}"))?;
+    Ok(filtered)
+}
+
+fn dispatch_pause_reason(
+    share_ready: bool,
+    cleanup_journal_blocked: bool,
+    dispatch_allowed: bool,
+    queues_empty: bool,
+) -> Option<&'static str> {
+    if !share_ready {
+        Some("waiting for shared-storage health; controller dispatch is paused")
+    } else if cleanup_journal_blocked {
+        Some("waiting for the NFS cleanup journal; controller dispatch is paused")
+    } else if !dispatch_allowed {
+        Some("controller maintenance is draining; this job remains queued")
+    } else if queues_empty {
+        Some("no queue is configured; this job remains queued")
+    } else {
+        None
+    }
 }
 
 struct SnapshotRetry {
@@ -689,18 +746,10 @@ impl RuntimeState {
             }
             let management_unavailable = node.management_unavailable()
                 || (scope.is_cluster_wide() && node.recently_host_unreachable(Instant::now()));
-            let offline_for_cluster_maintenance = scope.is_cluster_wide() && management_unavailable;
             let has_mutating_operation = node.in_flight.is_some_and(|operation| {
-                matches!(
-                    operation.kind,
-                    WorkKind::Start | WorkKind::Cancel | WorkKind::ReconcileNfs
-                )
+                matches!(operation.kind, WorkKind::Start | WorkKind::Cancel)
             });
-            let deferred_nfs_reconcile = offline_for_cluster_maintenance
-                && node
-                    .in_flight
-                    .is_some_and(|operation| operation.kind == WorkKind::ReconcileNfs);
-            if has_mutating_operation && !deferred_nfs_reconcile {
+            if has_mutating_operation {
                 blockers.push(format!(
                     "node {node_id} has a start or cancel operation in flight"
                 ));
@@ -899,13 +948,10 @@ impl RuntimeState {
                 let Some(runtime) = self.nodes.get_mut(node_id) else {
                     return Ok(());
                 };
-                if runtime
-                    .in_flight
-                    .is_none_or(|operation| operation.id != tag.operation_id)
-                {
+                if runtime.nfs_reconcile_in_flight != Some(tag.operation_id) {
                     return Ok(());
                 }
-                runtime.in_flight = None;
+                runtime.nfs_reconcile_in_flight = None;
                 if !identity_current
                     || !node_result_is_current(
                         &tag,
@@ -1362,6 +1408,7 @@ impl RuntimeState {
         if !service.dispatch_allowed()
             || service.node_is_maintenance_scoped(node_id)
             || runtime.in_flight.is_some()
+            || runtime.nfs_reconcile_in_flight.is_some()
             || runtime.pending_start.is_some()
             || !runtime.status_fresh(now)
             || !status.online
@@ -1415,11 +1462,43 @@ impl RuntimeState {
                 return Ok(());
             }
         };
-        let smb_credentials = match load_smb_credential_provisions(
+        let (smb_credentials, missing_smb_credentials) =
+            match load_available_smb_credential_provisions(
+                &service.config,
+                &CredentialHelperClient::system(),
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    self.defer_nfs_reconciliation(node_id, error, now);
+                    return Ok(());
+                }
+            };
+        if !missing_smb_credentials.is_empty()
+            && let Some(runtime) = self.nodes.get_mut(node_id)
+            && runtime.should_log_nfs_reconcile(
+                &missing_smb_credentials
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                now,
+            )
+        {
+            eprintln!(
+                "macluster: NFS reconciliation for {node_id} continues without unavailable SMB shares: {}",
+                missing_smb_credentials
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let reconciliation_config_toml = match reconciliation_config_without_unavailable_smb_servers(
+            &config_toml,
             &service.config,
-            &CredentialHelperClient::system(),
+            &missing_smb_credentials,
         ) {
-            Ok(credentials) => credentials,
+            Ok(config) => config,
             Err(error) => {
                 self.defer_nfs_reconciliation(node_id, error, now);
                 return Ok(());
@@ -1592,7 +1671,7 @@ impl RuntimeState {
             .collect::<Vec<_>>();
         let operation = Operation::ReconcileNfs {
             controller: service.epoch,
-            config_toml,
+            config_toml: reconciliation_config_toml,
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
@@ -1633,10 +1712,7 @@ impl RuntimeState {
             }
         }) {
             if let Some(runtime) = self.nodes.get_mut(node_id) {
-                runtime.in_flight = Some(InFlightNodeOperation {
-                    id: operation_id,
-                    kind: WorkKind::ReconcileNfs,
-                });
+                runtime.nfs_reconcile_in_flight = Some(operation_id);
             }
         }
         Ok(())
@@ -2254,11 +2330,19 @@ impl RuntimeState {
         queues: &[String],
     ) -> Result<(), ControllerError> {
         service.refresh_reset_barrier_policy()?;
-        if !self.share_ready(Instant::now())
-            || self.nfs_cleanup_journal_blocked
-            || !service.dispatch_allowed()
-            || queues.is_empty()
-        {
+        if let Some(reason) = dispatch_pause_reason(
+            self.share_ready(Instant::now()),
+            self.nfs_cleanup_journal_blocked,
+            service.dispatch_allowed(),
+            queues.is_empty(),
+        ) {
+            for index in pending_queue_heads(&jobs).into_values() {
+                if let Some(job) = jobs.get(index) {
+                    service
+                        .storage
+                        .set_waiting_reason(job.id, Some(reason.to_owned()))?;
+                }
+            }
             return Ok(());
         }
         let now = Instant::now();
@@ -2432,6 +2516,7 @@ impl RuntimeState {
                     id: NodeId::new(id.clone()).expect("validated node ID"),
                     logical_cpus: health.and_then(|health| health.logical_cpus),
                     idle_since_unix_ms,
+                    connected: runtime.is_some_and(|runtime| !runtime.management_unavailable()),
                     online,
                     agent_current: health_fresh
                         && health.is_some_and(|health| health.agent_current),
@@ -3224,12 +3309,14 @@ mod tests {
         IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NFS_RECONCILE_LOG_INTERVAL,
         NODE_HEALTH_RETRY, NODE_HEALTH_TTL, NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL,
         NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState, WakeForwarder, WorkKind,
-        WorkTag, WorkerCompletion, WorkerPool, WorkerResult, health_retry_delay,
-        maintenance_drain_complete, node_probe_retry_delay, node_result_is_current, now_ms,
-        pending_queue_heads, probe_delay, reset_drain_complete, retry_delay, run_forever,
-        should_measure_job_storage,
+        WorkTag, WorkerCompletion, WorkerPool, WorkerResult, dispatch_pause_reason,
+        health_retry_delay, maintenance_drain_complete, node_probe_retry_delay,
+        node_result_is_current, now_ms, pending_queue_heads, probe_delay,
+        reconciliation_config_without_unavailable_smb_servers, reset_drain_complete, retry_delay,
+        run_forever, should_measure_job_storage,
     };
     use crate::events::RuntimeSignal;
+    use macluster_core::config::ClusterConfig;
     use macluster_core::maintenance::ResetBarrierPolicy;
     use macluster_core::nfs_reconcile::{
         DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
@@ -3391,6 +3478,86 @@ mod tests {
                 Ok(ResponseBody::Ack)
             }
         }
+    }
+
+    #[test]
+    fn reconciliation_config_omits_only_smb_shares_with_unavailable_credentials() {
+        let source = r#"[cluster]
+name = "test"
+default_queue = "default"
+login_node = "login"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "login"
+protocol_version = 1
+
+[queues.default]
+nodes = ["login"]
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.1"
+transport = "local"
+machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+execution_uid = 501
+
+[nodes.nas-01]
+host = "192.0.2.10"
+transport = "storage"
+
+[nodes.nas-02]
+host = "192.0.2.11"
+transport = "storage"
+
+[shares.keep]
+protocol = "smb"
+server = "nas-01"
+source_root = "/keep"
+mount_root = "/Users/Shared/keep"
+share_uuid = "20000000-0000-4000-8000-000000000001"
+smb_user = "operator"
+
+[shares.drop]
+protocol = "smb"
+server = "nas-02"
+source_root = "/drop"
+mount_root = "/Users/Shared/drop"
+share_uuid = "30000000-0000-4000-8000-000000000001"
+smb_user = "operator"
+"#;
+        let config = ClusterConfig::parse(source).unwrap();
+        let filtered = reconciliation_config_without_unavailable_smb_servers(
+            source,
+            &config,
+            &[NodeId::new("nas-02").unwrap()],
+        )
+        .unwrap();
+        let filtered_config = ClusterConfig::parse(&filtered).unwrap();
+
+        assert!(filtered_config.shares.contains_key("keep"));
+        assert!(!filtered_config.shares.contains_key("drop"));
+        assert!(!filtered.contains("[shares.drop]"));
+    }
+
+    #[test]
+    fn dispatch_pause_reason_identifies_the_first_global_blocker() {
+        assert_eq!(
+            dispatch_pause_reason(false, false, true, false),
+            Some("waiting for shared-storage health; controller dispatch is paused")
+        );
+        assert_eq!(
+            dispatch_pause_reason(true, true, true, false),
+            Some("waiting for the NFS cleanup journal; controller dispatch is paused")
+        );
+        assert_eq!(
+            dispatch_pause_reason(true, false, false, false),
+            Some("controller maintenance is draining; this job remains queued")
+        );
+        assert_eq!(
+            dispatch_pause_reason(true, false, true, true),
+            Some("no queue is configured; this job remains queued")
+        );
+        assert_eq!(dispatch_pause_reason(true, false, true, false), None);
     }
 
     #[test]
@@ -3960,10 +4127,7 @@ scheduler = "fifo"
         runtime
             .schedule_nfs_reconciliation(&service, "worker")
             .unwrap();
-        assert_eq!(
-            runtime.nodes["worker"].in_flight.unwrap().kind,
-            WorkKind::ReconcileNfs
-        );
+        assert!(runtime.nodes["worker"].nfs_reconcile_in_flight.is_some());
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while runtime.nodes["worker"].health.is_some() {
@@ -4064,14 +4228,13 @@ scheduler = "fifo"
         runtime
             .schedule_nfs_reconciliation(&service, "worker")
             .unwrap();
-        assert_eq!(
-            runtime.nodes["worker"].in_flight.unwrap().kind,
-            WorkKind::ReconcileNfs,
+        assert!(
+            runtime.nodes["worker"].nfs_reconcile_in_flight.is_some(),
             "a returning node with a stale config must receive the current config before it can become schedulable"
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while runtime.nodes["worker"].in_flight.is_some() {
+        while runtime.nodes["worker"].nfs_reconcile_in_flight.is_some() {
             runtime.poll_workers(&mut service).unwrap();
             assert!(
                 Instant::now() < deadline,
@@ -5785,6 +5948,60 @@ scheduler = "fifo"
         let dispatch = next_dispatch(&queue_id, &queue, &[job], &availability)
             .expect("unaffected node should still receive work");
         assert_eq!(dispatch.node_id.as_str(), "node-001");
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_nfs_reconciliation_does_not_make_an_idle_node_unavailable() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-background-reconcile-availability-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = simulated_fleet_config(&root, 1);
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let now = Instant::now();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        runtime.share_ready = Some((true, now));
+        let node = runtime.nodes.get_mut("node-000").unwrap();
+        node.fenced = true;
+        node.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        node.health = Some(NodeHealthCache {
+            valid: true,
+            ready: true,
+            job_storage_ready: true,
+            ready_shares: BTreeSet::new(),
+            agent_current: true,
+            interactive_pty: true,
+            namespaced_jobs: true,
+            logical_cpus: Some(8),
+            sampled_at: now,
+            retry_at: now + NODE_HEALTH_TTL,
+        });
+        node.nfs_reconcile_in_flight = Some(7);
+
+        let availability = runtime.availability(&service, now);
+        let node = availability
+            .iter()
+            .find(|node| node.id.as_str() == "node-000")
+            .unwrap();
+
+        assert!(node.connected);
+        assert!(node.online);
+        assert!(!node.occupied);
+        assert!(node.namespaced_jobs);
         drop(runtime);
         drop(service);
         fs::remove_dir_all(root).unwrap();

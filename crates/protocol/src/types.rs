@@ -558,6 +558,31 @@ pub struct NodeHealth {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NfsProbeState {
+    Healthy,
+    Wedged,
+    TimedOut,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NfsShareProbe {
+    pub share_id: String,
+    pub target: String,
+    pub state: NfsProbeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NfsClientDiagnosis {
+    pub node_id: String,
+    pub wedged: bool,
+    pub probes: Vec<NfsShareProbe>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ControllerEpoch {
     pub controller_uuid: ControllerUuid,
     pub epoch: u64,
@@ -667,6 +692,7 @@ pub enum Operation {
         job_id: u64,
     },
     Health,
+    DiagnoseNfs,
     ReconcileNfs {
         controller: ControllerEpoch,
         config_toml: String,
@@ -722,6 +748,7 @@ pub enum ResponseBody {
     TaskResources(crate::resources::TaskResourceSample),
     Pong,
     Health(NodeHealth),
+    NfsDiagnosis(NfsClientDiagnosis),
     Started(StartResult),
     Execution(ExecutionStatus),
     FanControl(FanControlStatus),
@@ -757,7 +784,10 @@ pub struct ConfigRevision(pub u64);
 
 #[cfg(test)]
 mod interactive_job_compatibility_tests {
-    use super::{ControllerEpoch, JobSpec, NfsShareMarker, NodeHealth, Operation};
+    use super::{
+        ControllerEpoch, JobSpec, NfsClientDiagnosis, NfsProbeState, NfsShareMarker, NfsShareProbe,
+        NodeHealth, Operation, ResponseBody,
+    };
     use crate::{
         identifiers::{ControllerUuid, Id128},
         nfs_admin::{NfsAlias, NfsExportCleanup, NfsMount},
@@ -847,6 +877,41 @@ mod interactive_job_compatibility_tests {
         assert_eq!(
             serde_json::to_value(Operation::Ping).unwrap(),
             json!({ "type": "ping" })
+        );
+    }
+
+    #[test]
+    fn nfs_diagnosis_round_trips_probe_states_and_response() {
+        for (state, encoded) in [
+            (NfsProbeState::Healthy, "healthy"),
+            (NfsProbeState::Wedged, "wedged"),
+            (NfsProbeState::TimedOut, "timed_out"),
+            (NfsProbeState::Unavailable, "unavailable"),
+        ] {
+            let value = serde_json::to_value(state).unwrap();
+            assert_eq!(value, json!(encoded));
+            assert_eq!(
+                serde_json::from_value::<NfsProbeState>(value).unwrap(),
+                state
+            );
+        }
+
+        let diagnosis = NfsClientDiagnosis {
+            node_id: "worker".into(),
+            wedged: true,
+            probes: vec![NfsShareProbe {
+                share_id: "tools".into(),
+                target: "/mnt/tools".into(),
+                state: NfsProbeState::Wedged,
+                error: Some("cat: Interrupted system call".into()),
+            }],
+        };
+        let response = ResponseBody::NfsDiagnosis(diagnosis);
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["type"], "nfs_diagnosis");
+        assert_eq!(
+            serde_json::from_value::<ResponseBody>(encoded).unwrap(),
+            response
         );
     }
 }

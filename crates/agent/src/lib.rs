@@ -15,7 +15,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_core::{
@@ -299,6 +299,13 @@ fn handle_operation_with_config_path(
         Operation::Health => node_health(config, local_node_id)
             .map(ResponseBody::Health)
             .map_err(|error| ProtocolError::Failed(error.to_string())),
+        Operation::DiagnoseNfs => macluster_core::nfs_client_probe::diagnose_nfs_client(
+            config,
+            local_node_id,
+            Duration::from_secs(5),
+        )
+        .map(ResponseBody::NfsDiagnosis)
+        .map_err(ProtocolError::Failed),
         Operation::ReconcileNfs {
             controller,
             config_toml,

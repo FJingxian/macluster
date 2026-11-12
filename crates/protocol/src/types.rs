@@ -693,6 +693,9 @@ pub enum Operation {
     },
     Health,
     DiagnoseNfs,
+    RebootForNfsRepair {
+        controller: ControllerEpoch,
+    },
     ReconcileNfs {
         controller: ControllerEpoch,
         config_toml: String,
@@ -912,6 +915,21 @@ mod interactive_job_compatibility_tests {
         assert_eq!(
             serde_json::from_value::<ResponseBody>(encoded).unwrap(),
             response
+        );
+
+        let reboot = Operation::RebootForNfsRepair {
+            controller: ControllerEpoch {
+                controller_uuid: ControllerUuid(
+                    Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+                ),
+                epoch: 9,
+            },
+        };
+        let encoded = serde_json::to_value(&reboot).unwrap();
+        assert_eq!(encoded["type"], "reboot_for_nfs_repair");
+        assert_eq!(
+            serde_json::from_value::<Operation>(encoded).unwrap(),
+            reboot
         );
     }
 }

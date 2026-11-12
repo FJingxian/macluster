@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_NFS_ADMIN_REQUEST_BYTES: usize = 1024 * 1024;
 /// Wire version for requests handled by the privileged NFS service. Keep this
 /// independent from the installed root-owned CLI implementation revision.
-pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-4";
+pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-5";
 const MAX_BATCH_ITEMS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,6 +65,10 @@ pub enum NfsAdminOperation {
     /// Forget the pinned key for one cluster after an explicit node removal or reset.
     ForgetClusterUpdater {
         cluster_id: String,
+    },
+    RebootNode {
+        operation_id: String,
+        expected_boot_id: String,
     },
 }
 
@@ -228,6 +232,20 @@ impl NfsAdminRequest {
                     .map_err(|_| "cluster updater identity is invalid".to_owned())?;
                 if parsed.to_string() != *cluster_id {
                     return Err("cluster updater identity must be canonical".into());
+                }
+                Ok(())
+            }
+            NfsAdminOperation::RebootNode {
+                operation_id,
+                expected_boot_id,
+            } => {
+                Id128::parse(operation_id)
+                    .map_err(|_| "NFS reboot operation ID is invalid".to_owned())?;
+                if expected_boot_id.is_empty()
+                    || expected_boot_id.len() > 256
+                    || expected_boot_id.bytes().any(|byte| byte.is_ascii_control())
+                {
+                    return Err("NFS reboot boot ID is invalid".into());
                 }
                 Ok(())
             }
@@ -610,6 +628,47 @@ mod tests {
                 },
             };
             assert!(request.validate(501).is_err());
+        }
+    }
+
+    #[test]
+    fn reboot_node_request_requires_canonical_operation_and_boot_ids() {
+        let valid = NfsAdminRequest {
+            operation: NfsAdminOperation::RebootNode {
+                operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                expected_boot_id: "{ sec = 1794510000, usec = 123456 }".into(),
+            },
+        };
+        valid.validate(501).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<NfsAdminRequest>(&serde_json::to_vec(&valid).unwrap())
+                .unwrap(),
+            valid
+        );
+
+        for operation_id in ["", "../../reboot", "not-a-uuid"] {
+            assert!(
+                NfsAdminRequest {
+                    operation: NfsAdminOperation::RebootNode {
+                        operation_id: operation_id.into(),
+                        expected_boot_id: "{ sec = 1, usec = 2 }".into(),
+                    }
+                }
+                .validate(501)
+                .is_err()
+            );
+        }
+        for boot_id in ["", "line\nbreak", &"x".repeat(257)] {
+            assert!(
+                NfsAdminRequest {
+                    operation: NfsAdminOperation::RebootNode {
+                        operation_id: "00000000-0000-4000-8000-000000000001".into(),
+                        expected_boot_id: boot_id.into(),
+                    }
+                }
+                .validate(501)
+                .is_err()
+            );
         }
     }
 

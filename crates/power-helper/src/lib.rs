@@ -20,6 +20,8 @@ mod helper_update;
 mod nfs_admin;
 mod smb_credential;
 
+pub use nfs_admin::apply_privileged_nfs_reboot;
+
 const POWER_SOCKET: &str = "/var/run/org.macluster.power.sock";
 const POWER_CACHE_TTL: Duration = Duration::from_millis(POWER_SAMPLE_CACHE_TTL_MS);
 const POWER_REFRESH_INTERVAL: Duration = Duration::from_secs(4);

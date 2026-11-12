@@ -4,14 +4,14 @@ use std::{
     fs,
     io::{self, Read, Write},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
         process::CommandExt,
     },
     path::Path,
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use super::helper_update;
@@ -19,8 +19,10 @@ use macluster_protocol::nfs_admin::{
     MAX_NFS_ADMIN_REQUEST_BYTES, NFS_ADMIN_SERVICE_VERSION, NfsAdminOperation, NfsAdminReply,
     NfsAdminRequest,
 };
+use serde::Serialize;
 const SOCKET: &str = "/var/run/org.macluster.nfs-admin.sock";
 const ADMIN_CLI: &str = "/Library/PrivilegedHelperTools/org.macluster.macluster";
+const REBOOT_AUDIT_ROOT: &str = "/var/db/macluster/nfs-reboot";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ADMIN_STDERR_BYTES: usize = 256 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -30,6 +32,125 @@ enum MountStatus {
     NotMounted,
     Expected,
     Conflict(String),
+}
+
+#[derive(Serialize)]
+struct NfsRebootAudit<'a> {
+    operation_id: &'a str,
+    boot_id: &'a str,
+    requested_unix_ms: u64,
+}
+
+pub fn apply_privileged_nfs_reboot(
+    operation_id: &str,
+    expected_boot_id: &str,
+) -> Result<(), String> {
+    apply_privileged_nfs_reboot_at(
+        operation_id,
+        expected_boot_id,
+        Path::new(REBOOT_AUDIT_ROOT),
+        current_boot_id,
+        schedule_system_reboot,
+    )
+}
+
+fn apply_privileged_nfs_reboot_at(
+    operation_id: &str,
+    expected_boot_id: &str,
+    audit_root: &Path,
+    read_current_boot_id: impl FnOnce() -> Result<String, String>,
+    schedule_reboot: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let operation_id = macluster_protocol::identifiers::Id128::parse(operation_id)
+        .map_err(|_| "NFS reboot operation ID is invalid".to_owned())?
+        .to_string();
+    if expected_boot_id.is_empty()
+        || expected_boot_id.len() > 256
+        || expected_boot_id.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("NFS reboot boot ID is invalid".into());
+    }
+    let current_boot_id = read_current_boot_id()?;
+    if current_boot_id != expected_boot_id {
+        return Err(format!(
+            "node boot identity changed; refusing to replay NFS reboot operation {operation_id}"
+        ));
+    }
+    let audit_path = audit_root.join(format!("{operation_id}.json"));
+    if audit_path.exists() {
+        return Ok(());
+    }
+    if !audit_root.exists() {
+        fs::create_dir_all(audit_root)
+            .map_err(|error| format!("create NFS reboot audit directory: {error}"))?;
+        fs::set_permissions(audit_root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("protect NFS reboot audit directory: {error}"))?;
+    }
+    let temp = audit_path.with_extension("next");
+    let requested_unix_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let audit = NfsRebootAudit {
+        operation_id: &operation_id,
+        boot_id: &current_boot_id,
+        requested_unix_ms,
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|error| format!("open NFS reboot audit: {error}"))?;
+    file.write_all(
+        &serde_json::to_vec(&audit).map_err(|error| format!("encode NFS reboot audit: {error}"))?,
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| format!("write NFS reboot audit: {error}"))?;
+    fs::rename(&temp, &audit_path).map_err(|error| format!("commit NFS reboot audit: {error}"))?;
+    if let Err(error) = schedule_reboot() {
+        let _ = fs::remove_file(audit_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn current_boot_id() -> Result<String, String> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .map_err(|error| format!("read node boot identity: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "read node boot identity exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let boot_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if boot_id.is_empty() {
+        return Err("node boot identity is empty".into());
+    }
+    Ok(boot_id)
+}
+
+fn schedule_system_reboot() -> Result<(), String> {
+    let output = Command::new("/sbin/shutdown")
+        .args(["-r", "+1"])
+        .output()
+        .map_err(|error| format!("schedule node reboot: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "schedule node reboot exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
@@ -234,7 +355,8 @@ fn preflight_mounts(request: &NfsAdminRequest) -> Result<(), String> {
         | NfsAdminOperation::UpdateExports { .. }
         | NfsAdminOperation::RemoveExports { .. }
         | NfsAdminOperation::UpdateHelpers { .. }
-        | NfsAdminOperation::ForgetClusterUpdater { .. } => return Ok(()),
+        | NfsAdminOperation::ForgetClusterUpdater { .. }
+        | NfsAdminOperation::RebootNode { .. } => return Ok(()),
     };
     if mounts.is_empty() {
         return Ok(());
@@ -532,11 +654,13 @@ fn classify_mount(output: &str, expected_source: &str, target: &str) -> MountSta
 #[cfg(test)]
 mod tests {
     use super::{
-        HelperUpdateResponseAction, MountStatus, authorized_peer, classify_mount,
-        helper_update_response_action, run_child_bounded,
+        HelperUpdateResponseAction, MountStatus, apply_privileged_nfs_reboot_at, authorized_peer,
+        classify_mount, helper_update_response_action, run_child_bounded,
     };
     use std::{
+        fs,
         process::{Command, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
         time::{Duration, Instant},
     };
 
@@ -571,6 +695,44 @@ mod tests {
             classify_mount("", "192.0.2.1:/Users/Shared/data", "/Users/Shared/data"),
             MountStatus::NotMounted
         );
+    }
+
+    #[test]
+    fn privileged_nfs_reboot_requires_boot_identity_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-nfs-reboot-{}",
+            macluster_protocol::identifiers::Id128::random()
+        ));
+        let calls = AtomicUsize::new(0);
+        let error = apply_privileged_nfs_reboot_at(
+            "00000000-0000-4000-8000-000000000001",
+            "stale-boot",
+            &root,
+            || Ok("current-boot".into()),
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("boot identity changed"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        for _ in 0..2 {
+            apply_privileged_nfs_reboot_at(
+                "00000000-0000-4000-8000-000000000001",
+                "current-boot",
+                &root,
+                || Ok("current-boot".into()),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

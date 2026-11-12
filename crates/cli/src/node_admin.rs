@@ -88,7 +88,7 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-13";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-14";
 const POWER_HELPER_REVISION: &str = "power-4";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
 const SMB_CREDENTIAL_SOCKET_PATH: &str = "/var/run/org.macluster.smb-credential.sock";
@@ -7769,6 +7769,13 @@ pub(crate) fn apply_privileged_nfs_admin_request(
                 "cluster updater trust must be removed through the authenticated privileged service"
                     .into(),
             ),
+            NfsAdminOperation::RebootNode {
+                operation_id,
+                expected_boot_id,
+            } => macluster_power_helper::apply_privileged_nfs_reboot(
+                &operation_id,
+                &expected_boot_id,
+            ),
         }
     })();
     match result {
@@ -11011,13 +11018,13 @@ fn stale_nfs_admin_reply(
     reply: &NfsAdminReply,
     operation: &NfsAdminOperation,
 ) -> Option<Result<Option<()>, String>> {
-    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-4" {
+    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-5" {
         return Some(Ok(None));
     }
     if !matches!(
         reply.service_version.as_str(),
         "nfs-admin-2" | "nfs-admin-3"
-    ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-4"
+    ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-5"
     {
         return None;
     }
@@ -29516,7 +29523,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
         );
         assert!(script.contains(super::NFS_ADMIN_CLI_REVISION));
-        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-4");
+        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-5");
     }
 
     #[test]
@@ -29566,7 +29573,7 @@ ssh_port = 22
                 .unwrap()
                 .unwrap(),
             Some(()),
-            "nfs-admin-3 can authenticate the signed upgrade path to protocol 4"
+            "nfs-admin-3 can authenticate the signed upgrade path to protocol 5"
         );
         assert_eq!(
             super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &update)

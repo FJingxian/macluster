@@ -7,6 +7,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::identifiers::{Id128, NodeId};
 
 pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-24";
+const SMB_CREDENTIAL_SERVICE_VERSION_23: &str = "smb-credential-23";
 pub const MAX_SMB_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_SMB_CREDENTIAL_FRAME_BYTES: usize = 32 * 1024;
 
@@ -267,7 +268,10 @@ impl SmbCredentialRequest {
     }
 
     pub fn validate(&self) -> Result<(), SmbCredentialValidationError> {
-        if self.service_version != SMB_CREDENTIAL_SERVICE_VERSION {
+        if !matches!(
+            self.service_version.as_str(),
+            SMB_CREDENTIAL_SERVICE_VERSION | SMB_CREDENTIAL_SERVICE_VERSION_23
+        ) {
             return Err(SmbCredentialValidationError::IncompatibleServiceVersion);
         }
         self.operation.validate()
@@ -415,7 +419,7 @@ fn validate_account(account: &str) -> Result<(), SmbCredentialValidationError> {
 mod tests {
     use super::{
         MAX_SMB_CREDENTIAL_BYTES, MAX_SMB_CREDENTIAL_FRAME_BYTES, SecretString, SmbCredentialKey,
-        SmbCredentialOperation, SmbCredentialProvision, StoredSmbCredential,
+        SmbCredentialOperation, SmbCredentialProvision, SmbCredentialRequest, StoredSmbCredential,
     };
     use crate::{
         identifiers::{Id128, NodeId},
@@ -564,6 +568,14 @@ mod tests {
         .unwrap();
 
         assert!(encoded.len() < MAX_SMB_CREDENTIAL_FRAME_BYTES);
+    }
+
+    #[test]
+    fn request_accepts_previous_service_version_during_self_upgrade() {
+        let mut request = SmbCredentialRequest::new(SmbCredentialOperation::Ping);
+        request.service_version = "smb-credential-23".into();
+
+        assert!(request.validate().is_ok());
     }
 
     #[test]

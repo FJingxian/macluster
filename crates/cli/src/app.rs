@@ -23,10 +23,11 @@ use macluster_core::{
 use macluster_protocol::{
     control::{
         AgentCompatibilityRecord, AgentCompatibilityState, AgentCompatibilityUpdate,
-        ControlCommand, ControlPayload, ControllerHello, ControllerLifecycle, FanControlPayload,
-        MAX_CONTROL_COMPATIBILITY_NODES, MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, NodeFanControlResult,
+        ControlCommand, ControlError, ControlErrorCode, ControlPayload, ControllerHello,
+        ControllerLifecycle, FanControlPayload, HelloResponse, MAX_CONTROL_COMPATIBILITY_NODES,
+        MAX_CONTROL_SNAPSHOT_CHUNK_BYTES, NodeFanControlResult,
     },
-    framing::{MAX_SNAPSHOT_BYTES, sha256_hex},
+    framing::{MAX_SNAPSHOT_BYTES, sha256_hex, write_frame},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
         ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, CARGO_HOME_SEED_ENV,
@@ -1482,6 +1483,16 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     {
         return false;
     }
+    // Removing a named share is a recovery operation. Let its journaled
+    // cleanup path detach reachable mounts and defer unavailable peers instead
+    // of requiring every Agent to complete a cluster-wide update first.
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-umount" | "--umount"))
+    {
+        return false;
+    }
     // Removing a moved or unreachable node must not first update that node
     // through the stale endpoint. Removal performs its own identity and idle checks.
     if command == "node"
@@ -1528,6 +1539,15 @@ fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
         && args
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "start" | "stop" | "restart" | "status"))
+    {
+        return false;
+    }
+    // Unmount cleanup has its own per-node reachability and identity checks;
+    // address discovery must not prevent removal when a peer SSH endpoint is down.
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-umount" | "--umount"))
     {
         return false;
     }
@@ -8443,14 +8463,27 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 }
                 let current_ip =
                     crate::client_access::current_ssh_client_ipv4().map_err(|error| (1, error))?;
-                crate::client_access::replace_registered_client_address(
+                if let Err(error) = crate::client_access::replace_registered_client_address(
                     &config,
                     Path::new(&proxy.state_dir),
                     client_id,
                     recorded_ip,
                     &current_ip,
-                )
-                .map_err(|error| (1, error))?;
+                ) {
+                    let response = HelloResponse::Rejected(ControlError {
+                        code: ControlErrorCode::Unavailable,
+                        message: error,
+                    });
+                    write_frame(&mut io::stdout().lock(), &response).map_err(|error| {
+                        (
+                            1,
+                            format!(
+                                "cannot report login-client NFS authorization failure: {error}"
+                            ),
+                        )
+                    })?;
+                    return Ok(());
+                }
             }
             let binding =
                 ServiceBinding::load(Path::new(&proxy.config_path), Path::new(&proxy.state_dir))

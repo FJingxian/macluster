@@ -68,6 +68,7 @@ use crate::nfs_recovery::{NFS_MOUNT_LOCK_PATH, NFS_MOUNT_OPTIONS, NFS_MOUNT_TIME
 pub(crate) type AppResult<T> = Result<T, (i32, String)>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const NFS_SOURCE_PREFLIGHT_LIMIT: Duration = Duration::from_secs(5);
 const MAINTENANCE_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_EXPORTS_PATH: &str = "/etc/exports";
 const NFS_EXPORTS_TEMP_PATH: &str = "/etc/exports.macluster.tmp";
@@ -9865,6 +9866,17 @@ pub(crate) fn ensure_nfs_exports_with_setup(
     if !changed && !transaction_pending && setup_script.is_none() {
         return (managed, Ok(()));
     }
+    if changed || transaction_pending {
+        if let Err(error) = verify_nfs_export_sources(storage_node, requests) {
+            return (
+                managed,
+                Err(format!(
+                    "cannot validate NFS export source on {}: {error}\nMount the configured source volume on that server and confirm it is responsive, then rerun the command that requested NFS access. No NFS exports were changed.",
+                    storage_node.host,
+                )),
+            );
+        }
+    }
     let purpose = requests
         .iter()
         .map(|request| format!("{} for {}", request.root, request.client_ip))
@@ -9923,6 +9935,58 @@ fn nfs_admin_steps_for_requests(requests: &[NfsExportRequest]) -> String {
         .map(|request| nfs_admin_steps(&request.root, &request.client_ip))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn verify_nfs_export_sources(
+    storage_node: &NodeConfig,
+    requests: &[NfsExportRequest],
+) -> Result<(), String> {
+    let roots = requests
+        .iter()
+        .map(|request| request.root.as_str())
+        .collect::<BTreeSet<_>>();
+    if roots.is_empty() || storage_node.transport == Transport::Storage {
+        return Ok(());
+    }
+
+    if storage_node.transport == Transport::Local {
+        for root in roots {
+            // A stale NFS path can block metadata calls in the kernel. Keep
+            // that check out of the control-proxy process so its caller can
+            // still receive a bounded rejection instead of timing out first.
+            let mut command =
+                Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
+            command.args(["internal", "local-share-source-check", "--path", root]);
+            let output = run_child(command, None, NFS_SOURCE_PREFLIGHT_LIMIT)
+                .map_err(|(_, error)| format!("cannot inspect export source {root}: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "export source {root} is not a usable local NFS filesystem: {}",
+                    command_error("NFS export source check failed", &output)
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    let mut script = String::from("set -e\n");
+    for root in roots {
+        script.push_str(&shell_join(&[
+            &storage_node.remote_binary,
+            "internal",
+            "local-share-source-check",
+            "--path",
+            root,
+        ]));
+        script.push('\n');
+    }
+    let output =
+        ssh_output_with_timeout(storage_node, &script, None, NFS_SOURCE_PREFLIGHT_LIMIT)
+            .map_err(|(_, error)| format!("cannot inspect remote NFS export source: {error}"))?;
+    if !output.status.success() {
+        return Err(command_error("NFS export source check failed", &output));
+    }
+    Ok(())
 }
 
 fn plan_ensure_nfs_exports(
@@ -10277,7 +10341,7 @@ fn validate_storage_root_access(
 
 fn nfs_admin_steps(root: &str, client_ip: &str) -> String {
     format!(
-        "On the NFS server, preserve existing export options and authorize this client IP (create /etc/exports if this is the first export):\n  export: {root}\n  client: {client_ip}\nThen run `sudo {NFS_DAEMON_PATH} enable`, `sudo {NFS_DAEMON_PATH} start`, `sudo {NFS_DAEMON_PATH} checkexports`, and `sudo {NFS_DAEMON_PATH} update`. Rerun the same mnode --add command afterward."
+        "On the NFS server, preserve existing export options and authorize this client IP (create /etc/exports if this is the first export):\n  export: {root}\n  client: {client_ip}\nThen run `sudo {NFS_DAEMON_PATH} enable`, `sudo {NFS_DAEMON_PATH} start`, `sudo {NFS_DAEMON_PATH} checkexports`, and `sudo {NFS_DAEMON_PATH} update`. Rerun the command that requested NFS access afterward."
     )
 }
 
@@ -10366,6 +10430,7 @@ fn nfs_exports_update_body(
 had_enabled=no
 had_running=no
 transaction_active=no
+transaction_pending=no
 legacy_backup=
 legacy_temp=
 legacy_recovered=no
@@ -10378,12 +10443,18 @@ check_nfs_exports() {{
     case "$nfs_check_output" in
       *"sandbox_check failed"*"nfsd has no read access"*)
         echo 'macOS privacy protection blocks nfsd on this NFS server. In System Settings > Privacy & Security > Full Disk Access, add /sbin/nfsd and enable it. sudo cannot grant this permission.' >&2
-        echo 'After authorizing nfsd, run sudo /sbin/nfsd restart on this server, then rerun the same mnode --add command. A full Mac restart is not the first step.' >&2
+        echo 'After authorizing nfsd, run sudo /sbin/nfsd restart on this server, then rerun the command that requested NFS authorization. A full Mac restart is not the first step.' >&2
         ;;
       *"NFS exporting not supported by fstype"*)
         echo 'This volume cannot be exported by macOS NFS. Choose a directory on an NFS-capable volume, such as APFS; sudo and export options cannot add filesystem support.' >&2
         ;;
+      *"can't get physical path for "*|*"Can't allocate memory to add export path"*|*"Can't allocate memory to add directory"*)
+        echo 'macOS nfsd cannot resolve an NFS export path to the intended local filesystem. Verify that the source volume is mounted and responsive on this storage Mac. If this path is itself an NFS mount or a stale mount, use the original server-local source or restore the source mount before retrying.' >&2
+        ;;
     esac
+    if [ "$transaction_pending" = yes ]; then
+      echo 'The pending NFS transaction was retained but not finalized because export validation failed; resolve the error above and retry.' >&2
+    fi
     return "$nfs_check_status"
   fi
 }}
@@ -10432,6 +10503,7 @@ if [ -L {exports_path} ] || [ -L {temporary_path} ] || [ -L {backup_path} ] || [
 fi
 if [ -e {exports_path} ]; then actual=$(/usr/bin/shasum -a 256 {exports_path}); actual=${{actual%% *}}; else actual={empty_hash}; fi
 if [ -f {state_path} ]; then
+  transaction_pending=yes
   IFS='|' read -r version had_original had_enabled had_running baseline_hash accepted_before accepted_candidate < {state_path} || {{ echo 'NFS transaction state is unreadable' >&2; exit 1; }}
   if [ "$version" != MACLUSTER_NFS_TXN_V1 ]; then echo 'NFS transaction state has an unsupported format' >&2; exit 1; fi
   case "$had_original:$had_enabled:$had_running" in yes:yes:yes|yes:yes:no|yes:no:yes|yes:no:no|no:yes:yes|no:yes:no|no:no:yes|no:no:no) ;; *) echo 'NFS transaction state is malformed' >&2; exit 1 ;; esac
@@ -10458,6 +10530,7 @@ if [ -f {state_path} ]; then
         echo 'recovering a partial /etc/exports write from the saved original' >&2
         transaction_active=yes
         if [ "$had_original" = yes ]; then write_exports_from_file {backup_path}; else /bin/rm -f {exports_path}; fi
+        transaction_active=no
         actual=$baseline_hash
       else
         echo 'NFS exports changed during a pending transaction; transaction files were preserved' >&2
@@ -10468,8 +10541,8 @@ if [ -f {state_path} ]; then
       exit 1
     fi
   fi
-  transaction_active=yes
 else
+  transaction_pending=no
   legacy_count=0
   for possible_backup in {legacy_backups}; do [ -e "$possible_backup" ] || continue; legacy_count=$((legacy_count + 1)); legacy_backup=$possible_backup; done
   if [ "$legacy_count" -gt 1 ]; then echo 'multiple legacy NFS transactions need manual recovery; no exports were changed' >&2; exit 1; fi
@@ -10504,7 +10577,7 @@ check_nfs_exports -F {temporary_path}
         candidate = shell_quote(candidate),
     ));
     script.push_str(&format!(
-        r#"if [ "$transaction_active" = no ]; then
+r#"if [ "$transaction_pending" = no ]; then
   if [ "$legacy_recovered" = no ]; then
     /bin/rm -f {backup_path}
     if [ "$had_original" = yes ]; then write_target_from_file {backup_path} {exports_path}; fi
@@ -11120,12 +11193,12 @@ fn nfs_exports_permission_failure_guidance(node: &NodeConfig, error: &str) -> Op
     }
     let action = match node.transport {
         Transport::Local => format!(
-            "macOS denied the background NFS service access to /etc/exports. In System Settings > Privacy & Security > Full Disk Access, authorize {}. If the operation falls back to Terminal, authorize the Terminal app used for this command as well, quit and reopen it, then rerun the same mnode command.",
+            "macOS denied the privileged NFS helper access to /etc/exports on this Mac. In System Settings > Privacy & Security > Full Disk Access, authorize {} (or deploy an equivalent MDM privacy policy). Full Disk Access for Terminal does not grant it to the background helper; Full Disk Access for /sbin/nfsd is a separate permission for reading/checking exports. Retry the command that triggered this authorization.",
             UNIFIED_HELPER_PATH
         ),
         Transport::Ssh => format!(
-            "macOS denied the NFS export write on remote NFS server {}. Its TCC log identifies /Library/PrivilegedHelperTools/org.macluster.macluster as the responsible process. On that Mac, grant this exact executable Full Disk Access in System Settings > Privacy & Security > Full Disk Access (or use an equivalent MDM privacy policy), then rerun the same mnode command. Full Disk Access for /sbin/nfsd is a separate permission for nfsd to read/check exports; it does not authorize this write. SSH or sudo authorization alone cannot grant this macOS privacy permission.",
-            node.host
+            "macOS denied the NFS export write on remote NFS server {}. Its TCC log identifies {} as the responsible process. On that Mac, grant this exact executable Full Disk Access in System Settings > Privacy & Security > Full Disk Access (or use an equivalent MDM privacy policy), then retry the command that triggered this authorization. Full Disk Access for /sbin/nfsd is a separate permission for nfsd to read/check exports; it does not authorize this write. SSH or sudo authorization alone cannot grant this macOS privacy permission.",
+            node.host, UNIFIED_HELPER_PATH
         ),
         Transport::Storage => {
             "external storage providers manage their own server-side export permissions".into()
@@ -12405,13 +12478,42 @@ fn retry_deferred_share_marker_cleanup(
     Ok(deferred)
 }
 
+fn share_removal_ssh_unavailable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "ssh: connect to host ",
+        "kex_exchange_identification",
+        "connection reset by peer",
+        "connection timed out",
+        "operation timed out",
+        "connection refused",
+        "connection closed by remote host",
+        "no route to host",
+        "network is unreachable",
+        "could not resolve hostname",
+        "host key verification failed",
+        "remote host identification has changed",
+        "permission denied (publickey",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
 fn share_removal_unavailable_nodes(config: &ClusterConfig) -> BTreeSet<String> {
     config
         .nodes
         .iter()
         .filter_map(|(node_id, node)| {
-            (node.transport != Transport::Storage && !node_ssh_endpoint_reachable(node))
-                .then(|| node_id.clone())
+            if node.transport == Transport::Storage {
+                return None;
+            }
+            let ssh_available = if node.transport == Transport::Local {
+                true
+            } else {
+                ssh_output_with_timeout(node, "/usr/bin/true", None, Duration::from_secs(5))
+                    .is_ok_and(|output| output.status.success())
+            };
+            (!ssh_available).then(|| node_id.clone())
         })
         .collect()
 }
@@ -13421,8 +13523,7 @@ fn remove_registered_share(
         // managed mount. A host may still answer ping while sshd/Agent is
         // unavailable, so use the endpoint needed for cleanup and defer that
         // client's unmount/config sync until it reconnects.
-        let offline_nodes = share_removal_unavailable_nodes(&config);
-        let server_offline = offline_nodes.contains(&server_id);
+        let mut offline_nodes = share_removal_unavailable_nodes(&config);
         let mut deferred_output_sync = Vec::new();
         if state_dir.join("controller.sqlite3").is_file() {
             let jobs = ReadOnlyJobStore::open(state_dir)
@@ -13466,9 +13567,28 @@ fn remove_registered_share(
             if offline_nodes.contains(node_id) {
                 continue;
             }
-            verify_registered_node_identity(node_id, node, &state)?;
-            check_remote_idle(node, node_id, &config_path)?;
+            if let Err((_, error)) = verify_registered_node_identity(node_id, node, &state) {
+                if share_removal_ssh_unavailable(&error) {
+                    eprintln!(
+                        "Warning: SSH to {node_id} became unavailable during share removal; its mount and config cleanup will be deferred: {error}"
+                    );
+                    offline_nodes.insert(node_id.clone());
+                    continue;
+                }
+                return Err((1, error));
+            }
+            if let Err((_, error)) = check_remote_idle(node, node_id, &config_path) {
+                if share_removal_ssh_unavailable(&error) {
+                    eprintln!(
+                        "Warning: SSH to {node_id} became unavailable during share removal; its mount and config cleanup will be deferred: {error}"
+                    );
+                    offline_nodes.insert(node_id.clone());
+                    continue;
+                }
+                return Err((1, error));
+            }
         }
+        let server_offline = offline_nodes.contains(&server_id);
 
         let mut export_requests = config
             .nodes
@@ -27066,7 +27186,7 @@ ssh_port = 22
         assert!(guidance.contains("192.0.2.3"));
         assert!(guidance.contains("Full Disk Access"));
         assert!(guidance.contains("org.macluster.macluster"));
-        assert!(guidance.contains("rerun the same mnode command"));
+        assert!(guidance.contains("retry the command that triggered this authorization"));
         assert!(guidance.contains("transaction files were preserved"));
     }
 

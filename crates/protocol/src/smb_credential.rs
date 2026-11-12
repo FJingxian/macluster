@@ -6,7 +6,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::identifiers::{Id128, NodeId};
 
-pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-23";
+pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-24";
 pub const MAX_SMB_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_SMB_CREDENTIAL_FRAME_BYTES: usize = 32 * 1024;
 

@@ -19,6 +19,7 @@ use std::{
 };
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use macluster_core::smb_keychain::MacKeychain;
@@ -868,6 +869,203 @@ fn ensure_same_subnet_storage_route(server_host: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmbMountAction {
+    Keep,
+    Replace,
+}
+
+fn smb_mount_action(active: bool, readable: bool) -> SmbMountAction {
+    if active && readable {
+        SmbMountAction::Keep
+    } else {
+        SmbMountAction::Replace
+    }
+}
+
+trait SmbMountBackend {
+    fn is_active(&mut self, target: &str) -> Result<bool, String>;
+    fn verify_readable(&mut self, target: &str) -> Result<(), String>;
+    fn unmount(&mut self, target: &str, logical: &str, logical_target: &str) -> Result<(), String>;
+    fn mount(&mut self, source: &str, target: &str) -> Result<(), String>;
+    fn ensure_alias(&mut self, logical: &str, logical_target: &str) -> Result<(), String>;
+}
+
+struct RealSmbMountBackend<'a> {
+    uid: libc::uid_t,
+    user: &'a str,
+    home: &'a str,
+    vault: &'a dyn CredentialVault,
+    key: &'a SmbCredentialKey,
+}
+
+impl SmbMountBackend for RealSmbMountBackend<'_> {
+    fn is_active(&mut self, target: &str) -> Result<bool, String> {
+        smb_mount_is_active(target)
+    }
+
+    fn verify_readable(&mut self, target: &str) -> Result<(), String> {
+        verify_smb_mount_readable(self.uid, self.user, self.home, target)
+    }
+
+    fn unmount(&mut self, target: &str, logical: &str, logical_target: &str) -> Result<(), String> {
+        unmount_smb(self.uid, target, logical, logical_target)
+    }
+
+    fn mount(&mut self, source: &str, target: &str) -> Result<(), String> {
+        ensure_same_subnet_storage_route(&self.key.server_host)?;
+        let guest = self.key.account.eq_ignore_ascii_case("guest");
+        if guest {
+            let output = Command::new("/bin/launchctl")
+                .args(smb_mount_arguments(
+                    self.uid, self.user, source, target, true,
+                ))
+                .env_clear()
+                .env("HOME", self.home)
+                .env("USER", self.user)
+                .env("LOGNAME", self.user)
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("mount guest SMB share: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "mount guest SMB share exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            return Ok(());
+        }
+        let credential = self.vault.get(self.key)?.ok_or_else(|| {
+            "SMB credential is not available on this node; rerun mnode".to_owned()
+        })?;
+        let mut command = CommandBuilder::new("/bin/launchctl");
+        command.args(smb_mount_arguments(
+            self.uid, self.user, source, target, false,
+        ));
+        command.env_clear();
+        command.env("HOME", self.home);
+        command.env("USER", self.user);
+        command.env("LOGNAME", self.user);
+        command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+        command.env("LC_ALL", "C");
+        run_smb_mount_pty(command, &credential.password)
+    }
+
+    fn ensure_alias(&mut self, logical: &str, logical_target: &str) -> Result<(), String> {
+        ensure_smb_logical_alias(logical, logical_target)
+    }
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct SmbRepairState {
+    failures: u32,
+    retry_after_unix_ms: u64,
+}
+
+fn smb_repair_state(path: &Path) -> SmbRepairState {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn smb_repair_allowed(state_path: &Path, now_ms: u64) -> bool {
+    now_ms >= smb_repair_state(state_path).retry_after_unix_ms
+}
+
+fn record_smb_repair_failure(state_path: &Path, now_ms: u64) -> Result<(), String> {
+    let mut state = smb_repair_state(state_path);
+    state.failures = state.failures.saturating_add(1);
+    let exponent = state.failures.saturating_sub(1).min(3);
+    let delay_ms = 60_000_u64.saturating_mul(1_u64 << exponent).min(300_000);
+    state.retry_after_unix_ms = now_ms.saturating_add(delay_ms);
+    if let Some(parent) = state_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("create SMB repair state directory: {error}"))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("protect SMB repair state directory: {error}"))?;
+        }
+    }
+    let temp = state_path.with_extension("next");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|error| format!("open SMB repair state: {error}"))?;
+    file.write_all(
+        &serde_json::to_vec(&state).map_err(|error| format!("encode SMB repair state: {error}"))?,
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| format!("write SMB repair state: {error}"))?;
+    fs::rename(&temp, state_path).map_err(|error| format!("commit SMB repair state: {error}"))
+}
+
+fn clear_smb_repair_state(state_path: &Path) {
+    let _ = fs::remove_file(state_path);
+}
+
+fn smb_repair_state_path(target: &str) -> PathBuf {
+    let key = sha256_hex(target.as_bytes()).expect("SHA256");
+    Path::new("/var/run/org.macluster.smb-repair").join(format!("{key}.json"))
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn reconcile_smb_mount_with_backend(
+    source: &str,
+    target: &str,
+    logical: &str,
+    logical_target: &str,
+    repair_state: &Path,
+    now_ms: u64,
+    backend: &mut impl SmbMountBackend,
+) -> Result<(), String> {
+    let active = backend.is_active(target)?;
+    let readable = active && backend.verify_readable(target).is_ok();
+    if smb_mount_action(active, readable) == SmbMountAction::Keep {
+        return backend.ensure_alias(logical, logical_target);
+    }
+    if active {
+        if !smb_repair_allowed(repair_state, now_ms) {
+            return Err(format!(
+                "SMB mount {target} was unreadable; replacement is backing off"
+            ));
+        }
+        if let Err(error) = backend.unmount(target, logical, logical_target) {
+            let _ = record_smb_repair_failure(repair_state, now_ms);
+            return Err(error);
+        }
+    }
+    let result = (|| {
+        backend.mount(source, target)?;
+        backend.verify_readable(target)?;
+        backend.ensure_alias(logical, logical_target)
+    })();
+    match result {
+        Ok(()) => {
+            clear_smb_repair_state(repair_state);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = record_smb_repair_failure(repair_state, now_ms);
+            Err(error)
+        }
+    }
+}
+
 fn mount_smb_from_vault(
     uid: libc::uid_t,
     vault: &dyn CredentialVault,
@@ -887,45 +1085,22 @@ fn mount_smb_from_vault(
             "SMB mount target {target} must be a user-owned directory without symlinks"
         ));
     }
-    if !smb_mount_is_active(target)? {
-        ensure_same_subnet_storage_route(&key.server_host)?;
-        let guest = key.account.eq_ignore_ascii_case("guest");
-        if guest {
-            let output = Command::new("/bin/launchctl")
-                .args(smb_mount_arguments(uid, &user, source, target, true))
-                .env_clear()
-                .env("HOME", &home)
-                .env("USER", &user)
-                .env("LOGNAME", &user)
-                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-                .env("LC_ALL", "C")
-                .stdin(std::process::Stdio::null())
-                .output()
-                .map_err(|error| format!("mount guest SMB share: {error}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "mount guest SMB share exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-        } else {
-            let credential = vault.get(key)?.ok_or_else(|| {
-                "SMB credential is not available on this node; rerun mnode".to_owned()
-            })?;
-            let mut command = CommandBuilder::new("/bin/launchctl");
-            command.args(smb_mount_arguments(uid, &user, source, target, false));
-            command.env_clear();
-            command.env("HOME", &home);
-            command.env("USER", &user);
-            command.env("LOGNAME", &user);
-            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
-            command.env("LC_ALL", "C");
-            run_smb_mount_pty(command, &credential.password)?;
-        }
-    }
-    verify_smb_mount_readable(uid, &user, &home, target)?;
-    ensure_smb_logical_alias(logical, logical_target)
+    let mut backend = RealSmbMountBackend {
+        uid,
+        user: &user,
+        home: &home,
+        vault,
+        key,
+    };
+    reconcile_smb_mount_with_backend(
+        source,
+        target,
+        logical,
+        logical_target,
+        &smb_repair_state_path(target),
+        unix_time_ms(),
+        &mut backend,
+    )
 }
 
 fn smb_mount_is_active(target: &str) -> Result<bool, String> {
@@ -1462,9 +1637,11 @@ mod tests {
 
     use super::{
         CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore, SecretStore,
-        arp_delete_arguments, direct_storage_subnet_route_arguments, read_pinned_cluster,
-        route_delete_arguments, route_output_is_direct, run_bounded_process_group,
-        serve_client_with, smb_mount_arguments, smb_tcp_endpoint_reachable,
+        SmbMountAction, SmbMountBackend, arp_delete_arguments,
+        direct_storage_subnet_route_arguments, read_pinned_cluster,
+        reconcile_smb_mount_with_backend, record_smb_repair_failure, route_delete_arguments,
+        route_output_is_direct, run_bounded_process_group, serve_client_with, smb_mount_action,
+        smb_mount_arguments, smb_repair_allowed, smb_tcp_endpoint_reachable,
     };
 
     fn cluster() -> Id128 {
@@ -1669,6 +1846,142 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "nopassprompt,nobrowse,forcenewsession")
         );
+    }
+
+    #[test]
+    fn smb_mount_action_replaces_only_missing_or_unreadable_mounts() {
+        assert_eq!(smb_mount_action(false, false), SmbMountAction::Replace);
+        assert_eq!(smb_mount_action(true, true), SmbMountAction::Keep);
+        assert_eq!(smb_mount_action(true, false), SmbMountAction::Replace);
+    }
+
+    #[derive(Default)]
+    struct FakeSmbMountBackend {
+        active: bool,
+        readable: bool,
+        unmount_busy: bool,
+        verify_calls: usize,
+        unmount_calls: usize,
+        mount_calls: usize,
+        alias_calls: usize,
+    }
+
+    impl SmbMountBackend for FakeSmbMountBackend {
+        fn is_active(&mut self, _target: &str) -> Result<bool, String> {
+            Ok(self.active)
+        }
+
+        fn verify_readable(&mut self, _target: &str) -> Result<(), String> {
+            self.verify_calls += 1;
+            if self.readable {
+                Ok(())
+            } else {
+                Err("stale SMB session".into())
+            }
+        }
+
+        fn unmount(
+            &mut self,
+            _target: &str,
+            _logical: &str,
+            _logical_target: &str,
+        ) -> Result<(), String> {
+            self.unmount_calls += 1;
+            if self.unmount_busy {
+                return Err("operation remained busy; close files and retry".into());
+            }
+            self.active = false;
+            Ok(())
+        }
+
+        fn mount(&mut self, _source: &str, _target: &str) -> Result<(), String> {
+            self.mount_calls += 1;
+            self.active = true;
+            self.readable = true;
+            Ok(())
+        }
+
+        fn ensure_alias(&mut self, _logical: &str, _logical_target: &str) -> Result<(), String> {
+            self.alias_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stale_active_smb_mount_is_replaced_once() {
+        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
+        let mut backend = FakeSmbMountBackend {
+            active: true,
+            readable: false,
+            ..Default::default()
+        };
+
+        reconcile_smb_mount_with_backend(
+            "//user@nas/share",
+            "/mnt/share",
+            "/logical/share",
+            "/mnt/share",
+            &state,
+            1_000,
+            &mut backend,
+        )
+        .unwrap();
+
+        assert_eq!(backend.unmount_calls, 1);
+        assert_eq!(backend.mount_calls, 1);
+        assert_eq!(backend.verify_calls, 2);
+        assert_eq!(backend.alias_calls, 1);
+        assert!(backend.active);
+        assert!(backend.readable);
+    }
+
+    #[test]
+    fn stale_active_smb_mount_preserves_a_busy_unmount() {
+        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
+        let mut backend = FakeSmbMountBackend {
+            active: true,
+            readable: false,
+            unmount_busy: true,
+            ..Default::default()
+        };
+
+        let error = reconcile_smb_mount_with_backend(
+            "//user@nas/share",
+            "/mnt/share",
+            "/logical/share",
+            "/mnt/share",
+            &state,
+            1_000,
+            &mut backend,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(backend.unmount_calls, 1);
+        assert_eq!(backend.mount_calls, 0);
+        assert!(backend.active);
+        assert!(!backend.readable);
+    }
+
+    #[test]
+    fn smb_repair_backoff_grows_and_caps() {
+        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
+
+        assert!(smb_repair_allowed(&state, 1_000));
+        record_smb_repair_failure(&state, 1_000).unwrap();
+        assert!(!smb_repair_allowed(&state, 30_000));
+        assert!(smb_repair_allowed(&state, 61_000));
+
+        record_smb_repair_failure(&state, 61_000).unwrap();
+        assert!(!smb_repair_allowed(&state, 180_999));
+        assert!(smb_repair_allowed(&state, 181_000));
+
+        for now in [181_000, 361_000, 661_000, 961_000] {
+            record_smb_repair_failure(&state, now).unwrap();
+        }
+        assert!(!smb_repair_allowed(&state, 1_260_999));
+        assert!(smb_repair_allowed(&state, 1_261_000));
+        fs::remove_file(state).unwrap();
     }
 
     #[test]

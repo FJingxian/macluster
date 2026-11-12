@@ -9,8 +9,10 @@ license.workspace = true
 libc.workspace = true
 macluster-core = { path = "../core" }
 macluster-protocol = { path = "../protocol" }
+portable-pty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 macmon = { version = "0.10.0", default-features = false }

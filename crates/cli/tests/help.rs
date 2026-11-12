@@ -142,12 +142,13 @@ fn detailed_help_has_clear_examples_and_section_headings() {
 }
 
 #[test]
-fn smb_keychain_help_and_docs_describe_one_prompt_migration_and_secret_boundaries() {
+fn smb_help_and_docs_describe_one_prompt_migration_and_secret_boundaries() {
     let node = help(&["mnode", "--help"]);
     assert!(node.contains("--smb-user ACCOUNT"), "{node}");
     assert!(node.contains("--update-credential"), "{node}");
-    assert!(node.contains("System Keychain"), "{node}");
-    assert!(node.contains("login Keychain"), "{node}");
+    assert!(node.contains("root-only credential vault"), "{node}");
+    assert!(node.contains("root-only node copy"), "{node}");
+    assert!(node.contains("mount_smbfs"), "{node}");
 
     let english = include_str!("../../../README.md");
     let chinese = include_str!("../../../doc/README.zh-CN.md");
@@ -156,13 +157,18 @@ fn smb_keychain_help_and_docs_describe_one_prompt_migration_and_secret_boundarie
         assert!(
             document.contains("--smb-user")
                 && document.contains("--update-credential")
-                && (document.contains("Keychain") || document.contains("钥匙串")),
+                && (document.contains("SMB session")
+                    || document.contains("credential vault")
+                    || document.contains("vault")),
             "SMB credential documentation is incomplete"
         );
     }
-    assert!(english.contains("System Keychain"));
+    assert!(english.contains("root-only credential vault"));
+    assert!(english.contains("root-only node"));
+    assert!(english.contains("node copy"));
     assert!(english.contains("same URI"));
-    assert!(chinese.contains("系统钥匙串"));
+    assert!(chinese.contains("root 专用 vault"));
+    assert!(chinese.contains("root-only 节点凭据"));
     assert!(chinese.contains("相同 URI"));
     assert!(!english.contains("password in config"));
 }

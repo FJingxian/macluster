@@ -60,11 +60,12 @@ macluster --init --name home --queue default --shared-root /Users/Shared/maclust
 # 将示例中的 SSH 账户和地址换成计算节点的信息。
 macluster node -a worker@192.0.2.10
 macluster node -l
+macluster node -l default-001
 ```
 
-节点通过 Agent 和共享存储验证后才会进入正式集群。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
+节点通过 Agent 和共享存储验证后才会进入正式集群。`node -l` 提供紧凑的集群视图；在命令后附加一个节点 ID，可查看该 Mac 的 host、SSH 账户、端口和详细存储信息。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
 
-所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller、login client 或存储 Mac。无法接入统一 Agent 的外部 NFS/SMB 节点只显示在 `mnode` 中。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
+所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller、login client 或存储 Mac。无法接入统一 Agent 的外部 NFS/SMB 节点只显示为 storage mapping。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
 
 加入节点时会安装 Agent、配置共享空间。若没有 SSH 密钥登录，可在核对指纹并输入远程账户登录密码后安装密钥。NFS 和特权 helper 的配置还可能需要每台相关 Mac 的管理员授权，两者用途不同。
 
@@ -174,23 +175,32 @@ macluster submit -Is pip install -e .
 
 共享卷需要支持 NFS 导出，例如 APFS；ExFAT 无法导出。受保护目录和外接卷可能需要在**存储 Mac** 上为 `/sbin/nfsd` 开启“完整磁盘访问权限”，授权后在该机重启 nfsd，再重试加入节点。
 
-NAS 或其他外部 SMB 存储不需要 SSH 和 Agent，可直接注册为外部存储节点：
+NAS 或其他外部存储不需要 SSH 和 Agent，直接用 `-mount` 挂载，不会进入节点列表：
 
 ```sh
-macluster node -a storage:nas-01@192.0.2.5
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
-  --smb-user smb-user
+macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
+  --host 192.0.2.5 --smb-user nas-user
+
+macluster node -mount smb://192.0.2.5/data \
+  --mount-root /Volumes/test_data --smb-user nas-user
+
+macluster node -mount nfs://nas-01/export/data \
+  --mount-root /Volumes/nas-data --host 192.0.2.5
 ```
 
-只有成功托管共享后，NAS 才显示 `STORAGE` 角色。首次为某个服务器/账户配置时，只在终端中隐藏输入一次 SMB 密码。controller 会把验证成功的主密码保存到 macOS **系统钥匙串**，再通过已固定身份的 SSH stdin 分发；每台可达 Mac 将 Internet Password 存入当前用户的登录钥匙串。密码不会进入集群配置、SQLite、journal、任务环境、命令参数、临时文件或日志。持久挂载由当前登录用户运行，因此重启后 `mount_smbfs -N` 仍可读取该用户的钥匙串。
+URI 中的 server ID 可以是逻辑名称，`--host` 指定对应 IPv4 地址或 DNS 名称；也可以直接在 URI 写 IPv4 或 DNS 名称，CLI 会自动建立稳定的内部别名。首次为某个服务器/账户配置时，只在终端中隐藏输入一次 SMB 密码。controller 会把验证成功的主密码保存在 `/Library/PrivilegedHelperTools/org.macluster.credentials` 的 root 专用凭据 vault 中（目录 `0700`、条目 `0600`），再通过已固定身份的 SSH stdin 分发；节点副本也保存在该 Mac 的 root 专用 vault 中。特权 helper 在目标用户的 launchd 安全上下文中运行 `mount_smbfs`，并通过 PTY 喂入密码。交互式命令没有指定 `--smb-user` 时会先询问用户名，直接留空则使用 `guest`，不保存密码；认证失败最多允许输入三次。共享名不存在时会在密码提示前报错，并列出服务器可发现的第一层共享。相同 SMB source 已经挂在其他路径时，CLI 会询问是否复用它来创建新路径；输入 `n` 会取消且不改变现有挂载。密码不会进入集群配置、SQLite、journal、任务环境、命令参数、临时文件或日志。持久挂载由当前用户的 LaunchAgent 调用 helper 恢复；节点重连时会从 login 节点重新接收 root-only 节点凭据。
+如果误用 `mnode -a USER@NAS_ADDRESS`，命令会改为提示上述直接挂载方式，不会把 NAS 注册成集群节点。
 
-使用 `--update-credential` 时，新密码必须先验证成功，才会替换旧主密码。离线节点重连后会自动接收新的 generation；移除某个服务器/账户的最后一个共享时，会安排清理主密码与节点凭据。
+交互式重置遇到尚未配置密钥登录的旧 SSH 节点时，会只询问一次该节点账户密码，安装 macluster 专用重置密钥后继续精确清理。当前本机保存的旧 machine UUID 不一致不会再阻断本地重置。
+
+使用 `--update-credential` 时，新密码必须先强制建立新的 SMB session 并验证成功，才会替换旧主密码；已有挂载不会让错误密码误判为正确。离线节点重连后会自动接收新的 generation；移除某个服务器/账户的最后一个共享时，会安排清理主 vault 与节点 vault 条目。
+主密码写入 root 专用 vault 后，后续 helper 升级和节点重连不再重复要求密码。
 
 用 `mnode -l` 查看 mapping ID、标准 source URI 和本机 target。可以用任一端点卸载：
 
 ```sh
 macluster node -umount mnt-d2d3885d51b734dd
-macluster node -umount smb://nas-01/data
+macluster node -umount smb://nas-user/data
 ```
 
 `mnode --scan` 可以发现集群网段中的 SMB/NFS 服务候选，但不能安全枚举需要认证的 SMB 共享或 NFS exports。可挂载路径需要来自 NAS/存储管理员或已知共享 URI。
@@ -198,8 +208,8 @@ macluster node -umount smb://nas-01/data
 旧共享没有 `smb_user` 时，用相同 URI、相同挂载路径和 `--smb-user ACCOUNT` 重新执行 `mnode -mount` 即可原地迁移。原有 share ID 与 UUID 不变，也不会产生重复记录：
 
 ```sh
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
-  --smb-user smb-user
+macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
+  --host 192.0.2.5 --smb-user nas-user
 ```
 
 ## 查看资源

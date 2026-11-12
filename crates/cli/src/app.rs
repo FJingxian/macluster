@@ -421,6 +421,9 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
             ),
         ));
     }
+    if let Some(error) = crate::node_admin::storage_provider_add_redirect(&command, &args) {
+        return Err(error);
+    }
     let caller_has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     if command == "submit"
         && parse_submit_args(&args).is_ok_and(|options| options.interactive)
@@ -1483,13 +1486,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
     {
         return false;
     }
-    // Removing a named share is a recovery operation. Let its journaled
-    // cleanup path detach reachable mounts and defer unavailable peers instead
-    // of requiring every Agent to complete a cluster-wide update first.
+    // Mounting or removing storage is an SSH/Keychain recovery operation. Let
+    // its journaled path reconcile reachable peers and defer unavailable nodes
+    // instead of requiring every Agent to complete a cluster-wide update first.
     if command == "node"
-        && args
-            .first()
-            .is_some_and(|arg| matches!(arg.as_str(), "-umount" | "--umount"))
+        && args.first().is_some_and(|arg| {
+            matches!(arg.as_str(), "-mount" | "--mount" | "-umount" | "--umount")
+        })
     {
         return false;
     }
@@ -1542,12 +1545,12 @@ fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
     {
         return false;
     }
-    // Unmount cleanup has its own per-node reachability and identity checks;
-    // address discovery must not prevent removal when a peer SSH endpoint is down.
+    // Storage mount cleanup has its own per-node reachability and identity
+    // checks; address discovery must not prevent it when a peer is down.
     if command == "node"
-        && args
-            .first()
-            .is_some_and(|arg| matches!(arg.as_str(), "-umount" | "--umount"))
+        && args.first().is_some_and(|arg| {
+            matches!(arg.as_str(), "-mount" | "--mount" | "-umount" | "--umount")
+        })
     {
         return false;
     }
@@ -9827,6 +9830,26 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             assert!(
                 !should_preflight_agent_update("node", &[flag.into()]),
                 "mnode {flag} must report current reachability without starting Agent maintenance"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_mount_recovery_does_not_require_agent_update_preflight() {
+        for flag in ["-mount", "--mount"] {
+            let args = [
+                flag.into(),
+                "smb://192.0.2.5/data".into(),
+                "--mount-root".into(),
+                "/Volumes/test_data".into(),
+            ];
+            assert!(
+                !should_preflight_agent_update("node", &args),
+                "mnode {flag} must use its SSH-backed storage recovery path"
+            );
+            assert!(
+                !super::should_refresh_node_addresses("node", &args),
+                "mnode {flag} must not migrate addresses before storage setup"
             );
         }
     }

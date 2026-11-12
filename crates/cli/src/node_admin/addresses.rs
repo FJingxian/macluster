@@ -1759,7 +1759,11 @@ mod tests {
         };
         let script = address_unmount_script(&[request], &[])
             .replace("/sbin/mount", &shell_quote(&fake_mount.to_string_lossy()))
-            .replace("/sbin/umount", &shell_quote(&fake_umount.to_string_lossy()));
+            .replace("/sbin/umount", &shell_quote(&fake_umount.to_string_lossy()))
+            .replace(
+                crate::node_admin::UNIFIED_HELPER_PATH,
+                &shell_quote(&root.join("unavailable-helper").to_string_lossy()),
+            );
         fs::write(
             &table,
             format!(

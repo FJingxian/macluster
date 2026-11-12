@@ -2,20 +2,28 @@
 use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
-    fs,
+    ffi::CStr,
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
+        process::CommandExt,
     },
-    path::Path,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use zeroize::Zeroizing;
 
 use macluster_core::smb_keychain::MacKeychain;
 use macluster_protocol::{
+    framing::sha256_hex,
     identifiers::Id128,
     smb_credential::{
         MAX_SMB_CREDENTIAL_FRAME_BYTES, SecretString, SmbCredentialKey, SmbCredentialOperation,
@@ -25,7 +33,8 @@ use macluster_protocol::{
 
 const SOCKET: &str = "/var/run/org.macluster.smb-credential.sock";
 const CLUSTER_PIN: &str = "/Library/PrivilegedHelperTools/org.macluster.update/cluster-id";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+const SMB_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 const FAILURE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_FAILURES_PER_WINDOW: usize = 8;
 
@@ -33,6 +42,9 @@ trait SecretStore: Send + Sync {
     fn get(&self, service: &str, account: &str) -> Result<Option<SecretString>, String>;
     fn set(&self, service: &str, account: &str, value: &str) -> Result<(), String>;
     fn delete(&self, service: &str, account: &str) -> Result<bool, String>;
+    fn initial_generation(&self) -> u64 {
+        1
+    }
 }
 
 struct SystemSecretStore {
@@ -99,6 +111,221 @@ impl<T: SecretStore + ?Sized> SecretStore for Arc<T> {
     fn delete(&self, service: &str, account: &str) -> Result<bool, String> {
         (**self).delete(service, account)
     }
+
+    fn initial_generation(&self) -> u64 {
+        (**self).initial_generation()
+    }
+}
+
+const FILE_VAULT_ROOT: &str = "/Library/PrivilegedHelperTools/org.macluster.credentials";
+const FILE_VAULT_MAX_BYTES: u64 = 32 * 1024;
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct FileVaultRecord {
+    version: u8,
+    service: String,
+    account: String,
+    secret: SecretString,
+}
+
+struct FileSecretStore {
+    root: PathBuf,
+    owner_uid: u32,
+    legacy: Option<Arc<dyn SecretStore>>,
+}
+
+impl FileSecretStore {
+    fn system() -> Self {
+        Self {
+            root: PathBuf::from(FILE_VAULT_ROOT),
+            owner_uid: 0,
+            legacy: Some(Arc::new(SystemSecretStore::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(root: PathBuf, owner_uid: u32) -> Self {
+        Self {
+            root,
+            owner_uid,
+            legacy: None,
+        }
+    }
+
+    fn ensure_root(&self) -> Result<(), String> {
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != self.owner_uid
+                    || metadata.mode() & 0o077 != 0
+                {
+                    return Err(
+                        "SMB credential vault has unsafe ownership, type, or permissions".into(),
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&self.root)
+                    .map_err(|error| format!("create SMB credential vault: {error}"))?;
+                let metadata = fs::symlink_metadata(&self.root)
+                    .map_err(|error| format!("inspect SMB credential vault: {error}"))?;
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != self.owner_uid
+                {
+                    return Err("new SMB credential vault has unsafe ownership or type".into());
+                }
+                fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))
+                    .map_err(|error| format!("protect SMB credential vault: {error}"))?;
+            }
+            Err(error) => return Err(format!("inspect SMB credential vault: {error}")),
+        }
+        Ok(())
+    }
+
+    fn item_path(&self, service: &str, account: &str) -> Result<PathBuf, String> {
+        if service.is_empty()
+            || account.is_empty()
+            || service.len() > 256
+            || account.len() > 256
+            || service.contains('\0')
+            || account.contains('\0')
+        {
+            return Err("SMB credential vault key is invalid".into());
+        }
+        let digest = sha256_hex(format!("{service}\0{account}").as_bytes())
+            .map_err(|error| error.to_string())?;
+        Ok(self.root.join(format!("{digest}.json")))
+    }
+
+    fn read_record(
+        &self,
+        path: &Path,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<SecretString>, String> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("inspect SMB credential vault item: {error}")),
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != self.owner_uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() == 0
+            || metadata.len() > FILE_VAULT_MAX_BYTES
+        {
+            return Err(
+                "SMB credential vault item has unsafe ownership, type, permissions, or size".into(),
+            );
+        }
+        let bytes =
+            fs::read(path).map_err(|error| format!("read SMB credential vault item: {error}"))?;
+        let record: FileVaultRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| "SMB credential vault item is malformed".to_owned())?;
+        if record.version != 1 || record.service != service || record.account != account {
+            return Err("SMB credential vault item identity does not match its key".into());
+        }
+        Ok(Some(record.secret))
+    }
+
+    fn write_record(
+        &self,
+        path: &Path,
+        service: &str,
+        account: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let record = FileVaultRecord {
+            version: 1,
+            service: service.to_owned(),
+            account: account.to_owned(),
+            secret: SecretString::new(value),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|_| "serialize SMB credential vault item".to_owned())?;
+        if bytes.len() as u64 > FILE_VAULT_MAX_BYTES {
+            return Err("SMB credential vault item exceeds its size limit".into());
+        }
+        let temp = self
+            .root
+            .join(format!(".tmp-{}-{}", std::process::id(), Id128::random()));
+        let result = (|| -> Result<(), String> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp)
+                .map_err(|error| format!("create SMB credential vault item: {error}"))?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| format!("write SMB credential vault item: {error}"))?;
+            fs::rename(&temp, path)
+                .map_err(|error| format!("commit SMB credential vault item: {error}"))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
+        result
+    }
+}
+
+impl SecretStore for FileSecretStore {
+    fn get(&self, service: &str, account: &str) -> Result<Option<SecretString>, String> {
+        self.ensure_root()?;
+        let path = self.item_path(service, account)?;
+        if let Some(secret) = self.read_record(&path, service, account)? {
+            return Ok(Some(secret));
+        }
+        let Some(legacy) = &self.legacy else {
+            return Ok(None);
+        };
+        match legacy.get(service, account) {
+            Ok(Some(secret)) => {
+                self.write_record(&path, service, account, secret.as_secret())?;
+                Ok(Some(secret))
+            }
+            Ok(None) | Err(_) => Ok(None),
+        }
+    }
+
+    fn set(&self, service: &str, account: &str, value: &str) -> Result<(), String> {
+        self.ensure_root()?;
+        let path = self.item_path(service, account)?;
+        self.write_record(&path, service, account, value)?;
+        if let Some(legacy) = &self.legacy {
+            let _ = legacy.delete(service, account);
+        }
+        Ok(())
+    }
+
+    fn delete(&self, service: &str, account: &str) -> Result<bool, String> {
+        self.ensure_root()?;
+        let path = self.item_path(service, account)?;
+        let file_deleted = match fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("delete SMB credential vault item: {error}")),
+        };
+        let legacy_deleted = self
+            .legacy
+            .as_ref()
+            .and_then(|legacy| legacy.delete(service, account).ok())
+            .unwrap_or(false);
+        Ok(file_deleted || legacy_deleted)
+    }
+
+    fn initial_generation(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .max(1) as u64
+    }
 }
 
 trait CredentialVault: Send + Sync {
@@ -133,13 +360,13 @@ impl<S: SecretStore> CredentialVault for KeychainCredentialVault<S> {
         password: &SecretString,
     ) -> Result<StoredSmbCredential, String> {
         key.validate().map_err(|error| error.to_string())?;
-        let current = self
-            .get(key)?
-            .map(|credential| credential.generation)
-            .unwrap_or(0);
-        let generation = current
-            .checked_add(1)
-            .ok_or_else(|| "SMB credential generation is exhausted".to_owned())?;
+        let generation = match self.get(key)? {
+            Some(current) => current
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| "SMB credential generation is exhausted".to_owned())?,
+            None => self.store.initial_generation().max(1),
+        };
         let credential = StoredSmbCredential {
             generation,
             password: password.clone(),
@@ -226,7 +453,7 @@ pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
     if !authorized_peer(peer_uid, peer_uid) {
         return Err("configured SMB credential UID must be non-root".into());
     }
-    let store = SystemSecretStore::new();
+    let store = FileSecretStore::system();
     let vault = Arc::new(KeychainCredentialVault::new(store));
     let listener = bind_socket(peer_uid)?;
     let failures = Arc::new(FailureLimiter::default());
@@ -308,7 +535,7 @@ fn serve_client_with(
     let bytes = read_limited(stream)?;
     let request: SmbCredentialRequest =
         serde_json::from_slice(&bytes).map_err(|_| "invalid SMB credential request".to_owned())?;
-    match process_request(request, pinned_cluster, vault) {
+    match process_request(request, pinned_cluster, vault, actual_uid) {
         Ok(body) => write_reply(stream, SmbCredentialReply::success(body)),
         Err(error) => write_reply(stream, SmbCredentialReply::failure(error.to_string())),
     }
@@ -339,11 +566,11 @@ fn serve_client_with_limiter(
     let request: SmbCredentialRequest =
         serde_json::from_slice(&bytes).map_err(|_| "invalid SMB credential request".to_owned())?;
     let result = if matches!(request.operation, SmbCredentialOperation::Ping) {
-        process_request(request, Id128::random(), vault)
+        process_request(request, Id128::random(), vault, actual_uid)
     } else {
         read_pinned_cluster(Path::new(CLUSTER_PIN))
             .map_err(SecretFailure::Cluster)
-            .and_then(|pinned| process_request(request, pinned, vault))
+            .and_then(|pinned| process_request(request, pinned, vault, actual_uid))
     };
     match result {
         Ok(body) => write_reply(stream, SmbCredentialReply::success(body)),
@@ -358,6 +585,7 @@ fn process_request(
     request: SmbCredentialRequest,
     pinned_cluster: Id128,
     vault: &dyn CredentialVault,
+    peer_uid: libc::uid_t,
 ) -> Result<SmbCredentialReplyBody, SecretFailure> {
     request.validate().map_err(SecretFailure::Validation)?;
     validate_cluster(&request.operation, pinned_cluster).map_err(SecretFailure::Cluster)?;
@@ -385,6 +613,674 @@ fn process_request(
             .delete(&key)
             .map(SmbCredentialReplyBody::Deleted)
             .map_err(SecretFailure::Operation),
+        SmbCredentialOperation::ProvisionLogin {
+            key,
+            generation,
+            password,
+        } => {
+            let credential = StoredSmbCredential {
+                generation,
+                password,
+            };
+            vault
+                .import(&key, &credential)
+                .map(|()| SmbCredentialReplyBody::Provisioned)
+                .map_err(SecretFailure::Operation)
+        }
+        SmbCredentialOperation::DeleteLogin { key } => vault
+            .delete(&key)
+            .map(SmbCredentialReplyBody::Deleted)
+            .map_err(SecretFailure::Operation),
+        SmbCredentialOperation::MountSmb {
+            key,
+            source,
+            target,
+            logical,
+            logical_target,
+        } => mount_smb_from_vault(
+            peer_uid,
+            vault,
+            &key,
+            &source,
+            &target,
+            &logical,
+            &logical_target,
+        )
+        .map(|()| SmbCredentialReplyBody::Mounted)
+        .map_err(SecretFailure::Operation),
+        SmbCredentialOperation::UnmountSmb {
+            target,
+            logical,
+            logical_target,
+        } => unmount_smb(peer_uid, &target, &logical, &logical_target)
+            .map(|()| SmbCredentialReplyBody::Unmounted)
+            .map_err(SecretFailure::Operation),
+    }
+}
+
+fn smb_session_account(uid: libc::uid_t) -> Result<(String, String), String> {
+    if uid == 0 {
+        return Err("SMB session operations require a non-root user".into());
+    }
+    let account = unsafe { libc::getpwuid(uid) };
+    if account.is_null() {
+        return Err("SMB session user no longer exists".into());
+    }
+    let user = unsafe { CStr::from_ptr((*account).pw_name) }
+        .to_string_lossy()
+        .into_owned();
+    let home = unsafe { CStr::from_ptr((*account).pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+    if user.is_empty()
+        || !Path::new(&home).is_absolute()
+        || home.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("SMB session account metadata is invalid".into());
+    }
+    Ok((user, home))
+}
+
+fn smb_mount_arguments(
+    uid: libc::uid_t,
+    user: &str,
+    source: &str,
+    target: &str,
+    guest: bool,
+) -> Vec<String> {
+    let mut arguments = vec![
+        "asuser".into(),
+        uid.to_string(),
+        "/usr/bin/sudo".into(),
+        "-u".into(),
+        user.into(),
+        "-H".into(),
+        "/sbin/mount_smbfs".into(),
+    ];
+    if guest {
+        arguments.push("-N".into());
+    }
+    arguments.extend([
+        "-o".into(),
+        if guest {
+            "nopassprompt,nobrowse,forcenewsession".into()
+        } else {
+            "nobrowse,forcenewsession".into()
+        },
+        source.into(),
+        target.into(),
+    ]);
+    arguments
+}
+
+fn direct_storage_subnet_route_arguments<'a>(
+    network: &'a str,
+    netmask: &'a str,
+    interface: &'a str,
+) -> [&'a str; 8] {
+    [
+        "-n",
+        "add",
+        "-net",
+        network,
+        "-netmask",
+        netmask,
+        "-interface",
+        interface,
+    ]
+}
+
+fn route_delete_arguments<'a>(host: &'a str, interface: &'a str) -> [&'a str; 6] {
+    ["-n", "delete", "-host", host, "-ifscope", interface]
+}
+
+fn arp_delete_arguments(host: &str) -> [&str; 2] {
+    ["-d", host]
+}
+
+fn smb_tcp_endpoint_reachable(host: &str, port: u16, timeout: Duration) -> bool {
+    let Ok(server) = host.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&SocketAddr::from((server, port)), timeout).is_ok()
+}
+
+fn route_output_is_direct(output: &str) -> bool {
+    !output
+        .lines()
+        .any(|line| line.trim_start().starts_with("gateway:"))
+}
+
+fn route_output_uses_interface(output: &str, interface: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("interface:")
+            .is_some_and(|value| value.trim() == interface)
+    })
+}
+
+fn same_subnet_direct_route(server: Ipv4Addr) -> Option<(String, Ipv4Addr, Ipv4Addr)> {
+    let mut interfaces = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut interfaces) } != 0 {
+        return None;
+    }
+    let mut best: Option<(u32, String, Ipv4Addr, Ipv4Addr)> = None;
+    let mut current = interfaces;
+    while !current.is_null() {
+        let interface = unsafe { &*current };
+        current = interface.ifa_next;
+        if interface.ifa_addr.is_null()
+            || interface.ifa_netmask.is_null()
+            || unsafe { (*interface.ifa_addr).sa_family as i32 } != libc::AF_INET
+            || interface.ifa_flags & libc::IFF_LOOPBACK as u32 != 0
+        {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(interface.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        if !["en", "bridge", "anpi", "ap", "pdp_ip"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let address = unsafe { &*(interface.ifa_addr as *const libc::sockaddr_in) };
+        let netmask = unsafe { &*(interface.ifa_netmask as *const libc::sockaddr_in) };
+        let address = Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr));
+        let netmask = Ipv4Addr::from(u32::from_be(netmask.sin_addr.s_addr));
+        let mask = u32::from(netmask);
+        if mask == 0 || u32::from(server) & mask != u32::from(address) & mask {
+            continue;
+        }
+        let prefix = mask.leading_ones();
+        if best
+            .as_ref()
+            .is_none_or(|(best_prefix, _, _, _)| prefix > *best_prefix)
+        {
+            best = Some((
+                prefix,
+                name,
+                Ipv4Addr::from(u32::from(address) & mask),
+                netmask,
+            ));
+        }
+    }
+    unsafe { libc::freeifaddrs(interfaces) };
+    best.map(|(_, interface, network, netmask)| (interface, network, netmask))
+}
+
+fn ensure_same_subnet_storage_route(server_host: &str) -> Result<(), String> {
+    let server = server_host
+        .parse::<Ipv4Addr>()
+        .map_err(|_| format!("SMB server host '{server_host}' is not an IPv4 address"))?;
+    if smb_tcp_endpoint_reachable(server_host, 445, Duration::from_millis(750)) {
+        return Ok(());
+    }
+    let Some((interface, network, netmask)) = same_subnet_direct_route(server) else {
+        return Ok(());
+    };
+    // An unreachable server can still have a stale host route marked direct.
+    // Remove only that exact host route, then restore the connected subnet
+    // route that lets macOS build the scoped neighbor entry.
+    let _ = Command::new("/sbin/route")
+        .args(route_delete_arguments(server_host, &interface))
+        .output();
+    let network = network.to_string();
+    let netmask = netmask.to_string();
+    let added = Command::new("/sbin/route")
+        .args(direct_storage_subnet_route_arguments(
+            &network, &netmask, &interface,
+        ))
+        .output()
+        .map_err(|error| {
+            format!("add direct SMB subnet route {network}/{netmask} through {interface}: {error}")
+        })?;
+    if !added.status.success()
+        && !String::from_utf8_lossy(&added.stderr)
+            .to_ascii_lowercase()
+            .contains("file exists")
+    {
+        return Err(format!(
+            "add direct SMB subnet route {network}/{netmask} through {interface} exited with {}: {}",
+            added.status,
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
+    }
+    let _ = Command::new("/usr/sbin/arp")
+        .args(arp_delete_arguments(server_host))
+        .output();
+    let verified = Command::new("/sbin/route")
+        .args(["-n", "get", "-host", server_host])
+        .output()
+        .map_err(|error| format!("verify the route to SMB server {server_host}: {error}"))?;
+    let verified_text = String::from_utf8_lossy(&verified.stdout);
+    if verified.status.success()
+        && route_output_is_direct(&verified_text)
+        && route_output_uses_interface(&verified_text, &interface)
+        && smb_tcp_endpoint_reachable(server_host, 445, Duration::from_secs(1))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "SMB server {server_host} is not reachable through direct route {network}/{netmask} on {interface}"
+        ))
+    }
+}
+
+fn mount_smb_from_vault(
+    uid: libc::uid_t,
+    vault: &dyn CredentialVault,
+    key: &SmbCredentialKey,
+    source: &str,
+    target: &str,
+    logical: &str,
+    logical_target: &str,
+) -> Result<(), String> {
+    key.validate().map_err(|error| error.to_string())?;
+    let (user, home) = smb_session_account(uid)?;
+    let target_path = Path::new(target);
+    let metadata = fs::symlink_metadata(target_path)
+        .map_err(|error| format!("inspect SMB mount target {target}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
+        return Err(format!(
+            "SMB mount target {target} must be a user-owned directory without symlinks"
+        ));
+    }
+    if !smb_mount_is_active(target)? {
+        ensure_same_subnet_storage_route(&key.server_host)?;
+        let guest = key.account.eq_ignore_ascii_case("guest");
+        if guest {
+            let output = Command::new("/bin/launchctl")
+                .args(smb_mount_arguments(uid, &user, source, target, true))
+                .env_clear()
+                .env("HOME", &home)
+                .env("USER", &user)
+                .env("LOGNAME", &user)
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("mount guest SMB share: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "mount guest SMB share exited with {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        } else {
+            let credential = vault.get(key)?.ok_or_else(|| {
+                "SMB credential is not available on this node; rerun mnode".to_owned()
+            })?;
+            let mut command = CommandBuilder::new("/bin/launchctl");
+            command.args(smb_mount_arguments(uid, &user, source, target, false));
+            command.env_clear();
+            command.env("HOME", &home);
+            command.env("USER", &user);
+            command.env("LOGNAME", &user);
+            command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            command.env("LC_ALL", "C");
+            run_smb_mount_pty(command, &credential.password)?;
+        }
+    }
+    verify_smb_mount_readable(uid, &user, &home, target)?;
+    ensure_smb_logical_alias(logical, logical_target)
+}
+
+fn smb_mount_is_active(target: &str) -> Result<bool, String> {
+    let output = Command::new("/sbin/mount")
+        .output()
+        .map_err(|error| format!("inspect SMB mounts: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect SMB mounts exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let expected = format!(" on {target} (smbfs,");
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.contains(&expected)))
+}
+
+fn verify_smb_mount_readable(
+    uid: libc::uid_t,
+    user: &str,
+    home: &str,
+    target: &str,
+) -> Result<(), String> {
+    let mut command = Command::new("/bin/launchctl");
+    command
+        .args([
+            "asuser",
+            &uid.to_string(),
+            "/usr/bin/sudo",
+            "-u",
+            user,
+            "-H",
+            "/usr/bin/find",
+            target,
+            "-maxdepth",
+            "1",
+            "-print",
+            "-quit",
+        ])
+        .env_clear()
+        .env("HOME", home)
+        .env("USER", user)
+        .env("LOGNAME", user)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = run_bounded_process_group(command, Duration::from_secs(5))
+        .map_err(|error| format!("verify SMB mount {target}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SMB mount {target} was created but is not readable (status {status})"
+        ))
+    }
+}
+
+fn unmount_smb(
+    uid: libc::uid_t,
+    target: &str,
+    logical: &str,
+    logical_target: &str,
+) -> Result<(), String> {
+    let (user, home) = smb_session_account(uid)?;
+    if smb_mount_is_active(target)? {
+        let mut command = Command::new("/bin/launchctl");
+        command
+            .args([
+                "asuser",
+                &uid.to_string(),
+                "/usr/bin/sudo",
+                "-u",
+                &user,
+                "-H",
+                "/sbin/umount",
+                target,
+            ])
+            .env_clear()
+            .env("HOME", &home)
+            .env("USER", &user)
+            .env("LOGNAME", &user)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let status = run_bounded_process_group(command, Duration::from_secs(5))
+            .map_err(|error| format!("unmount SMB share {target}: {error}"))?;
+        if !status.success() {
+            return Err(format!("unmount SMB share {target} exited with {status}"));
+        }
+    }
+    remove_smb_logical_alias(logical, logical_target)
+}
+
+fn run_bounded_process_group(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command
+        .process_group(0)
+        .spawn()
+        .map_err(|error| format!("start bounded process group: {error}"))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("wait for bounded process group: {error}"))?
+        {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(format!(
+                "operation remained busy after {} seconds; close files and retry",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn ensure_smb_logical_alias(logical: &str, logical_target: &str) -> Result<(), String> {
+    if logical == logical_target {
+        return Ok(());
+    }
+    let logical = Path::new(logical);
+    match fs::symlink_metadata(logical) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let actual = fs::read_link(logical).map_err(|error| {
+                format!("read SMB logical alias {}: {error}", logical.display())
+            })?;
+            if actual == Path::new(logical_target) {
+                return Ok(());
+            }
+            return Err(format!(
+                "SMB logical alias {} points to {}, not {}",
+                logical.display(),
+                actual.display(),
+                logical_target
+            ));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            let mut entries = fs::read_dir(logical).map_err(|error| {
+                format!("inspect SMB logical path {}: {error}", logical.display())
+            })?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "SMB logical path {} is not empty",
+                    logical.display()
+                ));
+            }
+            fs::remove_dir(logical)
+                .map_err(|error| format!("replace empty SMB logical path: {error}"))?;
+        }
+        Ok(_) => {
+            return Err(format!(
+                "SMB logical path {} is not an empty directory or managed symlink",
+                logical.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect SMB logical path {}: {error}",
+                logical.display()
+            ));
+        }
+    }
+    let Some(parent) = logical.parent() else {
+        return Err("SMB logical alias has no parent directory".into());
+    };
+    ensure_real_directory_tree(parent)?;
+    std::os::unix::fs::symlink(logical_target, logical).map_err(|error| {
+        format!(
+            "create SMB logical alias {} -> {}: {error}",
+            logical.display(),
+            logical_target
+        )
+    })
+}
+
+fn remove_smb_logical_alias(logical: &str, logical_target: &str) -> Result<(), String> {
+    if logical == logical_target {
+        return Ok(());
+    }
+    let logical = Path::new(logical);
+    match fs::symlink_metadata(logical) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let actual = fs::read_link(logical).map_err(|error| {
+                format!("read SMB logical alias {}: {error}", logical.display())
+            })?;
+            if actual != Path::new(logical_target) {
+                return Err(format!(
+                    "refusing to remove foreign SMB logical alias {} -> {}",
+                    logical.display(),
+                    actual.display()
+                ));
+            }
+            fs::remove_file(logical)
+                .map_err(|error| format!("remove SMB logical alias {}: {error}", logical.display()))
+        }
+        Ok(_) => Err(format!(
+            "refusing to remove non-symlink SMB logical path {}",
+            logical.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "inspect SMB logical alias {}: {error}",
+            logical.display()
+        )),
+    }
+}
+
+fn ensure_real_directory_tree(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            _ => return Err("SMB logical directory contains an unsafe path component".into()),
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "SMB logical directory component {} is a symlink",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "SMB logical directory component {} is not a directory",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|error| {
+                    format!(
+                        "create SMB logical directory {}: {error}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect SMB logical directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_smb_mount_pty(command: CommandBuilder, password: &SecretString) -> Result<(), String> {
+    let pair = native_pty_system()
+        .openpty(PtySize::default())
+        .map_err(|error| format!("open SMB mount pseudo-terminal: {error}"))?;
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("start SMB mount operation: {error}"))?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| format!("read SMB mount operation: {error}"))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| format!("write SMB mount password: {error}"))?;
+    drop(pair.slave);
+    drop(pair.master);
+    let (sender, receiver) = mpsc::channel();
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = [0_u8; 512];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if sender.send(buffer[..count].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut sent_password = false;
+    let mut prompt_buffer = Zeroizing::new(Vec::new());
+    let mut output = Zeroizing::new(Vec::new());
+    let status = loop {
+        while let Ok(chunk) = receiver.try_recv() {
+            output.extend_from_slice(&chunk);
+            prompt_buffer.extend_from_slice(&chunk);
+            if prompt_buffer.len() > 4096 {
+                let excess = prompt_buffer.len() - 1024;
+                prompt_buffer.drain(..excess);
+            }
+            let prompt = String::from_utf8_lossy(&prompt_buffer).to_ascii_lowercase();
+            if !sent_password && prompt.contains("password for") {
+                writer
+                    .write_all(password.as_secret().as_bytes())
+                    .and_then(|()| writer.write_all(b"\n"))
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| format!("write SMB mount password: {error}"))?;
+                sent_password = true;
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("wait for SMB mount operation: {error}"))?
+        {
+            break status;
+        }
+        if started.elapsed() >= SMB_SESSION_TIMEOUT {
+            let _ = child.kill();
+            let detail = String::from_utf8_lossy(&output);
+            let redacted = detail.replace(password.as_secret(), "<redacted>");
+            return Err(format!(
+                "SMB mount operation timed out; output: {}",
+                redacted.trim()
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    drop(writer);
+    let _ = reader_thread.join();
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output);
+        let redacted = detail.replace(password.as_secret(), "<redacted>");
+        Err(format!(
+            "SMB mount operation exited with {status}: {}",
+            redacted.trim()
+        ))
     }
 }
 
@@ -410,10 +1306,14 @@ fn validate_cluster(
 ) -> Result<(), String> {
     let key = match operation {
         SmbCredentialOperation::Ping => return Ok(()),
+        SmbCredentialOperation::UnmountSmb { .. } => return Ok(()),
         SmbCredentialOperation::Put { key, .. }
         | SmbCredentialOperation::Get { key }
         | SmbCredentialOperation::Import { key, .. }
-        | SmbCredentialOperation::Delete { key } => key,
+        | SmbCredentialOperation::Delete { key }
+        | SmbCredentialOperation::ProvisionLogin { key, .. }
+        | SmbCredentialOperation::DeleteLogin { key }
+        | SmbCredentialOperation::MountSmb { key, .. } => key,
     };
     key.validate().map_err(|error| error.to_string())?;
     if key.cluster_uuid != pinned_cluster {
@@ -545,7 +1445,9 @@ impl SecretStore for MemorySecretStore {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{Read, Write},
+        os::unix::fs::MetadataExt,
         os::unix::net::UnixStream,
         sync::Arc,
     };
@@ -559,8 +1461,10 @@ mod tests {
     };
 
     use super::{
-        CredentialVault, KeychainCredentialVault, MemorySecretStore, read_pinned_cluster,
-        serve_client_with,
+        CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore, SecretStore,
+        arp_delete_arguments, direct_storage_subnet_route_arguments, read_pinned_cluster,
+        route_delete_arguments, route_output_is_direct, run_bounded_process_group,
+        serve_client_with, smb_mount_arguments, smb_tcp_endpoint_reachable,
     };
 
     fn cluster() -> Id128 {
@@ -603,6 +1507,227 @@ mod tests {
             SmbCredentialReplyBody::Credential(credential) => credential,
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_vault_survives_helper_restarts_without_keychain_acl_checks() {
+        let root = std::env::temp_dir().join(format!("macluster-file-vault-{}", Id128::random()));
+        let owner = unsafe { libc::geteuid() };
+        let first = FileSecretStore::for_test(root.clone(), owner);
+        first
+            .set("org.macluster.smb.test", "user@192.0.2.20", "vault-secret")
+            .unwrap();
+
+        let second = FileSecretStore::for_test(root.clone(), owner);
+        assert_eq!(
+            second
+                .get("org.macluster.smb.test", "user@192.0.2.20")
+                .unwrap()
+                .unwrap()
+                .as_secret(),
+            "vault-secret"
+        );
+        let item = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .unwrap();
+        let metadata = fs::metadata(item).unwrap();
+        assert_eq!(metadata.uid(), owner);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_vault_ignores_an_unreadable_legacy_keychain_item() {
+        struct Unreadable;
+        impl SecretStore for Unreadable {
+            fn get(&self, _: &str, _: &str) -> Result<Option<SecretString>, String> {
+                Err("Keychain authentication failed".into())
+            }
+            fn set(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _: &str, _: &str) -> Result<bool, String> {
+                Ok(false)
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("macluster-file-vault-{}", Id128::random()));
+        let owner = unsafe { libc::geteuid() };
+        let store = FileSecretStore {
+            root: root.clone(),
+            owner_uid: owner,
+            legacy: Some(Arc::new(Unreadable)),
+        };
+        assert!(
+            store
+                .get("org.macluster.smb.test", "user@192.0.2.20")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.initial_generation() > 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_vault_migrates_a_readable_legacy_keychain_item_once() {
+        let root = std::env::temp_dir().join(format!("macluster-file-vault-{}", Id128::random()));
+        let owner = unsafe { libc::geteuid() };
+        let legacy = Arc::new(MemorySecretStore::default());
+        legacy
+            .set("org.macluster.smb.test", "user@192.0.2.20", "legacy-secret")
+            .unwrap();
+        let store = FileSecretStore {
+            root: root.clone(),
+            owner_uid: owner,
+            legacy: Some(legacy),
+        };
+        assert_eq!(
+            store
+                .get("org.macluster.smb.test", "user@192.0.2.20")
+                .unwrap()
+                .unwrap()
+                .as_secret(),
+            "legacy-secret"
+        );
+
+        let migrated = FileSecretStore::for_test(root.clone(), owner);
+        assert_eq!(
+            migrated
+                .get("org.macluster.smb.test", "user@192.0.2.20")
+                .unwrap()
+                .unwrap()
+                .as_secret(),
+            "legacy-secret"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_vault_rejects_symlinked_items() {
+        let root = std::env::temp_dir().join(format!("macluster-file-vault-{}", Id128::random()));
+        let owner = unsafe { libc::geteuid() };
+        let store = FileSecretStore::for_test(root.clone(), owner);
+        store
+            .set("org.macluster.smb.test", "user@192.0.2.20", "vault-secret")
+            .unwrap();
+        let item = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .unwrap();
+        fs::remove_file(&item).unwrap();
+        let target = root.join("target");
+        fs::write(&target, "foreign").unwrap();
+        std::os::unix::fs::symlink(&target, &item).unwrap();
+
+        assert!(
+            store
+                .get("org.macluster.smb.test", "user@192.0.2.20")
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smb_mount_uses_the_target_user_without_secret_arguments() {
+        let arguments = smb_mount_arguments(
+            501,
+            "smb-user",
+            "//smb-user@192.0.2.20/Partition_2",
+            "/Users/Shared/.macluster-mounts/test",
+            false,
+        );
+        assert_eq!(&arguments[..3], ["asuser", "501", "/usr/bin/sudo"]);
+        assert_eq!(
+            &arguments[3..7],
+            ["-u", "smb-user", "-H", "/sbin/mount_smbfs"]
+        );
+        assert_eq!(
+            &arguments[7..],
+            [
+                "-o",
+                "nobrowse,forcenewsession",
+                "//smb-user@192.0.2.20/Partition_2",
+                "/Users/Shared/.macluster-mounts/test"
+            ]
+        );
+        assert!(!arguments.iter().any(|argument| argument.contains("secret")));
+
+        let guest = smb_mount_arguments(
+            501,
+            "smb-user",
+            "//guest@192.0.2.20/Public",
+            "/Users/Shared/.macluster-mounts/public",
+            true,
+        );
+        assert!(guest.iter().any(|argument| argument == "-N"));
+        assert!(
+            guest
+                .iter()
+                .any(|argument| argument == "nopassprompt,nobrowse,forcenewsession")
+        );
+    }
+
+    #[test]
+    fn same_subnet_storage_route_is_pinned_to_its_direct_interface() {
+        assert_eq!(
+            direct_storage_subnet_route_arguments("192.0.2.0", "255.255.255.0", "bridge0"),
+            [
+                "-n",
+                "add",
+                "-net",
+                "192.0.2.0",
+                "-netmask",
+                "255.255.255.0",
+                "-interface",
+                "bridge0"
+            ]
+        );
+        assert!(!route_output_is_direct(
+            "route to: 192.0.2.5\n  gateway: 192.0.2.1\n  interface: bridge0\n"
+        ));
+        assert!(route_output_is_direct(
+            "route to: 192.0.2.5\n  interface: bridge0\n  flags: <UP,HOST,DONE>\n"
+        ));
+        assert_eq!(
+            route_delete_arguments("192.0.2.5", "bridge0"),
+            [
+                "-n",
+                "delete",
+                "-host",
+                "192.0.2.5",
+                "-ifscope",
+                "bridge0"
+            ]
+        );
+        assert_eq!(arp_delete_arguments("192.0.2.5"), ["-d", "192.0.2.5"]);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert!(smb_tcp_endpoint_reachable(
+            "127.0.0.1",
+            listener.local_addr().unwrap().port(),
+            std::time::Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn bounded_process_group_timeout_kills_descendants() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let error =
+            run_bounded_process_group(command, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(error.contains("busy"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "timeout took too long"
+        );
     }
 
     #[test]
@@ -681,6 +1806,35 @@ mod tests {
         let credential = reply_credential(get);
         assert_eq!(credential.generation, 1);
         assert_eq!(credential.password.as_secret(), "test-secret");
+    }
+
+    #[test]
+    fn provision_login_stores_the_node_credential_for_helper_mounts() {
+        let store = Arc::new(MemorySecretStore::default());
+        let vault = KeychainCredentialVault::new(Arc::clone(&store));
+        let provisioned = call(
+            &request(SmbCredentialOperation::ProvisionLogin {
+                key: key("nas-01"),
+                generation: 17,
+                password: SecretString::new("node-secret"),
+            }),
+            unsafe { libc::geteuid() },
+            cluster(),
+            &vault,
+        );
+        assert_eq!(
+            provisioned.result.unwrap(),
+            SmbCredentialReplyBody::Provisioned
+        );
+
+        let credential = reply_credential(call(
+            &request(SmbCredentialOperation::Get { key: key("nas-01") }),
+            unsafe { libc::geteuid() },
+            cluster(),
+            &vault,
+        ));
+        assert_eq!(credential.generation, 17);
+        assert_eq!(credential.password.as_secret(), "node-secret");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::identifiers::{Id128, NodeId};
 
-pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-1";
+pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-23";
 pub const MAX_SMB_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_SMB_CREDENTIAL_FRAME_BYTES: usize = 32 * 1024;
 
@@ -182,6 +182,26 @@ pub enum SmbCredentialOperation {
     Delete {
         key: SmbCredentialKey,
     },
+    ProvisionLogin {
+        key: SmbCredentialKey,
+        generation: u64,
+        password: SecretString,
+    },
+    DeleteLogin {
+        key: SmbCredentialKey,
+    },
+    MountSmb {
+        key: SmbCredentialKey,
+        source: String,
+        target: String,
+        logical: String,
+        logical_target: String,
+    },
+    UnmountSmb {
+        target: String,
+        logical: String,
+        logical_target: String,
+    },
 }
 
 impl SmbCredentialOperation {
@@ -192,10 +212,41 @@ impl SmbCredentialOperation {
                 key.validate()?;
                 password.validate()
             }
-            Self::Get { key } | Self::Delete { key } => key.validate(),
+            Self::Get { key } | Self::Delete { key } | Self::DeleteLogin { key } => key.validate(),
             Self::Import { key, credential } => {
                 key.validate()?;
                 credential.validate()
+            }
+            Self::ProvisionLogin {
+                key,
+                generation,
+                password,
+            } => {
+                key.validate()?;
+                if *generation == 0 {
+                    return Err(SmbCredentialValidationError::GenerationZero);
+                }
+                password.validate()
+            }
+            Self::MountSmb {
+                key,
+                source,
+                target,
+                logical,
+                logical_target,
+            } => {
+                key.validate()?;
+                validate_smb_mount_source(key, source)?;
+                validate_smb_mount_target(target)?;
+                validate_smb_logical_alias(logical, logical_target)
+            }
+            Self::UnmountSmb {
+                target,
+                logical,
+                logical_target,
+            } => {
+                validate_smb_mount_target(target)?;
+                validate_smb_logical_alias(logical, logical_target)
             }
         }
     }
@@ -230,6 +281,9 @@ pub enum SmbCredentialReplyBody {
     Credential(StoredSmbCredential),
     Missing,
     Deleted(bool),
+    Provisioned,
+    Mounted,
+    Unmounted,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -274,6 +328,71 @@ pub enum SmbCredentialValidationError {
     InvalidServerId,
     #[error("SMB account must contain 1 to 64 safe ASCII characters")]
     InvalidAccount,
+    #[error("SMB mount source does not match the credential identity")]
+    InvalidMountSource,
+    #[error("SMB mount target is outside the managed mount directory")]
+    InvalidMountTarget,
+}
+
+fn validate_smb_mount_source(
+    key: &SmbCredentialKey,
+    source: &str,
+) -> Result<(), SmbCredentialValidationError> {
+    let prefix = format!("//{}@{}/", key.account, key.server_host);
+    let remainder = source
+        .strip_prefix(&prefix)
+        .ok_or(SmbCredentialValidationError::InvalidMountSource)?;
+    if remainder.is_empty()
+        || source.len() > 1024
+        || remainder.starts_with('/')
+        || remainder.ends_with('/')
+        || remainder.contains("//")
+        || remainder.contains("/../")
+        || remainder.ends_with("/..")
+        || remainder.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(SmbCredentialValidationError::InvalidMountSource);
+    }
+    Ok(())
+}
+
+fn validate_smb_mount_target(target: &str) -> Result<(), SmbCredentialValidationError> {
+    const PREFIX: &str = "/Users/Shared/.macluster-mounts/";
+    let name = target
+        .strip_prefix(PREFIX)
+        .ok_or(SmbCredentialValidationError::InvalidMountTarget)?;
+    if name.is_empty()
+        || target.len() > 1024
+        || name.contains('/')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(SmbCredentialValidationError::InvalidMountTarget);
+    }
+    Ok(())
+}
+
+fn validate_smb_logical_alias(
+    logical: &str,
+    logical_target: &str,
+) -> Result<(), SmbCredentialValidationError> {
+    if logical == logical_target {
+        return Ok(());
+    }
+    let remainder = logical
+        .strip_prefix("/Users/")
+        .ok_or(SmbCredentialValidationError::InvalidMountTarget)?;
+    if remainder.is_empty()
+        || logical.len() > 1024
+        || logical.contains("//")
+        || remainder.contains("/../")
+        || remainder.ends_with("/..")
+        || logical.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(SmbCredentialValidationError::InvalidMountTarget);
+    }
+    validate_smb_mount_target(logical_target)
 }
 
 fn validate_account(account: &str) -> Result<(), SmbCredentialValidationError> {
@@ -296,7 +415,7 @@ fn validate_account(account: &str) -> Result<(), SmbCredentialValidationError> {
 mod tests {
     use super::{
         MAX_SMB_CREDENTIAL_BYTES, MAX_SMB_CREDENTIAL_FRAME_BYTES, SecretString, SmbCredentialKey,
-        SmbCredentialProvision, StoredSmbCredential,
+        SmbCredentialOperation, SmbCredentialProvision, StoredSmbCredential,
     };
     use crate::{
         identifiers::{Id128, NodeId},
@@ -357,6 +476,74 @@ mod tests {
         };
 
         assert!(credential.validate().is_err());
+    }
+
+    #[test]
+    fn login_keychain_operations_validate_generation_and_key() {
+        let provision = SmbCredentialOperation::ProvisionLogin {
+            key: key(),
+            generation: 1,
+            password: SecretString::new("test-secret"),
+        };
+        assert!(provision.validate().is_ok());
+
+        let zero_generation = SmbCredentialOperation::ProvisionLogin {
+            key: key(),
+            generation: 0,
+            password: SecretString::new("test-secret"),
+        };
+        assert!(zero_generation.validate().is_err());
+
+        let invalid_key = SmbCredentialOperation::DeleteLogin {
+            key: SmbCredentialKey {
+                server_host: "192.0.2.20\n".into(),
+                ..key()
+            },
+        };
+        assert!(invalid_key.validate().is_err());
+
+        let mount = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(mount.validate().is_ok());
+
+        let wrong_source = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//Other@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(wrong_source.validate().is_err());
+
+        let wrong_target = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/tmp/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(wrong_target.validate().is_err());
+
+        let wrong_alias = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/tmp/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(wrong_alias.validate().is_err());
+
+        let unmount = SmbCredentialOperation::UnmountSmb {
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(unmount.validate().is_ok());
     }
 
     #[test]

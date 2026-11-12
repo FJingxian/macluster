@@ -813,8 +813,10 @@ dependencies = [
  "macluster-core",
  "macluster-protocol",
  "macmon",
+ "portable-pty",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

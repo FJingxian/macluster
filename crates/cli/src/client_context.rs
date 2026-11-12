@@ -267,13 +267,21 @@ pub(crate) fn select_remote_profile(
         || args
             .iter()
             .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
-        || !should_consider_remote_profile(
-            config_path.exists(),
-            explicit,
-            config_explicit,
-            local_controller_stopped,
-        )
     {
+        return Ok(None);
+    }
+    // A local node-admin config is the recovery authority even while its
+    // controller is stopped. Forwarding to a stale remote CLI would prevent
+    // reset, mount, and node repair from running with the binary in hand.
+    if command == "node" && explicit.is_none() && !config_explicit && config_path.exists() {
+        return Ok(None);
+    }
+    if !should_consider_remote_profile(
+        config_path.exists(),
+        explicit,
+        config_explicit,
+        local_controller_stopped,
+    ) {
         return Ok(None);
     }
     let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
@@ -342,6 +350,35 @@ mod tests {
     #[test]
     fn stopped_local_controller_allows_the_joined_profile() {
         assert!(should_consider_remote_profile(true, None, false, true));
+    }
+
+    #[test]
+    fn node_admin_with_local_config_uses_the_current_binary() {
+        let root = std::env::temp_dir().join(format!("macluster-context-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        fs::write(&config, "config").unwrap();
+
+        let selected = select_remote_profile(
+            &config,
+            "node",
+            &[
+                "-mount".into(),
+                "smb://192.0.2.5/data".into(),
+                "--mount-root".into(),
+                "/Volumes/test_data".into(),
+            ],
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            selected.is_none(),
+            "a valid local config must run node recovery with this binary"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

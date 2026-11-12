@@ -15174,7 +15174,7 @@ struct NodeNfsMapping {
     target: String,
 }
 
-fn verified_node_health<'a>(
+fn verified_share_health<'a>(
     config: &ClusterConfig,
     node_id: &str,
     health: Option<&'a NodeHealth>,
@@ -15182,8 +15182,7 @@ fn verified_node_health<'a>(
     let node = config.nodes.get(node_id)?;
     let digest = config.execution_digest().ok()?;
     health.filter(|health| {
-        health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
-            && health.execution_digest == digest
+        health.execution_digest == digest
             && node
                 .machine_uuid
                 .as_deref()
@@ -15194,12 +15193,21 @@ fn verified_node_health<'a>(
     })
 }
 
+fn verified_node_health<'a>(
+    config: &ClusterConfig,
+    node_id: &str,
+    health: Option<&'a NodeHealth>,
+) -> Option<&'a NodeHealth> {
+    verified_share_health(config, node_id, health)
+        .filter(|health| health.build_id.as_deref() == Some(macluster_protocol::BUILD_ID))
+}
+
 fn node_nfs_mappings(
     config: &ClusterConfig,
     node_id: &str,
     health: Option<&NodeHealth>,
 ) -> Vec<NodeNfsMapping> {
-    let health = verified_node_health(config, node_id, health);
+    let health = verified_share_health(config, node_id, health);
     let state = |ready| match ready {
         Some(true) => "READY",
         Some(false) => "PENDING",
@@ -15542,7 +15550,6 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 const MAX_NODE_LIST_PROBES: usize = 64;
-#[cfg(test)]
 const NODE_LIST_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_LIST_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const NODE_LIST_HOST_TIMEOUT: Duration = Duration::from_millis(400);
@@ -15585,6 +15592,120 @@ fn cached_node_list_state(
     } else {
         "ONLINE"
     })
+}
+
+fn probe_node_health_for_list(
+    transport: &ClusterTransport,
+    node_id: &str,
+    node: &NodeConfig,
+) -> Option<NodeHealth> {
+    let node_id = NodeId::new(node_id.to_owned()).ok()?;
+    let mut transport = transport.clone();
+    transport.timeout = NODE_LIST_RPC_TIMEOUT;
+    let mut probe_node = node.clone();
+    if node.transport == Transport::Local {
+        probe_node.remote_binary = std::env::current_exe().ok()?.to_string_lossy().into_owned();
+    }
+    match transport.call(&node_id, &probe_node, Operation::Health) {
+        Ok(ResponseBody::Health(health)) => Some(health),
+        _ => None,
+    }
+}
+
+fn refresh_node_health_for_list_with(
+    config: &ClusterConfig,
+    state_dir: &Path,
+    mut liveness: BTreeMap<String, macluster_controller::liveness::NodeLiveness>,
+    reachable: &BTreeMap<String, Option<bool>>,
+    sampled_unix_ms: u64,
+    probe: impl Fn(&str, &NodeConfig) -> Option<NodeHealth> + Sync,
+) -> BTreeMap<String, macluster_controller::liveness::NodeLiveness> {
+    let candidates = config
+        .nodes
+        .iter()
+        .filter(|(node_id, node)| {
+            if node.transport == Transport::Storage {
+                return false;
+            }
+            let reachable = node.transport == Transport::Local
+                || reachable.get(*node_id).and_then(|reachable| *reachable) == Some(true);
+            if !reachable {
+                return false;
+            }
+            let current = liveness.get(*node_id).and_then(|record| {
+                record.health.as_ref().filter(|_| {
+                    record.health_sampled_unix_ms.is_some_and(|sampled| {
+                        sampled_unix_ms.saturating_sub(sampled) <= NODE_LIST_HEALTH_CACHE_TTL_MS
+                    })
+                })
+            });
+            verified_share_health(config, node_id, current).is_none()
+        })
+        .map(|(node_id, node)| (node_id.clone(), node.clone()))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return liveness;
+    }
+
+    let tasks = Mutex::new(VecDeque::from_iter(candidates));
+    let workers = node_list_probe_worker_count(tasks.lock().map_or(0, |tasks| tasks.len()));
+    let observed = std::thread::scope(|scope| {
+        let handles = (0..workers)
+            .map(|_| {
+                let tasks = &tasks;
+                let probe = &probe;
+                scope.spawn(move || {
+                    let mut observed = Vec::new();
+                    loop {
+                        let Some((node_id, node)) =
+                            tasks.lock().ok().and_then(|mut tasks| tasks.pop_front())
+                        else {
+                            break;
+                        };
+                        if let Some(health) = probe(&node_id, &node)
+                            && verified_share_health(config, &node_id, Some(&health)).is_some()
+                        {
+                            observed.push((node_id, node, health));
+                        }
+                    }
+                    observed
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_default())
+            .collect::<Vec<_>>()
+    });
+
+    for (node_id, node, health) in observed {
+        let identity_key = node
+            .machine_uuid
+            .as_deref()
+            .unwrap_or(node.host.as_str())
+            .to_ascii_lowercase();
+        if let Err(error) = macluster_controller::liveness::update_health(
+            state_dir,
+            &config.share_uuid,
+            &node_id,
+            &identity_key,
+            health.clone(),
+            sampled_unix_ms,
+        ) {
+            eprintln!("macluster: could not persist fresh node health for {node_id}: {error}");
+        }
+        let record = liveness.entry(node_id).or_default();
+        record.identity_key = identity_key;
+        record.unreachable_since_unix_ms = None;
+        record.consecutive_failures = 0;
+        record.last_failed_probe_unix_ms = None;
+        record.last_reachable_unix_ms = Some(sampled_unix_ms);
+        record.health = Some(health);
+        record.health_sampled_unix_ms = Some(sampled_unix_ms);
+        record.agent_responding = Some(true);
+        record.agent_sampled_unix_ms = Some(sampled_unix_ms);
+    }
+    liveness
 }
 
 #[cfg(test)]
@@ -16025,25 +16146,35 @@ fn refresh_node_liveness_for_list(
             .flat_map(|handle| handle.join().unwrap_or_default())
             .collect::<Vec<_>>()
     });
-    if observations.is_empty() {
-        return (cached, BTreeMap::new());
-    }
     let probe_results = observations
         .iter()
         .map(|observation| (observation.node_id.clone(), observation.reachable))
         .collect::<BTreeMap<_, _>>();
-    let liveness = match macluster_controller::liveness::observe_many(
-        state_dir,
-        &config.share_uuid,
-        &observations,
-        validation_now_ms(),
-    ) {
-        Ok(refreshed) => refreshed,
-        Err(error) => {
-            eprintln!("macluster: could not refresh cached node reachability: {error}");
-            cached
+    let sampled_unix_ms = validation_now_ms();
+    let liveness = if observations.is_empty() {
+        cached
+    } else {
+        match macluster_controller::liveness::observe_many(
+            state_dir,
+            &config.share_uuid,
+            &observations,
+            sampled_unix_ms,
+        ) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                eprintln!("macluster: could not refresh cached node reachability: {error}");
+                cached
+            }
         }
     };
+    let liveness = refresh_node_health_for_list_with(
+        config,
+        state_dir,
+        liveness,
+        &probe_results,
+        sampled_unix_ms,
+        |node_id, node| probe_node_health_for_list(&transport, node_id, node),
+    );
     (liveness, probe_results)
 }
 
@@ -23751,6 +23882,66 @@ execution_uid = 501
                 .iter()
                 .all(|mapping| mapping.state == "UNKNOWN")
         );
+    }
+
+    #[test]
+    fn node_list_refreshes_stale_health_before_rendering_mapping_state() {
+        let config = parse_build_test_config();
+        let root = test_exports_path();
+        fs::create_dir_all(&root).unwrap();
+        let sampled_unix_ms = 1_000_000_u64;
+        let fresh = NodeHealth {
+            machine_uuid: config.nodes["login"].machine_uuid.clone().unwrap(),
+            execution_uid: 501,
+            build_id: Some("older-agent-build".into()),
+            logical_cpus: Some(8),
+            execution_digest: config.execution_digest().unwrap(),
+            primary_share_ready: true,
+            ..Default::default()
+        };
+        let stale = NodeHealth {
+            build_id: Some("older-agent-build".into()),
+            ..fresh.clone()
+        };
+        let liveness = BTreeMap::from([(
+            "login".to_owned(),
+            macluster_controller::liveness::NodeLiveness {
+                identity_key: config.nodes["login"]
+                    .machine_uuid
+                    .clone()
+                    .unwrap()
+                    .to_ascii_lowercase(),
+                last_transition_unix_ms: sampled_unix_ms
+                    .saturating_sub(super::NODE_LIST_HEALTH_CACHE_TTL_MS + 1),
+                last_reachable_unix_ms: Some(sampled_unix_ms),
+                health: Some(stale),
+                health_sampled_unix_ms: Some(
+                    sampled_unix_ms.saturating_sub(super::NODE_LIST_HEALTH_CACHE_TTL_MS + 1),
+                ),
+                agent_responding: Some(true),
+                agent_sampled_unix_ms: Some(sampled_unix_ms),
+                ..Default::default()
+            },
+        )]);
+        let reachable = BTreeMap::from([("login".to_owned(), Some(true))]);
+
+        let refreshed = super::refresh_node_health_for_list_with(
+            &config,
+            &root,
+            liveness,
+            &reachable,
+            sampled_unix_ms,
+            |node_id, _| {
+                assert_eq!(node_id, "login");
+                Some(fresh.clone())
+            },
+        );
+        let health = refreshed["login"].health.as_ref().unwrap();
+        assert_eq!(
+            node_nfs_mappings(&config, "login", Some(health))[0].state,
+            "READY"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

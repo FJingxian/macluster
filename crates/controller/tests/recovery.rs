@@ -178,6 +178,14 @@ impl NodeTransport for FakeTransport {
                     ..Default::default()
                 },
             )),
+            Operation::DiagnoseNfs => Ok(ResponseBody::NfsDiagnosis(
+                macluster_protocol::types::NfsClientDiagnosis {
+                    node_id: node_id.to_string(),
+                    wedged: false,
+                    probes: Vec::new(),
+                },
+            )),
+            Operation::RebootForNfsRepair { .. } => Ok(ResponseBody::Ack),
             Operation::QueryFanPolicy => Ok(ResponseBody::FanControl(
                 macluster_protocol::types::FanControlStatus {
                     policy: macluster_protocol::types::FanPolicy::System,

@@ -9,7 +9,6 @@ pub mod client_profile;
 pub mod client_storage;
 mod control_client;
 pub mod discovery;
-mod embedded_power;
 mod init;
 mod job_resources;
 mod mtop;

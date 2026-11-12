@@ -237,7 +237,7 @@ pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
                 let mut stream = match incoming {
                     Ok(stream) => stream,
                     Err(error) => {
-                        eprintln!("macluster-power: accept SMB credential client: {error}");
+                        eprintln!("macluster: accept SMB credential client: {error}");
                         continue;
                     }
                 };
@@ -246,7 +246,7 @@ pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
                 if let Err(error) =
                     serve_client_with_limiter(&mut stream, peer_uid, &vault, &failures)
                 {
-                    eprintln!("macluster-power: SMB credential request failed: {error}");
+                    eprintln!("macluster: SMB credential request failed: {error}");
                 }
             }
         })

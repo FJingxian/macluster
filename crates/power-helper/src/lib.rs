@@ -337,9 +337,16 @@ impl PowerCache {
     }
 }
 
-fn main() {
+pub fn run_cli() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let result = match args.as_slice() {
+    if let Err((status, error)) = run(&args) {
+        eprintln!("macluster: {error}");
+        std::process::exit(status);
+    }
+}
+
+pub fn run(args: &[String]) -> Result<(), (i32, String)> {
+    let result = match args {
         [] => {
             let sample = sample_powermetrics();
             println!(
@@ -354,19 +361,22 @@ fn main() {
             .and_then(serve),
         [command] if command == "--nfs-admin" => nfs_admin::client(),
         [command] if command == "--version" => {
-            println!("macluster-power {}", env!("CARGO_PKG_VERSION"));
+            println!("macluster {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: macluster-power [--version | --serve PEER_UID | --nfs-admin]".to_owned()),
+        _ => Err(
+            "usage: macluster internal power-helper [--version | --serve PEER_UID | --nfs-admin]"
+                .to_owned(),
+        ),
     };
-    if let Err(error) = result {
-        eprintln!("macluster-power: {error}");
-        std::process::exit(if error.starts_with("NFS_ADMIN_UNAVAILABLE:") {
+    result.map_err(|error| {
+        let status = if error.starts_with("NFS_ADMIN_UNAVAILABLE:") {
             78
         } else {
             1
-        });
-    }
+        };
+        (status, error)
+    })
 }
 
 fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
@@ -394,7 +404,7 @@ fn serve(peer_uid: libc::uid_t) -> Result<(), String> {
     let cache = Arc::new(Mutex::new(PowerCache::default()));
     let sampler_cache = Arc::clone(&cache);
     thread::Builder::new()
-        .name("macluster-power-sampler".into())
+        .name("macluster-helper-sampler".into())
         .spawn(move || {
             let mut gpu_sampler = GpuSampler::new();
             loop {
@@ -455,13 +465,13 @@ fn start_optional_fan_service(start: impl FnOnce() -> Result<(), String> + Send 
         .spawn(move || {
             if let Err(error) = start() {
                 eprintln!(
-                    "macluster-power: fan control unavailable: {error}; power/GPU sampling continues"
+                    "macluster: fan control unavailable: {error}; power/GPU sampling continues"
                 );
             }
         });
     if let Err(error) = result {
         eprintln!(
-            "macluster-power: could not start fan-control service: {error}; power/GPU sampling continues"
+            "macluster: could not start fan-control service: {error}; power/GPU sampling continues"
         );
     }
 }

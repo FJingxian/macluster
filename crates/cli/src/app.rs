@@ -50,6 +50,18 @@ const INTERACTIVE_FAST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INTERACTIVE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SUBMISSION_CACHE_ENTRIES: usize = 1024;
 const MAX_SUBMISSION_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const REMOTE_INTERACTIVE_EXECUTION_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HelpMode {
@@ -415,12 +427,27 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
     {
         return Err((2, "msub -Is requires terminal stdin and stdout".into()));
     }
+    let client_config_path = resolved_config_path(global.config.as_deref());
+    let local_controller_stopped = if global.cluster.is_none()
+        && global.config.is_none()
+        && client_config_path.is_file()
+        && crate::client_context::remote_command_supported(&command)
+    {
+        let state_dir = state_root(global.state_dir.as_deref())?;
+        let service_stopped = controller_service_manager(&global, &state_dir)
+            .and_then(|manager| manager.intent().map_err(service_error))
+            .is_ok_and(|intent| intent == ServiceIntent::Stopped);
+        service_stopped && !controller_is_running(&global, &state_dir)
+    } else {
+        false
+    };
     if let Some(profile) = crate::client_context::select_remote_profile(
-        &resolved_config_path(global.config.as_deref()),
+        &client_config_path,
         &command,
         &args,
         global.cluster.as_deref(),
         global.config.is_some(),
+        local_controller_stopped,
     )
     .map_err(|error| (1, error))?
     {
@@ -5118,12 +5145,46 @@ fn required_named_shares(
                 cwd.starts_with(root.as_path())
                     || Path::new(stdout_path).starts_with(root.as_path())
                     || Path::new(stderr_path).starts_with(root.as_path())
-                    || script.contains(text.as_ref())
-                    || env.values().any(|value| value.contains(text.as_ref()))
+                    || text_contains_path_token(&script, text.as_ref())
+                    || env
+                        .values()
+                        .any(|value| text_contains_path_token(value, text.as_ref()))
             });
             referenced.then(|| share_id.clone())
         })
         .collect()
+}
+
+fn text_contains_path_token(text: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let accepted_before = |character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ':' | ';' | ',' | '=' | '\'' | '"' | '(' | '[' | '{'
+            )
+    };
+    let accepted_after = |character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ':' | ';' | ',' | '=' | '\'' | '"' | ')' | ']' | '}' | '/'
+            )
+    };
+    let mut search_from = 0;
+    while let Some(relative) = text[search_from..].find(path) {
+        let start = search_from + relative;
+        let end = start + path.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if before.is_none_or(accepted_before) && after.is_none_or(accepted_after) {
+            return true;
+        }
+        search_from = end;
+    }
+    false
 }
 
 fn validate_shared_output_path(
@@ -8336,6 +8397,25 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn remote_interactive_child_environment(
+    controller: &BTreeMap<OsString, OsString>,
+    requested: &BTreeMap<String, String>,
+) -> BTreeMap<OsString, OsString> {
+    let mut merged = requested
+        .iter()
+        .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+        .collect::<BTreeMap<_, _>>();
+    for key in REMOTE_INTERACTIVE_EXECUTION_ENV {
+        let key = OsStr::new(key);
+        if let Some(value) = controller.get(key) {
+            merged.insert(key.to_os_string(), value.clone());
+        } else {
+            merged.remove(key);
+        }
+    }
+    merged
+}
+
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
@@ -8434,6 +8514,9 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             .map_err(|error| (2, format!("invalid interactive request: {error}")))?;
             fs::remove_file(&request_path).map_err(|error| (1, error.to_string()))?;
             let executable = env::current_exe().map_err(|error| (1, error.to_string()))?;
+            let controller_environment = env::vars_os().collect::<BTreeMap<_, _>>();
+            let child_environment =
+                remote_interactive_child_environment(&controller_environment, &request.environment);
             let mut command = process::Command::new(executable);
             command
                 .arg("--config")
@@ -8443,7 +8526,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 .args(request.args)
                 .current_dir(request.cwd)
                 .env_clear()
-                .envs(request.environment);
+                .envs(child_environment);
             let status = command.status().map_err(|error| (1, error.to_string()))?;
             if status.success() {
                 Ok(())
@@ -8675,26 +8758,8 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             )
         }
         Some("power-helper") => {
-            if args.get(1).map(String::as_str) != Some("--version") || args.len() != 2 {
-                return Err((2, "internal power-helper only supports --version".into()));
-            }
-            let helper =
-                crate::embedded_power::ExtractedHelper::new().map_err(|error| (1, error))?;
-            let output = process::Command::new(helper.path())
-                .arg("--version")
-                .output()
-                .map_err(|error| (1, format!("cannot inspect embedded power helper: {error}")))?;
-            if !output.status.success() {
-                return Err((
-                    1,
-                    format!(
-                        "embedded power helper failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                ));
-            }
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            Ok(())
+            let helper_args = args[1..].to_vec();
+            macluster_power_helper::run(&helper_args).map_err(|(status, error)| (status, error))
         }
         Some("publish-snapshot") => {
             let state_dir = global
@@ -8734,17 +8799,16 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                     ));
                 }
             };
-            if macluster_controller::verify_primary_share_direct(
+            if let Err(error) = macluster_controller::verify_primary_share_direct_detailed(
                 Path::new(&root),
                 Path::new(&source_root),
                 &uuid,
                 &host,
                 local_server,
             ) {
-                Ok(())
-            } else {
-                Err((1, "primary shared storage check failed".into()))
+                return Err((1, format!("primary shared storage check failed: {error}")));
             }
+            Ok(())
         }
         Some("node-check") => {
             let node = option_value(args, "--node")?
@@ -9528,6 +9592,29 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         );
 
         assert_eq!(required, ["data", "env", "project"]);
+    }
+
+    #[test]
+    fn generic_share_path_is_not_required_by_an_unrelated_env_substring() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\ndefault_queue=\"default\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\n[nodes.nas-01]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.nas-data]\nprotocol=\"smb\"\nserver=\"nas-01\"\nsource_root=\"/data\"\nmount_root=\"/Users/Shared/nas-data\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n",
+        )
+        .unwrap();
+        let task_env = BTreeMap::from([(
+            "PYTHONSTARTUP".into(),
+            "/Users/operator/Library/Application Support/Code/User/data/pythonrc.py".into(),
+        )]);
+
+        let required = required_named_shares(
+            &config,
+            Path::new("/Users/Shared/macluster"),
+            b"pwd",
+            &task_env,
+            "/Users/Shared/macluster/jobs/1/stdout.log",
+            "/Users/Shared/macluster/jobs/1/stderr.log",
+        );
+
+        assert!(required.is_empty(), "{required:?}");
     }
 
     #[test]
@@ -12313,10 +12400,16 @@ mod update_terminal_regressions {
 
 #[cfg(test)]
 mod remote_client_regressions {
+    use std::{
+        collections::BTreeMap,
+        ffi::{OsStr, OsString},
+    };
+
     use super::{
         AutomaticJoinCandidate, Id128, InteractiveRequestFile, ensure_remote_command_storage_with,
         job_uses_remote_cli, queue_uses_remote_cli, remote_command_requires_client_storage,
-        remote_interactive_submission_args, select_automatic_join_candidates,
+        remote_interactive_child_environment, remote_interactive_submission_args,
+        select_automatic_join_candidates,
     };
 
     fn control_only_profile() -> crate::client_profile::ClientProfile {
@@ -12382,6 +12475,55 @@ mod remote_client_regressions {
         assert_eq!(
             remote_interactive_submission_args(&["-Is".into(), "pwd".into()]),
             vec!["submit", "-Is", "pwd"]
+        );
+    }
+
+    #[test]
+    fn remote_interactive_preserves_controller_execution_identity() {
+        let controller = BTreeMap::from([
+            (OsString::from("HOME"), OsString::from("/Users/controller")),
+            (OsString::from("USER"), OsString::from("controller")),
+            (
+                OsString::from("TMPDIR"),
+                OsString::from("/private/tmp/controller"),
+            ),
+            (
+                OsString::from("SSH_AUTH_SOCK"),
+                OsString::from("/private/tmp/controller-agent.sock"),
+            ),
+        ]);
+        let requested = BTreeMap::from([
+            ("HOME".into(), "/Users/login-client".into()),
+            ("USER".into(), "login-client".into()),
+            ("TMPDIR".into(), "/var/folders/login-client".into()),
+            (
+                "SSH_AUTH_SOCK".into(),
+                "/private/tmp/login-agent.sock".into(),
+            ),
+            ("VIRTUAL_ENV".into(), "/Users/Shared/mamba/envs/test".into()),
+        ]);
+
+        let merged = remote_interactive_child_environment(&controller, &requested);
+
+        assert_eq!(
+            merged.get(OsStr::new("HOME")),
+            Some(&OsString::from("/Users/controller"))
+        );
+        assert_eq!(
+            merged.get(OsStr::new("USER")),
+            Some(&OsString::from("controller"))
+        );
+        assert_eq!(
+            merged.get(OsStr::new("TMPDIR")),
+            Some(&OsString::from("/private/tmp/controller"))
+        );
+        assert_eq!(
+            merged.get(OsStr::new("SSH_AUTH_SOCK")),
+            Some(&OsString::from("/private/tmp/controller-agent.sock"))
+        );
+        assert_eq!(
+            merged.get(OsStr::new("VIRTUAL_ENV")),
+            Some(&OsString::from("/Users/Shared/mamba/envs/test"))
         );
     }
 

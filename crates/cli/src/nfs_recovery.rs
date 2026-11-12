@@ -13,10 +13,14 @@ use std::{
 };
 
 const ROOT: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs";
+const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-7";
+const SERVICE_VERSION: &str = "nfs-recovery-10";
+pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
+pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
+pub(crate) const NFS_MOUNT_OPTIONS: &str = "resvport,intr,rsize=8192,wsize=8192";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -60,7 +64,6 @@ pub(crate) fn installation_probe_script(target: &Path) -> String {
 fn installation_check_script(dir: &Path, plist: &Path, service: &str, launchctl: &Path) -> String {
     let mut checks = Vec::new();
     for file in [
-        dir.join("macluster"),
         dir.join("manifest.json"),
         dir.join("version"),
         plist.to_owned(),
@@ -68,6 +71,7 @@ fn installation_check_script(dir: &Path, plist: &Path, service: &str, launchctl:
         let path = quote(&file.to_string_lossy());
         checks.push(format!("[ -f {path} ] && [ ! -L {path} ] && [ -s {path} ]"));
     }
+    checks.push(format!("[ -x {} ]", quote(DEPLOYED_HELPER)));
     checks.push(format!(
         "[ \"$(/bin/cat {} 2>/dev/null)\" = {} ]",
         quote(&dir.join("version").to_string_lossy()),
@@ -88,7 +92,6 @@ fn quote(s: &str) -> String {
 }
 
 pub(crate) fn install_script(
-    binary: &str,
     source: &str,
     target: &Path,
     uuid: &str,
@@ -96,12 +99,12 @@ pub(crate) fn install_script(
     allow_existing_contents: bool,
 ) -> String {
     let dir = quote(&directory(target).to_string_lossy());
+    let helper = quote(DEPLOYED_HELPER);
     let uid = execution_uid
         .map(|uid| uid.to_string())
         .unwrap_or_else(|| "${SUDO_UID:?missing execution UID}".into());
     format!(
-        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\n/usr/bin/install -o root -g wheel -m 700 {} {dir}/macluster.next\n/bin/mv -f {dir}/macluster.next {dir}/macluster\n{dir}/macluster internal nfs-recovery install {} {} {} {uid}{}\n",
-        quote(binary),
+        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\nif [ ! -x {helper} ] || [ -L {helper} ]; then echo 'unified macluster helper is not executable' >&2; exit 1; fi\n{helper} internal nfs-recovery install {} {} {} {uid}{}\n/bin/rm -f {dir}/macluster {dir}/macluster.next\n",
         quote(source),
         quote(&target.to_string_lossy()),
         quote(uuid),
@@ -116,29 +119,18 @@ pub(crate) fn install_script(
 
 #[cfg(test)]
 pub(crate) fn refresh_script(
-    binary: &str,
-    binary_digest: &str,
     source: &str,
     target: &Path,
     uuid: &str,
     execution_uid: Option<u32>,
     allow_existing_contents: bool,
 ) -> String {
-    let root = quote(ROOT);
-    let dir = quote(&directory(target).to_string_lossy());
-    let helper = quote(&directory(target).join("macluster").to_string_lossy());
-    let next = quote(&directory(target).join("macluster.next").to_string_lossy());
+    let helper = quote(DEPLOYED_HELPER);
     let uid = execution_uid
         .map(|uid| uid.to_string())
         .unwrap_or_else(|| "${SUDO_UID:?missing execution UID}".into());
     format!(
-        "[ ! -L {root} ] && [ ! -L {dir} ] || {{ echo 'unsafe NFS recovery install path' >&2; exit 1; }}\n/bin/mkdir -p {dir}\n/usr/sbin/chown root:wheel {root}\n/bin/chmod 755 {root}\n/usr/sbin/chown root:wheel {dir}\n/bin/chmod 755 {dir}\nif [ ! -f {} ] || [ -L {} ]; then echo 'NFS recovery source binary is not a regular file' >&2; exit 1; fi\nactual=$(/usr/bin/shasum -a 256 {})\n[ \"${{actual%% *}}\" = {} ] || {{ echo 'NFS recovery source checksum mismatch' >&2; exit 1; }}\n[ ! -L {next} ] || {{ echo 'unsafe NFS recovery staging path' >&2; exit 1; }}\n/usr/bin/install -o root -g wheel -m 700 {} {next}\nactual=$(/usr/bin/shasum -a 256 {next})\n[ \"${{actual%% *}}\" = {} ] || {{ /bin/rm -f {next}; echo 'NFS recovery staged checksum mismatch' >&2; exit 1; }}\n/bin/mv -f {next} {helper}\n{helper} internal nfs-recovery refresh {} {} {} {uid}{}\n",
-        quote(binary),
-        quote(binary),
-        quote(binary),
-        quote(binary_digest),
-        quote(binary),
-        quote(binary_digest),
+        "if [ ! -x {helper} ] || [ -L {helper} ]; then echo 'unified macluster helper is not executable' >&2; exit 1; fi\n{helper} internal nfs-recovery refresh {} {} {} {uid}{}\n",
         quote(source),
         quote(&target.to_string_lossy()),
         quote(uuid),
@@ -151,7 +143,7 @@ pub(crate) fn refresh_script(
 }
 
 pub(crate) fn cleanup_script(source: &str, target: &Path, uuid: &str) -> String {
-    let helper = quote(&directory(target).join("macluster").to_string_lossy());
+    let helper = quote(DEPLOYED_HELPER);
     format!(
         "if [ -e {helper} ]; then {helper} internal nfs-recovery remove {} {} {}; fi\n",
         quote(source),
@@ -280,8 +272,19 @@ fn ensure_mount(
     }
     safe_mount_target(target, allow_existing_contents)?;
     let attempt = execute(
-        "/sbin/mount_nfs",
-        &["-o", "resvport", source, &target.to_string_lossy()],
+        "/usr/bin/lockf",
+        &[
+            "-t",
+            NFS_MOUNT_TIMEOUT_SECS,
+            "-k",
+            "-w",
+            NFS_MOUNT_LOCK_PATH,
+            "/sbin/mount_nfs",
+            "-o",
+            NFS_MOUNT_OPTIONS,
+            source,
+            &target.to_string_lossy(),
+        ],
     );
     if let Err(error) = attempt {
         if !is_mount_busy_error(&error) {
@@ -299,8 +302,19 @@ fn ensure_mount(
             return Ok(());
         }
         execute(
-            "/sbin/mount_nfs",
-            &["-o", "resvport", source, &target.to_string_lossy()],
+            "/usr/bin/lockf",
+            &[
+                "-t",
+                NFS_MOUNT_TIMEOUT_SECS,
+                "-k",
+                "-w",
+                NFS_MOUNT_LOCK_PATH,
+                "/sbin/mount_nfs",
+                "-o",
+                NFS_MOUNT_OPTIONS,
+                source,
+                &target.to_string_lossy(),
+            ],
         )
         .map_err(|retry_error| {
             format!(
@@ -600,7 +614,7 @@ fn xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 fn plist(target: &Path) -> String {
-    let helper = directory(target).join("macluster");
+    let helper = Path::new(DEPLOYED_HELPER);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>internal</string><string>nfs-recovery</string><string>recover</string><string>{}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>15</integer><key>ProcessType</key><string>Background</string></dict></plist>\n",
         label(target),
@@ -1011,19 +1025,19 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let plist = dir.join("service.plist");
         let launchctl = dir.join("launchctl");
+        let helper = dir.join("helper");
         use std::os::unix::fs::PermissionsExt;
         fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
-        let files = [
-            dir.join("macluster"),
-            dir.join("manifest.json"),
-            plist.clone(),
-        ];
+        fs::write(&helper, "installed").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let files = [dir.join("manifest.json"), plist.clone()];
         for file in &files {
             fs::write(file, "installed").unwrap();
         }
         fs::write(dir.join("version"), helper_version()).unwrap();
-        let script = installation_check_script(&dir, &plist, "test.service", &launchctl);
+        let script = installation_check_script(&dir, &plist, "test.service", &launchctl)
+            .replace(DEPLOYED_HELPER, &helper.to_string_lossy());
         let check = || {
             Command::new("/bin/sh")
                 .args(["-c", &script])
@@ -1042,6 +1056,8 @@ mod tests {
         fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
         fs::write(dir.join("version"), "old-service-version").unwrap();
         assert!(!check());
+        fs::remove_file(&helper).unwrap();
+        assert!(!check(), "missing unified helper must require repair");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1052,24 +1068,25 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-7");
+        assert_eq!(version, "nfs-recovery-10");
     }
 
     #[test]
-    fn refresh_script_verifies_staged_binary_before_replacing_root_helper() {
+    fn refresh_script_uses_the_unified_privileged_helper() {
         let script = refresh_script(
-            "/Users/worker/.local/bin/macluster",
-            &"a".repeat(64),
             "192.0.2.1:/tools",
             Path::new("/Users/Shared/tools"),
             "00000000-0000-4000-8000-000000000001",
             Some(501),
             true,
         );
-        assert!(script.contains("checksum mismatch"));
+        assert!(script.contains(concat!(
+            "/Library/PrivilegedHelperTools/org.macluster.macluster",
+            "' internal nfs-recovery refresh"
+        )));
         assert!(script.contains("internal nfs-recovery refresh"));
         assert!(script.contains("00000000-0000-4000-8000-000000000001"));
-        assert!(script.contains("macluster.next"));
+        assert!(!script.contains("macluster.next"));
         let syntax = std::process::Command::new("/bin/sh")
             .args(["-n", "-c", &script])
             .output()
@@ -1084,7 +1101,6 @@ mod tests {
     #[test]
     fn install_script_passes_the_source_validated_uuid_to_recovery() {
         let script = install_script(
-            "/Users/operator/.local/bin/macluster",
             "192.0.2.1:/tools",
             Path::new("/Users/Shared/tools"),
             "00000000-0000-4000-8000-000000000001",
@@ -1095,6 +1111,8 @@ mod tests {
         assert!(script.contains(
             "internal nfs-recovery install '192.0.2.1:/tools' '/Users/Shared/tools' '00000000-0000-4000-8000-000000000001' 501"
         ));
+        assert!(script.contains("/bin/rm -f"));
+        assert!(script.contains("/macluster.next"));
         assert!(!script.contains("/bin/cat"));
         let syntax = Command::new("/bin/sh")
             .args(["-n", "-c", &script])
@@ -1229,7 +1247,7 @@ mod tests {
             } else {
                 String::new()
             }),
-            "/sbin/mount_nfs" => {
+            "/usr/bin/lockf" => {
                 mounted = true;
                 Ok(String::new())
             }
@@ -1272,7 +1290,7 @@ mod tests {
                 } else {
                     String::new()
                 }),
-                "/sbin/mount_nfs" => {
+                "/usr/bin/lockf" => {
                     attempts += 1;
                     if !network_ready {
                         return Err("network unavailable".into());
@@ -1300,7 +1318,7 @@ mod tests {
                 } else {
                     String::new()
                 }),
-                "/sbin/mount_nfs" => {
+                "/usr/bin/lockf" => {
                     attempts += 1;
                     assert!(network_ready);
                     mounted = true;
@@ -1348,7 +1366,7 @@ mod tests {
             } else {
                 String::new()
             }),
-            "/sbin/mount_nfs" => {
+            "/usr/bin/lockf" => {
                 mount_attempts += 1;
                 if mount_attempts == 1 {
                     Err("mount_nfs: Resource busy".into())
@@ -1413,7 +1431,7 @@ mod tests {
                 true,
                 &mut |program, _args| match program {
                     "/sbin/mount" => Ok(String::new()),
-                    "/sbin/mount_nfs" => {
+                    "/usr/bin/lockf" => {
                         mount_attempts += 1;
                         Err("mount_nfs: Resource busy".into())
                     }
@@ -1448,7 +1466,7 @@ mod tests {
             false,
             &mut |program, _args| match program {
                 "/sbin/mount" => Ok(String::new()),
-                "/sbin/mount_nfs" => {
+                "/usr/bin/lockf" => {
                     mount_attempts += 1;
                     Err("mount_nfs: Resource busy".into())
                 }
@@ -1491,7 +1509,7 @@ mod tests {
                         format!("192.0.2.9:/foreign on {} (nfs)\n", target.display())
                     })
                 }
-                "/sbin/mount_nfs" => {
+                "/usr/bin/lockf" => {
                     mount_attempts += 1;
                     Err("mount_nfs: Resource busy".into())
                 }
@@ -1588,7 +1606,7 @@ mod tests {
                 mounted = false;
                 Ok(String::new())
             }
-            "/sbin/mount_nfs" => {
+            "/usr/bin/lockf" => {
                 mount_attempts += 1;
                 mounted = true;
                 Ok(String::new())
@@ -1644,7 +1662,7 @@ mod tests {
                 mounted = false;
                 Ok(String::new())
             }
-            "/sbin/mount_nfs" => {
+            "/usr/bin/lockf" => {
                 mount_attempts += 1;
                 mounted = true;
                 Ok(String::new())

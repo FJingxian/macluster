@@ -1,7 +1,7 @@
 //! Signed, fixed-path updater for the privileged macluster components.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -26,9 +26,9 @@ const TRUST_LOCK: &str = "/Library/PrivilegedHelperTools/org.macluster.update/up
 const UPDATE_JOURNAL: &str = "/Library/PrivilegedHelperTools/org.macluster.update/transaction.json";
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 768 * 1024 * 1024;
-const POWER_HELPER: &str = "/Library/PrivilegedHelperTools/org.macluster.power";
+const UNIFIED_HELPER: &str = "/Library/PrivilegedHelperTools/org.macluster.macluster";
+const POWER_HELPER: &str = UNIFIED_HELPER;
 const POWER_REVISION: &str = "/Library/PrivilegedHelperTools/org.macluster.update/power.revision";
-const ADMIN_CLI: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs-admin";
 const ADMIN_REVISION: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs-admin.version";
 const RECOVERY_ROOT: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs";
 
@@ -44,6 +44,36 @@ struct Replacement {
     source: Option<PathBuf>,
     bytes: Vec<u8>,
     mode: u32,
+}
+
+fn add_unified_helper_replacement(
+    replacements: &mut Vec<Replacement>,
+    accepted_payload: &mut Option<PathBuf>,
+    payload: &Path,
+) -> Result<(), String> {
+    if let Some(previous) = accepted_payload {
+        if previous == payload {
+            return Ok(());
+        }
+        let previous_bytes = fs::read(previous)
+            .map_err(|error| format!("read previous unified helper payload: {error}"))?;
+        let payload_bytes =
+            fs::read(payload).map_err(|error| format!("read unified helper payload: {error}"))?;
+        if previous_bytes != payload_bytes {
+            return Err(
+                "signed helper update contains different payloads for the unified helper".into(),
+            );
+        }
+        return Ok(());
+    }
+    *accepted_payload = Some(payload.to_owned());
+    replacements.push(Replacement {
+        destination: PathBuf::from(UNIFIED_HELPER),
+        source: Some(payload.to_owned()),
+        bytes: Vec::new(),
+        mode: 0o755,
+    });
+    Ok(())
 }
 
 struct PayloadCleanupGuard(BTreeMap<String, PathBuf>);
@@ -116,7 +146,8 @@ pub(crate) fn apply(
     let staged = PayloadCleanupGuard(prepare_payloads(peer_uid, stage_dir, &manifest)?);
     let mut replacements = Vec::new();
     let mut recovery_labels = Vec::new();
-    let mut restart_power = false;
+    let mut restart_helper = false;
+    let mut unified_helper_payload = None;
     for artifact in &manifest.artifacts {
         let payload = staged
             .get(&artifact.stage_name)
@@ -128,19 +159,18 @@ pub(crate) fn apply(
                     &artifact.revision,
                     "power",
                 )?;
-                replacements.push(Replacement {
-                    destination: PathBuf::from(POWER_HELPER),
-                    source: Some(payload.clone()),
-                    bytes: Vec::new(),
-                    mode: 0o755,
-                });
+                add_unified_helper_replacement(
+                    &mut replacements,
+                    &mut unified_helper_payload,
+                    payload,
+                )?;
                 replacements.push(Replacement {
                     destination: PathBuf::from(POWER_REVISION),
                     source: None,
                     bytes: artifact.revision.as_bytes().to_vec(),
                     mode: 0o600,
                 });
-                restart_power = true;
+                restart_helper = true;
             }
             HelperComponent::NfsAdminCli => {
                 verify_revision_not_downgraded(
@@ -148,18 +178,18 @@ pub(crate) fn apply(
                     &artifact.revision,
                     "nfs-admin",
                 )?;
-                replacements.push(Replacement {
-                    destination: PathBuf::from(ADMIN_CLI),
-                    source: Some(payload.clone()),
-                    bytes: Vec::new(),
-                    mode: 0o755,
-                });
+                add_unified_helper_replacement(
+                    &mut replacements,
+                    &mut unified_helper_payload,
+                    payload,
+                )?;
                 replacements.push(Replacement {
                     destination: PathBuf::from(ADMIN_REVISION),
                     source: None,
                     bytes: format!("{}\n", artifact.revision).into_bytes(),
                     mode: 0o644,
                 });
+                restart_helper = true;
             }
             HelperComponent::NfsRecovery { target, share_uuid } => {
                 let dir = recovery_directory(target)?;
@@ -169,12 +199,6 @@ pub(crate) fn apply(
                     &artifact.revision,
                     "nfs-recovery",
                 )?;
-                replacements.push(Replacement {
-                    destination: dir.join("macluster"),
-                    source: Some(payload.clone()),
-                    bytes: Vec::new(),
-                    mode: 0o700,
-                });
                 replacements.push(Replacement {
                     destination: dir.join("version"),
                     source: None,
@@ -214,7 +238,7 @@ pub(crate) fn apply(
         };
     }
     finish_update_journal(&journal)?;
-    Ok(restart_power)
+    Ok(restart_helper)
 }
 
 /// Remove the trust record for a cluster that has explicitly removed this node
@@ -555,6 +579,7 @@ fn verify_managed_recovery(
 
 fn plan_update(replacements: &[Replacement], operation_id: &str) -> Result<UpdateJournal, String> {
     let mut entries = Vec::with_capacity(replacements.len());
+    let mut destinations = BTreeSet::new();
     for (index, replacement) in replacements.iter().enumerate() {
         let destination = &replacement.destination;
         let parent = destination
@@ -564,6 +589,12 @@ fn plan_update(replacements: &[Replacement], operation_id: &str) -> Result<Updat
         if !allowed_destination(destination) {
             return Err(format!(
                 "helper destination {} is not allowlisted",
+                destination.display()
+            ));
+        }
+        if !destinations.insert(destination.clone()) {
+            return Err(format!(
+                "helper update plans destination {} more than once",
                 destination.display()
             ));
         }
@@ -746,7 +777,6 @@ fn recover_interrupted_update() -> Result<(), String> {
     if journal.version != 1 || journal.entries.is_empty() || journal.entries.len() > 1024 {
         return Err("helper update journal has an unsupported version or size".into());
     }
-    let mut restart_labels = BTreeMap::new();
     for entry in journal.entries.iter().rev() {
         let destination = PathBuf::from(&entry.destination);
         let temporary = PathBuf::from(&entry.temporary);
@@ -810,18 +840,12 @@ fn recover_interrupted_update() -> Result<(), String> {
                 Err(error) => return Err(format!("clean helper transaction file: {error}")),
             }
         }
-        if let Some(label) = recovery_service_for_destination(&destination) {
-            restart_labels.insert(label.clone(), label);
-        }
     }
     fs::remove_file(UPDATE_JOURNAL)
         .map_err(|error| format!("remove recovered helper update journal: {error}"))?;
     File::open(TRUST_DIR)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync recovered helper update journal: {error}"))?;
-    for label in restart_labels.keys() {
-        let _ = restart_service(label);
-    }
     Ok(())
 }
 
@@ -848,15 +872,9 @@ fn finish_update_journal(journal: &UpdateJournal) -> Result<(), String> {
 }
 
 fn allowed_destination(path: &Path) -> bool {
-    if [
-        POWER_HELPER,
-        POWER_REVISION,
-        ADMIN_CLI,
-        ADMIN_REVISION,
-        TRUST_SEQUENCE,
-    ]
-    .into_iter()
-    .any(|value| path == Path::new(value))
+    if [POWER_HELPER, POWER_REVISION, ADMIN_REVISION, TRUST_SEQUENCE]
+        .into_iter()
+        .any(|value| path == Path::new(value))
     {
         return true;
     }
@@ -873,32 +891,13 @@ fn allowed_destination(path: &Path) -> bool {
             .is_some_and(|value| {
                 value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
-        && matches!(
-            path.file_name().and_then(|value| value.to_str()),
-            Some("macluster" | "version")
-        )
+        && path.file_name().and_then(|value| value.to_str()) == Some("version")
 }
 
 fn transaction_path_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|value| value.to_str())
         .is_some_and(|name| name.starts_with(".macluster-update-") && !name.contains('/'))
-}
-
-fn recovery_service_for_destination(path: &Path) -> Option<String> {
-    if path.file_name().and_then(|value| value.to_str()) != Some("macluster") {
-        return None;
-    }
-    let parent = path.parent()?;
-    let root = parent.parent()?;
-    if root != Path::new(RECOVERY_ROOT) {
-        return None;
-    }
-    let digest = parent.file_name()?.to_str()?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some(format!("org.macluster.nfs.{digest}"))
 }
 
 fn cleanup_payloads(payloads: &BTreeMap<String, PathBuf>) {
@@ -1128,7 +1127,10 @@ fn io_error(error: io::Error) -> String {
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
-    use super::{normalize_arch, read_stage_file, stage_id, verify_revision_not_downgraded};
+    use super::{
+        add_unified_helper_replacement, normalize_arch, read_stage_file, stage_id,
+        verify_revision_not_downgraded,
+    };
     use macluster_protocol::identifiers::Id128;
 
     #[test]
@@ -1240,6 +1242,45 @@ mod tests {
         assert_eq!(normalize_arch("aarch64").unwrap(), "arm64");
         assert_eq!(normalize_arch("x86_64").unwrap(), "x86_64");
         assert!(normalize_arch("i386").is_err());
+    }
+
+    #[test]
+    fn power_and_nfs_artifacts_share_one_unified_helper_replacement() {
+        let root = std::env::temp_dir().join(format!("helper-unified-target-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("power");
+        let second = root.join("nfs-admin");
+        let different = root.join("different");
+        fs::write(&first, b"same unified binary").unwrap();
+        fs::write(&second, b"same unified binary").unwrap();
+        fs::write(&different, b"different binary").unwrap();
+
+        let mut replacements = Vec::new();
+        let mut accepted = None;
+        add_unified_helper_replacement(&mut replacements, &mut accepted, &first).unwrap();
+        add_unified_helper_replacement(&mut replacements, &mut accepted, &second).unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(
+            replacements[0].destination,
+            Path::new(super::UNIFIED_HELPER)
+        );
+        assert!(
+            add_unified_helper_replacement(&mut replacements, &mut accepted, &different).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_power_and_nfs_admin_executables_are_not_update_destinations() {
+        use super::allowed_destination;
+
+        assert!(allowed_destination(Path::new(super::UNIFIED_HELPER)));
+        assert!(!allowed_destination(Path::new(
+            "/Library/PrivilegedHelperTools/org.macluster.power"
+        )));
+        assert!(!allowed_destination(Path::new(
+            "/Library/PrivilegedHelperTools/org.macluster.nfs-admin"
+        )));
     }
 
     #[test]

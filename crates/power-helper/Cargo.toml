@@ -5,10 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "macluster-power"
-path = "src/main.rs"
-
 [dependencies]
 libc.workspace = true
 macluster-core = { path = "../core" }

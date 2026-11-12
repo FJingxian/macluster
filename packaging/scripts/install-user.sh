@@ -12,6 +12,12 @@ fi
 
 mkdir -p "$prefix"
 install -m 755 "$binary" "$prefix/macluster"
+for legacy in macluster-power macluster-nfs-admin; do
+  path="$prefix/$legacy"
+  if [ -f "$path" ] || [ -L "$path" ]; then
+    rm -f "$path"
+  fi
+done
 if [ -L "$prefix/mupdate" ] && [ "$(readlink "$prefix/mupdate")" = "macluster" ]; then
   rm "$prefix/mupdate"
 fi

@@ -20,7 +20,7 @@ use macluster_protocol::nfs_admin::{
     NfsAdminRequest,
 };
 const SOCKET: &str = "/var/run/org.macluster.nfs-admin.sock";
-const ADMIN_CLI: &str = "/Library/PrivilegedHelperTools/org.macluster.nfs-admin";
+const ADMIN_CLI: &str = "/Library/PrivilegedHelperTools/org.macluster.macluster";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ADMIN_STDERR_BYTES: usize = 256 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -88,11 +88,11 @@ pub(crate) fn start(peer_uid: libc::uid_t) -> Result<(), String> {
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                eprintln!("macluster-power: NFS admin request failed: {error}");
+                                eprintln!("macluster: NFS admin request failed: {error}");
                             }
                         }
                     }
-                    Err(error) => eprintln!("macluster-power: accept NFS admin client: {error}"),
+                    Err(error) => eprintln!("macluster: accept NFS admin client: {error}"),
                 }
             }
         })

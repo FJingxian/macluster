@@ -374,7 +374,7 @@ fn standalone_binary_includes_its_power_helper() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        format!("macluster-power {}", env!("CARGO_PKG_VERSION"))
+        format!("macluster {}", env!("CARGO_PKG_VERSION"))
     );
 }
 
@@ -442,6 +442,9 @@ fn user_installer_accepts_only_the_main_binary() {
     let binary = download.join("macluster");
     fs::copy(env!("CARGO_BIN_EXE_macluster"), &binary).unwrap();
     let prefix = root.join("installed");
+    fs::create_dir(&prefix).unwrap();
+    fs::write(prefix.join("macluster-power"), b"legacy helper").unwrap();
+    fs::write(prefix.join("macluster-nfs-admin"), b"legacy admin").unwrap();
     let installer =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/scripts/install-user.sh");
     let output = Command::new("/bin/sh")
@@ -456,6 +459,7 @@ fn user_installer_accepts_only_the_main_binary() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!prefix.join("macluster-power").exists());
+    assert!(!prefix.join("macluster-nfs-admin").exists());
     for alias in ["msub", "mjob", "mqueue", "mkill", "mtop", "mnode"] {
         assert_eq!(
             fs::read_link(prefix.join(alias)).unwrap(),

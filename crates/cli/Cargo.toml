@@ -18,6 +18,7 @@ macluster-agent = { path = "../agent" }
 macluster-controller = { path = "../controller" }
 macluster-core = { path = "../core" }
 macluster-metrics = { path = "../metrics" }
+macluster-power-helper = { path = "../power-helper" }
 macluster-protocol = { path = "../protocol" }
 libc.workspace = true
 serde.workspace = true

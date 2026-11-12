@@ -6,6 +6,7 @@ use std::{
     process::Command,
 };
 
+use crate::nfs_recovery::{NFS_MOUNT_LOCK_PATH, NFS_MOUNT_OPTIONS, NFS_MOUNT_TIMEOUT_SECS};
 use crate::node_admin::shell_quote;
 
 const HELPER_ROOT: &str = "/Library/PrivilegedHelperTools";
@@ -167,7 +168,10 @@ fn client_mount_script(
                 mount.source, mount.physical_target
             ));
             body.push_str(&format!(
-                "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    echo 'macluster client mount target is already mounted from a different source; refusing to replace it' >&2\n    exit 1\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /sbin/mount_nfs -o resvport {source_arg} {target_arg}\nfi\n"
+                "if [ -L {target_arg} ]; then echo 'macluster client mount target is a symlink' >&2; exit 1; fi\nif [ -e {target_arg} ] && [ ! -d {target_arg} ]; then echo 'macluster client mount target is not a directory' >&2; exit 1; fi\nif /sbin/mount | /usr/bin/grep -F {mounted_target} >/dev/null 2>&1; then\n  if ! /sbin/mount | /usr/bin/grep -F {expected_mount} >/dev/null 2>&1; then\n    echo 'macluster client mount target is already mounted from a different source; refusing to replace it' >&2\n    exit 1\n  fi\nelse\n  /bin/mkdir -p {target_arg}\n  /usr/bin/lockf -t {mount_timeout} -k -w {mount_lock} /sbin/mount_nfs -o {mount_options} {source_arg} {target_arg}\nfi\n",
+                mount_timeout = NFS_MOUNT_TIMEOUT_SECS,
+                mount_lock = NFS_MOUNT_LOCK_PATH,
+                mount_options = NFS_MOUNT_OPTIONS,
             ));
         } else if mount.is_smb() {
             let logical = shell_quote(&mount.logical_target);
@@ -180,7 +184,7 @@ fn client_mount_script(
         }
     }
     let plist_body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{helper}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>5</integer><key>ProcessType</key><string>Background</string></dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{helper}</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>15</integer><key>ProcessType</key><string>Background</string></dict></plist>\n"
     );
     let mut retired = String::new();
     if let Some(previous) = previous {

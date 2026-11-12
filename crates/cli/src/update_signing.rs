@@ -97,6 +97,30 @@ pub(crate) fn ensure_cluster_update_key(
 
 pub(crate) fn next_cluster_update_sequence(state_dir: &Path) -> Result<u64, String> {
     validate_state_dir(state_dir)?;
+    let _lock = lock_cluster_update_sequence(state_dir)?;
+    let current = read_cluster_update_sequence(state_dir)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| "cluster update sequence is exhausted".to_owned())?;
+    write_cluster_update_sequence(state_dir, next)?;
+    Ok(next)
+}
+
+/// Repair a sequence counter restored from an older controller state without
+/// weakening the signed updater's monotonic replay protection.
+pub(crate) fn ensure_cluster_update_sequence_at_least(
+    state_dir: &Path,
+    minimum: u64,
+) -> Result<(), String> {
+    validate_state_dir(state_dir)?;
+    let _lock = lock_cluster_update_sequence(state_dir)?;
+    if read_cluster_update_sequence(state_dir)? >= minimum {
+        return Ok(());
+    }
+    write_cluster_update_sequence(state_dir, minimum)
+}
+
+fn lock_cluster_update_sequence(state_dir: &Path) -> Result<File, String> {
     let lock_path = state_dir.join(".cluster-update-sequence.lock");
     let lock = OpenOptions::new()
         .read(true)
@@ -112,9 +136,12 @@ pub(crate) fn next_cluster_update_sequence(state_dir: &Path) -> Result<u64, Stri
             io::Error::last_os_error()
         ));
     }
+    Ok(lock)
+}
 
+fn read_cluster_update_sequence(state_dir: &Path) -> Result<u64, String> {
     let sequence_path = state_dir.join("cluster-update.sequence");
-    let current = match fs::symlink_metadata(&sequence_path) {
+    match fs::symlink_metadata(&sequence_path) {
         Ok(metadata)
             if metadata.is_file()
                 && !metadata.file_type().is_symlink()
@@ -125,15 +152,16 @@ pub(crate) fn next_cluster_update_sequence(state_dir: &Path) -> Result<u64, Stri
                 .map_err(|error| format!("cannot read cluster update sequence: {error}"))?
                 .trim()
                 .parse::<u64>()
-                .map_err(|_| "cluster update sequence is malformed".to_owned())?
+                .map_err(|_| "cluster update sequence is malformed".to_owned())
         }
-        Ok(_) => return Err("cluster update sequence has unsafe ownership or permissions".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(format!("cannot inspect cluster update sequence: {error}")),
-    };
-    let next = current
-        .checked_add(1)
-        .ok_or_else(|| "cluster update sequence is exhausted".to_owned())?;
+        Ok(_) => Err("cluster update sequence has unsafe ownership or permissions".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!("cannot inspect cluster update sequence: {error}")),
+    }
+}
+
+fn write_cluster_update_sequence(state_dir: &Path, sequence: u64) -> Result<(), String> {
+    let sequence_path = state_dir.join("cluster-update.sequence");
     let temporary = state_dir.join(format!(".cluster-update-sequence-{}.next", Id128::random()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -142,7 +170,7 @@ pub(crate) fn next_cluster_update_sequence(state_dir: &Path) -> Result<u64, Stri
         .custom_flags(libc::O_NOFOLLOW)
         .open(&temporary)
         .map_err(|error| format!("cannot stage cluster update sequence: {error}"))?;
-    if let Err(error) = writeln!(file, "{next}").and_then(|_| file.sync_all()) {
+    if let Err(error) = writeln!(file, "{sequence}").and_then(|_| file.sync_all()) {
         let _ = fs::remove_file(&temporary);
         return Err(format!("cannot write cluster update sequence: {error}"));
     }
@@ -152,7 +180,7 @@ pub(crate) fn next_cluster_update_sequence(state_dir: &Path) -> Result<u64, Stri
     File::open(state_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("cannot sync cluster update sequence: {error}"))?;
-    Ok(next)
+    Ok(())
 }
 
 fn validate_state_dir(state_dir: &Path) -> Result<(), String> {
@@ -266,7 +294,10 @@ mod tests {
 
     use macluster_protocol::identifiers::Id128;
 
-    use super::{ensure_cluster_update_key, next_cluster_update_sequence};
+    use super::{
+        ensure_cluster_update_key, ensure_cluster_update_sequence_at_least,
+        next_cluster_update_sequence,
+    };
 
     fn test_dir() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -325,6 +356,16 @@ mod tests {
             fs::read_to_string(root.join("cluster-update.sequence")).unwrap(),
             "2\n"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restored_sequence_can_advance_past_an_installed_helper_sequence() {
+        let root = test_dir();
+        ensure_cluster_update_sequence_at_least(&root, 243).unwrap();
+        assert_eq!(next_cluster_update_sequence(&root).unwrap(), 244);
+        ensure_cluster_update_sequence_at_least(&root, 100).unwrap();
+        assert_eq!(next_cluster_update_sequence(&root).unwrap(), 245);
         fs::remove_dir_all(root).unwrap();
     }
 }

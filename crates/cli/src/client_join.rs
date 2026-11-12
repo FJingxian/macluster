@@ -405,14 +405,7 @@ fn join_key_cleanup_required(profile_persisted: bool, key_installed: bool) -> bo
 }
 
 fn resolve_remote_macluster(node: &NodeConfig) -> Result<String, String> {
-    let script = r#"set -eu
-for candidate in /opt/homebrew/bin/macluster /usr/local/bin/macluster "$HOME/.local/bin/macluster" "$HOME/.macluster/bin/macluster"; do
-  if [ -x "$candidate" ]; then /usr/bin/printf '%s\n' "$candidate"; exit 0; fi
-done
-candidate=$(command -v macluster 2>/dev/null || true)
-[ -n "$candidate" ] || { echo 'macluster is not installed on this login node' >&2; exit 127; }
-/usr/bin/printf '%s\n' "$candidate"
-"#;
+    let script = remote_macluster_search_script();
     let output = node_admin::ssh_output(node, script, None).map_err(|(_, error)| error)?;
     if !output.status.success() {
         return Err(format!(
@@ -421,6 +414,17 @@ candidate=$(command -v macluster 2>/dev/null || true)
         ));
     }
     parse_remote_macluster_path(&output.stdout)
+}
+
+fn remote_macluster_search_script() -> &'static str {
+    r#"set -eu
+for candidate in "$HOME/.local/bin/macluster" "$HOME/.macluster/bin/macluster" /usr/local/bin/macluster /opt/homebrew/bin/macluster; do
+  if [ -x "$candidate" ]; then /usr/bin/printf '%s\n' "$candidate"; exit 0; fi
+done
+candidate=$(command -v macluster 2>/dev/null || true)
+[ -n "$candidate" ] || { echo 'macluster is not installed on this login node' >&2; exit 127; }
+/usr/bin/printf '%s\n' "$candidate"
+"#
 }
 
 fn parse_remote_macluster_path(output: &[u8]) -> Result<String, String> {
@@ -591,7 +595,7 @@ mod tests {
     use super::{
         BootstrapResponse, JoinEndpoint, existing_mounts_are_active, join_key_cleanup_required,
         join_local_cleanup_required, parse_remote_macluster_path, profile_from_bootstrap,
-        verify_expected_cluster_uuid,
+        remote_macluster_search_script, verify_expected_cluster_uuid,
     };
 
     fn descriptor() -> macluster_protocol::control::ClientDescriptor {
@@ -741,6 +745,15 @@ mod tests {
         assert!(parse_remote_macluster_path(b"macluster\n").is_err());
         assert!(parse_remote_macluster_path(b"/tmp/../macluster\n").is_err());
         assert!(parse_remote_macluster_path(b"/tmp/macluster\nmalicious\n").is_err());
+    }
+
+    #[test]
+    fn login_node_binary_search_prefers_a_stable_user_install() {
+        let script = remote_macluster_search_script();
+        let local = script.find("\"$HOME/.local/bin/macluster\"").unwrap();
+        let homebrew = script.find("/opt/homebrew/bin/macluster").unwrap();
+
+        assert!(local < homebrew, "{script}");
     }
 
     #[test]

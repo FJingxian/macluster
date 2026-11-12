@@ -1028,7 +1028,10 @@ impl ResetPlan {
         config_digest: &str,
     ) -> AppResult<()> {
         for operation in operations {
-            if matches!(operation.phase.as_str(), "READY" | "REMOVED" | "ABORTED") {
+            if matches!(
+                operation.phase.as_str(),
+                "READY" | "REMOVED" | "REMOVED_OFFLINE" | "ABORTED"
+            ) {
                 continue;
             }
             if !admin_operation_matches_digest(&operation, config_digest) {

@@ -261,12 +261,18 @@ pub(crate) fn select_remote_profile(
     args: &[String],
     explicit: Option<&str>,
     config_explicit: bool,
+    local_controller_stopped: bool,
 ) -> Result<Option<ClientProfile>, String> {
     if !remote_command_supported(command)
         || args
             .iter()
             .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
-        || !should_consider_remote_profile(config_path.exists(), explicit, config_explicit)
+        || !should_consider_remote_profile(
+            config_path.exists(),
+            explicit,
+            config_explicit,
+            local_controller_stopped,
+        )
     {
         return Ok(None);
     }
@@ -283,8 +289,9 @@ fn should_consider_remote_profile(
     config_exists: bool,
     explicit: Option<&str>,
     config_explicit: bool,
+    local_controller_stopped: bool,
 ) -> bool {
-    explicit.is_some() || !config_explicit && !config_exists
+    explicit.is_some() || !config_explicit && (!config_exists || local_controller_stopped)
 }
 
 pub(crate) fn remote_command_supported(command: &str) -> bool {
@@ -314,18 +321,18 @@ mod tests {
     }
 
     #[test]
-    fn local_config_precedes_client_profiles() {
+    fn running_local_controller_precedes_client_profiles() {
         let root = std::env::temp_dir().join(format!("macluster-context-{}", Id128::random()));
         fs::create_dir_all(&root).unwrap();
         let config = root.join("config.toml");
         fs::write(&config, "config").unwrap();
         assert!(
-            select_remote_profile(&config, "queue", &[], None, false)
+            select_remote_profile(&config, "queue", &[], None, false, false)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            select_remote_profile(&config, "queue", &[], None, true)
+            select_remote_profile(&config, "queue", &[], None, true, true)
                 .unwrap()
                 .is_none()
         );
@@ -333,12 +340,27 @@ mod tests {
     }
 
     #[test]
+    fn stopped_local_controller_allows_the_joined_profile() {
+        assert!(should_consider_remote_profile(true, None, false, true));
+    }
+
+    #[test]
     fn explicit_cluster_selection_overrides_a_local_controller_config() {
-        assert!(should_consider_remote_profile(false, None, false));
-        assert!(!should_consider_remote_profile(true, None, false));
-        assert!(!should_consider_remote_profile(false, None, true));
-        assert!(should_consider_remote_profile(true, Some("remote"), false));
-        assert!(should_consider_remote_profile(false, Some("remote"), true));
+        assert!(should_consider_remote_profile(false, None, false, false));
+        assert!(!should_consider_remote_profile(true, None, false, false));
+        assert!(!should_consider_remote_profile(false, None, true, false));
+        assert!(should_consider_remote_profile(
+            true,
+            Some("remote"),
+            false,
+            false
+        ));
+        assert!(should_consider_remote_profile(
+            false,
+            Some("remote"),
+            true,
+            false
+        ));
     }
 
     #[test]

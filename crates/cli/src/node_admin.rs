@@ -1361,7 +1361,7 @@ fn confirm_controller_shutdown(operation: &str) -> AppResult<()> {
     }
 }
 
-fn shutdown_confirmation_accepted(response: &str) -> bool {
+pub(crate) fn shutdown_confirmation_accepted(response: &str) -> bool {
     matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
@@ -1903,6 +1903,10 @@ enum Action {
         storage: bool,
         node: Option<NodeId>,
     },
+    RepairNfs {
+        node_id: NodeId,
+        assume_yes: bool,
+    },
     Scan,
     Failures,
     Remove {
@@ -2037,6 +2041,10 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         Action::List { all, storage, node } => {
             list_nodes(&config_path, &state_dir, all, storage, node.as_ref())
         }
+        Action::RepairNfs {
+            node_id,
+            assume_yes,
+        } => crate::nfs_repair::repair_nfs_client(&config_path, &state_dir, &node_id, assume_yes),
         Action::Scan => {
             let config = read_config(&config_path)?;
             scan::scan_nodes(&config)
@@ -3698,6 +3706,26 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
         }
         return Ok(Action::List { all, storage, node });
     }
+    if key == "--repair-nfs" {
+        let node_text = inline
+            .map(str::to_owned)
+            .or_else(|| args.get(1).cloned())
+            .ok_or_else(|| (2, "mnode --repair-nfs requires NODE_ID".into()))?;
+        let mut assume_yes = false;
+        for option in &args[if inline.is_some() { 1 } else { 2 }..] {
+            match option.as_str() {
+                "--yes" if !assume_yes => assume_yes = true,
+                "--yes" => return Err((2, "--yes may only be specified once".into())),
+                _ => {
+                    return Err((2, format!("unknown mnode --repair-nfs option '{option}'")));
+                }
+            }
+        }
+        return Ok(Action::RepairNfs {
+            node_id: NodeId::new(node_text).map_err(|error| (2, error.to_string()))?,
+            assume_yes,
+        });
+    }
     if key == "--scan" {
         if inline.is_some() || args.len() != 1 {
             return Err((2, "mnode --scan does not accept arguments".into()));
@@ -4127,6 +4155,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -mount URI --mount-root PATH [--host HOST]
   mnode -umount MAPPING_ID|SOURCE_URI
   mnode -migrate controller:NODE_ID
+  mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
   mnode -rm|--remove NODE_ID|compute:NODE_ID|share:SHARE_ID
 
@@ -4135,6 +4164,7 @@ OPTIONS
   --mount-root PATH   Required client mount path.
   --overlay-existing  Confirm covering existing files.
   --force             Force-detach a busy share.
+  --yes               Confirm an unattended idle-node NFS reboot.
   --storage           Show detailed disk and share capacity.
 
 EXAMPLES
@@ -4144,6 +4174,7 @@ EXAMPLES
     --host 192.0.2.5 --smb-user nas-user
   mnode -mount nfs://login-01/Users/Shared/tools --mount-root /Users/Shared/tools
   mnode -umount mnt-0123456789abcdef
+  mnode --repair-nfs default-001
   mnode -l --storage
 
 Use `mnode -l --all` to include unreachable compute nodes.
@@ -4160,6 +4191,7 @@ Use --help for scan, SSH, and migration details."#;
         [--host HOST] [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
   mnode -umount MAPPING_ID|SOURCE_URI
   mnode -migrate controller:NODE_ID
+  mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
   mnode --scan
   mnode --failed
@@ -4177,6 +4209,7 @@ OPTIONS
   --overlay-existing  Keep client files underneath the NFS mount.
   --connect USER@IP   Reach a moved node at its current address.
   --force             Force-detach a named share whose client mount is in use.
+  --yes               Confirm an unattended idle-node NFS reboot.
   --storage           Show per-node system, external and share capacity.
 
 EXAMPLES
@@ -4189,6 +4222,7 @@ EXAMPLES
     --smb-user smb-user
   mnode -umount mnt-0123456789abcdef
   mnode -umount smb://nas-01/data/project
+  mnode --repair-nfs default-001
   mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
   mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
@@ -4203,6 +4237,13 @@ storage details.
 Missed or inconclusive probes show `RECONNECTING` during the recovery grace;
 three confirmed failures hide the node. Stale or unverified nodes stay hidden;
 use `mnode -l --all` to inspect them.
+
+NFS CLIENT RECOVERY
+  `mnode --repair-nfs NODE_ID` actively probes configured NFS markers and
+  offers to reboot an idle SSH compute node only when reads return the macOS
+  client EINTR failure. It never reboots login, controller, or storage nodes.
+  `--yes` skips the terminal prompt; it does not skip identity, wedge, idle,
+  output-sync, or boot-ID safeguards.
 
 ADD NODES
   Setup is verified before a node is listed. Failed attempts stay outside the
@@ -17503,7 +17544,7 @@ fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
             .map_err(|error| (1, format!("cannot encode SMB unmount request: {error}")))?,
     );
     Ok(format!(
-        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nstate={state}\nresponse=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n/usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif [ \"$backing\" != \"$physical\" ] && /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$backing\"; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then\n  response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nfi\nif [ \"$backing\" != \"$physical\" ] && /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$backing\"; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
         request = request,
     ))
 }
@@ -27431,6 +27472,49 @@ execution_uid = 501
             parse_action(&["--list", "default-001", "default-002"].map(str::to_owned)).is_err(),
             "the list view accepts at most one node identifier"
         );
+    }
+
+    #[test]
+    fn repair_nfs_action_accepts_one_node_and_optional_yes() {
+        for (args, expected_yes) in [
+            (vec!["--repair-nfs", "worker"], false),
+            (vec!["--repair-nfs", "worker", "--yes"], true),
+            (vec!["--repair-nfs=worker", "--yes"], true),
+        ] {
+            let action = parse_action(
+                &args
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            match action {
+                Action::RepairNfs {
+                    node_id,
+                    assume_yes,
+                } => {
+                    assert_eq!(node_id.as_str(), "worker");
+                    assert_eq!(assume_yes, expected_yes);
+                }
+                other => panic!("unexpected action: {other:?}"),
+            }
+        }
+
+        for args in [
+            vec!["--repair-nfs"],
+            vec!["--repair-nfs", "worker", "--yes", "--yes"],
+            vec!["--repair-nfs", "worker", "extra"],
+        ] {
+            assert!(
+                parse_action(
+                    &args
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

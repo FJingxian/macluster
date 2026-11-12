@@ -13,6 +13,7 @@ mod init;
 mod job_resources;
 mod mtop;
 mod nfs_recovery;
+mod nfs_repair;
 mod node_admin;
 mod remote_admin;
 mod remote_transport;

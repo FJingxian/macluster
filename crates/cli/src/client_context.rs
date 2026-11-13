@@ -1,12 +1,19 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
 use macluster_core::config::{ClusterConfig, NodeConfig, QueueConfig, ShareConfig, Transport};
 use macluster_protocol::control::{ClientDescriptor, ControlCommand, ControlPayload};
-use macluster_protocol::{identifiers::NodeId, types::PROTOCOL_VERSION, types::SchedulerKind};
+use macluster_protocol::framing::sha256_hex;
+use macluster_protocol::{
+    identifiers::{Id128, NodeId},
+    types::PROTOCOL_VERSION,
+    types::SchedulerKind,
+};
 
 use crate::{
     client_profile::{ClientProfile, ClientProfileStore, ClientSelection},
@@ -17,6 +24,138 @@ pub(crate) struct RemoteContext {
     pub profile: ClientProfile,
     pub descriptor: ClientDescriptor,
     pub client: ControlClient,
+}
+
+pub(crate) fn stage_current_binary_for_remote_profile(
+    profile: &ClientProfile,
+) -> Result<(), String> {
+    let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    let source = source.canonicalize().map_err(|error| error.to_string())?;
+    let bytes = fs::read(&source).map_err(|error| error.to_string())?;
+    let local_digest = sha256_hex(&bytes).map_err(|error| error.to_string())?;
+    let host_alias = format!("macluster-{}", profile.cluster_uuid);
+    let known_hosts = format!("UserKnownHostsFile={}", profile.known_hosts_path);
+    let host_key_alias = format!("HostKeyAlias={host_alias}");
+    let mut ssh = Command::new("/usr/bin/ssh");
+    ssh.args([
+        "-T",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        &known_hosts,
+        "-o",
+        &host_key_alias,
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        &profile.identity_file,
+        "-p",
+        &profile.controller_port.to_string(),
+        "-l",
+        &profile.controller_user,
+        &profile.controller_host,
+    ]);
+    let query = ssh
+        .arg(format!(
+            "/usr/bin/shasum -a 256 {} 2>/dev/null || true",
+            crate::node_admin::shell_quote(&profile.remote_binary)
+        ))
+        .output()
+        .map_err(|error| error.to_string())?;
+    if query.status.success()
+        && String::from_utf8_lossy(&query.stdout)
+            .split_whitespace()
+            .next()
+            == Some(local_digest.as_str())
+    {
+        return Ok(());
+    }
+
+    let staging = format!(
+        "{}.macluster-stage-{}",
+        profile.remote_binary,
+        Id128::random()
+    );
+    let mut scp = Command::new("/usr/bin/scp");
+    scp.args([
+        "-q",
+        "-P",
+        &profile.controller_port.to_string(),
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        &known_hosts,
+        "-o",
+        &host_key_alias,
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        &profile.identity_file,
+    ]);
+    scp.arg(&source).arg(format!(
+        "{}@{}:{}",
+        profile.controller_user, profile.controller_host, staging
+    ));
+    let copied = scp.output().map_err(|error| error.to_string())?;
+    if !copied.status.success() {
+        return Err(format!(
+            "could not stage the current macluster binary for controller migration: {}",
+            String::from_utf8_lossy(&copied.stderr).trim()
+        ));
+    }
+
+    let install = format!(
+        "/bin/chmod 700 {} && /bin/mv -f {} {}",
+        crate::node_admin::shell_quote(&staging),
+        crate::node_admin::shell_quote(&staging),
+        crate::node_admin::shell_quote(&profile.remote_binary),
+    );
+    let mut ssh = Command::new("/usr/bin/ssh");
+    ssh.args([
+        "-T",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        &known_hosts,
+        "-o",
+        &host_key_alias,
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        &profile.identity_file,
+        "-p",
+        &profile.controller_port.to_string(),
+        "-l",
+        &profile.controller_user,
+        &profile.controller_host,
+        &install,
+    ]);
+    let installed = ssh.output().map_err(|error| error.to_string())?;
+    if !installed.status.success() {
+        return Err(format!(
+            "could not install the current macluster binary on the controller: {}",
+            String::from_utf8_lossy(&installed.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 impl RemoteContext {
@@ -417,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_local_controller_forwards_listing_and_migration_to_the_remote_profile() {
+    fn stopped_local_controller_forwards_supported_node_admin_to_the_remote_profile() {
         for args in [
             vec!["-l"],
             vec!["--list"],

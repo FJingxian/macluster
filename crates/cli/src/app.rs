@@ -859,6 +859,14 @@ fn remote_command(
     command: &str,
     args: &[String],
 ) -> AppResult<()> {
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|argument| matches!(argument.as_str(), "-migrate" | "--migrate"))
+    {
+        crate::client_context::stage_current_binary_for_remote_profile(&profile)
+            .map_err(|error| (1, error))?;
+    }
     let profile = ensure_remote_command_storage_with(
         profile,
         command,
@@ -1493,6 +1501,13 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
         && args.first().is_some_and(|arg| {
             matches!(arg.as_str(), "-mount" | "--mount" | "-umount" | "--umount")
         })
+    {
+        return false;
+    }
+    if command == "node"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-migrate" | "--migrate"))
     {
         return false;
     }
@@ -8846,6 +8861,27 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             }
             Ok(())
         }
+        Some("sync-peer-config") => {
+            let config_path = resolved_config_path(global.config.as_deref());
+            let source = fs::read_to_string(&config_path)
+                .map_err(|error| (1, format!("cannot read {}: {error}", config_path.display())))?;
+            let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            let operation_id = Id128::random().to_string();
+            if let Err(error) = crate::node_admin::sync_remote_configs(
+                &config,
+                &source,
+                &state_dir,
+                &operation_id,
+                None,
+            ) {
+                // A migration must remain usable when one optional peer is
+                // offline. Successful peers are synchronized immediately;
+                // the controller will retry stale/reconnected nodes later.
+                eprintln!("macluster: peer config synchronization is deferred: {error}");
+            }
+            Ok(())
+        }
         Some("node-check") => {
             let node = option_value(args, "--node")?
                 .ok_or_else(|| (2, "node-check requires --node ID".into()))?;
@@ -9145,7 +9181,7 @@ struct RemoteNodeCheck {
     shares: BTreeMap<String, bool>,
 }
 
-fn local_machine_uuid() -> Result<String, String> {
+pub(crate) fn local_machine_uuid() -> Result<String, String> {
     let output = process::Command::new("/usr/sbin/ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
@@ -9854,6 +9890,14 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
                 "mnode {flag} must not migrate addresses before storage setup"
             );
         }
+    }
+
+    #[test]
+    fn controller_migration_uses_its_own_target_preflight() {
+        assert!(!should_preflight_agent_update(
+            "node",
+            &["-migrate".into(), "controller:login-01".into()]
+        ));
     }
 
     #[test]

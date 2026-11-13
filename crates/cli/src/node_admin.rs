@@ -4386,7 +4386,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
   mnode -a compute:NODE_ID
   mnode -mount URI --mount-root PATH [--host HOST]
-  mnode -umount MAPPING_ID|SOURCE_URI
+  mnode -umount MAPPING_ID|SOURCE_URI [--force [--yes]] [--wait [--timeout SECONDS]]
   mnode -migrate controller:NODE_ID
   mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
@@ -4411,8 +4411,7 @@ EXAMPLES
   mnode -l --storage
 
 Use `mnode -l --all` to include unreachable compute nodes.
-
-Use --help for scan, SSH, and migration details."#;
+"#;
     }
 
     r#"Usage
@@ -4422,7 +4421,7 @@ Use --help for scan, SSH, and migration details."#;
   mnode -mount nfs://NODE/PATH --mount-root PATH [--host HOST] [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH
         [--host HOST] [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
-  mnode -umount MAPPING_ID|SOURCE_URI
+  mnode -umount MAPPING_ID|SOURCE_URI [--force [--yes]] [--wait [--timeout SECONDS]]
   mnode -migrate controller:NODE_ID
   mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
@@ -4443,6 +4442,8 @@ OPTIONS
   --connect USER@IP   Reach a moved node at its current address.
   --force             Force-detach a named share whose client mount is in use.
   --yes               Confirm an unattended idle-node NFS reboot.
+  --wait              Wait for SMB mount cleanup after removal.
+  --timeout SECONDS   Set the SMB cleanup wait limit (1..3600).
   --storage           Show per-node system, external and share capacity.
 
 EXAMPLES
@@ -4455,6 +4456,8 @@ EXAMPLES
     --smb-user smb-user
   mnode -umount mnt-0123456789abcdef
   mnode -umount smb://nas-01/data/project
+  mnode -umount mnt-0123456789abcdef --force --yes
+  mnode -umount mnt-0123456789abcdef --wait --timeout 60
   mnode --repair-nfs default-001
   mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
@@ -18409,7 +18412,7 @@ fn parse_legacy_smb_state_records(
             current_lines.clear();
             continue;
         }
-        if current_path.is_some() {
+        if current_path.is_some() && !line.is_empty() {
             current_lines.push(line);
         }
     }
@@ -28228,7 +28231,7 @@ execution_uid = 501
     fn legacy_smb_state_parser_adopts_only_exact_managed_orphans() {
         let uuid = "928e8976-c946-509d-9e62-a3ef787664b7";
         let output = format!(
-            "BEGIN\t/Users/operator/Library/Application Support/macluster/smb/org.macluster.smb.{uuid}.state\n{uuid}\n/data\n/Users/operator/data\n/Users/Shared/.macluster-mounts/{uuid}\nEND\n"
+            "BEGIN\t/Users/operator/Library/Application Support/macluster/smb/org.macluster.smb.{uuid}.state\n{uuid}\n/data\n/Users/operator/data\n/Users/Shared/.macluster-mounts/{uuid}\n\nEND\n"
         );
         let config = ClusterConfig::parse(
             "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n",

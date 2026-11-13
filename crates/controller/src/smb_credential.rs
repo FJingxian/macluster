@@ -682,7 +682,6 @@ mod tests {
                 "/Users/Shared/.macluster-mounts/share-1",
                 "/Users/operator/data",
                 "/Users/Shared/.macluster-mounts/share-1",
-                false,
             )
             .unwrap();
         client
@@ -690,6 +689,7 @@ mod tests {
                 "/Users/Shared/.macluster-mounts/share-1",
                 "/Users/operator/data",
                 "/Users/Shared/.macluster-mounts/share-1",
+                false,
             )
             .unwrap();
 

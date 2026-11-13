@@ -1,6 +1,6 @@
 # macluster
 
-将多台 Mac 组成个人计算集群：在一台 Mac 上提交命令，让其他 Mac 执行，通过终端或浏览器查看资源和任务。
+将多台 Mac 组成个人计算集群：在一台 Mac 上提交命令，让其他 Mac 执行，并通过终端查看资源和任务。
 
 [English](../README.md) · 简体中文 · [Agent skill](../skills/macluster/SKILL.md)
 
@@ -65,7 +65,7 @@ macluster node -l default-001
 
 节点通过 Agent 和共享存储验证后才会进入正式集群。`node -l` 提供紧凑的集群视图；在命令后附加一个节点 ID，可查看该 Mac 的 host、SSH 账户、端口和详细存储信息。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
 
-所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller 或 login client。`mnode` 的 `ROLES` 只显示 `controller` 和 `compute`，NFS/SMB 所有权统一通过 storage mapping 展示。无法接入统一 Agent 的外部 NFS/SMB 节点只显示为 storage mapping。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
+所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue` 和 `mfans` 中，包括没有 compute 角色的 controller 或 login client。`mnode` 的 `ROLES` 只显示 `controller` 和 `compute`，NFS/SMB 所有权统一通过 storage mapping 展示。无法接入统一 Agent 的外部 NFS/SMB 节点只显示为 storage mapping。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
 
 提交快照会从 controller 本地状态分块发送给存储 Agent；选中的计算 Agent 也会在 `StartJob` 前收到任务脚本。因此，controller 发布和启动任务不再需要直接读取或写入 NFS。任务输入、输出和日志同步仍依赖相关节点能够访问配置的共享存储。
 
@@ -241,15 +241,13 @@ macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
 ```sh
 macluster top                                  # 终端面板
 macluster top --once                           # 单次表格
-macluster --web                                # 本机浏览器面板，自动选择端口
-macluster --web 127.0.0.1:8080                 # 可选指定本机 IP 和端口
 ```
 
 终端中，方向键或 `j`/`k` 选择节点，Enter 打开/收起进程详情，`c` 按 CPU 排序，`m` 按内存排序，`q` 退出。进程先显示快速预览，再更新为区间采样结果；预览会注明 CPU 是平均值、内存是 RSS。
 
 CPU 占用为所有逻辑 CPU 之和，例如 8 个逻辑 CPU 最高为 800%。GPU、温度、风扇、功耗取决于硬件与 helper 支持情况，无法获取时显示 `N/A`。
 
-浏览器面板只读，监听 `127.0.0.1`；`--web` 的本机 IP 和端口都可省略，省略端口时会自动选择空闲端口。加 `--no-open` 可打印访问链接；兼容的 controller 已运行时可以直接开启面板，无需重启。`mqueue` 也可通过 `macluster queue` 使用。
+`mqueue` 也可通过 `macluster queue` 使用。
 
 ## 管理和维护
 

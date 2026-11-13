@@ -3,7 +3,7 @@ use std::{
     io::{self, IsTerminal},
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::Path,
-    process::{Child, Command},
+    process::Command,
     time::Duration,
 };
 
@@ -180,24 +180,6 @@ fn close_control_master_socket_command(socket: &str, controller_host: &str) -> C
         ])
         .arg(controller_host);
     command
-}
-
-pub(crate) fn start_forward(
-    profile: &ClientProfile,
-    local_port: u16,
-    remote_port: u16,
-) -> io::Result<Child> {
-    let mut command = Command::new("/usr/bin/ssh");
-    let mut args = routine_ssh_args(profile, false);
-    let host = args.pop().expect("SSH arguments include a host");
-    args.extend([
-        "-N".into(),
-        "-L".into(),
-        format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"),
-        host,
-    ]);
-    command.args(args);
-    command.spawn()
 }
 
 pub(crate) fn revoke_client_key(profile: &ClientProfile) -> Result<(), String> {

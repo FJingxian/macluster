@@ -1124,17 +1124,6 @@ fn job_queue_and_kill_help_are_available_without_cluster_state() {
 }
 
 #[test]
-fn top_level_web_rejects_non_loopback_before_loading_cluster_state() {
-    let output = macluster_command()
-        .args(["--web", "192.0.2.10:8080"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("only supports 127.0.0.1"), "{stderr}");
-}
-
-#[test]
 fn noninteractive_init_requires_explicit_terminal_confirmation() {
     let root = std::env::temp_dir().join(format!(
         "macluster-init-no-tty-{}",

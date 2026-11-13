@@ -213,9 +213,6 @@ pub enum ControlCommand {
         node_id: NodeId,
         job_id: u64,
     },
-    StartWeb {
-        port: Option<u16>,
-    },
     BeginSnapshot {
         upload_id: Id128,
         size_bytes: u64,
@@ -271,14 +268,7 @@ pub enum ControlPayload {
     MonitorSnapshot(MonitorSnapshot),
     MonitorSubscribed,
     MonitorAcknowledged,
-    WebStarted {
-        port: u16,
-        token: String,
-        reused: bool,
-    },
-    SnapshotProgress {
-        offset: u64,
-    },
+    SnapshotProgress { offset: u64 },
     SnapshotFinished(SnapshotRef),
     Submission(JobRecord),
     Lookup(Option<JobRecord>),
@@ -286,9 +276,7 @@ pub enum ControlPayload {
     Jobs(JobPage),
     Queues(Vec<QueueSummary>),
     FanControl(FanControlPayload),
-    ReconciliationRequested {
-        accepted: bool,
-    },
+    ReconciliationRequested { accepted: bool },
 }
 
 /// Fan-control response accepts the older vector-only wire shape while the

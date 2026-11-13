@@ -352,41 +352,6 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
                 if control_only { ", control-only" } else { "" }
             );
             return Ok(());
-        } else if command_arg == "--web" {
-            if let Some(mode) = help_mode(&args[command_index + 1..]) {
-                println!("{}", web_shortcut_help(mode));
-                return Ok(());
-            }
-            let (leading, _) = take_global_options(args[..command_index].to_vec(), false)?;
-            if leading.cluster.is_some()
-                && (leading.config.is_some() || leading.state_dir.is_some())
-            {
-                return Err((
-                    2,
-                    "--cluster cannot be combined with --config or --state-dir".into(),
-                ));
-            }
-            if leading.cluster.is_some()
-                || !resolved_config_path(None).exists()
-                    && !args[..command_index]
-                        .iter()
-                        .any(|argument| argument == "--config" || argument.starts_with("--config="))
-            {
-                let store = crate::client_profile::ClientProfileStore::current()
-                    .map_err(|error| (1, error.to_string()))?;
-                if let crate::client_profile::ClientSelection::Explicit(profile)
-                | crate::client_profile::ClientSelection::LastUsed(profile)
-                | crate::client_profile::ClientSelection::Sole(profile) = store
-                    .select(leading.cluster.as_deref())
-                    .map_err(|error| (1, error.to_string()))?
-                {
-                    return remote_web(profile, &args[command_index + 1..]);
-                }
-            }
-            let controller_args = parse_web_shortcut_args(&args[command_index + 1..])?;
-            args.truncate(command_index);
-            args.extend(controller_args);
-            command = Some("controller".into());
         } else if command_arg == "init" {
             return Err((
                 2,
@@ -810,47 +775,6 @@ impl InteractiveRequestFile {
 impl Drop for InteractiveRequestFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn remote_web(profile: crate::client_profile::ClientProfile, args: &[String]) -> AppResult<()> {
-    let normalized = parse_web_shortcut_args(args)?;
-    let no_open = normalized.iter().any(|value| value == "--no-open");
-    let requested_local_port = normalized
-        .windows(2)
-        .find(|pair| pair[0] == "--web-port")
-        .and_then(|pair| pair[1].parse::<u16>().ok());
-    let local_port = requested_local_port
-        .filter(|port| *port != 0)
-        .unwrap_or_else(|| {
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .and_then(|listener| listener.local_addr())
-                .map(|address| address.port())
-                .unwrap_or(52_521)
-        });
-    let mut remote = crate::client_context::RemoteContext::connect(profile, false)
-        .map_err(|error| (1, error))?;
-    let ControlPayload::WebStarted { port, token, .. } = remote
-        .client
-        .request(ControlCommand::StartWeb { port: None })
-        .map_err(|error| (1, error.to_string()))?
-    else {
-        return Err((1, "Controller returned an invalid web response".into()));
-    };
-    let mut forward = crate::remote_admin::start_forward(&remote.profile, local_port, port)
-        .map_err(|error| (1, error.to_string()))?;
-    let base = format!("http://127.0.0.1:{local_port}/#{token}");
-    if no_open {
-        println!("Remote web monitor: {base}");
-    } else {
-        println!("Opened the remote web monitor at http://127.0.0.1:{local_port}/");
-        let _ = process::Command::new("/usr/bin/open").arg(&base).status();
-    }
-    let status = forward.wait().map_err(|error| (1, error.to_string()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err((1, "remote web forward closed".into()))
     }
 }
 
@@ -1464,6 +1388,13 @@ fn controller_build_mismatch(global: &GlobalOptions, state_dir: &Path) -> bool {
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    if command == "controller"
+        && args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--web" | "--web-port" | "--no-open"))
+    {
+        return false;
+    }
     // Monitoring is read-only and must remain available while an Agent update
     // is pending or a compute node is unreachable. mtop reports the mismatch
     // inside its UI instead of starting cluster-wide maintenance first.
@@ -1749,7 +1680,6 @@ fn defer_update_without_terminal(
 
 fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
     matches!(command, "submit" | "job" | "queue" | "kill" | "top")
-        || controller_web_monitor_requested(command, args)
         || command == "fans"
         || command == "node"
             && args
@@ -1759,12 +1689,6 @@ fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
 
 fn submission_must_wait_for_agent_update(command: &str) -> bool {
     command == "submit"
-}
-
-fn controller_web_monitor_requested(command: &str, args: &[String]) -> bool {
-    command == "controller"
-        && args.first().is_some_and(|arg| arg == "run")
-        && args.iter().any(|arg| arg == "--web")
 }
 
 fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
@@ -2281,77 +2205,6 @@ fn find_command_index(args: &[String]) -> AppResult<Option<usize>> {
         }
     }
     Ok(None)
-}
-
-fn parse_web_shortcut_args(args: &[String]) -> AppResult<Vec<String>> {
-    let mut normalized = vec!["run".into(), "--web".into()];
-    let mut option_index = 0;
-    if let Some(address) = args.first().filter(|argument| !argument.starts_with('-')) {
-        let (host, port) = address
-            .rsplit_once(':')
-            .map_or((address.as_str(), None), |(host, port)| (host, Some(port)));
-        let host = host.parse::<std::net::Ipv4Addr>().map_err(|_| {
-            (
-                2,
-                format!("invalid web address '{address}'; expected 127.0.0.1 or 127.0.0.1:PORT"),
-            )
-        })?;
-        if host != std::net::Ipv4Addr::LOCALHOST {
-            return Err((
-                2,
-                "the browser monitor is local-only; this shortcut only supports 127.0.0.1, and non-loopback binding is disabled".into(),
-            ));
-        }
-        if let Some(port) = port {
-            let port = port.parse::<u16>().map_err(|_| {
-                (
-                    2,
-                    format!("invalid web port '{port}'; expected a number from 0 to 65535"),
-                )
-            })?;
-            normalized.extend(["--web-port".into(), port.to_string()]);
-        }
-        option_index = 1;
-    }
-    for argument in &args[option_index..] {
-        if argument == "--no-open" {
-            normalized.push(argument.clone());
-        } else {
-            return Err((2, format!("unknown macluster --web option '{argument}'")));
-        }
-    }
-    Ok(normalized)
-}
-
-fn web_shortcut_help(mode: HelpMode) -> &'static str {
-    match mode {
-        HelpMode::Short => {
-            r#"Usage
-  macluster --web [127.0.0.1[:PORT]] [--no-open]
-
-Open the read-only browser monitor.
-
-The monitor is local-only."#
-        }
-        HelpMode::Long => {
-            r#"Usage
-  macluster --web [127.0.0.1[:PORT]] [--no-open]
-
-OPTIONS
-  127.0.0.1       Optional loopback address; omitted ports are selected automatically.
-  :PORT           Optional local port; use 0 for an automatic port.
-  --no-open       Print the monitor address without opening a browser.
-
-EXAMPLES
-  macluster --web
-  macluster --web 127.0.0.1 --no-open
-  macluster --web 127.0.0.1:8080
-  macluster --web 127.0.0.1:0 --no-open
-
-SECURITY
-  The monitor is local-only. Non-loopback addresses are rejected."#
-        }
-    }
 }
 
 fn client_clusters_help(mode: HelpMode) -> &'static str {
@@ -7035,27 +6888,10 @@ fn controller(
         "run" => {
             let mut once = false;
             let mut interval = 2_u64;
-            let mut web = false;
-            let mut web_port = None;
-            let mut no_open = false;
             let mut index = 1;
             while index < args.len() {
                 match args[index].as_str() {
                     "--once" => once = true,
-                    "--web" => web = true,
-                    "--no-open" => no_open = true,
-                    "--web-port" => {
-                        index += 1;
-                        let value = args
-                            .get(index)
-                            .ok_or_else(|| (2, "missing --web-port value".into()))?;
-                        web_port = Some(value.parse::<u16>().map_err(|_| {
-                            (
-                                2,
-                                format!("invalid web port '{value}'; expected 0 to 65535"),
-                            )
-                        })?);
-                    }
                     "--interval" => {
                         index += 1;
                         interval = args
@@ -7071,43 +6907,7 @@ fn controller(
                 }
                 index += 1;
             }
-            if no_open && !web {
-                return Err((2, "--no-open requires --web".into()));
-            }
-            if web_port.is_some() && !web {
-                return Err((2, "--web-port requires --web".into()));
-            }
-            if once && web {
-                return Err((2, "--web requires a long-running controller".into()));
-            }
             let config_file = resolved_config_path(global.config.as_deref());
-            if web
-                && let Ok(binding) = ServiceBinding::load(&config_file, &state_dir)
-                && let Ok(mut client) = crate::control_client::ControlClient::connect(
-                    &binding,
-                    Duration::from_millis(300),
-                )
-            {
-                let current_build =
-                    crate::service::current_executable_build_id().map_err(service_error)?;
-                if !controller_supports_web(&client) || client.hello().build_id != current_build {
-                    confirm_controller_web_update()?;
-                    eprintln!("Updating and restarting the controller for the browser monitor…");
-                    crate::service::ServiceManager::current(binding.clone())
-                        .map_err(service_error)?
-                        .ensure_running(crate::service::CONTROLLER_READY_TIMEOUT)
-                        .map_err(service_error)?;
-                    client = crate::control_client::ControlClient::connect(
-                        &binding,
-                        Duration::from_secs(5),
-                    )
-                    .map_err(|error| (1, error.to_string()))?;
-                }
-                client
-                    .set_timeouts(Duration::from_secs(10))
-                    .map_err(|error| (1, error.to_string()))?;
-                return start_web_monitor(&mut client, web_port, no_open);
-            }
             if service_child {
                 let binding = ServiceBinding::load(&config_file, &state_dir)
                     .map_err(|error| (1, format!("controller service binding failed: {error}")))?;
@@ -7241,7 +7041,7 @@ fn controller(
             }
             if address_migration_deferred {
                 eprintln!(
-                    "Browser monitoring will start, but new job dispatch is paused until the login node address can be verified."
+                    "New job dispatch is paused until the login node address can be verified."
                 );
             }
             let lifecycle = startup_policy.lifecycle;
@@ -7318,7 +7118,6 @@ fn controller(
                         "monitor.v1".into(),
                         macluster_protocol::resources::TASK_RESOURCE_FEATURE.into(),
                         "maintenance.v1".into(),
-                        "web.v1".into(),
                         macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE.into(),
                     ],
                     controller_epoch: service.epoch(),
@@ -7379,21 +7178,6 @@ fn controller(
                 let listener = control_listener
                     .as_mut()
                     .expect("long-running controller always has a control listener");
-                let _web_startup = if web {
-                    let binding = listener.binding().clone();
-                    Some(
-                        schedule_web_monitor_startup(binding, web_port, no_open).map_err(
-                            |error| {
-                                (
-                                    1,
-                                    format!("cannot schedule browser monitor startup: {error}"),
-                                )
-                            },
-                        )?,
-                    )
-                } else {
-                    None
-                };
                 service
                     .run_forever_with_control(interval, listener, control_hello.expect("control hello exists"),
                         config_file.clone(),
@@ -7478,7 +7262,6 @@ EXAMPLE
             r#"Usage
   macluster controller start|stop|restart|status
   macluster controller run [--once] [--interval SECONDS]
-  macluster controller run --web [--web-port PORT] [--no-open]
 
 COMMANDS
   start      Start the per-user background service.
@@ -7487,20 +7270,12 @@ COMMANDS
   status     Show service and controller readiness.
   run        Run in the foreground; --once performs one scheduler pass.
 
-WEB MONITOR
-  --web            Serve the read-only browser monitor on localhost.
-  --web-port PORT  Choose its local port.
-  --no-open        Print the address without opening a browser.
-
 EXAMPLES
   macluster controller start
   macluster controller status
-  macluster controller run --web
 
 NOTES
-  After cluster initialization, the controller runs as a per-user LaunchAgent.
-  If it is already running, `run --web` starts the monitor there. An older
-  controller may ask before restarting to enable the monitor."#
+  After cluster initialization, the controller runs as a per-user LaunchAgent."#
         }
     }
 }
@@ -7578,104 +7353,6 @@ fn query_control(
     client
         .request(command)
         .map_err(|error| (1, error.to_string()))
-}
-
-fn start_web_monitor(
-    client: &mut crate::control_client::ControlClient,
-    port: Option<u16>,
-    no_open: bool,
-) -> AppResult<()> {
-    if !controller_supports_web(client) {
-        return Err((
-            1,
-            "the running controller still does not support the browser monitor after its update; rebuild or install a macluster binary with browser monitor support".into(),
-        ));
-    }
-    let payload = query_control(client, ControlCommand::StartWeb { port })?;
-    let ControlPayload::WebStarted { port, token, .. } = payload else {
-        return Err((
-            1,
-            "controller returned an invalid browser monitor response".into(),
-        ));
-    };
-    let url = format!("http://127.0.0.1:{port}/#{token}");
-    if no_open {
-        println!("Web monitor URL: {url}");
-    } else if process::Command::new("open").arg(&url).spawn().is_ok() {
-        println!("Opened the local web monitor at http://127.0.0.1:{port}/");
-    } else {
-        println!("Could not launch a browser. Open this one-time URL manually:\n{url}");
-    }
-    println!("The read-only monitor runs while the controller is active.");
-    Ok(())
-}
-
-fn controller_supports_web(client: &crate::control_client::ControlClient) -> bool {
-    client
-        .hello()
-        .capabilities
-        .iter()
-        .any(|capability| capability == "web.v1")
-}
-
-fn confirm_controller_web_update() -> AppResult<()> {
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        return Err((
-            2,
-            "the running controller needs an update and restart to start the browser monitor; rerun `macluster controller run --web` in Terminal to confirm".into(),
-        ));
-    }
-    eprint!(
-        "The running controller needs an update and restart to start the browser monitor. Continue? Active jobs will not be killed; they block the update. [y/N] "
-    );
-    io::stderr()
-        .flush()
-        .map_err(|error| (1, error.to_string()))?;
-    let mut response = String::new();
-    io::stdin()
-        .read_line(&mut response)
-        .map_err(|error| (1, error.to_string()))?;
-    if matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(())
-    } else {
-        Err((
-            1,
-            "browser monitor startup cancelled; the controller was left unchanged".into(),
-        ))
-    }
-}
-
-fn schedule_web_monitor_startup(
-    binding: ServiceBinding,
-    port: Option<u16>,
-    no_open: bool,
-) -> io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
-        .name("macluster-web-startup".into())
-        .spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(20);
-            let mut last_error = "controller IPC did not become ready".to_owned();
-            while Instant::now() < deadline {
-                match crate::control_client::ControlClient::connect(
-                    &binding,
-                    Duration::from_secs(2),
-                ) {
-                    Ok(mut client) => {
-                        if let Err(error) = client.set_timeouts(Duration::from_secs(10)) {
-                            eprintln!("macluster: browser monitor startup failed: {error}");
-                            return;
-                        }
-                        if let Err((_, error)) = start_web_monitor(&mut client, port, no_open) {
-                            eprintln!("macluster: browser monitor startup failed: {error}");
-                        }
-                        return;
-                    }
-                    Err(error) => last_error = error.to_string(),
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            eprintln!("macluster: browser monitor startup failed: {last_error}");
-        })
 }
 
 static CONTROLLER_SHUTDOWN: std::sync::atomic::AtomicBool =
@@ -9724,34 +9401,6 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn web_shortcut_only_accepts_loopback_and_maps_controller_options() {
-        assert_eq!(
-            super::parse_web_shortcut_args(&[]).unwrap(),
-            ["run", "--web"]
-        );
-        assert_eq!(
-            super::parse_web_shortcut_args(&["127.0.0.1".into()]).unwrap(),
-            ["run", "--web"]
-        );
-        assert_eq!(
-            super::parse_web_shortcut_args(&["--no-open".into()]).unwrap(),
-            ["run", "--web", "--no-open"]
-        );
-        assert_eq!(
-            super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--no-open".into(),])
-                .unwrap(),
-            ["run", "--web", "--web-port", "8080", "--no-open"]
-        );
-        assert!(super::parse_web_shortcut_args(&["192.0.2.10".into()]).is_err());
-        assert!(super::parse_web_shortcut_args(&["192.0.2.10:8080".into()]).is_err());
-        assert!(super::parse_web_shortcut_args(&["127.0.0.1:nope".into()]).is_err());
-        assert!(
-            super::parse_web_shortcut_args(&["127.0.0.1:8080".into(), "--unknown".into(),])
-                .is_err()
-        );
-    }
-
-    #[test]
     fn interactive_completion_recovers_and_reads_terminal_state() {
         let job = std::cell::RefCell::new(sample_job(1, JobState::Running, "mini01", None, "wrap"));
         let attempts = std::cell::Cell::new(0);
@@ -9858,6 +9507,10 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         assert!(should_preflight_agent_update(
             "submit",
             &["python".into(), "-h".into()]
+        ));
+        assert!(!should_preflight_agent_update(
+            "controller",
+            &["run".into(), "--web".into()]
         ));
         assert!(!super::should_refresh_node_addresses("init", &[]));
         let scan_args = ["--scan".into()];
@@ -12372,7 +12025,6 @@ Modes
                                           Join an existing cluster.
   macluster --clusters                    List joined clusters.
   macluster [--cluster NAME|UUID] --leave Leave a joined cluster.
-  macluster --web [IP[:PORT]] [OPTIONS]   Open the read-only web monitor.
 
 Options
   -h, --help           Show this help message.

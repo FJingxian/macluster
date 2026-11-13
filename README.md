@@ -1,6 +1,6 @@
 # macluster
 
-Turn your Macs into a personal compute cluster. Submit commands from one Mac, run them on another, and monitor the cluster in your terminal or browser.
+Turn your Macs into a personal compute cluster. Submit commands from one Mac, run them on another, and monitor the cluster in your terminal.
 
 English · [简体中文](doc/README.zh-CN.md) · [Agent skill](skills/macluster/SKILL.md)
 
@@ -65,7 +65,7 @@ macluster node -l default-001
 
 Nodes enter the cluster after enrollment verifies the Agent and shared storage. `node -l` gives a compact cluster view; append one node ID to show that Mac's host, SSH account, port, and detailed storage information. Failed enrollment attempts are kept separately for retry. Inspect them with `macluster node --failed`. Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
 
-All Agent-managed Macs appear in `mtop`, `mqueue`, `mfans`, and the browser monitor, including a controller or login client that has no compute role. `mnode` reports only the `controller` and `compute` roles; NFS/SMB ownership is shown through storage mappings instead. External NFS/SMB providers have no compatible Agent and appear only as storage mappings. Queue rows continue to evaluate scheduling eligibility separately. `mnode -l --storage` refreshes system, external-volume, and mounted-share capacity in a bounded pass; plain `mnode -l` uses cached capacity where available.
+All Agent-managed Macs appear in `mtop`, `mqueue`, and `mfans`, including a controller or login client that has no compute role. `mnode` reports only the `controller` and `compute` roles; NFS/SMB ownership is shown through storage mappings instead. External NFS/SMB providers have no compatible Agent and appear only as storage mappings. Queue rows continue to evaluate scheduling eligibility separately. `mnode -l --storage` refreshes system, external-volume, and mounted-share capacity in a bounded pass; plain `mnode -l` uses cached capacity where available.
 
 Submission snapshots move from controller-local state to the storage Agent in bounded chunks, and the selected compute Agent receives the job script before `StartJob`. The controller therefore does not need direct NFS access to publish or launch a job. Job inputs, outputs, and log synchronization still depend on the configured shared storage being reachable from the nodes that use it.
 
@@ -266,15 +266,13 @@ macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
 ```sh
 macluster top                                  # Terminal dashboard
 macluster top --once                           # One-shot table
-macluster --web                                # Local browser dashboard; chooses a port
-macluster --web 127.0.0.1:8080                 # Optional loopback IP and port
 ```
 
 In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast preview, then replace it with interval samples. The preview labels its average CPU and RSS memory.
 
 CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, temperature, fan, and power readings depend on hardware/helper support; unavailable readings show `N/A`.
 
-The browser monitor is read-only and listens on `127.0.0.1`; `--web` accepts an optional loopback IP and port. Omit them to use an automatically selected port. Add `--no-open` to print its browser link. A compatible running controller can open it without a restart. `mqueue` is also available as `macluster queue`.
+`mqueue` is also available as `macluster queue`.
 
 ## Maintenance
 

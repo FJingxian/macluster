@@ -2929,7 +2929,6 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
     let mut next_maintenance_attempt = Instant::now();
     let mut next_job_storage_sweep = Instant::now();
     let mut next_smb_cleanup_retry = Instant::now();
-    let mut web_service: Option<crate::web::WebService> = None;
     if let Some((_, api)) = control.as_mut() {
         service.set_maintenance_scope(api.maintenance_scope());
     }
@@ -3007,27 +3006,6 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                             Ok(macluster_protocol::control::ControlPayload::ReconciliationRequested {
                                 accepted: runtime.request_node_probe(&node_id, job_id),
                             })
-                        } else if let macluster_protocol::control::ControlCommand::StartWeb {
-                            port,
-                        } = control_request.command.clone()
-                        {
-                            if let Some(web_service) = web_service.as_mut() {
-                                web_service
-                                    .start_or_reuse(port)
-                                    .map_err(web_start_control_error)
-                            } else {
-                                match crate::web::WebService::bind_and_start(
-                                    listener.binding().clone(),
-                                    service.config.clone(),
-                                    port,
-                                ) {
-                                    Ok((started, payload)) => {
-                                        web_service = Some(started);
-                                        Ok(payload)
-                                    }
-                                    Err(error) => Err(web_start_control_error(error)),
-                                }
-                            }
                         } else if let macluster_protocol::control::ControlCommand::FanControl {
                             node_id,
                             policy,
@@ -3122,9 +3100,6 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
                                                 ) {
                                                     Ok(()) => {
                                                         service.set_maintenance_recovery_blocked(false);
-                                                        if let Some(web_service) = web_service.as_ref() {
-                                                            web_service.update_config(service.config.clone());
-                                                        }
                                                         queue_names = service
                                                             .config
                                                             .queues
@@ -3435,23 +3410,6 @@ impl Drop for WakeForwarder {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-fn web_start_control_error(
-    error: crate::web::WebError,
-) -> macluster_protocol::control::ControlError {
-    let code = if matches!(
-        &error,
-        crate::web::WebError::PortConflict(_) | crate::web::WebError::RunningPortConflict { .. }
-    ) {
-        macluster_protocol::control::ControlErrorCode::Conflict
-    } else {
-        macluster_protocol::control::ControlErrorCode::Unavailable
-    };
-    macluster_protocol::control::ControlError {
-        code,
-        message: format!("cannot start local web monitor: {error}"),
     }
 }
 

@@ -501,6 +501,7 @@ fn node_command_can_use_remote_profile(args: &[String]) -> bool {
         Some(
             "-l" | "--list"
                 | "--failed"
+                | "--scan"
                 | "-migrate"
                 | "-mount"
                 | "--mount"
@@ -561,6 +562,7 @@ mod tests {
             vec!["-l"],
             vec!["--list"],
             vec!["--failed"],
+            vec!["--scan"],
             vec!["-migrate", "controller:login-01"],
             vec!["-mount", "smb://nas/data", "--mount-root", "/Volumes/data"],
             vec!["-umount", "mnt-existing"],

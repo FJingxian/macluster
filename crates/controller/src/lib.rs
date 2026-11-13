@@ -12,7 +12,6 @@ pub mod smb_credential;
 pub mod ssh;
 pub mod transport;
 pub mod wake;
-pub mod web;
 
 pub use control::ControlApi;
 pub use ipc::{

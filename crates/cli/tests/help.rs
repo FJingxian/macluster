@@ -105,19 +105,16 @@ fn main_help_is_a_compact_module_index() {
         output.contains("macluster [--cluster NAME|UUID] --leave"),
         "{output}"
     );
-    assert!(output.contains("macluster --web [IP[:PORT]]"), "{output}");
+    assert!(!output.contains("macluster --web"), "{output}");
     assert!(!output.contains("macluster controller"), "{output}");
 }
 
 #[test]
-fn top_level_init_and_web_shortcuts_have_help() {
+fn top_level_init_and_cluster_shortcuts_have_help() {
     assert!(help(&["--init", "--help"]).contains("FIRST SETUP"));
     assert!(help(&["--join", "--help"]).contains("multi-entry cluster"));
     assert!(help(&["--clusters", "--help"]).contains("Lists each"));
     assert!(help(&["--leave", "--help"]).contains("--cluster NAME|UUID"));
-    let web = help(&["--web", "--help"]);
-    assert!(web.contains("127.0.0.1[:PORT]"), "{web}");
-    assert!(web.contains("local-only"), "{web}");
 }
 
 #[test]

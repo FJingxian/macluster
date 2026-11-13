@@ -2,8 +2,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
+    env, fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -651,9 +652,11 @@ impl ControlApi {
     }
 
     fn client_descriptor(&self) -> ClientDescriptor {
-        let controller_binary = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.to_str().map(str::to_owned))
+        let current_exe = env::current_exe().unwrap_or_default();
+        let home = env::var_os("HOME").map(PathBuf::from);
+        let controller_binary = preferred_controller_binary(&current_exe, home.as_deref())
+            .to_str()
+            .map(str::to_owned)
             .unwrap_or_default();
         ClientDescriptor {
             cluster_uuid: self.config.share_uuid.to_ascii_lowercase(),
@@ -852,6 +855,26 @@ impl ControlApi {
         self.monitor.update_job_counts(counts);
         Ok(())
     }
+}
+
+fn preferred_controller_binary(current_exe: &Path, home: Option<&Path>) -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".local/bin/macluster"));
+        candidates.push(home.join(".macluster/bin/macluster"));
+    }
+    candidates.extend([
+        PathBuf::from("/usr/local/bin/macluster"),
+        PathBuf::from("/opt/homebrew/bin/macluster"),
+    ]);
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .unwrap_or_else(|| current_exe.to_path_buf())
 }
 
 pub(crate) fn invalid_request(message: impl Into<String>) -> ControlError {
@@ -1528,4 +1551,36 @@ fn resource_hub(
         }
     }));
     hub
+}
+
+#[cfg(test)]
+mod stable_controller_binary_tests {
+    use super::preferred_controller_binary;
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+
+    #[test]
+    fn stable_user_install_is_preferred_over_a_versioned_service_binary() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-stable-controller-binary-{}",
+            macluster_protocol::identifiers::Id128::random()
+        ));
+        let home = root.join("home");
+        let stable = home.join(".local/bin/macluster");
+        let current = root.join("service/versions/build/macluster");
+        fs::create_dir_all(stable.parent().unwrap()).unwrap();
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        for path in [&stable, &current] {
+            fs::write(path, b"binary").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert_eq!(preferred_controller_binary(&current, Some(&home)), stable);
+
+        fs::remove_file(&stable).unwrap();
+        assert_eq!(
+            preferred_controller_binary(&current, Some(&home)),
+            PathBuf::from(&current)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

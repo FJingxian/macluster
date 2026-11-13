@@ -465,17 +465,84 @@ mod macos {
         path: &Path,
         mounted: &[(String, Option<DiskCapacity>)],
     ) -> Option<DiskCapacity> {
-        let resolved = std::fs::canonicalize(path).ok()?;
+        let mut resolved = lexical_path(path)?;
+        for _ in 0..32 {
+            if let Some(index) = best_mount_for_path(&resolved, mounted) {
+                let mount_path = lexical_path(Path::new(&mounted[index].0))?;
+                if mount_path != Path::new("/") {
+                    // The mount inventory is authoritative. Avoid touching the
+                    // mount itself because an unresponsive NFS/SMB server can
+                    // leave canonicalize(), stat(), and realpath() blocked.
+                    return mounted[index].1.clone();
+                }
+            }
+
+            let mut prefix = std::path::PathBuf::from("/");
+            let components = resolved.components().skip(1).collect::<Vec<_>>();
+            let mut followed = false;
+            for (index, component) in components.iter().enumerate() {
+                prefix.push(component.as_os_str());
+                let metadata = std::fs::symlink_metadata(&prefix).ok()?;
+                if !metadata.file_type().is_symlink() {
+                    continue;
+                }
+                let target = std::fs::read_link(&prefix).ok()?;
+                let mut next = if target.is_absolute() {
+                    target
+                } else {
+                    prefix
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"))
+                        .join(target)
+                };
+                for remaining in components.iter().skip(index + 1) {
+                    next.push(remaining.as_os_str());
+                }
+                resolved = lexical_path(&next)?;
+                followed = true;
+                break;
+            }
+            if followed {
+                continue;
+            }
+            let index = best_mount_for_path(&resolved, mounted)?;
+            return mounted[index].1.clone();
+        }
+        None
+    }
+
+    fn best_mount_for_path(
+        path: &Path,
+        mounted: &[(String, Option<DiskCapacity>)],
+    ) -> Option<usize> {
         mounted
             .iter()
-            .filter_map(|(mount_point, capacity)| {
-                let mount_path = std::fs::canonicalize(mount_point).ok()?;
-                resolved
-                    .starts_with(mount_path)
-                    .then_some((mount_point.len(), capacity))
+            .enumerate()
+            .filter_map(|(index, (mount_point, _))| {
+                let mount_path = lexical_path(Path::new(mount_point))?;
+                path.starts_with(&mount_path)
+                    .then_some((mount_path.components().count(), index))
             })
             .max_by_key(|(length, _)| *length)
-            .and_then(|(_, capacity)| capacity.clone())
+            .map(|(_, index)| index)
+    }
+
+    fn lexical_path(path: &Path) -> Option<std::path::PathBuf> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut normalized = std::path::PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::Normal(value) => normalized.push(value),
+                std::path::Component::Prefix(_) => return None,
+            }
+        }
+        Some(normalized)
     }
 
     fn disk_capacity_from_statfs(
@@ -1438,6 +1505,43 @@ mod tests {
         ));
 
         assert_eq!(super::filesystem_capacity(&missing), None);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn filesystem_capacity_uses_mount_inventory_without_touching_an_unresponsive_mount() {
+        let mount_point = std::env::temp_dir()
+            .join(format!(
+                "macluster-unresponsive-capacity-{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let capacity = super::DiskCapacity {
+            mount_point: mount_point.clone(),
+            used_bytes: 20,
+            total_bytes: 200,
+        };
+        let mounted = vec![
+            (
+                "/".to_owned(),
+                Some(super::DiskCapacity {
+                    mount_point: "/".into(),
+                    used_bytes: 10,
+                    total_bytes: 100,
+                }),
+            ),
+            (mount_point.clone(), Some(capacity.clone())),
+        ];
+
+        assert_eq!(
+            super::macos::capacity_for_path_from_mounts(
+                &std::path::Path::new(&mount_point).join("nested/project"),
+                &mounted,
+            ),
+            Some(capacity),
+            "mount containment must come from getfsstat inventory instead of canonicalize()"
+        );
     }
 
     #[test]

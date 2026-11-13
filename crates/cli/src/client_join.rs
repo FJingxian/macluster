@@ -181,8 +181,29 @@ pub fn join_cluster_expected(
     control_only: bool,
     expected_cluster_uuid: Option<&str>,
 ) -> Result<ClientProfile, String> {
+    join_cluster_expected_with_binary(
+        endpoint,
+        control_only,
+        expected_cluster_uuid,
+        None,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn join_cluster_expected_with_binary(
+    endpoint: &str,
+    control_only: bool,
+    expected_cluster_uuid: Option<&str>,
+    remote_binary_override: Option<&str>,
+    preserve_existing_mounts: bool,
+    adopt_existing_mounts: bool,
+) -> Result<ClientProfile, String> {
     let endpoint = JoinEndpoint::parse(endpoint)?;
     let mut node = endpoint.node();
+    if let Some(binary) = remote_binary_override {
+        node.remote_binary = parse_remote_macluster_path(binary.as_bytes())?;
+    }
     let access = ssh_bootstrap::ensure_ssh_access_with_receipt(
         &mut node,
         &format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port),
@@ -202,7 +223,10 @@ pub fn join_cluster_expected(
     let mut profile_persisted = false;
     let mut known_hosts_cleanup = None;
     let result = (|| {
-        let remote_binary = resolve_remote_macluster(&node)?;
+        let remote_binary = match remote_binary_override {
+            Some(binary) => parse_remote_macluster_path(binary.as_bytes())?,
+            None => resolve_remote_macluster(&node)?,
+        };
         node.remote_binary = remote_binary.clone();
         let bootstrap_command = format!(
             "{} internal client-bootstrap --json --client-key-digest {client_key_digest}",
@@ -237,7 +261,7 @@ pub fn join_cluster_expected(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.to_string()),
         };
-        profile.mounts_enabled = !control_only;
+        profile.mounts_enabled = !control_only || adopt_existing_mounts;
         profile.retired_access = existing
             .as_ref()
             .map(|existing| existing.retired_access.clone())
@@ -256,6 +280,7 @@ pub fn join_cluster_expected(
                 ));
         }
         if control_only
+            && !adopt_existing_mounts
             && let Some(existing) = existing.as_ref().filter(|value| {
                 !value.nfs_client_id.is_empty()
                     && value.nfs_client_ip.parse::<std::net::Ipv4Addr>().is_ok()
@@ -271,11 +296,20 @@ pub fn join_cluster_expected(
             );
         }
         let existing_mounts_active = existing.as_ref().is_some_and(existing_mounts_are_active);
-        profile.mounted_descriptor = existing
-            .as_ref()
-            .filter(|_| existing_mounts_active)
-            .and_then(|value| value.installed_mount_descriptor().cloned());
-        if control_only {
+        profile.mounted_descriptor = if adopt_existing_mounts {
+            profile.descriptor.clone()
+        } else {
+            existing
+                .as_ref()
+                .filter(|_| existing_mounts_active)
+                .and_then(|value| value.installed_mount_descriptor().cloned())
+        };
+        if adopt_existing_mounts {
+            profile.transition_mount_descriptors = existing
+                .as_ref()
+                .map(|value| value.transition_mount_descriptors.clone())
+                .unwrap_or_default();
+        } else if control_only {
             profile.transition_mount_descriptors = existing
                 .as_ref()
                 .filter(|_| existing_mounts_active)
@@ -297,7 +331,11 @@ pub fn join_cluster_expected(
         // mutating the host or discarding the old profile.
         store.save(&profile).map_err(|error| error.to_string())?;
         profile_persisted = true;
-        if control_only && let Some(existing) = existing.as_ref() {
+        if control_only
+            && !preserve_existing_mounts
+            && !adopt_existing_mounts
+            && let Some(existing) = existing.as_ref()
+        {
             for descriptor in crate::client_storage::distinct_mount_layouts(
                 existing.mount_cleanup_descriptors(),
                 &existing.nfs_client_ip,

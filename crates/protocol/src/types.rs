@@ -87,6 +87,22 @@ pub struct SnapshotRef {
     pub size_bytes: u64,
 }
 
+pub const SNAPSHOT_UPLOAD_CHUNK_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotUpload {
+    pub job_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_namespace: Option<Id128>,
+    pub snapshot: SnapshotRef,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JobSnapshotUpload {
+    pub job_id: u64,
+    pub snapshot: SnapshotRef,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobMode {
@@ -693,6 +709,35 @@ pub enum Operation {
     },
     Health,
     DiagnoseNfs,
+    CheckStorage,
+    BeginSnapshot {
+        controller: ControllerEpoch,
+        upload: SnapshotUpload,
+    },
+    WriteSnapshotChunk {
+        controller: ControllerEpoch,
+        upload: SnapshotUpload,
+        offset: u64,
+        data_hex: String,
+    },
+    CommitSnapshot {
+        controller: ControllerEpoch,
+        upload: SnapshotUpload,
+    },
+    BeginJobSnapshot {
+        controller: ControllerEpoch,
+        upload: JobSnapshotUpload,
+    },
+    WriteJobSnapshotChunk {
+        controller: ControllerEpoch,
+        upload: JobSnapshotUpload,
+        offset: u64,
+        data_hex: String,
+    },
+    CommitJobSnapshot {
+        controller: ControllerEpoch,
+        upload: JobSnapshotUpload,
+    },
     RebootForNfsRepair {
         controller: ControllerEpoch,
     },
@@ -788,8 +833,9 @@ pub struct ConfigRevision(pub u64);
 #[cfg(test)]
 mod interactive_job_compatibility_tests {
     use super::{
-        ControllerEpoch, JobSpec, NfsClientDiagnosis, NfsProbeState, NfsShareMarker, NfsShareProbe,
-        NodeHealth, Operation, ResponseBody,
+        ControllerEpoch, JobSnapshotUpload, JobSpec, NfsClientDiagnosis, NfsProbeState,
+        NfsShareMarker, NfsShareProbe, NodeHealth, Operation, ResponseBody, SnapshotRef,
+        SnapshotUpload,
     };
     use crate::{
         identifiers::{ControllerUuid, Id128},
@@ -833,6 +879,80 @@ mod interactive_job_compatibility_tests {
 
         assert_eq!(decoded.logical_cpus, None);
         assert_eq!(encoded["features"], json!([]));
+    }
+
+    #[test]
+    fn storage_agent_snapshot_operations_round_trip() {
+        let controller = ControllerEpoch {
+            controller_uuid: ControllerUuid(
+                Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            ),
+            epoch: 9,
+        };
+        let upload = SnapshotUpload {
+            job_id: 42,
+            storage_namespace: Some(Id128::parse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap()),
+            snapshot: SnapshotRef {
+                sha256: "a".repeat(64),
+                size_bytes: 3,
+            },
+        };
+        let operations = [
+            Operation::CheckStorage,
+            Operation::BeginSnapshot {
+                controller,
+                upload: upload.clone(),
+            },
+            Operation::WriteSnapshotChunk {
+                controller,
+                upload: upload.clone(),
+                offset: 0,
+                data_hex: "616263".into(),
+            },
+            Operation::CommitSnapshot { controller, upload },
+        ];
+
+        for operation in operations {
+            let encoded = serde_json::to_vec(&operation).unwrap();
+            let decoded: Operation = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, operation);
+        }
+    }
+
+    #[test]
+    fn compute_job_snapshot_operations_round_trip() {
+        let controller = ControllerEpoch {
+            controller_uuid: ControllerUuid(
+                Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            ),
+            epoch: 9,
+        };
+        let upload = JobSnapshotUpload {
+            job_id: 42,
+            snapshot: SnapshotRef {
+                sha256: "a".repeat(64),
+                size_bytes: 3,
+            },
+        };
+        let operations = [
+            Operation::BeginJobSnapshot {
+                controller,
+                upload: upload.clone(),
+            },
+            Operation::WriteJobSnapshotChunk {
+                controller,
+                upload: upload.clone(),
+                offset: 0,
+                data_hex: "616263".into(),
+            },
+            Operation::CommitJobSnapshot { controller, upload },
+        ];
+
+        for operation in operations {
+            let encoded = serde_json::to_vec(&operation).unwrap();
+            let decoded: Operation = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, operation);
+        }
     }
 
     #[test]

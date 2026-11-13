@@ -185,6 +185,13 @@ impl NodeTransport for FakeTransport {
                     probes: Vec::new(),
                 },
             )),
+            Operation::CheckStorage
+            | Operation::BeginSnapshot { .. }
+            | Operation::WriteSnapshotChunk { .. }
+            | Operation::CommitSnapshot { .. }
+            | Operation::BeginJobSnapshot { .. }
+            | Operation::WriteJobSnapshotChunk { .. }
+            | Operation::CommitJobSnapshot { .. } => Ok(ResponseBody::Ack),
             Operation::RebootForNfsRepair { .. } => Ok(ResponseBody::Ack),
             Operation::QueryFanPolicy => Ok(ResponseBody::FanControl(
                 macluster_protocol::types::FanControlStatus {

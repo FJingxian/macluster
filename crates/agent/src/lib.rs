@@ -8,7 +8,7 @@ pub mod runner;
 use std::{
     ffi::{CStr, CString},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::{
         ffi::OsStrExt,
         fs::{OpenOptionsExt, PermissionsExt},
@@ -34,9 +34,9 @@ use macluster_protocol::{
     smb_credential::{SecretString, SmbCredentialProvision, SmbKeychainEndpoint},
     types::{
         ControllerEpoch, ExecutionStatus, FanControlStatus, FanHelperCommand, FanHelperResponse,
-        INTERACTIVE_PTY_FEATURE, JobMode, JobSpec, JobState, NfsShareMarker, NodeHealth, Operation,
-        PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody, RuntimePhase,
-        SnapshotRef, StartResult,
+        INTERACTIVE_PTY_FEATURE, JobMode, JobSnapshotUpload, JobSpec, JobState, NfsShareMarker,
+        NodeHealth, Operation, PROTOCOL_VERSION, ProtocolError, Request, Response, ResponseBody,
+        RuntimePhase, SNAPSHOT_UPLOAD_CHUNK_BYTES, SnapshotRef, SnapshotUpload, StartResult,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,45 @@ fn handle_operation_with_config_path(
         )
         .map(ResponseBody::NfsDiagnosis)
         .map_err(ProtocolError::Failed),
+        Operation::CheckStorage => {
+            check_local_storage(config, local_node_id).map(|()| ResponseBody::Ack)
+        }
+        Operation::BeginSnapshot { controller, upload } => {
+            authorize_storage_snapshot(config, local_node_id, state_dir, controller)?;
+            begin_snapshot_upload(state_dir, &upload).map(|()| ResponseBody::Ack)
+        }
+        Operation::WriteSnapshotChunk {
+            controller,
+            upload,
+            offset,
+            data_hex,
+        } => {
+            authorize_storage_snapshot(config, local_node_id, state_dir, controller)?;
+            write_snapshot_chunk(state_dir, &upload, offset, &data_hex).map(|()| ResponseBody::Ack)
+        }
+        Operation::CommitSnapshot { controller, upload } => {
+            authorize_storage_snapshot(config, local_node_id, state_dir, controller)?;
+            commit_snapshot_upload(config, local_node_id, state_dir, &upload)
+                .map(|()| ResponseBody::Ack)
+        }
+        Operation::BeginJobSnapshot { controller, upload } => {
+            authorize_job_snapshot(config, local_node_id, state_dir, controller)?;
+            begin_job_snapshot_upload(state_dir, &upload).map(|()| ResponseBody::Ack)
+        }
+        Operation::WriteJobSnapshotChunk {
+            controller,
+            upload,
+            offset,
+            data_hex,
+        } => {
+            authorize_job_snapshot(config, local_node_id, state_dir, controller)?;
+            write_job_snapshot_chunk(state_dir, &upload, offset, &data_hex)
+                .map(|()| ResponseBody::Ack)
+        }
+        Operation::CommitJobSnapshot { controller, upload } => {
+            authorize_job_snapshot(config, local_node_id, state_dir, controller)?;
+            commit_job_snapshot_upload(state_dir, &upload).map(|()| ResponseBody::Ack)
+        }
         Operation::RebootForNfsRepair { controller } => {
             if config.is_login_node(local_node_id)
                 || config.storage_server.as_str() == local_node_id
@@ -1494,12 +1533,7 @@ fn start_job(
     {
         return Err(ProtocolError::Conflict);
     }
-    let shared_script = spec
-        .shared_job_dir(&config.shared_root, job_id)
-        .join("script.sh");
-    if let Some(snapshot) = spec.snapshot.as_ref() {
-        verify_file(&shared_script, snapshot).map_err(|_| ProtocolError::StorageUnavailable)?;
-    } else if spec.mode == JobMode::Batch {
+    if spec.snapshot.is_none() && spec.mode == JobMode::Batch {
         return Err(ProtocolError::InvalidRequest);
     }
 
@@ -1569,14 +1603,7 @@ fn start_job(
         return Err(ProtocolError::Busy);
     }
 
-    let local_job_dir = state_dir.join("jobs").join(job_id.to_string());
-    fs::create_dir_all(&local_job_dir).map_err(protocol_failed)?;
-    fs::set_permissions(&local_job_dir, fs::Permissions::from_mode(0o700))
-        .map_err(protocol_failed)?;
-    let local_script = local_job_dir.join("script.sh");
-    if let Some(snapshot) = spec.snapshot.as_ref() {
-        copy_snapshot(&shared_script, &local_script, snapshot).map_err(protocol_failed)?;
-    }
+    prepare_local_job_script(config, state_dir, job_id, &spec)?;
 
     let storage_node = config
         .nodes
@@ -1694,6 +1721,45 @@ fn start_job(
         accepted: true,
         runner_pid: record.runner_pid,
     })
+}
+
+fn prepare_local_job_script(
+    config: &ClusterConfig,
+    state_dir: &Path,
+    job_id: u64,
+    spec: &JobSpec,
+) -> Result<PathBuf, ProtocolError> {
+    let local_job_dir = state_dir.join("jobs").join(job_id.to_string());
+    fs::create_dir_all(&local_job_dir).map_err(protocol_failed)?;
+    fs::set_permissions(&local_job_dir, fs::Permissions::from_mode(0o700))
+        .map_err(protocol_failed)?;
+    let local_script = local_job_dir.join("script.sh");
+    let Some(snapshot) = spec.snapshot.as_ref() else {
+        return Ok(local_script);
+    };
+    if local_script.exists() {
+        verify_file(&local_script, snapshot).map_err(|_| ProtocolError::StorageUnavailable)?;
+        return Ok(local_script);
+    }
+    let upload = JobSnapshotUpload {
+        job_id,
+        snapshot: snapshot.clone(),
+    };
+    let staged = job_snapshot_path(state_dir, &upload).map_err(protocol_failed)?;
+    let source = if staged.exists() {
+        verify_file(&staged, snapshot).map_err(|_| ProtocolError::StorageUnavailable)?;
+        staged
+    } else {
+        // Compatibility path for an older controller that predates
+        // compute-side snapshot staging.
+        let shared = spec
+            .shared_job_dir(&config.shared_root, job_id)
+            .join("script.sh");
+        verify_file(&shared, snapshot).map_err(|_| ProtocolError::StorageUnavailable)?;
+        shared
+    };
+    copy_snapshot(&source, &local_script, snapshot).map_err(protocol_failed)?;
+    Ok(local_script)
 }
 
 fn named_shares_for_job<'a>(
@@ -2606,6 +2672,393 @@ fn protocol_failed(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::Failed(error.to_string())
 }
 
+fn check_local_storage(config: &ClusterConfig, local_node_id: &str) -> Result<(), ProtocolError> {
+    if config.storage_server.as_str() != local_node_id {
+        return Err(ProtocolError::NotPermitted);
+    }
+    let root = config.primary_source_root();
+    let marker = root.join(".macluster-share-id");
+    let metadata = fs::symlink_metadata(&marker).map_err(protocol_failed)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ProtocolError::Failed(
+            "primary storage marker is not a regular file".into(),
+        ));
+    }
+    let value = fs::read_to_string(&marker).map_err(protocol_failed)?;
+    if value.trim() != config.share_uuid {
+        return Err(ProtocolError::Failed(
+            "primary storage marker UUID does not match".into(),
+        ));
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path =
+            CString::new(root.as_os_str().as_bytes()).map_err(|error| protocol_failed(error))?;
+        let mut info = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        if unsafe { libc::statfs(path.as_ptr(), info.as_mut_ptr()) } != 0 {
+            return Err(protocol_failed(io::Error::last_os_error()));
+        }
+        let info = unsafe { info.assume_init() };
+        let filesystem = unsafe { CStr::from_ptr(info.f_fstypename.as_ptr()) }.to_string_lossy();
+        if filesystem == "nfs" || info.f_flags & (libc::MNT_LOCAL as u32) == 0 {
+            return Err(ProtocolError::Failed(
+                "storage server primary root is not on a local filesystem".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn authorize_storage_snapshot(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    state_dir: &Path,
+    controller: ControllerEpoch,
+) -> Result<(), ProtocolError> {
+    if config.storage_server.as_str() != local_node_id {
+        return Err(ProtocolError::NotPermitted);
+    }
+    let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
+    let mut store = read_store(state_dir).map_err(protocol_failed)?;
+    admit_epoch(&mut store, controller).map_err(ProtocolError::Failed)?;
+    store.controller = Some(controller);
+    write_store(state_dir, &store).map_err(protocol_failed)
+}
+
+fn validate_snapshot_upload(upload: &SnapshotUpload) -> Result<(), ProtocolError> {
+    if upload.job_id == 0 {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    if upload.snapshot.size_bytes > MAX_SNAPSHOT_BYTES
+        || upload.snapshot.sha256.len() != 64
+        || !upload
+            .snapshot
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || upload.snapshot.sha256 != upload.snapshot.sha256.to_ascii_lowercase()
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_upload_root(state_dir: &Path) -> Result<PathBuf, ProtocolError> {
+    let root = state_dir.join("snapshot-uploads");
+    fs::create_dir_all(&root).map_err(protocol_failed)?;
+    let metadata = fs::symlink_metadata(&root).map_err(protocol_failed)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProtocolError::Failed(
+            "snapshot upload root is unsafe".into(),
+        ));
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(protocol_failed)?;
+    Ok(root)
+}
+
+fn snapshot_upload_path(
+    state_dir: &Path,
+    upload: &SnapshotUpload,
+) -> Result<PathBuf, ProtocolError> {
+    validate_snapshot_upload(upload)?;
+    Ok(ensure_snapshot_upload_root(state_dir)?
+        .join(format!("{}-{}.part", upload.job_id, upload.snapshot.sha256)))
+}
+
+fn begin_snapshot_upload(state_dir: &Path, upload: &SnapshotUpload) -> Result<(), ProtocolError> {
+    let path = snapshot_upload_path(state_dir, upload)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(protocol_failed)?;
+    file.sync_all().map_err(protocol_failed)?;
+    File::open(
+        path.parent()
+            .ok_or_else(|| ProtocolError::Failed("snapshot upload path has no parent".into()))?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(protocol_failed)
+}
+
+fn write_snapshot_chunk(
+    state_dir: &Path,
+    upload: &SnapshotUpload,
+    offset: u64,
+    data_hex: &str,
+) -> Result<(), ProtocolError> {
+    let data = hex_decode(data_hex).map_err(protocol_failed)?;
+    if data.is_empty() || data.len() > SNAPSHOT_UPLOAD_CHUNK_BYTES {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let end = offset
+        .checked_add(data.len() as u64)
+        .ok_or(ProtocolError::InvalidRequest)?;
+    if end > upload.snapshot.size_bytes {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let path = snapshot_upload_path(state_dir, upload)?;
+    let metadata = fs::symlink_metadata(&path).map_err(protocol_failed)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > upload.snapshot.size_bytes
+        || offset > metadata.len()
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(protocol_failed)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(protocol_failed)?;
+    file.write_all(&data).map_err(protocol_failed)?;
+    file.sync_all().map_err(protocol_failed)
+}
+
+fn commit_snapshot_upload(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    state_dir: &Path,
+    upload: &SnapshotUpload,
+) -> Result<(), ProtocolError> {
+    if config.storage_server.as_str() != local_node_id {
+        return Err(ProtocolError::NotPermitted);
+    }
+    validate_snapshot_upload(upload)?;
+    let source = snapshot_upload_path(state_dir, upload)?;
+    verify_file(&source, &upload.snapshot)
+        .map_err(|_| protocol_failed("staged snapshot digest or size does not match"))?;
+    let mut target = config.primary_source_root().join("jobs");
+    if let Some(namespace) = upload.storage_namespace {
+        target.push(namespace.to_string());
+    }
+    target.push(upload.job_id.to_string());
+    fs::create_dir_all(&target).map_err(protocol_failed)?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).map_err(protocol_failed)?;
+    let destination = target.join("script.sh");
+    if destination.exists() {
+        verify_file(&destination, &upload.snapshot)
+            .map_err(|_| protocol_failed("published snapshot digest or size does not match"))?;
+    } else {
+        let temp = target.join(format!(".script-{}.tmp", Id128::random()));
+        let result = (|| -> io::Result<()> {
+            let mut input = File::open(&source)?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temp)?;
+            io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            fs::rename(&temp, &destination)?;
+            File::open(&target)?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
+        result.map_err(protocol_failed)?;
+        verify_file(&destination, &upload.snapshot)
+            .map_err(|_| protocol_failed("published snapshot digest or size does not match"))?;
+    }
+    fs::remove_file(source).map_err(protocol_failed)
+}
+
+fn authorize_job_snapshot(
+    config: &ClusterConfig,
+    local_node_id: &str,
+    state_dir: &Path,
+    controller: ControllerEpoch,
+) -> Result<(), ProtocolError> {
+    let node = config
+        .nodes
+        .get(local_node_id)
+        .ok_or(ProtocolError::NotPermitted)?;
+    if node.transport == macluster_core::config::Transport::Storage {
+        return Err(ProtocolError::NotPermitted);
+    }
+    let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
+    let mut store = read_store(state_dir).map_err(protocol_failed)?;
+    admit_epoch(&mut store, controller).map_err(ProtocolError::Failed)?;
+    store.controller = Some(controller);
+    write_store(state_dir, &store).map_err(protocol_failed)
+}
+
+fn validate_job_snapshot_upload(upload: &JobSnapshotUpload) -> Result<(), ProtocolError> {
+    if upload.job_id == 0 {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    if upload.snapshot.size_bytes > MAX_SNAPSHOT_BYTES
+        || upload.snapshot.sha256.len() != 64
+        || !upload
+            .snapshot
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || upload.snapshot.sha256 != upload.snapshot.sha256.to_ascii_lowercase()
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn ensure_job_snapshot_root(state_dir: &Path) -> Result<PathBuf, ProtocolError> {
+    let root = state_dir.join("job-snapshots");
+    fs::create_dir_all(&root).map_err(protocol_failed)?;
+    let metadata = fs::symlink_metadata(&root).map_err(protocol_failed)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ProtocolError::Failed("job snapshot root is unsafe".into()));
+    }
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(protocol_failed)?;
+    Ok(root)
+}
+
+fn job_snapshot_upload_path(
+    state_dir: &Path,
+    upload: &JobSnapshotUpload,
+) -> Result<PathBuf, ProtocolError> {
+    validate_job_snapshot_upload(upload)?;
+    Ok(ensure_job_snapshot_root(state_dir)?
+        .join(format!("{}-{}.part", upload.job_id, upload.snapshot.sha256)))
+}
+
+fn job_snapshot_path(
+    state_dir: &Path,
+    upload: &JobSnapshotUpload,
+) -> Result<PathBuf, ProtocolError> {
+    validate_job_snapshot_upload(upload)?;
+    Ok(ensure_job_snapshot_root(state_dir)?
+        .join(format!("{}-{}.sh", upload.job_id, upload.snapshot.sha256)))
+}
+
+fn begin_job_snapshot_upload(
+    state_dir: &Path,
+    upload: &JobSnapshotUpload,
+) -> Result<(), ProtocolError> {
+    let path = job_snapshot_upload_path(state_dir, upload)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(protocol_failed)?;
+    file.sync_all().map_err(protocol_failed)?;
+    File::open(
+        path.parent()
+            .ok_or_else(|| ProtocolError::Failed("job snapshot path has no parent".into()))?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(protocol_failed)
+}
+
+fn write_job_snapshot_chunk(
+    state_dir: &Path,
+    upload: &JobSnapshotUpload,
+    offset: u64,
+    data_hex: &str,
+) -> Result<(), ProtocolError> {
+    let data = hex_decode(data_hex).map_err(protocol_failed)?;
+    if data.is_empty() || data.len() > SNAPSHOT_UPLOAD_CHUNK_BYTES {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let end = offset
+        .checked_add(data.len() as u64)
+        .ok_or(ProtocolError::InvalidRequest)?;
+    if end > upload.snapshot.size_bytes {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let path = job_snapshot_upload_path(state_dir, upload)?;
+    let metadata = fs::symlink_metadata(&path).map_err(protocol_failed)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > upload.snapshot.size_bytes
+        || offset > metadata.len()
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(protocol_failed)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(protocol_failed)?;
+    file.write_all(&data).map_err(protocol_failed)?;
+    file.sync_all().map_err(protocol_failed)
+}
+
+fn commit_job_snapshot_upload(
+    state_dir: &Path,
+    upload: &JobSnapshotUpload,
+) -> Result<(), ProtocolError> {
+    validate_job_snapshot_upload(upload)?;
+    let source = job_snapshot_upload_path(state_dir, upload)?;
+    verify_file(&source, &upload.snapshot)
+        .map_err(|_| protocol_failed("staged job snapshot digest or size does not match"))?;
+    let destination = job_snapshot_path(state_dir, upload)?;
+    if destination.exists() {
+        verify_file(&destination, &upload.snapshot)
+            .map_err(|_| protocol_failed("existing job snapshot digest or size does not match"))?;
+        fs::remove_file(source).map_err(protocol_failed)?;
+        return Ok(());
+    }
+    fs::rename(&source, &destination).map_err(protocol_failed)?;
+    File::open(
+        destination
+            .parent()
+            .ok_or_else(|| ProtocolError::Failed("job snapshot path has no parent".into()))?,
+    )
+    .and_then(|directory| directory.sync_all())
+    .map_err(protocol_failed)?;
+    verify_file(&destination, &upload.snapshot)
+        .map_err(|_| protocol_failed("committed job snapshot digest or size does not match"))
+}
+
+#[cfg(test)]
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() % 2 != 0 || value.len() > SNAPSHOT_UPLOAD_CHUNK_BYTES.saturating_mul(2) {
+        return Err("snapshot chunk is not valid bounded hex".into());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_digit(pair[0])?;
+            let low = hex_digit(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("snapshot chunk is not valid hex".into()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessIdentity {
     Match,
@@ -2757,7 +3210,7 @@ mod tests {
             SecretString, SmbCredentialKey, SmbCredentialProvision, SmbKeychainEndpoint,
             StoredSmbCredential,
         },
-        types::FanPolicy,
+        types::{FanPolicy, JobSnapshotUpload, SnapshotRef, SnapshotUpload},
     };
     use std::collections::BTreeMap;
     #[cfg(target_vendor = "apple")]
@@ -3008,6 +3461,145 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
 "#
         ))
         .unwrap()
+    }
+
+    fn snapshot_upload_config(root: &std::path::Path) -> ClusterConfig {
+        ClusterConfig::parse(&format!(
+            r#"
+[cluster]
+name = "snapshot-relay"
+login_node = "storage"
+default_queue = "workers"
+shared_root = "{}"
+storage_source_root = "{}"
+share_uuid = "{TEST_SHARE_UUID}"
+storage_server = "storage"
+protocol_version = 1
+
+[queues.workers]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.storage]
+host = "127.0.0.1"
+transport = "local"
+machine_uuid = "{TEST_STORAGE_MACHINE_UUID}"
+execution_uid = 501
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+"#,
+            root.join("shared").display(),
+            root.join("source").display(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn storage_agent_publishes_chunked_snapshot_to_primary_root() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-snapshot-relay-{}", Id128::random()));
+        let state = root.join("state");
+        fs::create_dir_all(root.join("source")).unwrap();
+        let config = snapshot_upload_config(&root);
+        let namespace = Id128::random();
+        let body = b"#!/bin/bash\nprintf relayed\n";
+        let upload = SnapshotUpload {
+            job_id: 42,
+            storage_namespace: Some(namespace),
+            snapshot: SnapshotRef {
+                sha256: sha256_hex(body).unwrap(),
+                size_bytes: body.len() as u64,
+            },
+        };
+
+        begin_snapshot_upload(&state, &upload).unwrap();
+        let split = 8;
+        write_snapshot_chunk(&state, &upload, 0, &hex_encode(&body[..split])).unwrap();
+        write_snapshot_chunk(&state, &upload, split as u64, &hex_encode(&body[split..])).unwrap();
+        commit_snapshot_upload(&config, "storage", &state, &upload).unwrap();
+
+        let destination = root
+            .join("source/jobs")
+            .join(namespace.to_string())
+            .join("42/script.sh");
+        assert_eq!(fs::read(destination).unwrap(), body);
+        assert!(!snapshot_upload_path(&state, &upload).unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_the_configured_storage_agent_can_publish_snapshots() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-snapshot-owner-{}", Id128::random()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        let config = snapshot_upload_config(&root);
+        let upload = SnapshotUpload {
+            job_id: 7,
+            storage_namespace: None,
+            snapshot: SnapshotRef {
+                sha256: sha256_hex(b"").unwrap(),
+                size_bytes: 0,
+            },
+        };
+
+        assert!(matches!(
+            commit_snapshot_upload(&config, "worker", &root.join("state"), &upload),
+            Err(ProtocolError::NotPermitted)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compute_agent_stages_job_script_without_reading_shared_storage() {
+        let root = std::env::temp_dir().join(format!("macluster-job-snapshot-{}", Id128::random()));
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let config = snapshot_upload_config(&root);
+        let body = b"#!/bin/bash\nprintf local-snapshot\n";
+        let upload = JobSnapshotUpload {
+            job_id: 43,
+            snapshot: SnapshotRef {
+                sha256: sha256_hex(body).unwrap(),
+                size_bytes: body.len() as u64,
+            },
+        };
+
+        begin_job_snapshot_upload(&state, &upload).unwrap();
+        let split = 9;
+        write_job_snapshot_chunk(&state, &upload, 0, &hex_encode(&body[..split])).unwrap();
+        write_job_snapshot_chunk(&state, &upload, split as u64, &hex_encode(&body[split..]))
+            .unwrap();
+        commit_job_snapshot_upload(&state, &upload).unwrap();
+
+        let staged = job_snapshot_path(&state, &upload).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), body);
+        assert!(!job_snapshot_upload_path(&state, &upload).unwrap().exists());
+
+        let spec = JobSpec {
+            storage_namespace: None,
+            required_shares: Some(Vec::new()),
+            queue: QueueName::new("workers").unwrap(),
+            node: None,
+            name: "local-snapshot".into(),
+            cwd: root
+                .join("missing-shared-cwd")
+                .to_string_lossy()
+                .into_owned(),
+            stdout_path: "stdout.log".into(),
+            stderr_path: "stderr.log".into(),
+            walltime_secs: None,
+            env: BTreeMap::new(),
+            mode: JobMode::Batch,
+            snapshot: Some(upload.snapshot),
+        };
+        let local = prepare_local_job_script(&config, &state, upload.job_id, &spec)
+            .expect("prepare script");
+        assert_eq!(fs::read(local).unwrap(), body);
+        assert!(!config.shared_root.join("jobs/43/script.sh").exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -35,7 +35,6 @@ pub struct ClusterConfig {
 pub enum NodeRole {
     Controller,
     Compute,
-    Storage,
 }
 
 impl NodeRole {
@@ -43,7 +42,6 @@ impl NodeRole {
         match self {
             Self::Controller => "controller",
             Self::Compute => "compute",
-            Self::Storage => "storage",
         }
     }
 }
@@ -55,7 +53,6 @@ impl std::str::FromStr for NodeRole {
         match value {
             "controller" => Ok(Self::Controller),
             "compute" => Ok(Self::Compute),
-            "storage" => Ok(Self::Storage),
             _ => Err(ConfigError::InvalidNodeRole(value.to_owned())),
         }
     }
@@ -329,9 +326,6 @@ impl ClusterConfig {
     pub fn node_roles(&self, node_id: &str) -> BTreeSet<NodeRole> {
         let configured = self.roles.get(node_id);
         let mut roles = configured.cloned().unwrap_or_default();
-        // Storage is a derived capability. Ignore stale explicit values so
-        // the advertised role cannot disagree with the active share table.
-        roles.remove(&NodeRole::Storage);
         let controller = self
             .login_node
             .as_ref()
@@ -344,14 +338,6 @@ impl ClusterConfig {
             });
         if controller == Some(node_id) {
             roles.insert(NodeRole::Controller);
-        }
-        if self.storage_server.as_str() == node_id
-            || self
-                .shares
-                .values()
-                .any(|share| share.server.as_str() == node_id)
-        {
-            roles.insert(NodeRole::Storage);
         }
         if configured.is_none()
             && controller != Some(node_id)
@@ -585,6 +571,7 @@ impl ClusterConfig {
                 let configured_roles = take_optional_strings(&mut table, &section, "roles")?
                     .unwrap_or_default()
                     .into_iter()
+                    .filter(|value| value != "storage")
                     .map(|value| value.parse())
                     .collect::<Result<BTreeSet<_>, _>>()?;
                 if transport == Transport::Local
@@ -794,7 +781,6 @@ impl ClusterConfig {
         let mut roles = BTreeMap::new();
         for name in nodes.keys() {
             let mut node_roles = explicit_roles.remove(name).unwrap_or_default();
-            node_roles.remove(&NodeRole::Storage);
             if node_roles.contains(&NodeRole::Controller)
                 && controller_id.as_deref() != Some(name.as_str())
             {

@@ -19,27 +19,47 @@ pub fn diagnose_nfs_client(
     if !config.nodes.contains_key(node_id) {
         return Err(format!("node '{node_id}' is not registered"));
     }
-    let mut probes = Vec::new();
+    let mut targets = Vec::new();
     if config.storage_server.as_str() != node_id {
-        let marker_target = &config.shared_root;
-        probes.push(probe_share(
-            "primary",
-            marker_target,
-            &config.share_uuid,
-            timeout,
+        targets.push((
+            "primary".to_owned(),
+            config.shared_root.clone(),
+            config.share_uuid.clone(),
         ));
     }
     for (share_id, share) in &config.shares {
         if share.protocol != StorageProtocol::Nfs || share.server.as_str() == node_id {
             continue;
         }
-        probes.push(probe_share(
-            share_id,
-            &share.mount_root,
-            &share.share_uuid,
-            timeout,
+        targets.push((
+            share_id.clone(),
+            share.mount_root.clone(),
+            share.share_uuid.clone(),
         ));
     }
+    let probes = std::thread::scope(|scope| {
+        let handles = targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, (share_id, target, expected_uuid))| {
+                scope.spawn(move || {
+                    (
+                        index,
+                        probe_share(&share_id, &target, &expected_uuid, timeout),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut probes = vec![None; handles.len()];
+        for handle in handles {
+            let (index, probe) = handle.join().expect("NFS probe thread panicked");
+            probes[index] = Some(probe);
+        }
+        probes
+    })
+    .into_iter()
+    .map(|probe| probe.expect("every NFS probe thread returned one result"))
+    .collect::<Vec<_>>();
     Ok(NfsClientDiagnosis {
         node_id: node_id.to_owned(),
         wedged: probes

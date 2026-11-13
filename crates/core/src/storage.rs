@@ -1236,6 +1236,10 @@ impl Storage {
         })
     }
 
+    pub fn mark_snapshot_synced(&self, job_id: u64) -> Result<(), SubmitError> {
+        self.set_snapshot_sync_pending(job_id, false)
+    }
+
     fn set_snapshot_sync_pending(&self, job_id: u64, pending: bool) -> Result<(), SubmitError> {
         self.transaction(|| {
             let mut record = self.get_job(job_id)?.ok_or(SubmitError::NotFound(job_id))?;

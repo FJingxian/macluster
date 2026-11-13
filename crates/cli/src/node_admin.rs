@@ -2404,9 +2404,54 @@ fn node_admin_operation_blocks_agent_update(
             "READY" | "REMOVED" | "REMOVED_OFFLINE" | "ABORTED"
         )
         && !is_uncommitted_enrollment(config, operation)
+        && !is_superseded_local_enrollment_refresh(config, config_digest, operation)
         && !(is_uncommitted_named_share_setup(config, operation)
             && operation.old_config_sha256.as_deref() == Some(config_digest))
         && !can_resume_config_sync_during_agent_update(operation, config_digest, update_operation)
+}
+
+fn is_superseded_local_enrollment_refresh(
+    config: &ClusterConfig,
+    config_digest: &str,
+    operation: &NodeOperation,
+) -> bool {
+    if operation.action != "add"
+        || !matches!(
+            operation.phase.as_str(),
+            "SETUP_PENDING" | "CANDIDATE_INSTALLED"
+        )
+        || operation.old_config_sha256.as_deref() != Some(config_digest)
+        || operation.candidate_config_sha256.is_some()
+        || !operation.endpoint.starts_with("local@")
+    {
+        return false;
+    }
+    config.nodes.get(&operation.node_id).is_some_and(|node| {
+        node.transport == Transport::Local
+            && operation.machine_uuid.is_some()
+            && node.machine_uuid.is_some()
+            && operation.machine_uuid == node.machine_uuid
+    })
+}
+
+fn retire_superseded_local_enrollment_refreshes(
+    state: &mut AdminState,
+    config: &ClusterConfig,
+    config_digest: &str,
+) -> usize {
+    let mut retired = 0;
+    for operation in state.operations.values_mut() {
+        if !is_superseded_local_enrollment_refresh(config, config_digest, operation) {
+            continue;
+        }
+        operation.phase = "ABORTED".into();
+        operation.detail = Some(
+            "superseded local node refresh was abandoned after the active config already contained the same local registration; existing mounts and shared data were preserved"
+                .into(),
+        );
+        retired += 1;
+    }
+    retired
 }
 
 fn can_resume_config_sync_during_agent_update(
@@ -2492,6 +2537,7 @@ fn ensure_no_pending_admin_operation_for_config(
     let mut active = state.clone();
     active.operations.retain(|_, operation| {
         !is_uncommitted_enrollment(config, operation)
+            && !is_superseded_local_enrollment_refresh(config, config_digest, operation)
             && !(is_uncommitted_named_share_setup(config, operation)
                 && operation.old_config_sha256.as_deref() == Some(config_digest))
             && !can_resume_config_sync_during_agent_update(
@@ -3322,6 +3368,9 @@ fn update_all_agents_impl(
         let old_digest = sha256_hex(source.as_bytes()).map_err(|error| (1, error.to_string()))?;
         let journal_path = state_dir.join("node-admin.json");
         let mut state = read_admin_state(&journal_path, &config_path, state_dir)?;
+        if retire_superseded_local_enrollment_refreshes(&mut state, &config, &old_digest) > 0 {
+            save_admin_state(&journal_path, &state)?;
+        }
         ensure_no_pending_admin_operation_for_config(&state, &config, &old_digest)?;
 
         let operation_key = "update:all";
@@ -4538,7 +4587,6 @@ fn compute_role_candidate(
     }
     let role_value = roles
         .iter()
-        .filter(|role| **role != macluster_core::config::NodeRole::Storage)
         .map(|role| format!("\"{}\"", role.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
@@ -4739,9 +4787,6 @@ fn controller_migration_candidate(
             format!("controller target '{target_id}' is not configured"),
         )
     })?;
-    if target.transport != Transport::Ssh {
-        return Err((2, "controller target must be a registered SSH node".into()));
-    }
     let current_id = config
         .login_node
         .as_ref()
@@ -4756,6 +4801,9 @@ fn controller_migration_candidate(
         .ok_or_else(|| (2, "configured controller node is missing".into()))?;
     if current_id == target_id {
         return Err((2, format!("node '{target_id}' is already the controller")));
+    }
+    if target.transport != Transport::Ssh {
+        return Err((2, "controller target must be a registered SSH node".into()));
     }
     let old = config
         .nodes
@@ -4856,14 +4904,17 @@ shared={shared}\n\
 config={config}\n\
 state={state}\n\
 archive_root={archive_root}\n\
-if /bin/test -e \"$state/controller.sqlite3\"; then\n\
-  /bin/test ! -e \"$config\" || {{ echo 'target already has an active controller config with stale state' >&2; exit 9; }}\n\
+/bin/test -d \"$shared\" && {marker_check}\n\
+digest=$(/usr/bin/shasum -a 256 {binary} | /usr/bin/awk '{{print $1}}')\n\
+if /bin/test -e \"$config\" || /bin/test -e \"$state/controller.sqlite3\"; then\n\
   /bin/mkdir -p \"$archive_root\"\n\
   archive=\"$archive_root/migration-$(/bin/date +%s)-$$\"\n\
-  /bin/mv \"$state\" \"$archive\"\n\
-  echo \"Archived stale target controller state at $archive\" >&2\n\
+  /bin/mkdir -p \"$archive\"\n\
+  if /bin/test -e \"$state/controller.sqlite3\"; then /bin/mv \"$state\" \"$archive/controller\"; fi\n\
+  if /bin/test -e \"$config\"; then /bin/mv \"$config\" \"$archive/config.toml\"; fi\n\
+  echo \"Archived stale target controller configuration and state at $archive\" >&2\n\
 fi\n\
-/bin/test -d \"$shared\" && {marker_check} && /bin/test ! -e \"$config\" && /bin/test ! -e \"$state/controller.sqlite3\" && /usr/bin/shasum -a 256 {binary} | /usr/bin/awk '{{print $1}}'\n",
+/bin/test ! -e \"$config\" && /bin/test ! -e \"$state/controller.sqlite3\" && /usr/bin/printf '%s\\n' \"$digest\"\n",
         shared = shell_quote(&shared_root.to_string_lossy()),
         config = shell_quote(&target_config.to_string_lossy()),
         state = shell_quote(&target_state.to_string_lossy()),
@@ -5082,6 +5133,46 @@ fn controller_migration_may_restart_old(was_running: bool, target_cleanup_ok: bo
     was_running && target_cleanup_ok
 }
 
+fn controller_migration_join_endpoint(target: &NodeConfig) -> Result<String, String> {
+    let user = target
+        .ssh_user
+        .as_deref()
+        .filter(|user| !user.is_empty())
+        .ok_or_else(|| "controller target has no SSH user for automatic client join".to_owned())?;
+    Ok(format!(
+        "{user}@{}:{}",
+        target.host,
+        target.ssh_port.unwrap_or(22)
+    ))
+}
+
+fn controller_migration_auto_join_with(
+    target: &NodeConfig,
+    cluster_uuid: &str,
+    join: impl FnOnce(&str, bool, Option<&str>) -> Result<(), String>,
+) -> Result<(), String> {
+    let endpoint = controller_migration_join_endpoint(target)?;
+    join(&endpoint, true, Some(cluster_uuid))
+}
+
+fn controller_migration_auto_join(target: &NodeConfig, cluster_uuid: &str) -> Result<(), String> {
+    controller_migration_auto_join_with(
+        target,
+        cluster_uuid,
+        |endpoint, control_only, expected_cluster_uuid| {
+            crate::client_join::join_cluster_expected_with_binary(
+                endpoint,
+                control_only,
+                expected_cluster_uuid,
+                Some(&target.remote_binary),
+                true,
+                true,
+            )
+            .map(|_| ())
+        },
+    )
+}
+
 fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) -> AppResult<()> {
     let config_path = config_path.canonicalize().map_err(io_error)?;
     let config = read_config(&config_path)?;
@@ -5109,6 +5200,20 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
                 format!("controller target '{target_id}' is not configured"),
             )
         })?;
+    let current_id = config
+        .login_node
+        .as_ref()
+        .map(|node| node.as_str())
+        .or_else(|| {
+            config
+                .nodes
+                .iter()
+                .find(|(_, node)| node.transport == Transport::Local)
+                .map(|(id, _)| id.as_str())
+        });
+    if current_id == Some(target_id.as_str()) {
+        return Err((2, format!("node '{target_id}' is already the controller")));
+    }
     if target.transport != Transport::Ssh {
         return Err((2, "controller target must be a registered SSH node".into()));
     }
@@ -5435,8 +5540,15 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             let _ = crate::smb_credentials::queue_global_master_cleanup(&provision.key);
         }
     }
+    if let Err(error) = controller_migration_auto_join(&target, &config.share_uuid) {
+        let endpoint = controller_migration_join_endpoint(&target)
+            .unwrap_or_else(|_| format!("{}@{}", target.host, target.host));
+        eprintln!(
+            "Warning: controller migration succeeded, but this login client could not be updated automatically: {error}. Run `macluster --join {endpoint}` to finish client setup."
+        );
+    }
     println!(
-        "Controller migrated to {target_id}. Existing login clients may need to rejoin through mDNS or `--join`."
+        "Controller migrated to {target_id}. This login client now uses the migrated controller."
     );
     Ok(())
 }
@@ -25030,7 +25142,7 @@ execution_uid = 501
                 "192.0.2.1".into(),
                 "local".into(),
                 "22".into(),
-                "CONTROLLER,STORAGE".into(),
+                "CONTROLLER".into(),
                 "-".into(),
                 "READY".into(),
             ],
@@ -25123,7 +25235,7 @@ execution_uid = 501
                 "192.0.2.1".into(),
                 "local".into(),
                 "22".into(),
-                "CONTROLLER,STORAGE".into(),
+                "CONTROLLER".into(),
                 "-".into(),
                 "READY".into(),
             ],
@@ -26891,6 +27003,18 @@ execution_uid = 501
     }
 
     #[test]
+    fn controller_migration_rejects_the_current_controller_before_transport_checks() {
+        let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n\n[queues.compute]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n\n[nodes.login]\nhost=\"127.0.0.1\"\ntransport=\"local\"\nremote_binary=\"/usr/local/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n\n[nodes.worker]\nhost=\"192.0.2.10\"\ntransport=\"ssh\"\nremote_binary=\"/usr/local/bin/macluster\"\n";
+        let config = ClusterConfig::parse(source).unwrap();
+
+        let (_, error) =
+            super::controller_migration_candidate(&config, source, "login", 501).unwrap_err();
+
+        assert!(error.contains("already the controller"), "{error}");
+        assert!(!error.contains("registered SSH node"), "{error}");
+    }
+
+    #[test]
     fn controller_migration_candidate_switches_local_transport() {
         let source = "[cluster]\nname=\"test\"\ndefault_queue=\"compute\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.compute]\nnodes=[\"default-001\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.default-001]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\nremote_binary=\"/opt/homebrew/bin/macluster\"\nssh_user=\"worker\"\nssh_port=22\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdee\"\nroles=[\"compute\"]\n";
         let config = ClusterConfig::parse(source).unwrap();
@@ -27117,8 +27241,116 @@ execution_uid = 501
         assert!(
             fs::read_dir(root.join("controller-archive"))
                 .unwrap()
-                .any(|entry| entry.unwrap().path().join("controller.sqlite3").is_file())
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .join("controller/controller.sqlite3")
+                        .is_file()
+                })
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controller_migration_archives_stale_target_config_and_state_before_activation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-migration-stale-config-state-{}",
+            Id128::random()
+        ));
+        let shared = root.join("shared");
+        let config = root.join("target-config.toml");
+        let state = root.join("target-state");
+        let binary = root.join("macluster");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(shared.join(".macluster-share-id"), "share-uuid\n").unwrap();
+        fs::write(&config, b"stale config\n").unwrap();
+        fs::write(state.join("controller.sqlite3"), b"stale state").unwrap();
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let expected = super::local_sha256(&binary).unwrap();
+        let script = super::controller_migration_target_preflight_script(
+            &shared,
+            "share-uuid",
+            &config,
+            &state,
+            &binary.to_string_lossy(),
+        );
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        assert!(!config.exists());
+        assert!(!state.join("controller.sqlite3").exists());
+        let archive = fs::read_dir(root.join("controller-archive"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .expect("migration archive directory");
+        assert_eq!(
+            fs::read_to_string(archive.join("config.toml")).unwrap(),
+            "stale config\n"
+        );
+        assert_eq!(
+            fs::read(archive.join("controller/controller.sqlite3")).unwrap(),
+            b"stale state"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn controller_migration_does_not_archive_target_before_storage_validation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-migration-preflight-order-{}",
+            Id128::random()
+        ));
+        let shared = root.join("shared");
+        let config = root.join("target-config.toml");
+        let state = root.join("target-state");
+        let binary = root.join("macluster");
+        fs::create_dir_all(&shared).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        fs::write(shared.join(".macluster-share-id"), "wrong-uuid\n").unwrap();
+        fs::write(&config, b"existing config\n").unwrap();
+        fs::write(state.join("controller.sqlite3"), b"existing state").unwrap();
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let script = super::controller_migration_target_preflight_script(
+            &shared,
+            "expected-uuid",
+            &config,
+            &state,
+            &binary.to_string_lossy(),
+        );
+
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "existing config\n");
+        assert_eq!(
+            fs::read(state.join("controller.sqlite3")).unwrap(),
+            b"existing state"
+        );
+        assert!(!root.join("controller-archive").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -27164,6 +27396,45 @@ execution_uid = 501
         assert!(!super::controller_migration_may_restart_old(true, false));
         assert!(!super::controller_migration_may_restart_old(false, true));
         assert!(!super::controller_migration_may_restart_old(false, false));
+    }
+
+    #[test]
+    fn controller_migration_auto_joins_the_invoking_login_client() {
+        let target = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("operator".into()),
+            ssh_port: Some(2222),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let mut observed = None;
+
+        super::controller_migration_auto_join_with(
+            &target,
+            "00000000-0000-4000-8000-000000000001",
+            |endpoint, control_only, cluster_uuid| {
+                observed = Some((
+                    endpoint.to_owned(),
+                    control_only,
+                    cluster_uuid.map(str::to_owned),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed,
+            Some((
+                "operator@192.0.2.20:2222".into(),
+                true,
+                Some("00000000-0000-4000-8000-000000000001".into())
+            ))
+        );
     }
 
     #[test]
@@ -27298,10 +27569,11 @@ execution_uid = 501
         let updated = ClusterConfig::parse(&candidate).unwrap();
 
         assert!(!updated.is_compute_node("storage"));
+        assert!(updated.node_roles("storage").is_empty());
         assert!(
-            updated
-                .node_roles("storage")
-                .contains(&macluster_core::config::NodeRole::Storage)
+            !candidate
+                .lines()
+                .any(|line| line.starts_with("roles=") && line.contains("\"storage\""))
         );
         assert!(
             updated
@@ -30519,6 +30791,63 @@ execution_uid = 501
         operation.node_id = "new-worker".into();
         operation.action = "remove".into();
         assert!(!super::is_uncommitted_enrollment(&config, &operation));
+    }
+
+    #[test]
+    fn existing_local_enrollment_refresh_is_retired_without_touching_mounts() {
+        let config = parse_build_test_config();
+        let digest = "current-config";
+        let mut operation = update_operation("SETUP_PENDING", digest, "unused-candidate");
+        operation.action = "add".into();
+        operation.node_id = "login".into();
+        operation.endpoint = "local@127.0.0.1:22".into();
+        operation.machine_uuid = config.nodes["login"].machine_uuid.clone();
+        operation.candidate_config_sha256 = None;
+        operation.client_setup_attempted = Some(true);
+        operation.managed_export = true;
+
+        assert!(super::is_superseded_local_enrollment_refresh(
+            &config, digest, &operation
+        ));
+        assert!(!super::node_admin_operation_blocks_agent_update(
+            &config, digest, &operation, None
+        ));
+
+        let mut state = AdminState {
+            version: 1,
+            config_path: String::new(),
+            state_dir: String::new(),
+            reserved_node_ids: BTreeSet::new(),
+            machine_uuids: BTreeMap::new(),
+            operations: BTreeMap::from([("add-local".into(), operation.clone())]),
+        };
+        assert_eq!(
+            super::retire_superseded_local_enrollment_refreshes(&mut state, &config, digest),
+            1
+        );
+        assert_eq!(state.operations["add-local"].phase, "ABORTED");
+        assert!(
+            state.operations["add-local"].detail.as_deref().is_some_and(
+                |detail| detail.contains("existing mounts and shared data were preserved")
+            )
+        );
+
+        let mut changed_candidate = operation;
+        changed_candidate.candidate_config_sha256 = Some("a committed candidate".into());
+        assert!(!super::is_superseded_local_enrollment_refresh(
+            &config,
+            digest,
+            &changed_candidate
+        ));
+
+        let mut mismatched_identity = changed_candidate;
+        mismatched_identity.candidate_config_sha256 = None;
+        mismatched_identity.machine_uuid = Some("fedcba98-7654-3210-fedc-ba9876543210".into());
+        assert!(!super::is_superseded_local_enrollment_refresh(
+            &config,
+            digest,
+            &mismatched_identity
+        ));
     }
 
     #[test]

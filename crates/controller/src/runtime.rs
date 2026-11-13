@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    io,
+    fs, io,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -27,8 +27,9 @@ use macluster_protocol::{
     identifiers::{Id128, NodeId},
     nfs_admin::{NfsAlias, NfsExportCleanup, NfsMount},
     types::{
-        ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobState, NfsShareMarker,
-        Operation, ProtocolError, ResponseBody,
+        ControllerEpoch, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSnapshotUpload, JobState,
+        NfsShareMarker, Operation, ProtocolError, ResponseBody, SNAPSHOT_UPLOAD_CHUNK_BYTES,
+        SnapshotUpload,
     },
 };
 
@@ -170,7 +171,7 @@ struct WorkerCompletion {
 
 enum WorkerResult {
     Probe(ProbeResult),
-    Control(Result<ResponseBody, String>),
+    Control(Result<ResponseBody, TransportError>),
     ReconcileNfs {
         result: Result<(), String>,
         acknowledged: NfsCleanupAck,
@@ -512,6 +513,160 @@ fn dispatch_pause_reason(
     } else {
         None
     }
+}
+
+fn storage_health_with_transport<T: NodeTransport>(config: &ClusterConfig, transport: &T) -> bool {
+    let node_id =
+        NodeId::new(config.storage_server.to_string()).expect("validated storage server node ID");
+    let Some(node) = config.nodes.get(config.storage_server.as_str()) else {
+        return false;
+    };
+    if node.transport == Transport::Local {
+        return crate::verify_shared_storage(config);
+    }
+    matches!(
+        transport.call(&node_id, node, Operation::CheckStorage),
+        Ok(ResponseBody::Ack)
+    )
+}
+
+fn publish_snapshot_with_transport<T: NodeTransport>(
+    config: &ClusterConfig,
+    transport: &T,
+    controller: ControllerEpoch,
+    upload: SnapshotUpload,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let node_id =
+        NodeId::new(config.storage_server.to_string()).expect("validated storage server node ID");
+    let node = config
+        .nodes
+        .get(config.storage_server.as_str())
+        .ok_or_else(|| "storage server is not configured".to_owned())?;
+    let mut offset = 0_u64;
+    let mut sent_begin = false;
+    while offset < bytes.len() as u64 {
+        if !sent_begin {
+            match transport.call(
+                &node_id,
+                node,
+                Operation::BeginSnapshot {
+                    controller,
+                    upload: upload.clone(),
+                },
+            ) {
+                Ok(ResponseBody::Ack) => sent_begin = true,
+                Ok(other) => return Err(format!("storage Agent returned {other:?}")),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let start = offset as usize;
+        let end = (start + SNAPSHOT_UPLOAD_CHUNK_BYTES).min(bytes.len());
+        let data_hex = hex_encode(&bytes[start..end]);
+        match transport.call(
+            &node_id,
+            node,
+            Operation::WriteSnapshotChunk {
+                controller,
+                upload: upload.clone(),
+                offset,
+                data_hex,
+            },
+        ) {
+            Ok(ResponseBody::Ack) => offset = end as u64,
+            Ok(other) => return Err(format!("storage Agent returned {other:?}")),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    if !sent_begin {
+        match transport.call(
+            &node_id,
+            node,
+            Operation::BeginSnapshot {
+                controller,
+                upload: upload.clone(),
+            },
+        ) {
+            Ok(ResponseBody::Ack) => {}
+            Ok(other) => return Err(format!("storage Agent returned {other:?}")),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match transport.call(
+        &node_id,
+        node,
+        Operation::CommitSnapshot { controller, upload },
+    ) {
+        Ok(ResponseBody::Ack) => Ok(()),
+        Ok(other) => Err(format!("storage Agent returned {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn stage_job_snapshot_with_transport<T: NodeTransport>(
+    transport: &T,
+    node_id: &NodeId,
+    node: &macluster_core::config::NodeConfig,
+    controller: ControllerEpoch,
+    upload: JobSnapshotUpload,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if upload.snapshot.size_bytes != bytes.len() as u64
+        || macluster_protocol::framing::sha256_hex(bytes).map_err(|error| error.to_string())?
+            != upload.snapshot.sha256
+    {
+        return Err("local job snapshot does not match its recorded digest".into());
+    }
+    match transport.call(
+        node_id,
+        node,
+        Operation::BeginJobSnapshot {
+            controller,
+            upload: upload.clone(),
+        },
+    ) {
+        Ok(ResponseBody::Ack) => {}
+        Ok(other) => return Err(format!("compute Agent returned {other:?}")),
+        Err(error) => return Err(error.to_string()),
+    }
+    let mut offset = 0_u64;
+    while offset < bytes.len() as u64 {
+        let start = offset as usize;
+        let end = (start + SNAPSHOT_UPLOAD_CHUNK_BYTES).min(bytes.len());
+        match transport.call(
+            node_id,
+            node,
+            Operation::WriteJobSnapshotChunk {
+                controller,
+                upload: upload.clone(),
+                offset,
+                data_hex: hex_encode(&bytes[start..end]),
+            },
+        ) {
+            Ok(ResponseBody::Ack) => offset = end as u64,
+            Ok(other) => return Err(format!("compute Agent returned {other:?}")),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match transport.call(
+        node_id,
+        node,
+        Operation::CommitJobSnapshot { controller, upload },
+    ) {
+        Ok(ResponseBody::Ack) => Ok(()),
+        Ok(other) => Err(format!("compute Agent returned {other:?}")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 struct SnapshotRetry {
@@ -915,6 +1070,7 @@ impl RuntimeState {
                 }
                 match completion.result {
                     WorkerResult::PublishSnapshot(Ok(())) => {
+                        service.storage.mark_snapshot_synced(job_id)?;
                         self.snapshot_retry.remove(&job_id);
                     }
                     WorkerResult::PublishSnapshot(Err(_)) => {
@@ -1107,23 +1263,48 @@ impl RuntimeState {
                                     service.storage.mark_running(job_id)?;
                                 }
                             }
-                            WorkerResult::Control(Err(_error)) => {
-                                runtime.control_failures =
-                                    runtime.control_failures.saturating_add(1);
-                                if tag.kind == WorkKind::Start
-                                    && let Some(job_id) = tag.job_id
-                                    && let Some(job) = service.storage.get_job(job_id)?
-                                    && job.state == JobState::Starting
-                                    && job
-                                        .node
-                                        .as_ref()
-                                        .is_some_and(|node| node.as_str() == node_id)
+                            WorkerResult::Control(Err(error)) => {
+                                if tag.kind == WorkKind::Cancel
+                                    && matches!(
+                                        error,
+                                        TransportError::Remote(ProtocolError::NotFound)
+                                    )
                                 {
-                                    // Keep the stable reservation and token. If the
-                                    // remote accepted Start but its reply was lost,
-                                    // the retry is idempotent; if it rejected Start,
-                                    // the same job can recover when the node returns.
-                                    runtime.pending_start = Some(job);
+                                    if let Some(job_id) = tag.job_id
+                                        && let Some(job) = service.storage.get_job(job_id)?
+                                        && job.state == JobState::Cancelling
+                                    {
+                                        service.storage.finish_job(
+                                            job_id,
+                                            JobState::Cancelled,
+                                            Some(130),
+                                            Some(
+                                                "cancelled before the node recorded an execution"
+                                                    .into(),
+                                            ),
+                                        )?;
+                                    }
+                                    runtime.control_failures = 0;
+                                    runtime.status = None;
+                                    runtime.next_probe_at = now;
+                                } else {
+                                    runtime.control_failures =
+                                        runtime.control_failures.saturating_add(1);
+                                    if tag.kind == WorkKind::Start
+                                        && let Some(job_id) = tag.job_id
+                                        && let Some(job) = service.storage.get_job(job_id)?
+                                        && job.state == JobState::Starting
+                                        && job
+                                            .node
+                                            .as_ref()
+                                            .is_some_and(|node| node.as_str() == node_id)
+                                    {
+                                        // Keep the stable reservation and token. If the
+                                        // remote accepted Start but its reply was lost,
+                                        // the retry is idempotent; if it rejected Start,
+                                        // the same job can recover when the node returns.
+                                        runtime.pending_start = Some(job);
+                                    }
                                 }
                             }
                             _ => {}
@@ -1747,8 +1928,9 @@ impl RuntimeState {
         let operation_id = self.operation_id();
         let tag = self.tag(service, None, 0, operation_id, WorkKind::ShareHealth, None);
         let config = service.config.clone();
+        let transport = Arc::clone(&service.transport);
         if self.share_pool.try_spawn(move || {
-            let ready = crate::verify_shared_storage(&config);
+            let ready = storage_health_with_transport(&config, transport.as_ref());
             WorkerCompletion {
                 tag,
                 received_at: Instant::now(),
@@ -2158,11 +2340,7 @@ impl RuntimeState {
             if self.control_pool.try_spawn(move || WorkerCompletion {
                 received_at: Instant::now(),
                 tag: worker_tag,
-                result: WorkerResult::Control(
-                    transport
-                        .call(&node, &node_config, operation)
-                        .map_err(|error| error.to_string()),
-                ),
+                result: WorkerResult::Control(transport.call(&node, &node_config, operation)),
             }) && let Some(runtime) = self.nodes.get_mut(node_id)
             {
                 runtime.generation = generation;
@@ -2244,14 +2422,56 @@ impl RuntimeState {
                 job_id: current.id,
                 spec: current.spec.clone(),
             };
+            let staged_snapshot = current
+                .spec
+                .snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    fs::read(service.storage.snapshot_path(snapshot))
+                        .map_err(|error| format!("cannot read local job snapshot: {error}"))
+                        .map(|bytes| {
+                            (
+                                JobSnapshotUpload {
+                                    job_id: current.id,
+                                    snapshot: snapshot.clone(),
+                                },
+                                bytes,
+                            )
+                        })
+                })
+                .transpose();
+            let staged_snapshot = match staged_snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if let Some(runtime) = self.nodes.get_mut(&node_id) {
+                        runtime.next_control_at = now + retry_delay(1);
+                    }
+                    service
+                        .storage
+                        .set_waiting_reason(current.id, Some(error.clone()))?;
+                    eprintln!("macluster: job {} Start is deferred: {error}", current.id);
+                    continue;
+                }
+            };
+            let controller = service.epoch;
+            let worker_node = node_config.clone();
             if self.control_pool.try_spawn(move || WorkerCompletion {
                 received_at: Instant::now(),
                 tag: worker_tag,
-                result: WorkerResult::Control(
-                    transport
-                        .call(&node, &node_config, operation)
-                        .map_err(|error| error.to_string()),
-                ),
+                result: WorkerResult::Control((|| {
+                    if let Some((upload, bytes)) = staged_snapshot {
+                        stage_job_snapshot_with_transport(
+                            transport.as_ref(),
+                            &node,
+                            &worker_node,
+                            controller,
+                            upload,
+                            &bytes,
+                        )
+                        .map_err(TransportError::Io)?;
+                    }
+                    transport.call(&node, &worker_node, operation)
+                })()),
             }) && let Some(runtime) = self.nodes.get_mut(&node_id)
             {
                 runtime.pending_start = None;
@@ -2303,21 +2523,92 @@ impl RuntimeState {
                 WorkKind::PublishSnapshot,
                 Some(job_id),
             );
-            let state_dir = service.storage.root().to_path_buf();
-            let shared_root = service.config.shared_root.clone();
-            if self.snapshot_pool.try_spawn(move || {
-                let result = crate::publish_snapshot_bounded(
-                    &state_dir,
-                    job_id,
-                    &shared_root,
-                    Duration::from_secs(10),
-                );
-                WorkerCompletion {
-                    tag,
-                    received_at: Instant::now(),
-                    result: WorkerResult::PublishSnapshot(result),
+            let local_storage = service
+                .config
+                .nodes
+                .get(service.config.storage_server.as_str())
+                .is_some_and(|node| node.transport == Transport::Local);
+            let spawned = if local_storage {
+                let state_dir = service.storage.root().to_path_buf();
+                let shared_root = service.config.shared_root.clone();
+                self.snapshot_pool.try_spawn(move || {
+                    let result = crate::publish_snapshot_bounded(
+                        &state_dir,
+                        job_id,
+                        &shared_root,
+                        Duration::from_secs(10),
+                    );
+                    WorkerCompletion {
+                        tag,
+                        received_at: Instant::now(),
+                        result: WorkerResult::PublishSnapshot(result),
+                    }
+                })
+            } else {
+                let prepared = service
+                    .storage
+                    .get_job(job_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|record| {
+                        record.ok_or_else(|| {
+                            format!("job {job_id} disappeared before snapshot upload")
+                        })
+                    })
+                    .and_then(|record| {
+                        let snapshot = record
+                            .spec
+                            .snapshot
+                            .clone()
+                            .ok_or_else(|| format!("job {job_id} has no snapshot"))?;
+                        let bytes = fs::read(service.storage.snapshot_path(&snapshot))
+                            .map_err(|error| format!("cannot read local snapshot: {error}"))?;
+                        Ok((
+                            SnapshotUpload {
+                                job_id,
+                                storage_namespace: record.spec.storage_namespace,
+                                snapshot,
+                            },
+                            bytes,
+                        ))
+                    });
+                match prepared {
+                    Ok((upload, bytes)) => {
+                        let config = service.config.clone();
+                        let transport = Arc::clone(&service.transport);
+                        let controller = service.epoch;
+                        self.snapshot_pool.try_spawn(move || {
+                            let result = publish_snapshot_with_transport(
+                                &config,
+                                transport.as_ref(),
+                                controller,
+                                upload,
+                                &bytes,
+                            );
+                            WorkerCompletion {
+                                tag,
+                                received_at: Instant::now(),
+                                result: WorkerResult::PublishSnapshot(result),
+                            }
+                        })
+                    }
+                    Err(error) => {
+                        let attempts = self
+                            .snapshot_retry
+                            .get(&job_id)
+                            .map_or(1, |retry| retry.attempts.saturating_add(1));
+                        self.snapshot_retry.insert(
+                            job_id,
+                            SnapshotRetry {
+                                attempts,
+                                retry_at: Instant::now() + retry_delay(attempts),
+                            },
+                        );
+                        eprintln!("macluster: snapshot upload for job {job_id} deferred: {error}");
+                        continue;
+                    }
                 }
-            }) {
+            };
+            if spawned {
                 self.snapshot_in_flight.insert(job_id, operation_id);
             }
         }
@@ -3312,10 +3603,12 @@ mod tests {
         WorkTag, WorkerCompletion, WorkerPool, WorkerResult, dispatch_pause_reason,
         health_retry_delay, maintenance_drain_complete, node_probe_retry_delay,
         node_result_is_current, now_ms, pending_queue_heads, probe_delay,
-        reconciliation_config_without_unavailable_smb_servers, reset_drain_complete, retry_delay,
-        run_forever, should_measure_job_storage,
+        publish_snapshot_with_transport, reconciliation_config_without_unavailable_smb_servers,
+        reset_drain_complete, retry_delay, run_forever, should_measure_job_storage,
+        stage_job_snapshot_with_transport, storage_health_with_transport,
     };
     use crate::events::RuntimeSignal;
+    use crate::transport::TransportError;
     use macluster_core::config::ClusterConfig;
     use macluster_core::maintenance::ResetBarrierPolicy;
     use macluster_core::nfs_reconcile::{
@@ -3333,8 +3626,8 @@ mod tests {
         },
         identifiers::{ControllerUuid, Id128, NodeId, QueueName, RequestId},
         types::{
-            ControllerEpoch, FanControlStatus, FanPolicy, JobMode, JobRecord, JobSpec, JobState,
-            Operation, ResponseBody,
+            ControllerEpoch, FanControlStatus, FanPolicy, JobMode, JobRecord, JobSnapshotUpload,
+            JobSpec, JobState, Operation, ProtocolError, ResponseBody, SnapshotRef, SnapshotUpload,
         },
     };
     use std::{
@@ -3349,6 +3642,170 @@ mod tests {
     struct SlowFanTransport {
         started: Arc<AtomicUsize>,
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct StorageRelayTransport {
+        operations: Mutex<Vec<Operation>>,
+    }
+
+    impl crate::transport::NodeTransport for StorageRelayTransport {
+        fn call(
+            &self,
+            _node_id: &NodeId,
+            _node: &macluster_core::config::NodeConfig,
+            operation: Operation,
+        ) -> Result<ResponseBody, crate::transport::TransportError> {
+            self.operations.lock().unwrap().push(operation);
+            Ok(ResponseBody::Ack)
+        }
+    }
+
+    fn remote_storage_config() -> ClusterConfig {
+        ClusterConfig::parse(
+            r#"
+[cluster]
+name = "remote-storage"
+default_queue = "workers"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "storage"
+protocol_version = 1
+
+[queues.workers]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.storage]
+host = "192.0.2.1"
+transport = "ssh"
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_storage_health_uses_the_storage_agent_operation() {
+        let config = remote_storage_config();
+        let transport = StorageRelayTransport::default();
+
+        assert!(storage_health_with_transport(&config, &transport));
+        assert!(matches!(
+            transport.operations.lock().unwrap().as_slice(),
+            [Operation::CheckStorage]
+        ));
+    }
+
+    #[test]
+    fn remote_snapshot_publication_uses_bounded_chunks() {
+        let config = remote_storage_config();
+        let transport = StorageRelayTransport::default();
+        let bytes = vec![b'x'; macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES + 7];
+        let upload = SnapshotUpload {
+            job_id: 19,
+            storage_namespace: None,
+            snapshot: SnapshotRef {
+                sha256: "a".repeat(64),
+                size_bytes: bytes.len() as u64,
+            },
+        };
+        let controller = ControllerEpoch {
+            controller_uuid: ControllerUuid(Id128::random()),
+            epoch: 3,
+        };
+
+        publish_snapshot_with_transport(&config, &transport, controller, upload, &bytes).unwrap();
+
+        let operations = transport.operations.lock().unwrap();
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::BeginSnapshot { .. })
+        ));
+        let chunks = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::WriteSnapshotChunk {
+                    offset, data_hex, ..
+                } => Some((*offset, data_hex.len() / 2)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks,
+            [
+                (0, macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES),
+                (
+                    macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES as u64,
+                    7
+                )
+            ]
+        );
+        assert!(matches!(
+            operations.last(),
+            Some(Operation::CommitSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn compute_job_snapshot_is_staged_in_bounded_chunks_before_start() {
+        let config = remote_storage_config();
+        let transport = StorageRelayTransport::default();
+        let bytes = vec![b'y'; macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES + 5];
+        let upload = JobSnapshotUpload {
+            job_id: 20,
+            snapshot: SnapshotRef {
+                sha256: macluster_protocol::framing::sha256_hex(&bytes).unwrap(),
+                size_bytes: bytes.len() as u64,
+            },
+        };
+        let controller = ControllerEpoch {
+            controller_uuid: ControllerUuid(Id128::random()),
+            epoch: 4,
+        };
+        let worker = &config.nodes["worker"];
+
+        stage_job_snapshot_with_transport(
+            &transport,
+            &NodeId::new("worker").unwrap(),
+            worker,
+            controller,
+            upload,
+            &bytes,
+        )
+        .unwrap();
+
+        let operations = transport.operations.lock().unwrap();
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::BeginJobSnapshot { .. })
+        ));
+        let chunks = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::WriteJobSnapshotChunk {
+                    offset, data_hex, ..
+                } => Some((*offset, data_hex.len() / 2)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks,
+            [
+                (0, macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES),
+                (
+                    macluster_protocol::types::SNAPSHOT_UPLOAD_CHUNK_BYTES as u64,
+                    5
+                )
+            ]
+        );
+        assert!(matches!(
+            operations.last(),
+            Some(Operation::CommitJobSnapshot { .. })
+        ));
     }
 
     impl crate::transport::NodeTransport for SlowFanTransport {
@@ -3840,6 +4297,9 @@ smb_user = "operator"
                     }))
                 }
                 Operation::CancelJob { .. } | Operation::Fence { .. } => Ok(ResponseBody::Ack),
+                Operation::BeginJobSnapshot { .. }
+                | Operation::WriteJobSnapshotChunk { .. }
+                | Operation::CommitJobSnapshot { .. } => Ok(ResponseBody::Ack),
                 Operation::Health => Ok(ResponseBody::Health(
                     macluster_protocol::types::NodeHealth {
                         machine_uuid: String::new(),
@@ -3890,6 +4350,9 @@ smb_user = "operator"
                     }))
                 }
                 Operation::CancelJob { .. } | Operation::Fence { .. } => Ok(ResponseBody::Ack),
+                Operation::BeginJobSnapshot { .. }
+                | Operation::WriteJobSnapshotChunk { .. }
+                | Operation::CommitJobSnapshot { .. } => Ok(ResponseBody::Ack),
                 Operation::Health => Ok(ResponseBody::Health(NodeHealth {
                     machine_uuid: "01234567-89ab-cdef-0123-456789abcdef".into(),
                     execution_uid: 501,
@@ -4916,7 +5379,7 @@ scheduler = "fifo"
                 started_at: now,
             },
             received_at: now,
-            result: WorkerResult::Control(Err("remote start rejected".into())),
+            result: WorkerResult::Control(Err(TransportError::Io("remote start rejected".into()))),
         };
 
         runtime.handle_completion(&mut service, completion).unwrap();
@@ -4928,6 +5391,66 @@ scheduler = "fifo"
         assert_eq!(retry.id, reserved.id);
         assert_eq!(retry.start_token, reserved.start_token);
         assert!(runtime.nodes["worker"].next_control_at > now);
+        drop(runtime);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_reservation_absent_from_the_agent_finishes_as_cancelled() {
+        use crate::ControllerService;
+        use macluster_core::storage::Storage;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-cancel-missing-start-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = login_and_worker_config(&root);
+        let shared_root = config.shared_root.clone();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let mut service = ControllerService::new(config, storage, IsolatedNodeTransport).unwrap();
+        let submitted = submit_dispatch_test_job(&service.storage, &shared_root, None);
+        let reserved = service
+            .storage
+            .reserve_job(submitted.id, NodeId::new("worker").unwrap())
+            .unwrap();
+        service.storage.request_cancel(reserved.id, true).unwrap();
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(1)).unwrap();
+        let operation_id = 42;
+        let generation = 8;
+        let now = Instant::now();
+        let node = runtime.nodes.get_mut("worker").unwrap();
+        node.fenced = true;
+        node.generation = generation;
+        node.in_flight = Some(InFlightNodeOperation {
+            id: operation_id,
+            kind: WorkKind::Cancel,
+        });
+        let completion = WorkerCompletion {
+            tag: WorkTag {
+                epoch: service.epoch,
+                config_digest: runtime.digest.clone(),
+                node_id: Some("worker".into()),
+                generation,
+                operation_id,
+                kind: WorkKind::Cancel,
+                job_id: Some(reserved.id),
+                started_at: now,
+            },
+            received_at: now,
+            result: WorkerResult::Control(Err(TransportError::Remote(ProtocolError::NotFound))),
+        };
+
+        runtime.handle_completion(&mut service, completion).unwrap();
+
+        assert_eq!(
+            service.storage.get_job(reserved.id).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+        assert!(runtime.nodes["worker"].pending_start.is_none());
         drop(runtime);
         drop(service);
         fs::remove_dir_all(root).unwrap();

@@ -204,12 +204,6 @@ impl RemoteContext {
                     .insert(macluster_core::config::NodeRole::Compute);
             }
         }
-        for share in shares.values() {
-            roles
-                .entry(share.server.to_string())
-                .or_insert_with(std::collections::BTreeSet::new)
-                .insert(macluster_core::config::NodeRole::Storage);
-        }
         ClusterConfig {
             name: self.descriptor.cluster_name.clone(),
             login_node: Some(controller.clone()),
@@ -273,7 +267,12 @@ pub(crate) fn select_remote_profile(
     // A local node-admin config is the recovery authority even while its
     // controller is stopped. Forwarding to a stale remote CLI would prevent
     // reset, mount, and node repair from running with the binary in hand.
-    if command == "node" && explicit.is_none() && !config_explicit && config_path.exists() {
+    if command == "node"
+        && explicit.is_none()
+        && !config_explicit
+        && config_path.exists()
+        && !node_command_can_use_remote_profile(args)
+    {
         return Ok(None);
     }
     if !should_consider_remote_profile(
@@ -302,6 +301,13 @@ fn should_consider_remote_profile(
     explicit.is_some() || !config_explicit && (!config_exists || local_controller_stopped)
 }
 
+fn node_command_can_use_remote_profile(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("-l" | "--list" | "--failed" | "-migrate")
+    )
+}
+
 pub(crate) fn remote_command_supported(command: &str) -> bool {
     matches!(
         command,
@@ -316,8 +322,8 @@ mod tests {
     use macluster_protocol::identifiers::Id128;
 
     use super::{
-        needs_mount_reconciliation, remote_command_supported, select_remote_profile,
-        should_consider_remote_profile,
+        needs_mount_reconciliation, node_command_can_use_remote_profile, remote_command_supported,
+        select_remote_profile, should_consider_remote_profile,
     };
 
     #[test]
@@ -345,6 +351,33 @@ mod tests {
                 .is_none()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stopped_local_controller_forwards_listing_and_migration_to_the_remote_profile() {
+        for args in [
+            vec!["-l"],
+            vec!["--list"],
+            vec!["--failed"],
+            vec!["-migrate", "controller:login-01"],
+        ] {
+            let owned = args
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            assert!(node_command_can_use_remote_profile(&owned), "{args:?}");
+        }
+        for args in [
+            vec!["-a", "worker@192.0.2.20"],
+            vec!["-rm", "worker"],
+            vec!["-mount", "smb://nas/data"],
+        ] {
+            let owned = args
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            assert!(!node_command_can_use_remote_profile(&owned), "{args:?}");
+        }
     }
 
     #[test]

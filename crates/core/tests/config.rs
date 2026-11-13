@@ -1,5 +1,6 @@
 use macluster_core::config::{ClusterConfig, ConfigError, NodeRole};
 use macluster_core::storage_uri::StorageProtocol;
+use std::collections::BTreeSet;
 
 const VALID: &str = r#"
 [cluster]
@@ -20,7 +21,7 @@ transport = "ssh"
 "#;
 
 #[test]
-fn documented_config_resolves_queue_members_and_storage_role() {
+fn documented_config_resolves_queue_members_and_storage_source() {
     let config = ClusterConfig::parse(VALID).unwrap();
 
     assert_eq!(config.name, "macluster");
@@ -49,30 +50,27 @@ fn explicit_node_roles_can_overlap() {
     let config = ClusterConfig::parse(&source).unwrap();
 
     let roles = config.node_roles("login");
-    assert!(roles.contains(&NodeRole::Controller));
-    assert!(roles.contains(&NodeRole::Compute));
-    assert!(roles.contains(&NodeRole::Storage));
+    assert_eq!(
+        roles,
+        BTreeSet::from([NodeRole::Controller, NodeRole::Compute])
+    );
     assert!(config.is_compute_node("login"));
 }
 
 #[test]
-fn storage_role_is_derived_from_active_share_ownership() {
+fn storage_ownership_does_not_create_a_node_role() {
     let idle_node =
         "\n[nodes.idle]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nroles = [\"storage\"]\n";
     let without_share = format!("{}{idle_node}", extended_config());
     let without_share = ClusterConfig::parse(&without_share).unwrap();
-    assert!(
-        !without_share
-            .node_roles("idle")
-            .contains(&NodeRole::Storage)
-    );
+    assert!(without_share.node_roles("idle").is_empty());
 
     let with_share = format!(
         "{}{idle_node}\n[shares.idle]\nserver = \"idle\"\nsource_root = \"/Volumes/idle\"\nmount_root = \"/Volumes/idle-cache\"\nshare_uuid = \"00000000-0000-4000-8000-000000000006\"\n",
         extended_config()
     );
     let with_share = ClusterConfig::parse(&with_share).unwrap();
-    assert!(with_share.node_roles("idle").contains(&NodeRole::Storage));
+    assert!(with_share.node_roles("idle").is_empty());
 }
 
 #[test]
@@ -92,7 +90,7 @@ fn config_rejects_a_second_explicit_controller_role() {
 }
 
 #[test]
-fn external_storage_transport_needs_no_agent_identity_and_derives_storage_role() {
+fn external_storage_transport_needs_no_agent_identity_or_node_role() {
     let source = format!(
         "{}\n[nodes.nas-01]\nhost = \"192.0.2.5\"\ntransport = \"storage\"\n\n[shares.nas-data]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/data\"\nmount_root = \"/Users/Shared/nas-data\"\nshare_uuid = \"00000000-0000-4000-8000-000000000007\"\n",
         extended_config()
@@ -101,7 +99,7 @@ fn external_storage_transport_needs_no_agent_identity_and_derives_storage_role()
     let config = ClusterConfig::parse(&source).unwrap();
 
     assert_eq!(format!("{:?}", config.nodes["nas-01"].transport), "Storage");
-    assert!(config.node_roles("nas-01").contains(&NodeRole::Storage));
+    assert!(config.node_roles("nas-01").is_empty());
     assert!(!config.is_compute_node("nas-01"));
 }
 

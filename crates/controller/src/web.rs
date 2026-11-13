@@ -1846,10 +1846,7 @@ mod blocker_tests {
         )
         .unwrap();
 
-        assert_eq!(
-            web_node_role(&config, "controller"),
-            "controller, compute, storage"
-        );
+        assert_eq!(web_node_role(&config, "controller"), "controller, compute");
         assert_eq!(web_node_role(&config, "worker"), "compute");
     }
 

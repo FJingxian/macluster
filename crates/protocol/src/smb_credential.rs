@@ -6,7 +6,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::identifiers::{Id128, NodeId};
 
-pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-24";
+pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-25";
+const SMB_CREDENTIAL_SERVICE_VERSION_24: &str = "smb-credential-24";
 const SMB_CREDENTIAL_SERVICE_VERSION_23: &str = "smb-credential-23";
 pub const MAX_SMB_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_SMB_CREDENTIAL_FRAME_BYTES: usize = 32 * 1024;
@@ -202,6 +203,8 @@ pub enum SmbCredentialOperation {
         target: String,
         logical: String,
         logical_target: String,
+        #[serde(default)]
+        force: bool,
     },
 }
 
@@ -245,6 +248,7 @@ impl SmbCredentialOperation {
                 target,
                 logical,
                 logical_target,
+                force: _,
             } => {
                 validate_smb_mount_target(target)?;
                 validate_smb_logical_alias(logical, logical_target)
@@ -270,7 +274,9 @@ impl SmbCredentialRequest {
     pub fn validate(&self) -> Result<(), SmbCredentialValidationError> {
         if !matches!(
             self.service_version.as_str(),
-            SMB_CREDENTIAL_SERVICE_VERSION | SMB_CREDENTIAL_SERVICE_VERSION_23
+            SMB_CREDENTIAL_SERVICE_VERSION
+                | SMB_CREDENTIAL_SERVICE_VERSION_24
+                | SMB_CREDENTIAL_SERVICE_VERSION_23
         ) {
             return Err(SmbCredentialValidationError::IncompatibleServiceVersion);
         }
@@ -546,6 +552,7 @@ mod tests {
             target: "/Users/Shared/.macluster-mounts/share-1".into(),
             logical: "/Users/operator/data".into(),
             logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            force: false,
         };
         assert!(unmount.validate().is_ok());
     }
@@ -576,6 +583,39 @@ mod tests {
         request.service_version = "smb-credential-23".into();
 
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_smb_unmount_defaults_to_non_forced() {
+        let operation: SmbCredentialOperation = serde_json::from_value(json!({
+            "operation": "unmount_smb",
+            "payload": {
+                "target": "/Users/Shared/.macluster-mounts/share-1",
+                "logical": "/Users/operator/data",
+                "logical_target": "/Users/Shared/.macluster-mounts/share-1"
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            operation,
+            SmbCredentialOperation::UnmountSmb { force: false, .. }
+        ));
+    }
+
+    #[test]
+    fn smb_unmount_round_trips_force() {
+        let operation = SmbCredentialOperation::UnmountSmb {
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            force: true,
+        };
+
+        let encoded = serde_json::to_value(&operation).unwrap();
+        let decoded: SmbCredentialOperation = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded, operation);
     }
 
     #[test]

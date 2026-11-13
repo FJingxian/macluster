@@ -36,6 +36,7 @@ const SOCKET: &str = "/var/run/org.macluster.smb-credential.sock";
 const CLUSTER_PIN: &str = "/Library/PrivilegedHelperTools/org.macluster.update/cluster-id";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 const SMB_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+const SMB_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const FAILURE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_FAILURES_PER_WINDOW: usize = 8;
 const SMB_BACKING_ROOT: &str = "/Users/Shared/.macluster-mounts";
@@ -654,7 +655,8 @@ fn process_request(
             target,
             logical,
             logical_target,
-        } => unmount_smb(peer_uid, &target, &logical, &logical_target)
+            force,
+        } => unmount_smb(peer_uid, &target, &logical, &logical_target, force)
             .map(|()| SmbCredentialReplyBody::Unmounted)
             .map_err(SecretFailure::Operation),
     }
@@ -910,7 +912,7 @@ impl SmbMountBackend for RealSmbMountBackend<'_> {
     }
 
     fn unmount(&mut self, target: &str, logical: &str, logical_target: &str) -> Result<(), String> {
-        unmount_smb(self.uid, target, logical, logical_target)
+        unmount_smb(self.uid, target, logical, logical_target, false)
     }
 
     fn mount(&mut self, source: &str, target: &str) -> Result<(), String> {
@@ -1168,22 +1170,23 @@ fn unmount_smb(
     target: &str,
     logical: &str,
     logical_target: &str,
+    force: bool,
 ) -> Result<(), String> {
     let (user, home) = smb_session_account(uid)?;
     unmount_smb_with(logical, logical_target, || {
         if smb_mount_is_active(target)? {
             let mut command = Command::new("/bin/launchctl");
+            command.args([
+                "asuser",
+                &uid.to_string(),
+                "/usr/bin/sudo",
+                "-u",
+                &user,
+                "-H",
+                "/sbin/umount",
+            ]);
+            command.args(smb_unmount_arguments(target, force));
             command
-                .args([
-                    "asuser",
-                    &uid.to_string(),
-                    "/usr/bin/sudo",
-                    "-u",
-                    &user,
-                    "-H",
-                    "/sbin/umount",
-                    target,
-                ])
                 .env_clear()
                 .env("HOME", &home)
                 .env("USER", &user)
@@ -1193,7 +1196,7 @@ fn unmount_smb(
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let status = run_bounded_process_group(command, Duration::from_secs(5))
+            let status = run_bounded_process_group(command, SMB_UNMOUNT_TIMEOUT)
                 .map_err(|error| format!("unmount SMB share {target}: {error}"))?;
             if !status.success() {
                 return Err(format!("unmount SMB share {target} exited with {status}"));
@@ -1201,6 +1204,14 @@ fn unmount_smb(
         }
         Ok(())
     })
+}
+
+fn smb_unmount_arguments(target: &str, force: bool) -> Vec<&str> {
+    if force {
+        vec!["-f", target]
+    } else {
+        vec![target]
+    }
 }
 
 fn unmount_smb_with(
@@ -1668,13 +1679,13 @@ mod tests {
     };
 
     use super::{
-        CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore, SecretStore,
-        SmbMountAction, SmbMountBackend, arp_delete_arguments,
+        CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore,
+        SMB_UNMOUNT_TIMEOUT, SecretStore, SmbMountAction, SmbMountBackend, arp_delete_arguments,
         direct_storage_subnet_route_arguments, ensure_smb_logical_alias, read_pinned_cluster,
         reconcile_smb_mount_with_backend, record_smb_repair_failure, remove_smb_logical_alias,
         route_delete_arguments, route_output_is_direct, run_bounded_process_group,
         serve_client_with, smb_mount_action, smb_mount_arguments, smb_repair_allowed,
-        smb_tcp_endpoint_reachable, unmount_smb_with,
+        smb_tcp_endpoint_reachable, smb_unmount_arguments, unmount_smb_with,
     };
 
     fn cluster() -> Id128 {
@@ -2044,6 +2055,19 @@ mod tests {
             std::io::ErrorKind::NotFound
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normal_smb_unmount_uses_ten_seconds_and_force_prefix() {
+        assert_eq!(SMB_UNMOUNT_TIMEOUT, std::time::Duration::from_secs(10));
+        assert_eq!(
+            smb_unmount_arguments("/managed/mount", false),
+            vec!["/managed/mount"]
+        );
+        assert_eq!(
+            smb_unmount_arguments("/managed/mount", true),
+            vec!["-f", "/managed/mount"]
+        );
     }
 
     #[test]

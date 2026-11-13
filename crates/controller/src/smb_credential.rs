@@ -153,11 +153,13 @@ impl CredentialHelperClient {
         target: &str,
         logical: &str,
         logical_target: &str,
+        force: bool,
     ) -> Result<(), SmbCredentialClientError> {
         match self.call(SmbCredentialOperation::UnmountSmb {
             target: target.to_owned(),
             logical: logical.to_owned(),
             logical_target: logical_target.to_owned(),
+            force,
         })? {
             SmbCredentialReplyBody::Unmounted => Ok(()),
             other => Err(SmbCredentialClientError::UnexpectedReply {
@@ -656,10 +658,12 @@ mod tests {
                     target,
                     logical,
                     logical_target,
+                    force,
                 } => {
                     assert_eq!(target, "/Users/Shared/.macluster-mounts/share-1");
                     assert_eq!(logical, "/Users/operator/data");
                     assert_eq!(logical_target, "/Users/Shared/.macluster-mounts/share-1");
+                    assert!(!force);
                 }
                 operation => panic!("unexpected operation: {operation:?}"),
             }
@@ -678,6 +682,7 @@ mod tests {
                 "/Users/Shared/.macluster-mounts/share-1",
                 "/Users/operator/data",
                 "/Users/Shared/.macluster-mounts/share-1",
+                false,
             )
             .unwrap();
         client

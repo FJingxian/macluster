@@ -17817,7 +17817,7 @@ fn smb_mount_script(
     Ok(script.replace("/bin/sh \"$helper\"", &launch_script))
 }
 
-fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
+fn smb_unmount_script(share: &ShareConfig, force: bool) -> AppResult<String> {
     let physical_path = smb_backing_path(&share.share_uuid);
     let physical = shell_quote(&physical_path.to_string_lossy());
     let logical = shell_quote(&share.mount_root.to_string_lossy());
@@ -17835,6 +17835,7 @@ fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
         target: physical_path.to_string_lossy().into_owned(),
         logical: share.mount_root.to_string_lossy().into_owned(),
         logical_target: logical_target.to_string_lossy().into_owned(),
+        force,
     });
     let request = shell_quote(
         &serde_json::to_string(&request)
@@ -17864,7 +17865,15 @@ pub(crate) fn unmount_smb_share_for_cleanup(
     node: &NodeConfig,
     share: &ShareConfig,
 ) -> Result<(), String> {
-    let script = smb_unmount_script(share).map_err(|(_, error)| error)?;
+    unmount_smb_share_for_cleanup_with_force(node, share, false)
+}
+
+pub(crate) fn unmount_smb_share_for_cleanup_with_force(
+    node: &NodeConfig,
+    share: &ShareConfig,
+    force: bool,
+) -> Result<(), String> {
+    let script = smb_unmount_script(share, force).map_err(|(_, error)| error)?;
     run_smb_user_script(node, &script)
 }
 
@@ -17952,7 +17961,7 @@ fn reconcile_local_smb_shares_with_home(
                     smb_user: None,
                     allow_existing_contents: false,
                 };
-                let script = smb_unmount_script(&stale)?;
+                let script = smb_unmount_script(&stale, false)?;
                 let mut command = Command::new("/bin/sh");
                 command.args(["-c", &script]);
                 command.env("HOME", home);
@@ -18117,7 +18126,7 @@ pub(crate) fn cleanup_smb_shares_for_reset(config: &ClusterConfig) -> AppResult<
         .filter(|share| share.protocol == StorageProtocol::Smb)
     {
         smb_share_parts(share)?;
-        let script = smb_unmount_script(share)?;
+        let script = smb_unmount_script(share, false)?;
         let unavailable = unavailable_share_client_nodes(
             config,
             share.server.as_str(),
@@ -18340,7 +18349,7 @@ fn register_smb_share(
                 continue;
             }
             if let Err(error) = run_smb_user_script(node, &mount_script) {
-                let cleanup = smb_unmount_script(&share)?;
+                let cleanup = smb_unmount_script(&share, false)?;
                 let _ = run_smb_user_script(node, &cleanup);
                 eprintln!("Warning: SMB mount on {node_id} was deferred: {error}");
                 deferred_clients.insert(node_id.clone());
@@ -18462,7 +18471,7 @@ fn unregister_smb_share(
         );
         let mut deferred_cleanup = BTreeSet::new();
         let mut successfully_unmounted = BTreeSet::new();
-        let unmount_script = smb_unmount_script(&share)?;
+        let unmount_script = smb_unmount_script(&share, false)?;
         for (node_id, node) in smb_credential_nodes(&config, share.server.as_str()) {
             if unavailable.contains(node_id.as_str()) {
                 deferred_cleanup.insert(node_id.to_string());
@@ -27281,7 +27290,7 @@ execution_uid = 501
         let mount =
             super::smb_mount_script("00000000-0000-4000-8000-000000000001", &share, &server)
                 .unwrap();
-        let unmount = super::smb_unmount_script(&share).unwrap();
+        let unmount = super::smb_unmount_script(&share, false).unwrap();
         assert!(
             unmount.contains("case \"$actual\" in /Users/Shared/.macluster-mounts/*"),
             "removal must clean a stale managed logical alias even when no SMB mount remains"

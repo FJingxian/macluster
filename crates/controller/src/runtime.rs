@@ -5,6 +5,7 @@ use std::{
     fs, io,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
@@ -67,6 +68,9 @@ const MAX_NFS_RECONCILE_RESULT_AGE: Duration = Duration::from_secs(180);
 const MAX_IDLE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const JOB_STORAGE_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const JOB_STORAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+static SMB_CLEANUP_RETRY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LEGACY_SMB_DISCOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 type WorkerTask<R> = Box<dyn FnOnce() -> R + Send + 'static>;
 
@@ -3487,12 +3491,16 @@ fn retry_delay(failures: u8) -> Duration {
 }
 
 fn start_global_smb_cleanup_retry() {
+    let Some(claim) = claim_background_worker(&SMB_CLEANUP_RETRY_ACTIVE) else {
+        return;
+    };
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
     let _ = thread::Builder::new()
         .name("macluster-smb-cleanup".into())
         .spawn(move || {
+            let _claim = claim;
             let _ = std::process::Command::new(executable)
                 .args(["internal", "smb-cleanup", "retry"])
                 .stdin(std::process::Stdio::null())
@@ -3503,12 +3511,16 @@ fn start_global_smb_cleanup_retry() {
 }
 
 fn start_legacy_smb_discovery() {
+    let Some(claim) = claim_background_worker(&LEGACY_SMB_DISCOVERY_ACTIVE) else {
+        return;
+    };
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
     let _ = thread::Builder::new()
         .name("macluster-smb-discover-legacy".into())
         .spawn(move || {
+            let _claim = claim;
             let _ = std::process::Command::new(executable)
                 .args(["internal", "smb-discover-legacy"])
                 .stdin(std::process::Stdio::null())
@@ -3516,6 +3528,23 @@ fn start_legacy_smb_discovery() {
                 .stderr(std::process::Stdio::null())
                 .status();
         });
+}
+
+struct BackgroundWorkerClaim<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for BackgroundWorkerClaim<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+fn claim_background_worker(active: &AtomicBool) -> Option<BackgroundWorkerClaim<'_>> {
+    active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+        .then_some(BackgroundWorkerClaim { active })
 }
 
 fn global_smb_cleanup_worker_required() -> bool {
@@ -3601,9 +3630,9 @@ mod tests {
         IDLE_NODE_PROBE_INTERVAL, InFlightNodeOperation, NFS_RECONCILE_LOG_INTERVAL,
         NODE_HEALTH_RETRY, NODE_HEALTH_TTL, NODE_STALE_AGENT_RETRY, NODE_STATUS_TTL,
         NodeHealthCache, NodeRuntime, NodeStatusCache, RuntimeState, WakeForwarder, WorkKind,
-        WorkTag, WorkerCompletion, WorkerPool, WorkerResult, dispatch_pause_reason,
-        health_retry_delay, maintenance_drain_complete, node_probe_retry_delay,
-        node_result_is_current, now_ms, pending_queue_heads, probe_delay,
+        WorkTag, WorkerCompletion, WorkerPool, WorkerResult, claim_background_worker,
+        dispatch_pause_reason, health_retry_delay, maintenance_drain_complete,
+        node_probe_retry_delay, node_result_is_current, now_ms, pending_queue_heads, probe_delay,
         publish_snapshot_with_transport, reconciliation_config_without_unavailable_smb_servers,
         reset_drain_complete, retry_delay, run_forever, should_measure_job_storage,
         smb_cleanup_worker_required, stage_job_snapshot_with_transport,
@@ -3694,6 +3723,17 @@ mod tests {
                 .unwrap(),
         );
         assert!(smb_cleanup_worker_required(&state, 1_000));
+    }
+
+    #[test]
+    fn background_cleanup_workers_cannot_overlap() {
+        let active = std::sync::atomic::AtomicBool::new(false);
+
+        let claim = claim_background_worker(&active).expect("first claim succeeds");
+        assert!(claim_background_worker(&active).is_none());
+        drop(claim);
+
+        assert!(claim_background_worker(&active).is_some());
     }
 
     #[derive(Default)]

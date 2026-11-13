@@ -18943,13 +18943,37 @@ fn unregister_smb_share(
     wait: bool,
     timeout: Option<u64>,
 ) -> AppResult<()> {
+    unregister_smb_share_with_cleanup_wait(
+        config_path,
+        state_dir,
+        share_id,
+        mount_root,
+        force,
+        assume_yes,
+        wait,
+        timeout,
+        wait_for_smb_cleanup,
+    )
+}
+
+fn unregister_smb_share_with_cleanup_wait(
+    config_path: &Path,
+    state_dir: &Path,
+    share_id: &str,
+    mount_root: &Path,
+    force: bool,
+    assume_yes: bool,
+    wait: bool,
+    timeout: Option<u64>,
+    mut cleanup_wait: impl FnMut(&str, Duration) -> Result<(), String>,
+) -> AppResult<()> {
     let maintenance = acquire_node_maintenance_scoped(
         config_path,
         state_dir,
         "SMB share removal",
         MaintenanceScope::Cluster,
     )?;
-    let result = (|| -> AppResult<()> {
+    let result = (|| -> AppResult<Option<(String, Duration)>> {
         MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
             (
                 1,
@@ -19185,16 +19209,18 @@ fn unregister_smb_share(
         if force_skipped {
             println!("Force unmount was not applied; background cleanup remains queued.");
         }
-        if wait {
-            wait_for_smb_cleanup(
-                &share.share_uuid,
+        Ok(wait.then(|| {
+            (
+                share.share_uuid.clone(),
                 Duration::from_secs(timeout.unwrap_or(300)),
             )
-            .map_err(|error| (1, error))?;
-        }
-        Ok(())
+        }))
     })();
-    finish_node_maintenance(maintenance, result)
+    let cleanup = finish_node_maintenance(maintenance, result)?;
+    if let Some((share_uuid, timeout)) = cleanup {
+        cleanup_wait(&share_uuid, timeout).map_err(|error| (1, error))?;
+    }
+    Ok(())
 }
 
 fn deferred_smb_mount_cleanup(
@@ -28132,6 +28158,51 @@ execution_uid = 501
         )
         .unwrap();
         assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn smb_cleanup_wait_runs_after_cluster_maintenance_is_released() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-smb-wait-order-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let state_dir = root.join("state");
+        fs::write(
+            &config_path,
+            "[cluster]\nname = \"test\"\ndefault_queue = \"compute\"\nshared_root = \"/Users/Shared/macluster\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"nas\"\nprotocol_version = 1\n\n[queues.compute]\nnodes = []\nscheduler = \"fifo\"\n\n[nodes.nas]\nhost = \"192.0.2.5\"\ntransport = \"storage\"\n\n[shares.smb]\nprotocol = \"smb\"\nserver = \"nas\"\nsource_root = \"/Partition_2\"\nmount_root = \"/Users/Shared/smb\"\nshare_uuid = \"00000000-0000-4000-8000-000000000002\"\nsmb_user = \"guest\"\n",
+        )
+        .unwrap();
+        Storage::open(&state_dir).unwrap();
+        let barrier = macluster_core::maintenance::maintenance_barrier_path(&config_path);
+        let observed = Arc::new(Mutex::new(None));
+        let observed_by_wait = Arc::clone(&observed);
+
+        super::unregister_smb_share_with_cleanup_wait(
+            &config_path,
+            &state_dir,
+            "smb",
+            Path::new("/Users/Shared/smb"),
+            false,
+            false,
+            true,
+            Some(1),
+            move |share_uuid, timeout| {
+                *observed_by_wait.lock().unwrap() =
+                    Some((share_uuid.to_owned(), timeout, barrier.exists()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().clone(),
+            Some((
+                "00000000-0000-4000-8000-000000000002".to_owned(),
+                Duration::from_secs(1),
+                false,
+            ))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

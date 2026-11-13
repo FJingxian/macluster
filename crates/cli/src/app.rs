@@ -8166,6 +8166,11 @@ fn remote_interactive_child_environment(
 fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
         Some("nfs-recovery") => crate::nfs_recovery::run(&args[1..]).map_err(|error| (1, error)),
+        Some("smb-discover-legacy") if args.len() == 1 => {
+            let config_path = resolved_config_path(global.config.as_deref());
+            let state_dir = state_root(global.state_dir.as_deref())?;
+            crate::node_admin::discover_legacy_smb_orphans(&config_path, &state_dir)
+        }
         Some("nfs-admin") => internal_nfs_admin(&args[1..]),
         Some("control-proxy") => {
             let config_path = resolved_config_path(global.config.as_deref());

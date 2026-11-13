@@ -17083,17 +17083,25 @@ fn pending_smb_cleanup_lines(path: &Path, now_unix_ms: u64) -> io::Result<Vec<St
                 / 1000;
             format!("next retry in {seconds}s")
         };
-        let kind = entry
-            .last_error_kind
-            .map(|kind| match kind {
-                SmbCleanupFailureKind::Busy => "busy",
-                SmbCleanupFailureKind::Unresponsive => "unresponsive",
-                SmbCleanupFailureKind::Offline => "offline",
-                SmbCleanupFailureKind::Authentication => "authentication",
-                SmbCleanupFailureKind::Permission => "permission",
-                SmbCleanupFailureKind::Unknown => "unknown",
-            })
-            .unwrap_or("pending");
+        let kind = if entry
+            .last_error_summary
+            .as_deref()
+            .is_some_and(|summary| summary.starts_with("legacy-orphan:"))
+        {
+            "legacy-orphan"
+        } else {
+            entry
+                .last_error_kind
+                .map(|kind| match kind {
+                    SmbCleanupFailureKind::Busy => "busy",
+                    SmbCleanupFailureKind::Unresponsive => "unresponsive",
+                    SmbCleanupFailureKind::Offline => "offline",
+                    SmbCleanupFailureKind::Authentication => "authentication",
+                    SmbCleanupFailureKind::Permission => "permission",
+                    SmbCleanupFailureKind::Unknown => "unknown",
+                })
+                .unwrap_or("pending")
+        };
         lines.push(format!(
             "  attempts {}; {}; {}",
             entry.attempts, kind, retry
@@ -18315,6 +18323,196 @@ fn reconcile_local_smb_shares_with_home(
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedSmbStateRecord {
+    share_uuid: String,
+    source_share: String,
+    logical: PathBuf,
+    backing: PathBuf,
+}
+
+fn parse_legacy_smb_state_records(
+    output: &str,
+    node_id: &str,
+    config: &ClusterConfig,
+    global_cleanup: &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup,
+) -> Vec<ManagedSmbStateRecord> {
+    let active = config
+        .shares
+        .values()
+        .map(|share| share.share_uuid.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let pending = global_cleanup
+        .nodes
+        .get(node_id)
+        .into_iter()
+        .flat_map(|entry| entry.shares.iter())
+        .map(|share| share.share_uuid.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let mut records = Vec::new();
+    let mut current_path = None;
+    let mut current_lines = Vec::new();
+    for line in output.lines().chain(std::iter::once("END")) {
+        if let Some(path) = line.strip_prefix("BEGIN\t") {
+            current_path = Some(PathBuf::from(path));
+            current_lines.clear();
+            continue;
+        }
+        if line == "END" {
+            let Some(path) = current_path.take() else {
+                current_lines.clear();
+                continue;
+            };
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                current_lines.clear();
+                continue;
+            };
+            let Some(file_uuid) = file_name
+                .strip_prefix("org.macluster.smb.")
+                .and_then(|name| name.strip_suffix(".state"))
+            else {
+                current_lines.clear();
+                continue;
+            };
+            let (share_uuid, source_share, logical, backing) = match current_lines.as_slice() {
+                [share_uuid, source_share, logical] => (*share_uuid, *source_share, *logical, None),
+                [share_uuid, source_share, logical, backing] => {
+                    (*share_uuid, *source_share, *logical, Some(*backing))
+                }
+                _ => {
+                    current_lines.clear();
+                    continue;
+                }
+            };
+            let managed_backing = format!("/Users/Shared/.macluster-mounts/{share_uuid}");
+            if Id128::parse(share_uuid).is_err()
+                || !file_uuid.eq_ignore_ascii_case(share_uuid)
+                || !safe_absolute_remote_path(source_share)
+                || !safe_absolute_remote_path(logical)
+                || backing.is_some_and(|backing| backing != managed_backing)
+                || active.contains(&share_uuid.to_ascii_lowercase())
+                || pending.contains(&share_uuid.to_ascii_lowercase())
+            {
+                current_lines.clear();
+                continue;
+            }
+            records.push(ManagedSmbStateRecord {
+                share_uuid: share_uuid.to_owned(),
+                source_share: source_share.to_owned(),
+                logical: PathBuf::from(logical),
+                backing: PathBuf::from(managed_backing),
+            });
+            current_lines.clear();
+            continue;
+        }
+        if current_path.is_some() {
+            current_lines.push(line);
+        }
+    }
+    records.sort_by(|left, right| {
+        (&left.share_uuid, &left.logical).cmp(&(&right.share_uuid, &right.logical))
+    });
+    records.dedup();
+    records
+}
+
+fn legacy_smb_state_scan_script() -> &'static str {
+    r#"support="$HOME/Library/Application Support/macluster/smb"
+[ -d "$support" ] || exit 0
+for state in "$support"/org.macluster.smb.*.state; do
+  [ -f "$state" ] || continue
+  printf 'BEGIN\t%s\n' "$state"
+  /bin/cat "$state"
+  printf '\nEND\n'
+done
+"#
+}
+
+fn adopt_legacy_smb_records_with(
+    node_id: &str,
+    node: &NodeConfig,
+    records: Vec<ManagedSmbStateRecord>,
+    mut queue: impl FnMut(DeferredSmbCredentialCleanup) -> Result<(), String>,
+    mut cleanup: impl FnMut(&ShareConfig) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut adopted = 0_usize;
+    for record in records {
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("legacy-orphan").expect("static node ID"),
+            source_root: record.source_share.into(),
+            mount_root: record.logical,
+            share_uuid: record.share_uuid,
+            allow_existing_contents: false,
+            smb_user: None,
+        };
+        let mut entry = deferred_smb_mount_cleanup(node_id, node, &share);
+        crate::smb_credentials::record_node_cleanup_failure(
+            &mut entry,
+            "legacy-orphan: managed helper state missing from active config",
+            unix_time_ms(),
+        );
+        queue(entry)?;
+        let _ = cleanup(&share);
+        adopted = adopted.saturating_add(1);
+    }
+    Ok(adopted)
+}
+
+pub(crate) fn discover_legacy_smb_orphans(config_path: &Path, _state_dir: &Path) -> AppResult<()> {
+    let config = read_config(config_path)?;
+    let global_path =
+        macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default_path()
+            .map_err(io_error)?;
+    let global =
+        macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::load(&global_path)
+            .map_err(io_error)?;
+    let mut adopted = 0_usize;
+    for (node_id, node) in &config.nodes {
+        if !config.is_operational_node(node_id)
+            || (node.transport == Transport::Ssh && !node_ssh_endpoint_reachable(node))
+        {
+            continue;
+        }
+        let Ok(output) = ssh_output_with_timeout(
+            node,
+            legacy_smb_state_scan_script(),
+            None,
+            Duration::from_secs(5),
+        ) else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let records = parse_legacy_smb_state_records(
+            &String::from_utf8_lossy(&output.stdout),
+            node_id,
+            &config,
+            &global,
+        );
+        adopted = adopted.saturating_add(
+            adopt_legacy_smb_records_with(
+                node_id,
+                node,
+                records,
+                crate::smb_credentials::queue_global_node_cleanup,
+                |share| unmount_smb_share_for_cleanup(node, share),
+            )
+            .map_err(|error| {
+                (
+                    1,
+                    format!("cannot queue legacy SMB cleanup for {node_id}: {error}"),
+                )
+            })?,
+        );
+    }
+    if adopted > 0 {
+        eprintln!("macluster: adopted {adopted} legacy SMB mount cleanup record(s)");
     }
     Ok(())
 }
@@ -28023,6 +28221,136 @@ execution_uid = 501
         assert!(!support.join(format!("{label}.state")).exists());
         assert!(!support.join(format!("{label}.sh")).exists());
         assert!(!agents.join(format!("{label}.plist")).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_smb_state_parser_adopts_only_exact_managed_orphans() {
+        let uuid = "928e8976-c946-509d-9e62-a3ef787664b7";
+        let output = format!(
+            "BEGIN\t/Users/operator/Library/Application Support/macluster/smb/org.macluster.smb.{uuid}.state\n{uuid}\n/data\n/Users/operator/data\n/Users/Shared/.macluster-mounts/{uuid}\nEND\n"
+        );
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n",
+        )
+        .unwrap();
+
+        let records = super::parse_legacy_smb_state_records(
+            &output,
+            "worker",
+            &config,
+            &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default(),
+        );
+
+        assert_eq!(
+            records,
+            vec![super::ManagedSmbStateRecord {
+                share_uuid: uuid.into(),
+                source_share: "/data".into(),
+                logical: PathBuf::from("/Users/operator/data"),
+                backing: PathBuf::from(format!("/Users/Shared/.macluster-mounts/{uuid}")),
+            }]
+        );
+
+        let foreign = output.replace(
+            &format!("/Users/Shared/.macluster-mounts/{uuid}"),
+            "/Users/Shared/.macluster-mounts/foreign",
+        );
+        assert!(
+            super::parse_legacy_smb_state_records(
+                &foreign,
+                "worker",
+                &config,
+                &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default(),
+            )
+            .is_empty()
+        );
+
+        let mut configured = config.clone();
+        configured.shares.insert(
+            "configured".into(),
+            ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: NodeId::new("nas").unwrap(),
+                source_root: "/data".into(),
+                mount_root: "/Users/operator/data".into(),
+                share_uuid: uuid.into(),
+                allow_existing_contents: false,
+                smb_user: Some("smb-user".into()),
+            },
+        );
+        assert!(
+            super::parse_legacy_smb_state_records(
+                &output,
+                "worker",
+                &configured,
+                &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default(),
+            )
+            .is_empty()
+        );
+
+        assert!(
+            super::parse_legacy_smb_state_records(
+                "malformed",
+                "worker",
+                &config,
+                &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_smb_adoption_queues_before_removing_the_alias() {
+        let root = std::env::temp_dir().join(format!("macluster-legacy-adopt-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let logical = root.join("data");
+        let uuid = "928e8976-c946-509d-9e62-a3ef787664b7";
+        std::os::unix::fs::symlink(format!("/Users/Shared/.macluster-mounts/{uuid}"), &logical)
+            .unwrap();
+        let node = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("machine".into()),
+            execution_uid: Some(501),
+        };
+        let record = super::ManagedSmbStateRecord {
+            share_uuid: uuid.into(),
+            source_share: "/data".into(),
+            logical: logical.clone(),
+            backing: PathBuf::from(format!("/Users/Shared/.macluster-mounts/{uuid}")),
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+        let queue_events = std::sync::Arc::clone(&events);
+        let cleanup_events = std::sync::Arc::clone(&events);
+
+        let adopted = super::adopt_legacy_smb_records_with(
+            "worker",
+            &node,
+            vec![record],
+            move |entry| {
+                queue_events.lock().unwrap().push("queue");
+                assert_eq!(entry.shares[0].share_uuid, uuid);
+                Ok(())
+            },
+            |share| {
+                assert_eq!(cleanup_events.lock().unwrap().as_slice(), ["queue"]);
+                assert_eq!(share.mount_root, logical);
+                cleanup_events.lock().unwrap().push("cleanup");
+                fs::remove_file(&logical).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(adopted, 1);
+        assert_eq!(*events.lock().unwrap(), ["queue", "cleanup"]);
+        assert!(!logical.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -47,6 +47,7 @@ const CONTROL_WORKERS: usize = 4;
 const FAN_CONTROL_WORKERS: usize = 2;
 const FAN_CONTROL_NODE_WORKERS: usize = 32;
 const SMB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const LEGACY_SMB_DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
 const FAN_CONTROL_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
@@ -2930,6 +2931,7 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
     let mut next_maintenance_attempt = Instant::now();
     let mut next_job_storage_sweep = Instant::now();
     let mut next_smb_cleanup_retry = Instant::now();
+    let mut next_legacy_smb_discovery = Instant::now();
     if let Some((_, api)) = control.as_mut() {
         service.set_maintenance_scope(api.maintenance_scope());
     }
@@ -2958,6 +2960,10 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         if Instant::now() >= next_smb_cleanup_retry {
             next_smb_cleanup_retry = Instant::now() + SMB_CLEANUP_RETRY_INTERVAL;
+        }
+        if Instant::now() >= next_legacy_smb_discovery && !maintenance_active {
+            start_legacy_smb_discovery();
+            next_legacy_smb_discovery = Instant::now() + LEGACY_SMB_DISCOVERY_INTERVAL;
         }
         runtime.poll_workers(service)?;
         if let Some(measurement) = runtime.take_job_storage_measurement()
@@ -3489,6 +3495,22 @@ fn start_global_smb_cleanup_retry() {
         .spawn(move || {
             let _ = std::process::Command::new(executable)
                 .args(["internal", "smb-cleanup", "retry"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+}
+
+fn start_legacy_smb_discovery() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("macluster-smb-discover-legacy".into())
+        .spawn(move || {
+            let _ = std::process::Command::new(executable)
+                .args(["internal", "smb-discover-legacy"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())

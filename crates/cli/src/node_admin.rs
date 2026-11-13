@@ -5009,12 +5009,40 @@ fn controller_migration_target_script(
     let state_dir = target_home.join("Library/Application Support/macluster/controller");
     let staging = target_home.join(format!(".macluster-controller-migration-{operation_id}"));
     format!(
-        "set -eu\nconfig={config}\nstate={state}\nstaging={staging}\nif [ -e \"$config\" ] || [ -e \"$state/controller.sqlite3\" ]; then echo 'target already has active controller configuration or state' >&2; exit 9; fi\n/bin/rm -rf \"$staging\"\n/bin/mkdir -p \"$staging\"\n/usr/bin/tar -xzf - -C \"$staging\"\n/bin/mkdir -p \"$(/usr/bin/dirname \"$config\")\" \"$state\"\n/bin/cp \"$staging/config.toml\" \"$config\"\n/bin/cp -R \"$staging/controller/.\" \"$state/\"\n{bin} --config \"$config\" --state-dir \"$state\" controller start\n/bin/rm -rf \"$staging\"\n",
+        "set -eu\nconfig={config}\nstate={state}\nstaging={staging}\nif [ -e \"$config\" ] || [ -e \"$state/controller.sqlite3\" ]; then echo 'target already has active controller configuration or state' >&2; exit 9; fi\n/bin/rm -rf \"$staging\"\n/bin/mkdir -p \"$staging\"\n/usr/bin/tar -xzf - -C \"$staging\"\n/bin/mkdir -p \"$(/usr/bin/dirname \"$config\")\" \"$state\"\n/bin/cp \"$staging/config.toml\" \"$config\"\n/bin/cp -R \"$staging/controller/.\" \"$state/\"\n{bin} --config \"$config\" --state-dir \"$state\" controller start\n{bin} --config \"$config\" --state-dir \"$state\" internal sync-peer-config\n{bin} --config \"$config\" --state-dir \"$state\" controller restart\n{bin} --config \"$config\" --state-dir \"$state\" mnode -l >/dev/null\n/bin/rm -rf \"$staging\"\n",
         config = shell_quote(&config_path.to_string_lossy()),
         state = shell_quote(&state_dir.to_string_lossy()),
         staging = shell_quote(&staging.to_string_lossy()),
         bin = shell_quote(&target.remote_binary),
     )
+}
+
+fn run_controller_migration_target_command(
+    target: &NodeConfig,
+    script: &str,
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Output, String> {
+    ssh_output_with_timeout(target, script, input, timeout).map_err(|(_, error)| error)
+}
+
+fn stage_controller_migration_target_binary(target: &NodeConfig) -> AppResult<()> {
+    let source = std::env::current_exe().map_err(io_error)?;
+    let source = source.canonicalize().map_err(io_error)?;
+    let staging = format!(
+        "{}.macluster-stage-{}",
+        target.remote_binary,
+        Id128::random()
+    );
+    scp_to_node(target, &source, &staging)?;
+    let install = format!(
+        "/bin/chmod 700 {} && /bin/mv -f {} {}",
+        shell_quote(&staging),
+        shell_quote(&staging),
+        shell_quote(&target.remote_binary),
+    );
+    remote_run(target, &install, None)?;
+    Ok(())
 }
 
 fn controller_migration_target_cleanup_script(
@@ -5068,8 +5096,8 @@ fn run_target_smb_master_command(
         .collect::<Vec<_>>()
         .join(" ");
     let input = include_password.then(|| provision.credential.password.as_secret().as_bytes());
-    let output = ssh_output_with_timeout(target, &command, input, Duration::from_secs(45))
-        .map_err(|(_, error)| error)?;
+    let output =
+        run_controller_migration_target_command(target, &command, input, Duration::from_secs(45))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -5132,6 +5160,16 @@ fn stage_target_smb_masters(
 
 fn controller_migration_may_restart_old(was_running: bool, target_cleanup_ok: bool) -> bool {
     was_running && target_cleanup_ok
+}
+
+fn controller_migration_peer_sync_error_is_local_only(
+    error: &str,
+    local_node_id: Option<&str>,
+) -> bool {
+    local_node_id.is_some_and(|node_id| {
+        !error.contains("; ")
+            && error.contains(&format!("remote config sync is pending on {node_id}:"))
+    })
 }
 
 fn controller_migration_join_endpoint(target: &NodeConfig) -> Result<String, String> {
@@ -5301,6 +5339,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     if force_migration {
         confirm_force_controller_migration(&blockers)?;
     }
+    stage_controller_migration_target_binary(&target)?;
     let facts = read_remote_facts(&target).map_err(|(_, error)| (1, error))?;
     if !remote_os_is_macos(&facts.os) {
         return Err((1, "controller target must be a macOS node".into()));
@@ -5317,7 +5356,9 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         &target_state,
         &target.remote_binary,
     );
-    let preflight = ssh_output(&target, &preflight, None).map_err(|(_, error)| (1, error))?;
+    let preflight =
+        run_controller_migration_target_command(&target, &preflight, None, Duration::from_secs(30))
+            .map_err(|error| (1, error))?;
     if !preflight.status.success() {
         return Err((
             1,
@@ -5340,7 +5381,8 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
     let candidate =
         controller_migration_candidate(&migration_config, &source, target_id.as_str(), facts.uid)?;
     let candidate = apply_recovered_smb_users(&candidate, &recovered_smb_users)?;
-    ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
+    let candidate_config =
+        ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
     let was_running = manager
         .intent()
         .map_err(|error| (1, format!("cannot read controller service intent: {error}")))?
@@ -5451,15 +5493,19 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         cleanup_target_smb_masters(&target, &smb_masters);
         let cleanup_script =
             controller_migration_target_cleanup_script(&target, &target_home, &operation_id);
-        let cleanup =
-            ssh_output_with_timeout(&target, &cleanup_script, None, Duration::from_secs(30));
+        let cleanup = run_controller_migration_target_command(
+            &target,
+            &cleanup_script,
+            None,
+            Duration::from_secs(30),
+        );
         let cleanup_error = match cleanup {
             Ok(output) if output.status.success() => None,
             Ok(output) => Some(command_error(
                 "stop and remove the failed target controller",
                 &output,
             )),
-            Err((_, error)) => Some(error),
+            Err(error) => Some(error),
         };
         let restart = if controller_migration_may_restart_old(was_running, cleanup_error.is_none())
         {
@@ -5489,8 +5535,12 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         }
         Err((1, message))
     };
-    let activation =
-        ssh_output_with_timeout(&target, &script, Some(&archive), Duration::from_secs(120));
+    let activation = run_controller_migration_target_command(
+        &target,
+        &script,
+        Some(&archive),
+        Duration::from_secs(120),
+    );
     let activation = match activation {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
@@ -5499,7 +5549,7 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
                 command_error("activate controller target", &output)
             ));
         }
-        Err((_, error)) => return target_failure(format!("target activation failed: {error}")),
+        Err(error) => return target_failure(format!("target activation failed: {error}")),
     };
     drop(activation);
     let config_path_text = target_home
@@ -5516,19 +5566,20 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
         shell_quote(&config_path_text),
         shell_quote(&state_dir_text),
     );
-    let verified = ssh_output_with_timeout(&target, &verify, None, Duration::from_secs(30))
-        .map_err(|(_, error)| error)
-        .and_then(|output| {
-            if output.status.success() && String::from_utf8_lossy(&output.stdout).contains("Ready")
-            {
-                Ok(output)
-            } else {
-                Err(format!(
-                    "target did not become Ready: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ))
-            }
-        });
+    let verified =
+        run_controller_migration_target_command(&target, &verify, None, Duration::from_secs(30))
+            .and_then(|output| {
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("Ready")
+                {
+                    Ok(output)
+                } else {
+                    Err(format!(
+                        "target did not become Ready: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ))
+                }
+            });
     let verified = match verified {
         Ok(output) => output,
         Err(error) => return target_failure(error),
@@ -5546,6 +5597,56 @@ fn migrate_controller(config_path: &Path, state_dir: &Path, target_id: &NodeId) 
             .unwrap_or_else(|_| format!("{}@{}", target.host, target.host));
         eprintln!(
             "Warning: controller migration succeeded, but this login client could not be updated automatically: {error}. Run `macluster --join {endpoint}` to finish client setup."
+        );
+    }
+    let local_uuid = crate::app::local_machine_uuid().ok();
+    let local_node_id = local_uuid.and_then(|uuid| {
+        config
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.machine_uuid
+                    .as_deref()
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&uuid))
+            })
+            .map(|(id, _)| id.clone())
+    });
+    if local_node_id.is_some()
+        && let Err((_, error)) = atomic_write(&config_path, candidate.as_bytes())
+    {
+        eprintln!(
+            "Warning: controller migration succeeded, but the local config could not be updated: {error}"
+        );
+    }
+    if let Err(error) = sync_remote_configs(
+        &candidate_config,
+        &candidate,
+        state_dir,
+        &Id128::random().to_string(),
+        None,
+    ) {
+        if !controller_migration_peer_sync_error_is_local_only(&error, local_node_id.as_deref()) {
+            eprintln!(
+                "Warning: controller migration succeeded, but peer config synchronization is deferred: {error}"
+            );
+        }
+    }
+    let refresh = format!(
+        "{} --config {} --state-dir {} mnode -l >/dev/null",
+        shell_quote(&target.remote_binary),
+        shell_quote(&config_path_text),
+        shell_quote(&state_dir_text),
+    );
+    if let Err(error) =
+        run_controller_migration_target_command(&target, &refresh, None, Duration::from_secs(30))
+            .and_then(|output| {
+                output.status.success().then_some(()).ok_or_else(|| {
+                    command_error("refresh target node health after migration", &output)
+                })
+            })
+    {
+        eprintln!(
+            "Warning: controller migration succeeded, but target node health refresh is deferred: {error}"
         );
     }
     println!(
@@ -5909,6 +6010,10 @@ pub(crate) fn read_remote_facts(node: &NodeConfig) -> AppResult<RemoteFacts> {
     if !output.status.success() {
         return Err((1, command_error("SSH preflight failed", &output)));
     }
+    parse_remote_facts(&output)
+}
+
+fn parse_remote_facts(output: &Output) -> AppResult<RemoteFacts> {
     let mut facts = BTreeMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some((key, value)) = line.split_once('=') {
@@ -15728,6 +15833,26 @@ fn nfs_mapping(
 }
 
 fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
+    let provider_states = rows
+        .iter()
+        .flat_map(|row| {
+            row.mappings
+                .iter()
+                .filter(|mapping| mapping.source_node == row.columns[0])
+                .map(move |mapping| {
+                    (
+                        (
+                            mapping.name.clone(),
+                            mapping.protocol.to_string(),
+                            mapping.source_node.clone(),
+                            mapping.source_uri.clone(),
+                            mapping.target.clone(),
+                        ),
+                        mapping.state,
+                    )
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut indexes: BTreeMap<(String, String, String, String, String), usize> = BTreeMap::new();
     let mut mappings: Vec<NodeNfsMapping> = Vec::new();
     for mapping in rows.iter().flat_map(|row| &row.mappings) {
@@ -15755,6 +15880,18 @@ fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
         } else {
             indexes.insert(key, mappings.len());
             mappings.push(mapping.clone());
+        }
+    }
+    for mapping in &mut mappings {
+        let key = (
+            mapping.name.clone(),
+            mapping.protocol.to_string(),
+            mapping.source_node.clone(),
+            mapping.source_uri.clone(),
+            mapping.target.clone(),
+        );
+        if let Some(state) = provider_states.get(&key) {
+            mapping.state = state;
         }
     }
     mappings
@@ -22499,19 +22636,21 @@ mod tests {
         abort_duplicate_pristine_adds, acquire_maintenance_client_lock, acquire_node_maintenance,
         acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
         add_node_admin_ssh_pool_args, admin_shell_command, agent_update_completion_summary,
-        agent_update_maintenance_scope, agent_update_recovery_pending, cached_node_list_state,
-        candidate_admin_script, classify_configured_agents, cleanup_node_from_endpoint,
-        client_mount_admin_request, client_mount_batch_script, client_mount_status_awk_script,
-        client_nfs_cleanup_batch_script, client_nfs_cleanup_plan, client_share_alias_script,
-        config_path_candidate, controller_command_matches, ensure_controller_recovery_clean,
-        ensure_no_node_maintenance_in_progress, existing_ssh_endpoint_matches, format_node_list,
-        has_committed_config_generation_path, inspect_configured_agent_build,
-        installed_helper_sequence_from_error, list_nodes, local_config_candidate,
-        maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
-        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
-        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
-        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
-        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mount_source,
+        agent_update_maintenance_scope, agent_update_recovery_pending, aggregate_nfs_mappings,
+        cached_node_list_state, candidate_admin_script, classify_configured_agents,
+        cleanup_node_from_endpoint, client_mount_admin_request, client_mount_batch_script,
+        client_mount_status_awk_script, client_nfs_cleanup_batch_script, client_nfs_cleanup_plan,
+        client_share_alias_script, config_path_candidate, controller_command_matches,
+        controller_migration_peer_sync_error_is_local_only, controller_migration_target_script,
+        ensure_controller_recovery_clean, ensure_no_node_maintenance_in_progress,
+        existing_ssh_endpoint_matches, format_node_list, has_committed_config_generation_path,
+        inspect_configured_agent_build, installed_helper_sequence_from_error, list_nodes,
+        local_config_candidate, maintenance_inputs_unchanged, managed_binary_digest,
+        migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
+        named_share_mount_status, named_share_operation_endpoint, named_share_operation_matches,
+        named_share_request_matches, nfs_exports_read_command,
+        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
+        nfs_exports_update_script_for_expected, nfs_mapping, nfs_mount_source,
         node_admin_recovery_pending, node_nfs_mappings, node_ssh_endpoint_reachable,
         normalize_binary_path, parse_action, parse_agent_build_probe,
         parse_nfs_exports_update_baseline, peer_config_sync_pending,
@@ -22522,7 +22661,7 @@ mod tests {
         provider_storage_inventory, queue_candidate_with_node, reachable_configured_node_ids,
         read_admin_state, remote_config_belongs_to_cluster, remote_execution_status,
         reset_admin_operations, reset_node_from_endpoint, resume_existing_ssh_add_sync,
-        save_admin_state, should_resume_add_operation, shutdown_confirmation_accepted,
+        save_admin_state, shell_quote, should_resume_add_operation, shutdown_confirmation_accepted,
         unavailable_share_client_nodes, update_recovery, validate_pending_node_identity,
         validate_storage_root_access,
     };
@@ -25088,6 +25227,48 @@ execution_uid = 501
     }
 
     #[test]
+    fn storage_mapping_uses_the_provider_state_when_a_client_report_is_stale() {
+        let ready = nfs_mapping(
+            "login",
+            "primary",
+            "login",
+            Path::new("/Users/Shared/macluster"),
+            Path::new("/Users/Shared/macluster"),
+            StorageProtocol::Nfs,
+            "READY",
+        );
+        let stale = nfs_mapping(
+            "worker",
+            "primary",
+            "login",
+            Path::new("/Users/Shared/macluster"),
+            Path::new("/Users/Shared/macluster"),
+            StorageProtocol::Nfs,
+            "UNKNOWN",
+        );
+        let row = |id: &str, mapping: NodeNfsMapping| NodeListRow {
+            columns: [
+                id.into(),
+                "192.0.2.1".into(),
+                "-".into(),
+                "22".into(),
+                "-".into(),
+                "-".into(),
+                "READY".into(),
+            ],
+            mappings: vec![mapping],
+            storage: NodeStorageInventory::default(),
+        };
+
+        let mappings = aggregate_nfs_mappings(&[row("login", ready), row("worker", stale)]);
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings[0].state, "READY",
+            "the storage provider's authenticated health must not be overridden by a stale client"
+        );
+    }
+
+    #[test]
     fn node_list_refreshes_stale_health_before_rendering_mapping_state() {
         let config = parse_build_test_config();
         let root = test_exports_path();
@@ -27343,6 +27524,91 @@ execution_uid = 501
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn controller_migration_target_synchronizes_peer_configs_before_verification() {
+        use std::{
+            io::Write,
+            os::unix::fs::PermissionsExt,
+            process::{Command, Stdio},
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-migration-config-sync-{}",
+            Id128::random()
+        ));
+        let home = root.join("home");
+        let stage = root.join("stage");
+        let binary = root.join("macluster");
+        let log = root.join("commands.log");
+        fs::create_dir_all(home.join(".config/macluster")).unwrap();
+        fs::create_dir_all(home.join("Library/Application Support/macluster/controller")).unwrap();
+        fs::create_dir_all(stage.join("controller")).unwrap();
+        fs::write(stage.join("config.toml"), "[cluster]\nname=\"test\"\n").unwrap();
+        fs::write(stage.join("controller/controller.sqlite3"), b"state").unwrap();
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+                shell_quote(&log.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let target = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: binary.to_string_lossy().into_owned(),
+            ssh_user: Some("operator".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let operation_id = Id128::random().to_string();
+        let script = controller_migration_target_script(&target, &home, &operation_id);
+        let archive = root.join("migration.tar.gz");
+        assert!(
+            Command::new("/usr/bin/tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(&stage)
+                .args(["config.toml", "controller"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&fs::read(&archive).unwrap())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(
+            commands.contains("internal sync-peer-config"),
+            "target controller must synchronize the migrated config before health verification: {commands}"
+        );
+        assert!(
+            commands.contains("controller restart"),
+            "target controller must refresh cached health after peer config synchronization: {commands}"
+        );
+        assert!(
+            commands.contains("mnode -l"),
+            "target migration must refresh authoritative node health before returning: {commands}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn controller_migration_does_not_archive_target_before_storage_validation() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -27426,6 +27692,27 @@ execution_uid = 501
         assert!(!super::controller_migration_may_restart_old(true, false));
         assert!(!super::controller_migration_may_restart_old(false, true));
         assert!(!super::controller_migration_may_restart_old(false, false));
+    }
+
+    #[test]
+    fn controller_migration_suppresses_only_a_local_self_sync_failure() {
+        let local = "remote config sync is pending on login-01: permission denied";
+        assert!(controller_migration_peer_sync_error_is_local_only(
+            local,
+            Some("login-01")
+        ));
+        assert!(!controller_migration_peer_sync_error_is_local_only(
+            local,
+            Some("default-003")
+        ));
+        assert!(!controller_migration_peer_sync_error_is_local_only(
+            "remote config sync is pending on default-003: timeout",
+            Some("login-01")
+        ));
+        assert!(!controller_migration_peer_sync_error_is_local_only(
+            "remote config sync is pending on login-01: permission denied; default-003: timeout",
+            Some("login-01")
+        ));
     }
 
     #[test]

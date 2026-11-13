@@ -65,7 +65,9 @@ macluster node -l default-001
 
 节点通过 Agent 和共享存储验证后才会进入正式集群。`node -l` 提供紧凑的集群视图；在命令后附加一个节点 ID，可查看该 Mac 的 host、SSH 账户、端口和详细存储信息。加入失败的尝试保留在恢复记录中，可用 `macluster node --failed` 查看错误，再重试原来的加入命令。
 
-所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller、login client 或存储 Mac。无法接入统一 Agent 的外部 NFS/SMB 节点只显示为 storage mapping。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
+所有可由 Agent 管理的 Mac 都会显示在 `mtop`、`mqueue`、`mfans` 和浏览器监控中，包括没有 compute 角色的 controller 或 login client。`mnode` 的 `ROLES` 只显示 `controller` 和 `compute`，NFS/SMB 所有权统一通过 storage mapping 展示。无法接入统一 Agent 的外部 NFS/SMB 节点只显示为 storage mapping。队列调度资格仍单独判断。`mnode -l --storage` 会以有界并发刷新系统盘、外接盘和已挂载共享的容量；普通 `mnode -l` 优先使用缓存容量。
+
+提交快照会从 controller 本地状态分块发送给存储 Agent；选中的计算 Agent 也会在 `StartJob` 前收到任务脚本。因此，controller 发布和启动任务不再需要直接读取或写入 NFS。任务输入、输出和日志同步仍依赖相关节点能够访问配置的共享存储。
 
 加入节点时会安装 Agent、配置共享空间。若没有 SSH 密钥登录，可在核对指纹并输入远程账户登录密码后安装密钥。NFS 和特权 helper 的配置还可能需要每台相关 Mac 的管理员授权，两者用途不同。
 

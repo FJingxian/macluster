@@ -364,16 +364,25 @@ fn mount_table_has_exact(mount_table: &str, mount: &ClientMount) -> bool {
                 && actual_target == mount.physical_target
                 && filesystem == Some("nfs")
         } else {
+            // macOS prints authenticated SMB sources as
+            // `//USER@HOST/SHARE`; compare the account and endpoint
+            // independently so success does not depend on how the source
+            // was normalized by the mount helper.
             let expected = mount.source.trim_start_matches("//");
+            let (expected_user, expected_endpoint) = expected
+                .rsplit_once('@')
+                .map_or((None, expected), |(user, endpoint)| (Some(user), endpoint));
+            let (actual_user, actual_endpoint) = actual_source
+                .trim_start_matches("//")
+                .rsplit_once('@')
+                .map_or(
+                    (None, actual_source.trim_start_matches("//")),
+                    |(user, endpoint)| (Some(user), endpoint),
+                );
             actual_target == mount.physical_target
                 && filesystem == Some("smbfs")
-                && actual_source
-                    .trim_start_matches("//")
-                    .rsplit_once('@')
-                    .map_or(actual_source.trim_start_matches("//"), |(_, endpoint)| {
-                        endpoint
-                    })
-                    .ends_with(expected)
+                && actual_endpoint == expected_endpoint
+                && expected_user.is_none_or(|expected| actual_user == Some(expected))
         }
     })
 }
@@ -693,6 +702,32 @@ mod tests {
         assert_eq!(
             missing_mounts(&descriptor, wrong_source, None, "192.0.2.10"),
             vec!["/Volumes/project".to_owned()]
+        );
+        let mounted_smb = "//smb-user@192.0.2.20/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
+        assert!(
+            missing_mounts(&descriptor, mounted_smb, None, "192.0.2.10").is_empty(),
+            "authenticated SMB source must match after both actual and expected usernames are normalized"
+        );
+    }
+
+    #[test]
+    fn smb_mount_rejects_endpoint_suffix_match() {
+        let mut descriptor = descriptor();
+        descriptor.shares.push(ClientShareDescriptor {
+            id: "smb-project".into(),
+            server: "nas".parse().unwrap(),
+            protocol: "smb".into(),
+            server_host: "192.0.2.20".into(),
+            source_root: "/data/project".into(),
+            mount_root: "/Volumes/project".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            smb_user: Some("smb-user".into()),
+        });
+        let suffix_only_match = "//smb-user@evil-192.0.2.20/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
+        assert_eq!(
+            missing_mounts(&descriptor, suffix_only_match, None, "192.0.2.10"),
+            vec!["/Volumes/project".to_owned()],
+            "SMB host/share matching must not accept a source whose endpoint only shares a suffix"
         );
     }
 

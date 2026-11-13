@@ -1880,6 +1880,18 @@ fn status(state_dir: &Path) -> Result<ExecutionStatus, ProtocolError> {
         if had_stale_barrier && store.nfs_reboot_barrier.is_none() {
             write_store(state_dir, &store).map_err(protocol_failed)?;
         }
+        let legacy_interactive_log_pending = store.active.as_ref().is_some_and(|record| {
+            record.terminal() && record.log_sync_pending && record.spec.mode == JobMode::Interactive
+        });
+        if legacy_interactive_log_pending {
+            // Interactive output has already been streamed to the attached
+            // terminal. Older records may still carry a pending shared-log
+            // flag; release the node instead of blocking the next task.
+            let record = store.active.as_mut().expect("checked interactive record");
+            record.log_sync_pending = false;
+            record.log_sync_retry_after_unix_ms = None;
+            write_store(state_dir, &store).map_err(protocol_failed)?;
+        }
         let Some(record) = store.active.as_mut() else {
             return Err(ProtocolError::NotFound);
         };
@@ -2188,6 +2200,18 @@ pub(crate) fn finalize_active(
     exit_code: Option<i32>,
     reason: Option<String>,
 ) -> Result<AgentRecord, AgentError> {
+    finalize_active_with_log_sync(state_dir, job_id, token, state, exit_code, reason, true)
+}
+
+pub(crate) fn finalize_active_with_log_sync(
+    state_dir: &Path,
+    job_id: u64,
+    token: StartToken,
+    state: JobState,
+    exit_code: Option<i32>,
+    reason: Option<String>,
+    log_sync_pending: bool,
+) -> Result<AgentRecord, AgentError> {
     let _lock = StateLock::acquire(state_dir)?;
     let mut store = read_store(state_dir)?;
     let record = store
@@ -2204,7 +2228,7 @@ pub(crate) fn finalize_active(
     record.phase = RuntimePhase::Idle;
     record.child_pid = None;
     record.child_start_id = None;
-    record.log_sync_pending = true;
+    record.log_sync_pending = log_sync_pending;
     record.log_sync_retry_after_unix_ms = None;
     let output = record.clone();
     write_store(state_dir, &store)?;
@@ -2425,7 +2449,11 @@ fn primary_nfs_mount_matches(
         source_root.display(),
         mount_root.display()
     );
-    mount_output.lines().any(|line| line.starts_with(&expected))
+    mount_output
+        .lines()
+        .filter(|line| line.starts_with(&expected))
+        .count()
+        == 1
 }
 
 fn named_nfs_mount_matches(
@@ -2439,7 +2467,11 @@ fn named_nfs_mount_matches(
         source_root.display(),
         mount_root.display()
     );
-    mount_output.lines().any(|line| line.starts_with(&expected))
+    mount_output
+        .lines()
+        .filter(|line| line.starts_with(&expected))
+        .count()
+        == 1
 }
 
 fn read_share_marker(path: &Path) -> Result<String, AgentError> {
@@ -4209,6 +4241,27 @@ execution_uid = 501
     }
 
     #[test]
+    fn status_releases_legacy_interactive_log_pending_records() {
+        let current_boot = boot_id();
+        let (root, state_dir, _token, _shared) = status_fixture(
+            "legacy-interactive-logs",
+            &current_boot,
+            Some(JobState::Completed),
+            true,
+        );
+        let mut store = read_store(&state_dir).unwrap();
+        store.active.as_mut().unwrap().spec.mode = JobMode::Interactive;
+        write_store(&state_dir, &store).unwrap();
+
+        let status = status(&state_dir).unwrap();
+        let record = read_store(&state_dir).unwrap().active.unwrap();
+
+        assert!(!status.log_sync_pending);
+        assert!(!record.log_sync_pending);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn status_keeps_sync_pending_when_the_shared_root_is_not_the_nfs_mount() {
         let current_boot = boot_id();
         let (root, state_dir, _token, shared) = status_fixture(
@@ -4555,6 +4608,21 @@ execution_uid = 501
             result.is_ok(),
             "primary mount health must not open the NFS path: {result:?}"
         );
+    }
+
+    #[test]
+    fn primary_client_health_rejects_stacked_expected_mounts() {
+        let mut config = status_config(Path::new("/definitely/missing/primary"));
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        config.storage_source_root = Some(PathBuf::from("/Volumes/primary"));
+        let mount_output = concat!(
+            "192.0.2.2:/Volumes/primary on /definitely/missing/primary (nfs, nodev, nosuid)\n",
+            "192.0.2.2:/Volumes/primary on /definitely/missing/primary (nfs, nodev, nosuid)\n"
+        );
+
+        let result = verify_share_with_mount_output(&config, "login-01", mount_output);
+
+        assert!(matches!(result, Err(AgentError::SharedStorage)));
     }
 
     #[test]

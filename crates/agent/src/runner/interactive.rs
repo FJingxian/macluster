@@ -635,13 +635,14 @@ fn run_authorized_with_attach_timeout(
             }
         }
     }
-    crate::finalize_active(
+    crate::finalize_active_with_log_sync(
         state_dir,
         job_id,
         token,
         result.state,
         result.exit_code,
         result.reason,
+        false,
     )?;
     let _ = fs::remove_file(&socket_path);
     Ok(())
@@ -667,13 +668,22 @@ fn wait_for_attachment(
             return Ok(None);
         }
         if let Some(cause) = record.termination_cause {
-            crate::finalize_active(state_dir, job_id, token, cause, None, record.end_reason)?;
+            crate::finalize_active_with_log_sync(
+                state_dir,
+                job_id,
+                token,
+                cause,
+                None,
+                record.end_reason,
+                false,
+            )?;
             return Ok(None);
         }
         if Instant::now() >= deadline {
-            crate::finalize_active(
+            crate::finalize_active_with_log_sync(
                 state_dir, job_id, token, JobState::Failed, None,
                 Some("interactive terminal did not attach before the allocation timeout; user command was not started".into()),
+                false,
             )?;
             return Ok(None);
         }
@@ -1913,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn local_pty_shell_accepts_input_and_streams_output() {
+    fn completed_interactive_output_does_not_block_the_node_on_shared_log_sync() {
         let (root, state_dir, token) = ready_interactive_state(None, None);
         let runner = run_in_thread(state_dir.clone(), token);
         let mut attachment = attach_socket(&state_dir, 1, token);
@@ -1925,12 +1935,8 @@ mod tests {
         assert!(output.contains("INTERACTIVE_PTY_MARKER"), "{output}");
         let record = crate::active_record(&state_dir, 1, token).unwrap();
         assert_eq!(record.terminal_state, Some(JobState::Completed));
-        assert!(record.log_sync_pending);
-        crate::runner::publish_logs_for_test(&state_dir, record).unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("shared/jobs/1/stdout.log")).unwrap(),
-            output
-        );
+        assert!(!record.log_sync_pending);
+        assert!(!root.join("shared/jobs/1/stdout.log").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

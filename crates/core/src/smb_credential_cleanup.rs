@@ -113,9 +113,10 @@ impl GlobalSmbCredentialCleanup {
             pending.wait_for_unmount |= entry.wait_for_unmount;
             pending.attempts = pending.attempts.max(entry.attempts);
             pending.next_retry_unix_ms =
-                match (pending.next_retry_unix_ms, entry.next_retry_unix_ms) {
-                    (0, next) | (next, 0) => next,
-                    (current, next) => current.min(next),
+                if pending.next_retry_unix_ms == 0 || entry.next_retry_unix_ms == 0 {
+                    0
+                } else {
+                    pending.next_retry_unix_ms.min(entry.next_retry_unix_ms)
                 };
             if entry.last_error_kind.is_some() {
                 pending.last_error_kind = entry.last_error_kind;
@@ -328,5 +329,39 @@ mod tests {
 
         assert!(!state.has_due_cleanup(1_000));
         assert!(state.has_due_cleanup(2_000));
+    }
+
+    #[test]
+    fn merging_a_due_entry_keeps_cleanup_immediately_due() {
+        let node = crate::config::NodeConfig {
+            host: "192.0.2.2".into(),
+            transport: crate::config::Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("machine".into()),
+            execution_uid: Some(501),
+        };
+        let entry =
+            |attempts, next_retry_unix_ms| crate::nfs_reconcile::DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: Some("machine".into()),
+                node: node.clone(),
+                shares: Vec::new(),
+                endpoints: Vec::new(),
+                wait_for_unmount: true,
+                attempts,
+                next_retry_unix_ms,
+                last_error_kind: None,
+                last_error_summary: None,
+            };
+        let mut state = GlobalSmbCredentialCleanup::default();
+        state.remember_node(entry(1, 10_000));
+        state.remember_node(entry(0, 0));
+
+        assert!(state.has_due_cleanup(1_000));
+        assert_eq!(state.nodes["worker"].next_retry_unix_ms, 0);
     }
 }

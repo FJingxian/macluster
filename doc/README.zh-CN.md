@@ -215,6 +215,22 @@ URI 中的 server ID 可以是逻辑名称，`--host` 指定对应 IPv4 地址�
 有界卸载、修复同网段路由和 ARP、使用托管凭据重新连接、验证挂载并恢复逻辑路径。
 忙碌挂载会保留并报告错误，不会强制卸载；重复失败采用有界退避，避免重挂风暴。
 
+移除 SMB mapping：
+
+```sh
+macluster node -umount mnt-0123456789abcdef
+macluster node -umount mnt-0123456789abcdef --force
+macluster node -umount mnt-0123456789abcdef --force --yes
+macluster node -umount mnt-0123456789abcdef --wait --timeout 60
+```
+
+默认不阻塞：即使底层 mount busy，也会立即移除 mapping 和对应逻辑路径。
+物理清理会在 15、30、60 秒后重试，之后每 5 分钟重试。`--force` 会在普通
+卸载失败的节点上询问一次是否强制卸载；`--yes` 用于自动化并跳过询问。
+`--wait` 跟踪后台清理，默认最长等待 300 秒。`macluster node --failed`
+显示尝试次数、失败类别和下次重试时间。配置中已经不存在的旧受管 SMB
+helper state 也会自动纳管，避免旧 hidden mount 留下悬空 `~` 路径。
+
 交互式重置遇到尚未配置密钥登录的旧 SSH 节点时，会只询问一次该节点账户密码，安装 macluster 专用重置密钥后继续精确清理。当前本机保存的旧 machine UUID 不一致不会再阻断本地重置。
 
 使用 `--update-credential` 时，新密码必须先强制建立新的 SMB session 并验证成功，才会替换旧主密码；已有挂载不会让错误密码误判为正确。离线节点重连后会自动接收新的 generation；移除某个服务器/账户的最后一个共享时，会安排清理主 vault 与节点 vault 条目。

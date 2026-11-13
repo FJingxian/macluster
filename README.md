@@ -238,6 +238,24 @@ ARP state, reconnects with the stored credential, verifies the mount, and
 restores the logical path. A busy unmount is preserved and reported. Repeated
 failures use bounded backoff rather than repeated forced detaches.
 
+To remove an SMB mapping:
+
+```sh
+macluster node -umount mnt-0123456789abcdef
+macluster node -umount mnt-0123456789abcdef --force
+macluster node -umount mnt-0123456789abcdef --force --yes
+macluster node -umount mnt-0123456789abcdef --wait --timeout 60
+```
+
+The default is non-blocking: the mapping is removed immediately and the
+logical path disappears even if the kernel mount is busy. Physical cleanup is
+retried after 15, 30, and 60 seconds, then every 5 minutes. `--force` asks once
+before force-detaching failed nodes; `--yes` skips that prompt for automation.
+`--wait` follows the background retry and defaults to a 300-second limit.
+`macluster node --failed` shows attempts, failure category, and next retry.
+Legacy managed SMB helper state that is no longer in the configuration is
+adopted automatically so an old hidden mount cannot leave a dangling `~` path.
+
 During an interactive reset, an old SSH-managed node without key login prompts
 once for that node account so macluster can install its dedicated reset key and
 finish exact remote cleanup. A stale local machine UUID does not block local

@@ -22,10 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use macluster_core::{
-    config::{ClusterConfig, NodeConfig, Transport},
-    storage_uri::StorageProtocol,
-};
+use macluster_core::config::{ClusterConfig, NodeConfig, Transport};
 use macluster_protocol::identifiers::Id128;
 use serde::{Deserialize, Serialize};
 
@@ -94,19 +91,17 @@ impl Drop for ExclusiveLock {
     }
 }
 
-/// Local compute jobs need SSH responsibility only when they can access an
-/// external SMB volume. The primary NFS share and ordinary local paths keep
-/// the lower-overhead direct launch path.
-pub fn required(config: &ClusterConfig, node_id: &str) -> bool {
+/// Local compute jobs need SSH responsibility when they can access a named
+/// network share. Primary-storage-only and ordinary local paths keep the
+/// lower-overhead direct launch path.
+pub fn required(config: &ClusterConfig, node_id: &str, required_shares: Option<&[String]>) -> bool {
     config
         .nodes
         .get(node_id)
         .is_some_and(|node| node.transport == Transport::Local)
         && config.is_compute_node(node_id)
-        && config
-            .shares
-            .values()
-            .any(|share| share.protocol == StorageProtocol::Smb)
+        && required_shares.is_none_or(|required| !required.is_empty())
+        && !config.shares.is_empty()
 }
 
 pub fn launch(
@@ -646,7 +641,16 @@ mod tests {
         let config = config(
             "[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nlogin_node=\"controller\"\nshared_root=\"/tmp/shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"controller\"\nprotocol_version=1\n[queues.q]\nnodes=[\"controller\"]\nscheduler=\"fifo\"\n[nodes.controller]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\nroles=[\"controller\",\"compute\"]\n[nodes.nas]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.data]\nprotocol=\"smb\"\nserver=\"nas\"\nsource_root=\"/data\"\nmount_root=\"/Users/Shared/data\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\nsmb_user=\"operator\"\n",
         );
-        assert!(required(&config, "controller"));
+        assert!(required(&config, "controller", Some(&["data".into()])));
+    }
+
+    #[test]
+    fn local_named_nfs_compute_requires_ssh_loopback() {
+        let config = config(
+            "[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nlogin_node=\"controller\"\nshared_root=\"/tmp/shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"controller\"\nprotocol_version=1\n[queues.q]\nnodes=[\"controller\"]\nscheduler=\"fifo\"\n[nodes.controller]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\nroles=[\"controller\",\"compute\"]\n[nodes.tools]\nhost=\"192.0.2.20\"\ntransport=\"ssh\"\n[shares.tools]\nprotocol=\"nfs\"\nserver=\"tools\"\nsource_root=\"/opt/tools\"\nmount_root=\"/opt/tools\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n",
+        );
+        assert!(required(&config, "controller", Some(&["tools".into()])));
+        assert!(!required(&config, "controller", Some(&[])));
     }
 
     #[test]
@@ -654,7 +658,7 @@ mod tests {
         let config = config(
             "[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nlogin_node=\"controller\"\nshared_root=\"/tmp/shared\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"controller\"\nprotocol_version=1\n[queues.q]\nnodes=[\"controller\"]\nscheduler=\"fifo\"\n[nodes.controller]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\nroles=[\"controller\",\"compute\"]\n",
         );
-        assert!(!required(&config, "controller"));
+        assert!(!required(&config, "controller", None));
     }
 
     #[test]

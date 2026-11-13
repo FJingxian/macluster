@@ -1686,7 +1686,11 @@ fn start_job(
         "--start-token".into(),
         start_token.to_string(),
     ];
-    let launch_result = if local_loopback::required(config, local_node_id) {
+    let launch_result = if local_loopback::required(
+        config,
+        local_node_id,
+        record.spec.required_shares.as_deref(),
+    ) {
         local_loopback::launch(
             state_dir,
             config,

@@ -45,7 +45,7 @@ pub(super) fn schedule(
             "--start-token".into(),
             token.to_string(),
         ];
-        if local_loopback::required(config, local_node_id) {
+        if local_loopback::required(config, local_node_id, None) {
             local_loopback::launch(
                 state_dir,
                 config,

@@ -1231,12 +1231,45 @@ fn verify_named_share_with_mount_output(
     mount_output: &str,
 ) -> Result<(), AgentError> {
     if share.protocol == macluster_core::storage_uri::StorageProtocol::Smb {
-        let backing = format!(
-            "/Users/Shared/.macluster-mounts/{}",
-            share.share_uuid.trim()
-        );
-        let expected = format!(" on {backing} (smbfs");
-        return if mount_output.lines().any(|line| line.contains(&expected)) {
+        let server = config
+            .nodes
+            .get(share.server.as_str())
+            .ok_or(AgentError::SharedStorage)?;
+        let share_name = share
+            .source_root
+            .to_str()
+            .and_then(|path| path.trim_start_matches('/').split('/').next())
+            .filter(|name| !name.is_empty())
+            .ok_or(AgentError::SharedStorage)?;
+        let logical_target = match fs::read_link(&share.mount_root) {
+            Ok(target) if target.is_absolute() => target,
+            Ok(_) => return Err(AgentError::SharedStorage),
+            Err(_) => share.mount_root.clone(),
+        };
+        let exact_source = share
+            .smb_user
+            .as_deref()
+            .map(|user| format!("//{user}@{}/{}", server.host, share_name));
+        let anonymous_source = format!("//{}/{}", server.host, share_name);
+        return if mount_output.lines().any(|line| {
+            let Some((actual_source, rest)) = line.split_once(" on ") else {
+                return false;
+            };
+            let source_matches = actual_source == anonymous_source
+                || exact_source
+                    .as_deref()
+                    .is_some_and(|expected| actual_source == expected);
+            let Some((destination, metadata)) = rest.split_once(" (") else {
+                return false;
+            };
+            let destination = Path::new(destination);
+            source_matches
+                && metadata
+                    .split(',')
+                    .next()
+                    .is_some_and(|kind| kind == "smbfs")
+                && (logical_target == destination || logical_target.starts_with(destination))
+        }) {
             Ok(())
         } else {
             Err(AgentError::SharedStorage)
@@ -3567,24 +3600,31 @@ execution_uid = 501
     #[test]
     fn smb_client_health_uses_the_protocol_backing_mount() {
         use macluster_core::storage_uri::StorageProtocol;
+        use std::os::unix::fs::symlink;
 
+        let root = std::env::temp_dir().join(format!("macluster-smb-health-{}", Id128::random()));
+        let share_uuid = "00000000-0000-4000-8000-000000000098";
+        let backing = root.join("mounts").join(share_uuid);
+        let logical = root.join("project");
+        fs::create_dir_all(&backing).unwrap();
+        symlink(&backing, &logical).unwrap();
         let mut config = status_config(Path::new("/tmp/macluster-health-primary"));
         config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
-        let share_uuid = "00000000-0000-4000-8000-000000000098";
         config.shares.insert(
             "project".into(),
             macluster_core::config::ShareConfig {
                 protocol: StorageProtocol::Smb,
                 server: NodeId::new("mini01-a").unwrap(),
                 source_root: PathBuf::from("/data/project"),
-                mount_root: PathBuf::from("/Volumes/project"),
+                mount_root: logical,
                 share_uuid: share_uuid.into(),
                 smb_user: Some("smb-user".into()),
                 allow_existing_contents: false,
             },
         );
         let mount_output = format!(
-            "//192.0.2.2/data on /Users/Shared/.macluster-mounts/{share_uuid} (smbfs, nodev, nosuid)\n"
+            "//192.0.2.2/data on {} (smbfs, nodev, nosuid)\n",
+            backing.display()
         );
 
         let result = verify_named_share_with_mount_output(
@@ -3593,11 +3633,98 @@ execution_uid = 501
             config.shares.get("project").unwrap(),
             &mount_output,
         );
+        fs::remove_dir_all(root).unwrap();
 
         assert!(
             result.is_ok(),
             "SMB backing mount was not recognized: {result:?}"
         );
+    }
+
+    #[test]
+    fn smb_client_health_accepts_a_reused_source_mount_through_the_logical_alias() {
+        use macluster_core::storage_uri::StorageProtocol;
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("macluster-smb-reuse-{}", Id128::random()));
+        let backing = root.join("mounts/older-mapping");
+        let logical = root.join("data");
+        fs::create_dir_all(&backing).unwrap();
+        symlink(&backing, &logical).unwrap();
+
+        let mut config = status_config(Path::new("/tmp/macluster-health-primary"));
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        let share_uuid = "00000000-0000-4000-8000-000000000097";
+        config.shares.insert(
+            "project".into(),
+            macluster_core::config::ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: NodeId::new("mini01-a").unwrap(),
+                source_root: PathBuf::from("/Partition_2"),
+                mount_root: logical.clone(),
+                share_uuid: share_uuid.into(),
+                smb_user: Some("smb-user".into()),
+                allow_existing_contents: false,
+            },
+        );
+        let mount_output = format!(
+            "//smb-user@192.0.2.2/Partition_2 on {} (smbfs, nodev, nosuid)\n",
+            backing.display()
+        );
+
+        let result = verify_named_share_with_mount_output(
+            &config,
+            "login-01",
+            config.shares.get("project").unwrap(),
+            &mount_output,
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            result.is_ok(),
+            "a reused source mount must remain healthy through its logical symlink: {result:?}"
+        );
+    }
+
+    #[test]
+    fn smb_client_health_rejects_a_logical_alias_to_another_smb_source() {
+        use macluster_core::storage_uri::StorageProtocol;
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("macluster-smb-mismatch-{}", Id128::random()));
+        let backing = root.join("mounts/other-source");
+        let logical = root.join("data");
+        fs::create_dir_all(&backing).unwrap();
+        symlink(&backing, &logical).unwrap();
+
+        let mut config = status_config(Path::new("/tmp/macluster-health-primary"));
+        config.nodes.get_mut("mini01-a").unwrap().host = "192.0.2.2".into();
+        config.shares.insert(
+            "project".into(),
+            macluster_core::config::ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: NodeId::new("mini01-a").unwrap(),
+                source_root: PathBuf::from("/Partition_2"),
+                mount_root: logical,
+                share_uuid: "00000000-0000-4000-8000-000000000096".into(),
+                smb_user: Some("smb-user".into()),
+                allow_existing_contents: false,
+            },
+        );
+        let mount_output = format!(
+            "//smb-user@192.0.2.2/OtherShare on {} (smbfs, nodev, nosuid)\n",
+            backing.display()
+        );
+
+        let result = verify_named_share_with_mount_output(
+            &config,
+            "login-01",
+            config.shares.get("project").unwrap(),
+            &mount_output,
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(matches!(result, Err(AgentError::SharedStorage)));
     }
 
     #[test]

@@ -60,11 +60,12 @@ macluster --init --name home --queue default --shared-root /Users/Shared/maclust
 # Replace the SSH account and address with your compute Mac.
 macluster node -a worker@192.0.2.10
 macluster node -l
+macluster node -l default-001
 ```
 
-Nodes enter the cluster after enrollment verifies the Agent and shared storage. `node -l` lists registered nodes as READY or OFFLINE; failed enrollment attempts are kept separately for retry. Inspect them with `macluster node --failed`. Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
+Nodes enter the cluster after enrollment verifies the Agent and shared storage. `node -l` gives a compact cluster view; append one node ID to show that Mac's host, SSH account, port, and detailed storage information. Failed enrollment attempts are kept separately for retry. Inspect them with `macluster node --failed`. Enrollment installs the Agent and configures shared storage. It can install an SSH key after you verify the fingerprint and enter the remote account's login password. NFS and privileged helper setup may separately require administrator authorization on each affected Mac.
 
-All Agent-managed Macs appear in `mtop`, `mqueue`, `mfans`, and the browser monitor, including a controller, login client, or storage Mac that has no compute role. External NFS/SMB providers have no compatible Agent and appear only in `mnode`. Queue rows continue to evaluate scheduling eligibility separately. `mnode -l --storage` refreshes system, external-volume, and mounted-share capacity in a bounded pass; plain `mnode -l` uses cached capacity where available.
+All Agent-managed Macs appear in `mtop`, `mqueue`, `mfans`, and the browser monitor, including a controller, login client, or storage Mac that has no compute role. External NFS/SMB providers have no compatible Agent and appear only as storage mappings. Queue rows continue to evaluate scheduling eligibility separately. `mnode -l --storage` refreshes system, external-volume, and mounted-share capacity in a bounded pass; plain `mnode -l` uses cached capacity where available.
 
 Initialization installs a per-user background LaunchAgent. Closing Terminal does not stop the controller; logging out of that macOS user session does. Scheduling needs the controller. Job and queue queries can read persisted state while it is stopped.
 
@@ -172,23 +173,56 @@ Environment variables are stored with jobs: avoid exporting secrets. Avoid concu
 
 Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected folders and external volumes may require Full Disk Access for `/sbin/nfsd` on the **storage Mac**. After granting it, restart nfsd there and retry enrollment.
 
-For a NAS or another external SMB provider, register it without SSH or an Agent:
+For a NAS or another external storage provider, mount it directly. It is not
+added to the node list:
 
 ```sh
-macluster node -a storage:nas-01@192.0.2.5
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
-  --smb-user smb-user
+macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
+  --host 192.0.2.5 --smb-user nas-user
+
+macluster node -mount smb://192.0.2.5/data \
+  --mount-root /Volumes/test_data --smb-user nas-user
+
+macluster node -mount nfs://nas-01/export/data \
+  --mount-root /Volumes/nas-data --host 192.0.2.5
 ```
 
-The NAS becomes a `STORAGE` node only after it serves a share. The first new server/account asks for the SMB password once with hidden input. The controller stores the validated master password in the macOS **System Keychain**; every reachable node then receives it through pinned SSH stdin and stores an Internet Password in that user's login Keychain. Passwords do not enter cluster configuration, SQLite, journals, job environment, command arguments, temporary files, or logs. Persistent mounts run as the logged-in user, so `mount_smbfs -N` can use that Keychain after reboot.
+The server ID in the URI can be a logical name while `--host` provides its IPv4
+address or DNS name. An IPv4 address or DNS name can also be used directly in
+the URI; the CLI creates a stable internal alias automatically. The first new
+server/account asks for the SMB password once with hidden input. The controller
+stores the validated master password in a root-only credential vault under
+`/Library/PrivilegedHelperTools/org.macluster.credentials` (mode `0700`, item
+files mode `0600`); every reachable node then receives it through pinned SSH
+stdin and stores the node copy in the same root-only vault. The privileged
+helper runs `mount_smbfs` in the target user's launchd security context and
+feeds the password through a pseudo-terminal.
+If `--smb-user` is omitted in an interactive terminal, macluster asks for the
+user and defaults a blank response to `guest` without password storage.
+Rejected credentials can be retried three times. A missing share is reported
+before any password prompt, with the server's discoverable first-level shares.
+If the same SMB source is already mounted at another path, the CLI asks whether
+to reuse that mount for the requested target; answering `n` cancels without
+changing the existing mount.
+Passwords do not enter cluster configuration, SQLite, journals, job environment,
+command arguments, temporary files, or logs. The per-user LaunchAgent asks the
+helper to restore the mount; reconnecting nodes receive a fresh root-only node
+credential from the login Mac's vault.
+An `mnode -a USER@NAS_ADDRESS` attempt is redirected to this direct-mount
+workflow and never enrolls the NAS as a cluster node.
 
-Use `--update-credential` to validate and rotate the password before replacing the old master. Offline nodes receive the new generation automatically after reconnect. Removing the last share for a server/account schedules cleanup of the master and node credentials.
+During an interactive reset, an old SSH-managed node without key login prompts
+once for that node account so macluster can install its dedicated reset key and
+finish exact remote cleanup. A stale local machine UUID does not block local
+reset cleanup.
+
+Use `--update-credential` to validate and rotate the password before replacing the old master. Validation forces a fresh SMB session so an existing mount cannot make a wrong password appear valid. Offline nodes receive the new generation automatically after reconnect. Removing the last share for a server/account schedules cleanup of the master and node vault entries.
 
 Inspect the mapping ID, canonical source URI, and local target with `mnode -l`. Remove a managed mount through either endpoint:
 
 ```sh
 macluster node -umount mnt-d2d3885d51b734dd
-macluster node -umount smb://nas-01/data
+macluster node -umount smb://nas-user/data
 ```
 
 `mnode --scan` identifies SMB and NFS service candidates on the cluster subnet. It cannot safely enumerate authenticated SMB shares or NFS exports, so mountable paths come from the NAS/provider administrator or a known share URI.
@@ -196,8 +230,8 @@ macluster node -umount smb://nas-01/data
 Older shares without `smb_user` migrate in place by rerunning `mnode -mount` with the same URI, the same mount root, and `--smb-user ACCOUNT`. This preserves the existing share ID and UUID and does not create a duplicate:
 
 ```sh
-macluster node -mount smb://nas-01/data --mount-root /Users/Shared/nas-data \
-  --smb-user smb-user
+macluster node -mount smb://nas-user/data --mount-root /Users/Shared/nas-data \
+  --host 192.0.2.5 --smb-user nas-user
 ```
 
 ## Monitor

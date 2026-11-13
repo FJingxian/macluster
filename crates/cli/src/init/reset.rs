@@ -328,7 +328,11 @@ pub(crate) fn run(
                 ));
             }
         };
-        if let Err(error) = crate::client_access::revoke_all_registered_clients(&old, &state_dir) {
+        if let Err(error) = crate::client_access::revoke_all_registered_clients_with_nodes(
+            &old,
+            &state_dir,
+            &plan.nodes,
+        ) {
             cancel_temporary_drain(&path);
             return Err((
                 1,
@@ -358,7 +362,12 @@ pub(crate) fn run(
             journal.discard_terminal_sync,
             &journal.abandoned_sync_jobs,
         )?;
-        crate::client_access::revoke_all_registered_clients(&old, &state_dir).map_err(|error| {
+        crate::client_access::revoke_all_registered_clients_with_nodes(
+            &old,
+            &state_dir,
+            &plan.nodes,
+        )
+        .map_err(|error| {
             (
                 1,
                 format!("reset cleanup cannot revoke login-client NFS access: {error}"),
@@ -823,6 +832,15 @@ struct ResetPlan {
     remote_agent_states: Vec<RemoteAgentStateSpec>,
 }
 
+fn reset_operational_nodes(config: &ClusterConfig) -> BTreeMap<String, NodeConfig> {
+    config
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.transport != Transport::Storage)
+        .map(|(id, node)| (id.clone(), node.clone()))
+        .collect()
+}
+
 impl ResetPlan {
     fn preflight(
         config: &ClusterConfig,
@@ -842,19 +860,10 @@ impl ResetPlan {
             )
         })?;
         let config_digest = sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
+        let nodes = reset_operational_nodes(config);
         let mut plan = Self {
-            nodes: config
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.transport != Transport::Storage)
-                .map(|(id, node)| (id.clone(), node.clone()))
-                .collect(),
-            active_nodes: config
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.transport != Transport::Storage)
-                .map(|(id, _)| id.clone())
-                .collect(),
+            active_nodes: nodes.keys().cloned().collect(),
+            nodes,
             known_uuids: known_uuids.clone(),
             mounts: Vec::new(),
             exports: BTreeMap::new(),
@@ -926,10 +935,13 @@ impl ResetPlan {
 
         let operations = node_admin::reset_admin_operations(config_path, state_dir)?;
         plan.add_pending_admin_resources(config, operations, &known_uuids, &config_digest)?;
+        for node_id in plan.nodes.keys().cloned().collect::<Vec<_>>() {
+            plan.ensure_reset_ssh_access(&node_id)?;
+        }
 
         for (node_id, node) in &plan.nodes {
             verify_node_identity(node_id, node, known_uuids.get(node_id))?;
-            if plan.active_nodes.contains(node_id) {
+            if should_check_reset_remote_status(node, plan.active_nodes.contains(node_id)) {
                 check_reset_remote_status(
                     node_id,
                     node_admin::remote_execution_status(node, node_id, config_path),
@@ -997,9 +1009,10 @@ impl ResetPlan {
             )
         })?;
         let config_digest = sha256_hex(&config_bytes).map_err(|error| (1, error.to_string()))?;
+        let nodes = reset_operational_nodes(config);
         let mut plan = Self {
-            nodes: config.nodes.clone(),
-            active_nodes: config.nodes.keys().cloned().collect(),
+            active_nodes: nodes.keys().cloned().collect(),
+            nodes,
             known_uuids: known_uuids.clone(),
             mounts: Vec::new(),
             exports: BTreeMap::new(),
@@ -1010,6 +1023,9 @@ impl ResetPlan {
         };
         let operations = node_admin::reset_admin_operations(config_path, state_dir)?;
         plan.add_pending_admin_resources(config, operations, &known_uuids, &config_digest)?;
+        for node_id in plan.nodes.keys().cloned().collect::<Vec<_>>() {
+            plan.ensure_reset_ssh_access(&node_id)?;
+        }
         for (node_id, node) in &plan.nodes {
             verify_node_identity(node_id, node, known_uuids.get(node_id))?;
         }
@@ -1028,6 +1044,12 @@ impl ResetPlan {
         config_digest: &str,
     ) -> AppResult<()> {
         for operation in operations {
+            // Cluster-wide Agent update receipts are controller maintenance
+            // metadata, not node resources. Reset archives their owning state
+            // directory, so stale or failed receipts must never block cleanup.
+            if operation.action == "update" {
+                continue;
+            }
             if matches!(
                 operation.phase.as_str(),
                 "READY" | "REMOVED" | "REMOVED_OFFLINE" | "ABORTED"
@@ -1055,7 +1077,6 @@ impl ResetPlan {
                 },
             )?;
             match operation.action.as_str() {
-                "update" => continue,
                 "add" | "remove" => {
                     if self.nodes.contains_key(&operation.node_id) {
                         if let (Some(recorded), Some(configured)) = (
@@ -1505,6 +1526,65 @@ impl ResetPlan {
         Ok(())
     }
 
+    fn ensure_reset_ssh_access(&mut self, node_id: &str) -> AppResult<()> {
+        let Some(node) = self.nodes.get(node_id).cloned() else {
+            return Ok(());
+        };
+        if node.transport != Transport::Ssh {
+            return Ok(());
+        }
+        let user = node.ssh_user.as_deref().ok_or_else(|| {
+            (
+                1,
+                format!("cannot prepare reset SSH access for {node_id}: SSH user is missing"),
+            )
+        })?;
+        let endpoint = format!("{user}@{}:{}", node.host, node.ssh_port.unwrap_or(22));
+        let mut repaired = node;
+        crate::ssh_bootstrap::ensure_ssh_access(&mut repaired, &endpoint).map_err(|error| {
+            (
+                1,
+                format!("cannot prepare reset SSH access for {node_id}: {error}"),
+            )
+        })?;
+        self.replace_node_transport(node_id, &repaired);
+        Ok(())
+    }
+
+    fn replace_node_transport(&mut self, node_id: &str, repaired: &NodeConfig) {
+        self.nodes.insert(node_id.to_owned(), repaired.clone());
+        for mount in &mut self.mounts {
+            if mount.node_id == node_id {
+                mount.node = repaired.clone();
+            }
+        }
+        for (server_id, group) in &mut self.exports {
+            if server_id == node_id {
+                group.server = repaired.clone();
+            }
+        }
+        for marker in self.markers.values_mut() {
+            if marker.server_id == node_id {
+                marker.server = repaired.clone();
+            }
+        }
+        for alias in &mut self.aliases {
+            if alias.server_id == node_id {
+                alias.server = repaired.clone();
+            }
+        }
+        for remote in &mut self.remote_configs {
+            if remote.node_id == node_id {
+                remote.node = repaired.clone();
+            }
+        }
+        for state in &mut self.remote_agent_states {
+            if state.node_id == node_id {
+                state.node = repaired.clone();
+            }
+        }
+    }
+
     fn preflight_mounts(&self) -> AppResult<()> {
         let mut outputs = BTreeMap::<String, String>::new();
         for mount in &self.mounts {
@@ -1744,13 +1824,17 @@ fn verify_node_identity(node_id: &str, node: &NodeConfig, known: Option<&String>
         let actual = node_admin::local_platform_uuid()?;
         let expected = node.machine_uuid.as_ref().or(known);
         if expected.is_some_and(|expected| !expected.eq_ignore_ascii_case(&actual)) {
-            return Err((1, format!("local node {node_id} machine identity changed")));
+            eprintln!(
+                "Warning: local node {node_id} no longer matches the old Mac identity; reset will continue using its exact managed paths and UUID-tagged resources."
+            );
         }
         if node
             .execution_uid
             .is_some_and(|uid| uid != unsafe { libc::geteuid() })
         {
-            return Err((1, format!("local node {node_id} execution UID changed")));
+            eprintln!(
+                "Warning: local node {node_id} execution UID changed; reset will continue as the current account and preserve all non-managed files."
+            );
         }
         return Ok(());
     }
@@ -1773,6 +1857,10 @@ fn verify_node_identity(node_id: &str, node: &NodeConfig, known: Option<&String>
         return Err((1, format!("node {node_id} execution UID changed")));
     }
     Ok(())
+}
+
+fn should_check_reset_remote_status(node: &NodeConfig, active: bool) -> bool {
+    active && node.transport != Transport::Local
 }
 
 fn known_machine_uuids(state_dir: &Path) -> AppResult<BTreeMap<String, String>> {
@@ -2940,12 +3028,7 @@ fn archive_old_cluster(journal: &mut ResetJournal, path: &Path) -> AppResult<()>
     let config_path = PathBuf::from(&journal.config_path);
     let archived_config = archive_dir.join("config.toml");
     if !journal.is_completed("archive:config") {
-        archive_file_exact(
-            &config_path,
-            &archived_config,
-            &journal.old_config_sha256,
-            "cluster config",
-        )?;
+        archive_reset_config(journal, &config_path, &archived_config)?;
         journal.mark_completed("archive:config");
         save_journal(path, journal, false)?;
     }
@@ -2973,6 +3056,64 @@ fn archive_old_cluster(journal: &mut ResetJournal, path: &Path) -> AppResult<()>
         save_journal(path, journal, false)?;
     }
     Ok(())
+}
+
+fn archive_reset_config(
+    journal: &ResetJournal,
+    config_path: &Path,
+    archived_config: &Path,
+) -> AppResult<()> {
+    if !config_path.exists() && !archived_config.exists() {
+        let bytes = journal.old_config.as_bytes();
+        let digest = sha256_hex(bytes).map_err(|error| (1, error.to_string()))?;
+        if digest != journal.old_config_sha256 {
+            return Err((
+                1,
+                "saved reset configuration does not match its recorded digest".into(),
+            ));
+        }
+        let parent = archived_config.parent().ok_or_else(|| {
+            (
+                1,
+                format!(
+                    "archive config path {} has no parent",
+                    archived_config.display()
+                ),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|error| (1, error.to_string()))?;
+        let temporary = parent.join(format!(".config-{}.tmp", Id128::random()));
+        let result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, archived_config)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|error| {
+            (
+                1,
+                format!(
+                    "cannot recover archived cluster config {}: {error}",
+                    archived_config.display()
+                ),
+            )
+        })?;
+    }
+    archive_file_exact(
+        config_path,
+        archived_config,
+        &journal.old_config_sha256,
+        "cluster config",
+    )
 }
 
 fn archive_abandoned_sync_manifest(journal: &ResetJournal) -> AppResult<()> {
@@ -3421,17 +3562,24 @@ mod tests {
     }
 
     use super::{
-        AbandonedSyncJob, AliasSpec, ArchiveTransition, ExportGroup, ManagedExportSpec, MountSpec,
-        RemoteAgentStateSpec, ResetJournal, ResetMode, ResetPlan, admin_operation_matches_digest,
-        advance_archive_phase, archive_abandoned_sync_manifest, belongs_to_cluster,
-        check_reset_remote_status, cleanup_batch_key, cleanup_batches, enable_force_reset,
-        ensure_abandoned_sync_manifest, ensure_no_reset_in_progress,
-        ensure_old_paths_are_outside_shared_root, job_blockers, journal_path,
-        managed_marker_matches, mount_conflict, mount_matches, parse_pending_share_endpoint,
-        pending_remote_config_path, remote_publisher_stop_command, remove_managed_exports,
-        terminal_sync_abandonments, verify_archived_abandoned_sync_manifest,
+        AbandonedSyncJob, AliasSpec, ArchiveTransition, ExportGroup, ManagedExportSpec, MarkerSpec,
+        MountSpec, RemoteAgentStateSpec, RemoteConfigSpec, ResetJournal, ResetMode, ResetPlan,
+        admin_operation_matches_digest, advance_archive_phase, archive_abandoned_sync_manifest,
+        archive_reset_config, belongs_to_cluster, check_reset_remote_status, cleanup_batch_key,
+        cleanup_batches, enable_force_reset, ensure_abandoned_sync_manifest,
+        ensure_no_reset_in_progress, ensure_old_paths_are_outside_shared_root, job_blockers,
+        journal_path, managed_marker_matches, mount_conflict, mount_matches,
+        parse_pending_share_endpoint, pending_remote_config_path, remote_publisher_stop_command,
+        remove_managed_exports, reset_operational_nodes, terminal_sync_abandonments,
+        verify_archived_abandoned_sync_manifest,
     };
-    use std::{collections::BTreeMap, fs, net::Ipv4Addr, os::unix::fs::PermissionsExt, path::Path};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        net::Ipv4Addr,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
 
     use macluster_core::storage::Storage;
     use macluster_protocol::{
@@ -4398,6 +4546,173 @@ mod tests {
     }
 
     #[test]
+    fn reset_allows_current_local_machine_to_replace_a_stale_identity() {
+        use macluster_core::config::{NodeConfig, Transport};
+
+        let actual = crate::node_admin::local_platform_uuid().unwrap();
+        let stale = if actual.eq_ignore_ascii_case("00000000-0000-4000-8000-000000000000") {
+            "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        } else {
+            "00000000-0000-4000-8000-000000000000"
+        }
+        .to_owned();
+        let node = NodeConfig {
+            host: "192.0.2.10".into(),
+            transport: Transport::Local,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some(stale.clone()),
+            execution_uid: Some(unsafe { libc::geteuid() }),
+        };
+
+        super::verify_node_identity("login-01", &node, Some(&stale))
+            .expect("exact managed cleanup must not be blocked by a stale local machine identity");
+    }
+
+    #[test]
+    fn reset_archives_local_agent_state_without_querying_its_old_command() {
+        use macluster_core::config::{NodeConfig, Transport};
+
+        let node = |transport| NodeConfig {
+            host: "192.0.2.10".into(),
+            transport,
+            remote_binary: "/old/build/macluster".into(),
+            ssh_user: None,
+            ssh_port: None,
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+
+        assert!(!super::should_check_reset_remote_status(
+            &node(Transport::Local),
+            true
+        ));
+        assert!(super::should_check_reset_remote_status(
+            &node(Transport::Ssh),
+            true
+        ));
+        assert!(!super::should_check_reset_remote_status(
+            &node(Transport::Ssh),
+            false
+        ));
+    }
+
+    #[test]
+    fn reset_ssh_repair_updates_every_planned_resource_copy() {
+        use macluster_core::config::{NodeConfig, Transport};
+
+        let original = NodeConfig {
+            host: "192.0.2.10".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("operator".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let repaired = NodeConfig {
+            ssh_identity_file: Some("/Users/operator/.ssh/macluster/reset/node_ed25519".into()),
+            ..original.clone()
+        };
+        let source_root = PathBuf::from("/Users/Shared/source");
+        let mount_root = PathBuf::from("/Users/Shared/mount");
+        let mut plan = ResetPlan {
+            nodes: BTreeMap::from([("worker".into(), original.clone())]),
+            active_nodes: ["worker".into()].into_iter().collect(),
+            known_uuids: BTreeMap::new(),
+            mounts: vec![MountSpec {
+                share_uuid: "share".into(),
+                node_id: "worker".into(),
+                node: original.clone(),
+                server_host: "192.0.2.10".into(),
+                source_root: source_root.clone(),
+                mount_root: mount_root.clone(),
+                label: "primary".into(),
+            }],
+            exports: BTreeMap::from([(
+                "worker".into(),
+                ExportGroup {
+                    server: original.clone(),
+                    specs: Vec::new(),
+                },
+            )]),
+            markers: BTreeMap::from([(
+                ("share".into(), source_root.clone(), "uuid".into()),
+                MarkerSpec {
+                    server_id: "worker".into(),
+                    server: original.clone(),
+                    source_root: source_root.clone(),
+                    share_uuid: "uuid".into(),
+                    label: "share".into(),
+                },
+            )]),
+            aliases: vec![AliasSpec {
+                server_id: "worker".into(),
+                server: original.clone(),
+                source_root: source_root.clone(),
+                mount_root: mount_root.clone(),
+                committed: true,
+            }],
+            remote_configs: vec![RemoteConfigSpec {
+                node_id: "worker".into(),
+                node: original.clone(),
+                path: "/Users/operator/remote.toml".into(),
+                backup: "/Users/operator/remote.toml.bak".into(),
+            }],
+            remote_agent_states: vec![RemoteAgentStateSpec {
+                node_id: "worker".into(),
+                node: original,
+                path: "/Users/operator/agent".into(),
+                archive: "/Users/operator/archive".into(),
+                stop_publisher: true,
+            }],
+        };
+
+        plan.replace_node_transport("worker", &repaired);
+
+        assert_eq!(
+            plan.nodes["worker"].ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.mounts[0].node.ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.exports["worker"].server.ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.markers
+                .values()
+                .next()
+                .unwrap()
+                .server
+                .ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.aliases[0].server.ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.remote_configs[0].node.ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+        assert_eq!(
+            plan.remote_agent_states[0].node.ssh_identity_file,
+            repaired.ssh_identity_file
+        );
+    }
+
+    #[test]
     fn reset_groups_mount_export_and_alias_cleanup_per_mac() {
         use macluster_core::config::{NodeConfig, Transport};
 
@@ -4790,6 +5105,95 @@ mod tests {
     }
 
     #[test]
+    fn reset_ignores_stale_global_agent_update_operations() {
+        let config = test_config("test", "00000000-0000-4000-8000-000000000001");
+        let mut plan = ResetPlan {
+            nodes: config.nodes.clone(),
+            active_nodes: config.nodes.keys().cloned().collect(),
+            known_uuids: BTreeMap::new(),
+            mounts: Vec::new(),
+            exports: BTreeMap::new(),
+            markers: BTreeMap::new(),
+            aliases: Vec::new(),
+            remote_configs: Vec::new(),
+            remote_agent_states: Vec::new(),
+        };
+        let operation = crate::node_admin::ResetAdminOperation {
+            id: "stale-update".into(),
+            action: "update".into(),
+            connection_endpoint: None,
+            remote_config_path: None,
+            node_id: "all".into(),
+            endpoint: "cluster".into(),
+            machine_uuid: None,
+            phase: "UPDATE_FAILED".into(),
+            old_config_sha256: Some("different-digest".into()),
+            candidate_config_sha256: None,
+            client_setup_may_have_run: false,
+        };
+
+        plan.add_pending_admin_resources(
+            &config,
+            vec![operation],
+            &BTreeMap::new(),
+            "active-digest",
+        )
+        .expect("a failed global Agent update is reset metadata, not a node resource");
+    }
+
+    #[test]
+    fn reset_operational_nodes_exclude_external_storage_providers() {
+        use macluster_core::config::ClusterConfig;
+
+        let config = ClusterConfig::parse(
+            r#"
+[cluster]
+name = "test"
+login_node = "login"
+default_queue = "default"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "login"
+protocol_version = 1
+
+[queues.default]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.1"
+transport = "local"
+machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+execution_uid = 501
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+
+[nodes.nas-01]
+host = "192.0.2.5"
+transport = "storage"
+
+[shares.data]
+protocol = "smb"
+server = "nas-01"
+source_root = "/data"
+mount_root = "/Volumes/data"
+share_uuid = "00000000-0000-4000-8000-000000000002"
+smb_user = "nas-user"
+"#,
+        )
+        .unwrap();
+
+        let nodes = reset_operational_nodes(&config);
+
+        assert_eq!(
+            nodes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["login", "worker"]
+        );
+    }
+
+    #[test]
     fn reset_rejects_old_config_or_state_inside_shared_storage() {
         assert!(
             ensure_old_paths_are_outside_shared_root(
@@ -4905,6 +5309,32 @@ mod tests {
             super::archive_file_exact(&source, &destination, &digest, "cluster config").is_err()
         );
         assert_eq!(fs::read(&source).unwrap(), b"changed config\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reset_archive_recovers_a_missing_live_config_from_the_journal() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-reset-config-recovery-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        let config_path = root.join("active/config.toml");
+        let archived_config = root.join("archive/config.toml");
+        let source = "[cluster]\nname = \"recover\"\n";
+        let mut reset = journal();
+        reset.old_config = source.into();
+        reset.old_config_sha256 =
+            macluster_protocol::framing::sha256_hex(source.as_bytes()).unwrap();
+
+        archive_reset_config(&reset, &config_path, &archived_config).unwrap();
+
+        assert_eq!(fs::read_to_string(&archived_config).unwrap(), source);
+        assert!(!config_path.exists());
+        assert_eq!(
+            fs::metadata(&archived_config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -7,7 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use macluster_core::config::{ClusterConfig, ShareConfig};
+use macluster_core::config::{ClusterConfig, ShareConfig, Transport};
+use macluster_core::storage_uri::StorageProtocol;
 use macluster_protocol::identifiers::Id128;
 
 use crate::node_admin::{NfsExportRequest, ensure_nfs_exports, remove_managed_nfs_exports};
@@ -65,6 +66,9 @@ fn client_requests(
             });
     }
     for share in config.shares.values() {
+        if share.protocol != StorageProtocol::Nfs {
+            continue;
+        }
         let server = config
             .nodes
             .get(share.server.as_str())
@@ -118,6 +122,9 @@ pub(crate) fn authorize_client(
             .nodes
             .get(&server_id)
             .ok_or_else(|| format!("NFS storage server '{server_id}' is not configured"))?;
+        if server.transport == Transport::Storage {
+            continue;
+        }
         let (_, result) = ensure_nfs_exports(server, &requests, &Id128::random().to_string());
         result.map_err(|error| {
             format!(
@@ -138,6 +145,9 @@ pub(crate) fn revoke_client(
             .nodes
             .get(&server_id)
             .ok_or_else(|| format!("NFS storage server '{server_id}' is not configured"))?;
+        if server.transport == Transport::Storage {
+            continue;
+        }
         remove_managed_nfs_exports(server, &requests, &Id128::random().to_string()).map_err(
             |error| {
                 format!(
@@ -320,9 +330,10 @@ pub(crate) fn revoke_client_at_current_address(
     }
 }
 
-pub(crate) fn revoke_all_registered_clients(
+pub(crate) fn revoke_all_registered_clients_with_nodes(
     config: &ClusterConfig,
     state_dir: &Path,
+    prepared_nodes: &BTreeMap<String, macluster_core::config::NodeConfig>,
 ) -> Result<usize, String> {
     let root = client_network_root(state_dir);
     let entries = match fs::read_dir(&root) {
@@ -353,7 +364,16 @@ pub(crate) fn revoke_all_registered_clients(
             .ok_or_else(|| "login-client registry has a non-UTF-8 identity".to_owned())?;
         let client_ip = read_registered_address(state_dir, client_id)?
             .ok_or_else(|| format!("login-client registry entry {} disappeared", path.display()))?;
-        revoke_client(config, client_id, &client_ip)?;
+        for (server_id, requests) in client_requests(config, client_id, &client_ip)? {
+            let server = storage_server_for_revocation(config, prepared_nodes, &server_id)?;
+            remove_managed_nfs_exports(server, &requests, &Id128::random().to_string()).map_err(
+                |error| {
+                    format!(
+                        "could not revoke login client {client_ip} from {server_id} NFS storage: {error}"
+                    )
+                },
+            )?;
+        }
         fs::remove_file(&path).map_err(|error| {
             format!(
                 "cannot remove login-client registry entry {}: {error}",
@@ -363,6 +383,17 @@ pub(crate) fn revoke_all_registered_clients(
         revoked += 1;
     }
     Ok(revoked)
+}
+
+fn storage_server_for_revocation<'a>(
+    config: &'a ClusterConfig,
+    prepared_nodes: &'a BTreeMap<String, macluster_core::config::NodeConfig>,
+    server_id: &str,
+) -> Result<&'a macluster_core::config::NodeConfig, String> {
+    prepared_nodes
+        .get(server_id)
+        .or_else(|| config.nodes.get(server_id))
+        .ok_or_else(|| format!("NFS storage server '{server_id}' is not configured"))
 }
 
 pub(crate) fn forget_registered_client(state_dir: &Path, client_id: &str) -> Result<(), String> {
@@ -378,14 +409,14 @@ pub(crate) fn forget_registered_client(state_dir: &Path, client_id: &str) -> Res
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
 
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::identifiers::Id128;
 
     use super::{
         client_requests, forget_registered_client, parse_ssh_client_ipv4, read_registered_address,
-        registered_client_share_requests, write_registered_address,
+        registered_client_share_requests, storage_server_for_revocation, write_registered_address,
     };
 
     #[test]
@@ -425,11 +456,23 @@ execution_uid = 501
 host = "192.0.2.2"
 transport = "ssh"
 
+[nodes.nas]
+host = "192.0.2.20"
+transport = "storage"
+
 [shares.tools]
 server = "login"
 source_root = "/Users/Shared/tools"
 mount_root = "/Users/Shared/tools"
 share_uuid = "82d02835-f6ab-52b4-aaab-f90cafde9981"
+
+[shares.smb-data]
+protocol = "smb"
+server = "nas"
+source_root = "/data"
+mount_root = "/Volumes/data"
+share_uuid = "55fb9b02-ce96-5a69-8ad3-356563eff27b"
+smb_user = "smb-user"
 "#,
         )
         .unwrap();
@@ -449,6 +492,49 @@ share_uuid = "82d02835-f6ab-52b4-aaab-f90cafde9981"
             request.root == "/Users/Shared/tools"
                 && request.share_uuid == "82d02835-f6ab-52b4-aaab-f90cafde9981"
         }));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.root.contains("/data")),
+            "SMB mappings must not create NFS export requests"
+        );
+    }
+
+    #[test]
+    fn reset_client_revocation_uses_the_prepared_ssh_transport() {
+        let config = ClusterConfig::parse(
+            r#"
+[cluster]
+name = "client-access"
+login_node = "login"
+default_queue = "compute"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "f779bcf5-ea85-5caa-9579-74b395f3cce5"
+storage_server = "login"
+protocol_version = 1
+
+[queues.compute]
+nodes = []
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.1"
+transport = "local"
+machine_uuid = "4c0f4722-1130-50cf-ae36-55ff1abb5146"
+execution_uid = 501
+"#,
+        )
+        .unwrap();
+        let mut repaired = config.nodes["login"].clone();
+        repaired.ssh_identity_file = Some("/tmp/macluster-reset-key".into());
+        let prepared = BTreeMap::from([("login".into(), repaired)]);
+
+        let selected = storage_server_for_revocation(&config, &prepared, "login").unwrap();
+
+        assert_eq!(
+            selected.ssh_identity_file.as_deref(),
+            Some("/tmp/macluster-reset-key")
+        );
     }
 
     #[test]

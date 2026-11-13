@@ -3,11 +3,10 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{Cursor, Read, Write},
-    os::unix::fs::PermissionsExt,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -16,7 +15,7 @@ use macluster_controller::smb_credential::CredentialHelperClient;
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, Transport},
     smb_credential_cleanup::GlobalSmbCredentialCleanup,
-    smb_credentials_state::{NodeKeychainState, entry_key, record_generation, remove_endpoint},
+    smb_credentials_state::{record_generation, remove_endpoint},
     storage_uri::StorageUri,
 };
 use macluster_protocol::{
@@ -32,11 +31,80 @@ use zeroize::Zeroizing;
 
 use crate::node_admin::AppResult;
 
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+
 const SECURITY_BINARY: &str = "/usr/bin/security";
 const MOUNT_SMBFS_BINARY: &str = "/sbin/mount_smbfs";
+#[cfg(test)]
 const PTY_TIMEOUT: Duration = Duration::from_secs(20);
 const SECURITY_ITEM_NOT_FOUND: i32 = 44;
 const SMB_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+const SMB_PASSWORD_ATTEMPTS: u8 = 3;
+
+pub(crate) fn ensure_smb_share_visible(server_host: &str, source: &str) -> Result<(), String> {
+    let share = source
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if share.is_empty() {
+        return Err("SMB URI must contain a share name after the server".into());
+    }
+    let mut command = Command::new("/usr/bin/smbutil");
+    command.arg("view");
+    command.args(["-N", &format!("//{server_host}")]);
+    command.env("LC_ALL", "C");
+    let output = match macluster_controller::transport::run_child_bounded(
+        command,
+        None,
+        Duration::from_secs(10),
+    ) {
+        Ok(output) => output,
+        Err(_) => return Ok(()),
+    };
+    if !output.status.success() {
+        // Some servers require authenticated enumeration. In that case the
+        // normal credential validation remains authoritative.
+        return Ok(());
+    }
+    let shares = parse_smbutil_shares(&String::from_utf8_lossy(&output.stdout));
+    if shares.is_empty()
+        || shares
+            .iter()
+            .any(|available| available.eq_ignore_ascii_case(share))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "SMB share '{share}' does not exist on {server_host}. This is not a password error. Available shares: {}. Use `smb://{server_host}/SHARE/...` with one of those names.",
+        shares.join(", ")
+    ))
+}
+
+fn parse_smbutil_shares(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with("Share ")
+                || line.starts_with("---")
+                || line.ends_with("shares listed")
+            {
+                return None;
+            }
+            let (name, disk) = if let Some(index) = line.find(" Disk") {
+                (line[..index].trim(), true)
+            } else if let Some(index) = line.find(" Pipe") {
+                (line[..index].trim(), false)
+            } else {
+                return None;
+            };
+            (disk && !name.is_empty()).then(|| name.to_owned())
+        })
+        .collect()
+}
 
 pub(crate) fn run_internal(args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
@@ -51,23 +119,44 @@ fn run_node_keychain(args: &[String]) -> AppResult<()> {
         Some("store") => {
             let options = parse_options(
                 &args[1..],
-                &["--cluster-uuid", "--server", "--account", "--generation"],
+                &[
+                    "--cluster-uuid",
+                    "--server-id",
+                    "--server",
+                    "--account",
+                    "--generation",
+                ],
             )?;
             let cluster = parse_cluster(required(&options, "--cluster-uuid")?)?;
             let endpoint = endpoint_from_options(&options)?;
             let generation = parse_generation(required(&options, "--generation")?)?;
-            let run = PtySecurityRunner;
             let state_dir = default_state_dir()?;
-            let mut stdin = std::io::stdin().lock();
-            store_from_reader(
-                &state_dir,
-                cluster,
-                &endpoint,
-                generation,
-                &mut stdin,
-                Arc::new(run),
-            )
-            .map_err(|error| (1, error.to_string()))?;
+            let stdin = std::io::stdin().lock();
+            let mut bytes = Vec::new();
+            stdin
+                .take(MAX_SMB_CREDENTIAL_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| (1, format!("cannot read SMB password: {error}")))?;
+            if bytes.len() > MAX_SMB_CREDENTIAL_BYTES {
+                return Err((
+                    2,
+                    format!("SMB password exceeds the {MAX_SMB_CREDENTIAL_BYTES}-byte limit"),
+                ));
+            }
+            let password =
+                SecretString::from_bytes(bytes).map_err(|error| (2, error.to_string()))?;
+            let key = SmbCredentialKey {
+                cluster_uuid: cluster,
+                server_id: NodeId::new(required(&options, "--server-id")?.to_owned())
+                    .map_err(|error| (2, error.to_string()))?,
+                server_host: endpoint.server.clone(),
+                account: endpoint.account.clone(),
+            };
+            CredentialHelperClient::system()
+                .provision_login_keychain(&key, generation, &password)
+                .map_err(|error| (1, error.to_string()))?;
+            record_node_generation(&state_dir, cluster, &endpoint, generation)
+                .map_err(|error| (1, error.to_string()))?;
             println!(
                 "{}",
                 serde_json::json!({ "status": "stored", "generation": generation })
@@ -105,6 +194,16 @@ fn run_node_keychain(args: &[String]) -> AppResult<()> {
 
 fn run_master_keychain(args: &[String]) -> AppResult<()> {
     match args.first().map(String::as_str) {
+        Some("ping") => {
+            if args.len() != 1 {
+                return Err((2, "internal smb-master ping takes no options".into()));
+            }
+            CredentialHelperClient::system()
+                .ping()
+                .map_err(|error| (1, error.to_string()))?;
+            println!("{}", serde_json::json!({ "status": "pong" }));
+            Ok(())
+        }
         Some("import") => {
             let options = parse_options(
                 &args[1..],
@@ -287,13 +386,14 @@ fn default_state_dir() -> AppResult<PathBuf> {
     Ok(home.join("Library/Application Support/macluster"))
 }
 
+#[cfg(test)]
 fn store_from_reader(
     state_dir: &Path,
     cluster_uuid: Id128,
     endpoint: &SmbKeychainEndpoint,
     generation: u64,
     input: &mut impl Read,
-    runner: Arc<dyn NodeKeychainCommandRunner>,
+    runner: std::sync::Arc<dyn NodeKeychainCommandRunner>,
 ) -> Result<(), NodeKeychainError> {
     endpoint
         .validate()
@@ -385,6 +485,10 @@ struct PtySmbAuthenticator {
     server_host: String,
 }
 
+fn smb_validation_arguments(source: &str) -> Vec<String> {
+    vec!["view".into(), "-f".into(), source.into()]
+}
+
 impl SmbAuthenticator for PtySmbAuthenticator {
     fn validate(
         &self,
@@ -392,49 +496,25 @@ impl SmbAuthenticator for PtySmbAuthenticator {
         account: &str,
         password: &SecretString,
     ) -> Result<(), SmbAuthError> {
-        validate_mount_with_io(
-            |source, target| {
-                run_password_pty(
-                    Path::new("/sbin/mount_smbfs"),
-                    &[
-                        "-s".to_owned(),
-                        source.to_owned(),
-                        target.to_string_lossy().into_owned(),
-                    ],
-                    password,
-                    SMB_AUTH_TIMEOUT,
-                )
-                .map_err(|error| match error {
-                    NodeKeychainError::Timeout(_) => SmbAuthError::Timeout,
-                    other => SmbAuthError::Pty(other),
-                })
-            },
-            |target| {
-                let status = std::process::Command::new("/sbin/umount")
-                    .arg(target)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map_err(|error| SmbAuthError::Cleanup(error.to_string()))?;
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(SmbAuthError::Cleanup(format!(
-                        "umount exited with {:?}",
-                        status.code()
-                    )))
-                }
-            },
-            &format!(
-                "//{account}@{}/{}",
-                self.server_host,
-                uri.source
-                    .trim_start_matches('/')
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-            ),
+        let source = format!(
+            "//{account}@{}/{}",
+            self.server_host,
+            uri.source
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .unwrap_or("")
+        );
+        run_password_pty(
+            Path::new("/usr/bin/smbutil"),
+            &smb_validation_arguments(&source),
+            password,
+            SMB_AUTH_TIMEOUT,
         )
+        .map_err(|error| match error {
+            NodeKeychainError::Timeout(_) => SmbAuthError::Timeout,
+            other => SmbAuthError::Pty(other),
+        })
     }
 }
 
@@ -457,6 +537,7 @@ pub(crate) trait CredentialDistributor: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProvisionState {
     Provisioned,
+    #[allow(dead_code)]
     Current,
     Deferred(String),
 }
@@ -478,17 +559,61 @@ pub(crate) struct CredentialPlan {
 
 pub(crate) fn ensure_smb_mount_credential(
     config_path: &Path,
-    _state_dir: &Path,
+    state_dir: &Path,
     uri: &StorageUri,
     options: &crate::node_admin::StorageMountOptions,
+    account: &str,
 ) -> AppResult<CredentialPlan> {
     let source = fs::read_to_string(config_path)
         .map_err(|error| (1, format!("cannot read cluster config: {error}")))?;
     let config = ClusterConfig::parse(&source).map_err(|error| (2, error.to_string()))?;
-    let account =
-        crate::node_admin::resolve_smb_user(&config, &uri.server, options.smb_user.as_deref())
-            .map_err(|error| (2, error.to_string()))?;
+    let local_node_id = config
+        .login_node
+        .as_ref()
+        .map(NodeId::as_str)
+        .or_else(|| {
+            config
+                .nodes
+                .iter()
+                .find(|(_, node)| node.transport == macluster_core::config::Transport::Local)
+                .map(|(id, _)| id.as_str())
+        })
+        .ok_or_else(|| {
+            (
+                1,
+                "SMB credential helper requires a local login node".into(),
+            )
+        })?;
+    let local_node = config.nodes.get(local_node_id).ok_or_else(|| {
+        (
+            1,
+            format!("local login node '{local_node_id}' is not configured"),
+        )
+    })?;
+    let _ = local_node;
     let nodes = crate::node_admin::smb_credential_nodes(&config, uri.server.as_str());
+    let helper_operation = Id128::random().to_string();
+    for (node_id, node) in &nodes {
+        if node.transport == Transport::Ssh && !crate::node_admin::node_ssh_endpoint_reachable(node)
+        {
+            continue;
+        }
+        crate::node_admin::ensure_smb_credential_helper_for_node(
+            &config,
+            node_id.as_str(),
+            node,
+            state_dir,
+            &helper_operation,
+        )
+        .map_err(|error| {
+            (
+                1,
+                format!(
+                    "cannot prepare the SMB session helper on {node_id} before prompting: {error}"
+                ),
+            )
+        })?;
+    }
     let prompt = TerminalPasswordPrompt;
     let authenticator = PtySmbAuthenticator {
         server_host: config.nodes[uri.server.as_str()].host.clone(),
@@ -498,7 +623,7 @@ pub(crate) fn ensure_smb_mount_credential(
     ensure_smb_mount_credential_with(
         &config,
         uri,
-        &account,
+        account,
         options.update_credential,
         &nodes,
         &prompt,
@@ -534,17 +659,68 @@ fn ensure_smb_mount_credential_with(
     };
     key.validate()
         .map_err(|error| CredentialWorkflowError::Config(error.to_string()))?;
-    let existing = master.get(&key).map_err(CredentialWorkflowError::Master)?;
+    // An explicit credential rotation must not need to read the old secret.
+    // The system-keychain ACL may have been invalidated by a helper update,
+    // while the privileged store operation can still replace the item.
+    let existing = if update_credential {
+        None
+    } else {
+        master.get(&key).map_err(CredentialWorkflowError::Master)?
+    };
     let newly_created = existing.is_none();
     let credential = if let Some(existing) = existing.filter(|_| !update_credential) {
         existing
     } else {
-        let password = prompt
-            .prompt(&key.endpoint())
-            .map_err(CredentialWorkflowError::Prompt)?;
-        authenticator
-            .validate(uri, account, &password)
-            .map_err(CredentialWorkflowError::Authentication)?;
+        let mut attempt = 0;
+        let password = loop {
+            attempt += 1;
+            let password = prompt
+                .prompt(&key.endpoint())
+                .map_err(CredentialWorkflowError::Prompt)?;
+            match authenticator.validate(uri, account, &password) {
+                Ok(()) => break password,
+                Err(error)
+                    if error.failure_kind() == SmbAuthFailureKind::Authentication
+                        && attempt < SMB_PASSWORD_ATTEMPTS =>
+                {
+                    eprintln!(
+                        "SMB authentication failed for {account}@{} (attempt {attempt}/{SMB_PASSWORD_ATTEMPTS}); try again.",
+                        key.server_host
+                    );
+                }
+                Err(error) if error.failure_kind() == SmbAuthFailureKind::Authentication => {
+                    return Err(CredentialWorkflowError::Authentication(
+                        SmbAuthError::InvalidCredentials {
+                            attempts: attempt,
+                            detail: error.to_string(),
+                        },
+                    ));
+                }
+                Err(error) if error.failure_kind() == SmbAuthFailureKind::ShareNotFound => {
+                    let share = uri
+                        .source
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or_default();
+                    return Err(CredentialWorkflowError::Authentication(
+                        SmbAuthError::ShareNotFound(format!(
+                            "SMB share '{share}' was not found on {}. This is not a password error; check the share name with `/usr/bin/smbutil view -N //{}` and use `smb://{}/{}/...`.",
+                            key.server_host, key.server_host, key.server_host, share
+                        )),
+                    ));
+                }
+                Err(error) if error.failure_kind() == SmbAuthFailureKind::MountConflict => {
+                    return Err(CredentialWorkflowError::Authentication(
+                        SmbAuthError::MountConflict(format!(
+                            "{}; the same SMB source appears to be mounted through another server name or account. Run `mnode -l`, accept the mount reuse prompt, or unmount the existing source before retrying.",
+                            error
+                        )),
+                    ));
+                }
+                Err(error) => return Err(CredentialWorkflowError::Authentication(error)),
+            }
+        };
         master
             .put(&key, &password)
             .map_err(CredentialWorkflowError::Master)?
@@ -839,6 +1015,7 @@ pub(crate) fn run_cleanup_command(args: &[String]) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_mount_with_io(
     mount: impl FnOnce(&str, &Path) -> Result<(), SmbAuthError>,
     unmount: impl FnOnce(&Path) -> Result<(), SmbAuthError>,
@@ -878,48 +1055,20 @@ impl CredentialDistributor for SshCredentialDistributor {
     ) -> Result<ProvisionState, DistributionError> {
         if node.transport == Transport::Local {
             let endpoint = provision.key.endpoint();
-            let runner = PtySecurityRunner;
             let state_dir =
                 default_state_dir().map_err(|(_, error)| DistributionError::Local(error))?;
-            let state = NodeKeychainState::load(&state_dir)
-                .map_err(|error| DistributionError::Local(error.to_string()))?;
-            let existing = state.entries.get(&entry_key(&endpoint));
-            let has_credential = runner
-                .has(&endpoint)
-                .map_err(|error| DistributionError::Local(error.to_string()))?;
-            if has_credential
-                && existing.is_some_and(|entry| {
-                    entry.cluster_uuid == provision.key.cluster_uuid
-                        && entry.generation >= provision.credential.generation
-                })
-            {
-                return Ok(ProvisionState::Current);
-            }
-            if has_credential && existing.is_none() {
-                record_node_generation(
-                    &state_dir,
-                    provision.key.cluster_uuid,
-                    &endpoint,
+            CredentialHelperClient::system()
+                .provision_login_keychain(
+                    &provision.key,
                     provision.credential.generation,
+                    &provision.credential.password,
                 )
                 .map_err(|error| DistributionError::Local(error.to_string()))?;
-                return Ok(ProvisionState::Current);
-            }
-            let mut input = Cursor::new(
-                provision
-                    .credential
-                    .password
-                    .as_secret()
-                    .as_bytes()
-                    .to_vec(),
-            );
-            store_from_reader(
+            record_node_generation(
                 &state_dir,
                 provision.key.cluster_uuid,
                 &endpoint,
                 provision.credential.generation,
-                &mut input,
-                Arc::new(runner),
             )
             .map_err(|error| DistributionError::Local(error.to_string()))?;
             Ok(ProvisionState::Provisioned)
@@ -977,21 +1126,93 @@ pub(crate) enum SmbAuthError {
     #[error("SMB authentication process failed: {0}")]
     Pty(NodeKeychainError),
     #[error("SMB authentication cleanup failed: {0}")]
+    #[cfg(test)]
     Cleanup(String),
     #[cfg(test)]
     #[error("SMB server rejected the supplied credentials")]
     Rejected,
+    #[error("SMB credentials were rejected after {attempts} attempt(s): {detail}")]
+    InvalidCredentials { attempts: u8, detail: String },
+    #[error("{0}")]
+    ShareNotFound(String),
+    #[error("{0}")]
+    MountConflict(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmbAuthFailureKind {
+    Authentication,
+    ShareNotFound,
+    MountConflict,
+    Other,
+}
+
+impl SmbAuthError {
+    fn failure_kind(&self) -> SmbAuthFailureKind {
+        let detail = match self {
+            #[cfg(test)]
+            Self::Rejected => return SmbAuthFailureKind::Authentication,
+            Self::MountConflict(_) => return SmbAuthFailureKind::MountConflict,
+            Self::InvalidCredentials { .. } => {
+                return SmbAuthFailureKind::Authentication;
+            }
+            Self::ShareNotFound(_) => return SmbAuthFailureKind::ShareNotFound,
+            Self::Timeout => return SmbAuthFailureKind::Other,
+            #[cfg(test)]
+            Self::Cleanup(_) => return SmbAuthFailureKind::Other,
+            Self::Pty(NodeKeychainError::SecurityFailed { detail, .. }) => {
+                detail.as_deref().unwrap_or_default()
+            }
+            Self::Pty(_) => return SmbAuthFailureKind::Other,
+        };
+        let detail = detail.to_ascii_lowercase();
+        if detail.contains("file exists") {
+            SmbAuthFailureKind::MountConflict
+        } else if [
+            "no such file or directory",
+            "bad network name",
+            "tree connect failed",
+            "share not found",
+            "network name not found",
+            "status_not_found",
+            "path not found",
+        ]
+        .iter()
+        .any(|needle| detail.contains(needle))
+        {
+            SmbAuthFailureKind::ShareNotFound
+        } else if [
+            "authentication",
+            "logon failure",
+            "invalid credentials",
+            "permission denied",
+            "access denied",
+            "status_logon_failure",
+            "status_access_denied",
+            "session setup failed",
+            "not authorized",
+            "password",
+        ]
+        .iter()
+        .any(|needle| detail.contains(needle))
+        {
+            SmbAuthFailureKind::Authentication
+        } else {
+            SmbAuthFailureKind::Other
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub(crate) enum DistributionError {
-    #[error("local Keychain update failed: {0}")]
+    #[error("local SMB credential helper update failed: {0}")]
     Local(String),
     #[error("node transport failed: {0}")]
     Transport(String),
 }
 
 trait NodeKeychainCommandRunner: Send + Sync {
+    #[cfg(test)]
     fn store(
         &self,
         endpoint: &SmbKeychainEndpoint,
@@ -1005,6 +1226,7 @@ trait NodeKeychainCommandRunner: Send + Sync {
 struct PtySecurityRunner;
 
 impl NodeKeychainCommandRunner for PtySecurityRunner {
+    #[cfg(test)]
     fn store(
         &self,
         endpoint: &SmbKeychainEndpoint,
@@ -1080,6 +1302,7 @@ fn run_security_metadata(spec: &SecurityCommandSpec) -> Result<bool, NodeKeychai
     }
 }
 
+#[cfg(test)]
 fn run_security_pty(
     spec: &SecurityCommandSpec,
     password: &SecretString,
@@ -1235,17 +1458,21 @@ fn redact_security_output(output: &[u8], secret: &str) -> String {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(crate) enum NodeKeychainError {
-    #[error("SMB Keychain endpoint is invalid: {0}")]
+    #[cfg(test)]
+    #[error("SMB credential endpoint is invalid: {0}")]
     InvalidEndpoint(macluster_protocol::smb_credential::SmbCredentialValidationError),
+    #[cfg(test)]
     #[error("SMB credential generation must be greater than zero")]
     InvalidGeneration,
+    #[cfg(test)]
     #[error("SMB password exceeds the {maximum}-byte limit")]
     FrameTooLarge { maximum: usize },
+    #[cfg(test)]
     #[error("SMB password is invalid: {0}")]
     InvalidSecret(macluster_protocol::smb_credential::SmbCredentialValidationError),
-    #[error("SMB Keychain I/O failed: {0}")]
+    #[error("SMB credential helper I/O failed: {0}")]
     Io(String),
-    #[error("SMB Keychain pseudo-terminal failed: {0}")]
+    #[error("SMB credential helper pseudo-terminal failed: {0}")]
     Pty(String),
     #[error("security {action} failed with status {code:?}{}", detail.as_deref().map(|value| format!(": {value}")).unwrap_or_default())]
     SecurityFailed {
@@ -1253,9 +1480,10 @@ pub(crate) enum NodeKeychainError {
         code: Option<i32>,
         detail: Option<String>,
     },
-    #[error("SMB Keychain state failed: {0}")]
+    #[cfg(test)]
+    #[error("SMB credential helper state failed: {0}")]
     State(String),
-    #[error("SMB Keychain operation timed out after {0:?}")]
+    #[error("SMB credential helper operation timed out after {0:?}")]
     Timeout(Duration),
 }
 
@@ -1273,6 +1501,7 @@ mod tests {
 
     use macluster_core::{
         config::{ClusterConfig, NodeConfig, Transport},
+        smb_credentials_state::NodeKeychainState,
         storage_uri::StorageUri,
     };
     use macluster_protocol::{
@@ -1285,11 +1514,12 @@ mod tests {
 
     use super::{
         CredentialDistributor, CredentialPlan, CredentialWorkflowError, DistributionError,
-        MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, NodeKeychainState,
-        PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError, SmbAuthenticator,
+        MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, PasswordPrompt,
+        ProvisionReport, ProvisionState, SmbAuthError, SmbAuthFailureKind, SmbAuthenticator,
         cleanup_smb_credential_if_unused_with, ensure_smb_mount_credential_with,
-        provision_before_commit_with, pty_action_name, rollback_smb_credential_plan,
-        security_command, store_from_reader, validate_mount_with_io,
+        parse_smbutil_shares, provision_before_commit_with, pty_action_name,
+        rollback_smb_credential_plan, security_command, smb_validation_arguments,
+        store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -1389,14 +1619,41 @@ mod tests {
         }
     }
 
+    struct RetryAuthenticator {
+        failures_left: AtomicUsize,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl SmbAuthenticator for RetryAuthenticator {
+        fn validate(
+            &self,
+            _uri: &StorageUri,
+            _account: &str,
+            _password: &SecretString,
+        ) -> Result<(), SmbAuthError> {
+            self.events.lock().unwrap().push("auth");
+            let remaining = self.failures_left.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.failures_left.store(remaining - 1, Ordering::SeqCst);
+                Err(SmbAuthError::Rejected)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakeMaster {
         credential: Mutex<Option<StoredSmbCredential>>,
+        get_error: Mutex<Option<String>>,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl MasterCredentialStore for FakeMaster {
         fn get(&self, _key: &SmbCredentialKey) -> Result<Option<StoredSmbCredential>, String> {
+            if let Some(error) = self.get_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(self.credential.lock().unwrap().clone())
         }
 
@@ -1579,6 +1836,117 @@ mod tests {
     }
 
     #[test]
+    fn smbutil_share_parser_distinguishes_existing_and_missing_shares() {
+        let shares = parse_smbutil_shares(
+            "Share                                           Type    Comments\n\
+             -------------------------------\n\
+             external-disk                                           Disk    external-disk share directory\n\
+             cluster-user                                            Disk    cluster-user share directory\n\
+             Shared Data                                     Disk    share with a space\n\
+             IPC$                                            Pipe    IPC Service\n\
+             \n\
+             4 shares listed\n",
+        );
+        assert_eq!(shares, ["external-disk", "cluster-user", "Shared Data"]);
+    }
+
+    #[test]
+    fn smb_credential_validation_forces_a_fresh_authenticated_session() {
+        assert_eq!(
+            smb_validation_arguments("//smb-user@192.0.2.20/Partition_2"),
+            ["view", "-f", "//smb-user@192.0.2.20/Partition_2"]
+        );
+    }
+
+    #[test]
+    fn smb_mount_errors_are_classified_before_retrying_passwords() {
+        let missing = SmbAuthError::Pty(NodeKeychainError::SecurityFailed {
+            action: "mount_smbfs".into(),
+            code: Some(64),
+            detail: Some(
+                "mount_smbfs: mount error: //user@host/data: No such file or directory".into(),
+            ),
+        });
+        assert_eq!(missing.failure_kind(), SmbAuthFailureKind::ShareNotFound);
+
+        let rejected = SmbAuthError::Pty(NodeKeychainError::SecurityFailed {
+            action: "mount_smbfs".into(),
+            code: Some(13),
+            detail: Some("Authentication error".into()),
+        });
+        assert_eq!(rejected.failure_kind(), SmbAuthFailureKind::Authentication);
+
+        let conflict = SmbAuthError::Pty(NodeKeychainError::SecurityFailed {
+            action: "mount_smbfs".into(),
+            code: Some(64),
+            detail: Some("mount_smbfs: mount error: //user@host/share: File exists".into()),
+        });
+        assert_eq!(conflict.failure_kind(), SmbAuthFailureKind::MountConflict);
+    }
+
+    #[test]
+    fn wrong_password_is_prompted_three_times_before_failing() {
+        let config = workflow_config();
+        let uri = StorageUri::parse("smb://nas-01/data").unwrap();
+        let nodes = workflow_nodes();
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let error = ensure_smb_mount_credential_with(
+            &config,
+            &uri,
+            "smb-user",
+            false,
+            &nodes,
+            &FakePrompt {
+                count: Arc::clone(&prompt_count),
+                result: Ok(SecretString::new("wrong-secret")),
+            },
+            &RetryAuthenticator {
+                failures_left: AtomicUsize::new(3),
+                events: Arc::clone(&events),
+            },
+            &FakeMaster::default(),
+            &workflow_distributor(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CredentialWorkflowError::Authentication(_)));
+        assert_eq!(prompt_count.load(Ordering::SeqCst), 3);
+        assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn password_retry_succeeds_before_the_third_attempt() {
+        let config = workflow_config();
+        let uri = StorageUri::parse("smb://nas-01/data").unwrap();
+        let nodes = workflow_nodes();
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let plan = ensure_smb_mount_credential_with(
+            &config,
+            &uri,
+            "smb-user",
+            false,
+            &nodes,
+            &FakePrompt {
+                count: Arc::clone(&prompt_count),
+                result: Ok(SecretString::new("correct-secret")),
+            },
+            &RetryAuthenticator {
+                failures_left: AtomicUsize::new(2),
+                events: Arc::clone(&events),
+            },
+            &FakeMaster::default(),
+            &workflow_distributor(),
+        )
+        .unwrap();
+
+        assert_eq!(prompt_count.load(Ordering::SeqCst), 3);
+        assert_eq!(events.lock().unwrap().len(), 3);
+        assert_eq!(plan.credential.generation, 1);
+    }
+
+    #[test]
     fn first_run_prompts_once_and_second_run_reuses_the_master() {
         let config = workflow_config();
         let uri = StorageUri::parse("smb://nas-01/data").unwrap();
@@ -1669,7 +2037,7 @@ mod tests {
 
         assert!(matches!(error, CredentialWorkflowError::Authentication(_)));
         assert_eq!(master.credential.lock().unwrap().as_ref(), Some(&old));
-        assert_eq!(auth_events.lock().unwrap().as_slice(), ["auth"]);
+        assert_eq!(auth_events.lock().unwrap().len(), 3);
         assert!(master.events.lock().unwrap().is_empty());
         assert!(!format!("{error:?}").contains("wrong-secret"));
     }
@@ -1721,6 +2089,7 @@ mod tests {
                 generation: 3,
                 password: SecretString::new("old-secret"),
             })),
+            get_error: Mutex::new(None),
             events: Arc::clone(&events),
         };
         let prompt = FakePrompt {
@@ -1744,6 +2113,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.credential.generation, 4);
+        assert_eq!(events.lock().unwrap().as_slice(), ["auth", "put"]);
+    }
+
+    #[test]
+    fn credential_rotation_prompts_without_reading_an_unreadable_master() {
+        let config = workflow_config();
+        let uri = StorageUri::parse("smb://nas-01/data").unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let master = FakeMaster {
+            credential: Mutex::new(None),
+            get_error: Mutex::new(Some("Keychain authentication failed".into())),
+            events: Arc::clone(&events),
+        };
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+
+        let plan = ensure_smb_mount_credential_with(
+            &config,
+            &uri,
+            "smb-user",
+            true,
+            &workflow_nodes(),
+            &FakePrompt {
+                count: Arc::clone(&prompt_count),
+                result: Ok(SecretString::new("replacement-secret")),
+            },
+            &FakeAuthenticator {
+                succeed: true,
+                events: Arc::clone(&events),
+            },
+            &master,
+            &workflow_distributor(),
+        )
+        .unwrap();
+
+        assert_eq!(prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(plan.credential.generation, 1);
         assert_eq!(events.lock().unwrap().as_slice(), ["auth", "put"]);
     }
 

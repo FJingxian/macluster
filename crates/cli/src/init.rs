@@ -9,7 +9,7 @@ use std::{
 };
 
 use macluster_core::{
-    config::{ClusterConfig, NodeConfig},
+    config::{ClusterConfig, NodeConfig, Transport},
     maintenance::MaintenanceLock,
 };
 use macluster_protocol::{
@@ -920,6 +920,7 @@ fn finish_local_init(
     }
 
     prepare_local_primary_inner(&config.shared_root, &config.share_uuid, true)?;
+    prepare_local_named_share_sources(&config)?;
     if !existing_config {
         atomic_create_config(&expected_config, journal.config_source.as_bytes())?;
     }
@@ -952,6 +953,159 @@ fn finish_local_init(
         .and_then(|directory| directory.sync_all())
         .map_err(|error| (1, format!("cannot flush initialization cleanup: {error}")))?;
     Ok(())
+}
+
+fn prepare_local_named_share_sources(config: &ClusterConfig) -> AppResult<()> {
+    let Some(login_id) = config.login_node.as_ref().filter(|id| {
+        config
+            .nodes
+            .get(id.as_str())
+            .is_some_and(|node| node.transport == Transport::Local)
+    }) else {
+        return Err((1, "local init config is missing its login node".into()));
+    };
+    for (share_id, share) in &config.shares {
+        if share.server != *login_id {
+            continue;
+        }
+        create_real_directory_path(&share.source_root)?;
+        let marker = share.source_root.join(".macluster-share-id");
+        let marker_matches = match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let existing = fs::read_to_string(&marker).map_err(|error| {
+                    (
+                        1,
+                        format!(
+                            "cannot read software share marker {}: {error}",
+                            marker.display()
+                        ),
+                    )
+                })?;
+                if existing.trim() == share.share_uuid {
+                    true
+                } else {
+                    false
+                }
+            }
+            Ok(_) => {
+                return Err((
+                    1,
+                    format!(
+                        "software share marker {} must be a regular file",
+                        marker.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err((
+                    1,
+                    format!(
+                        "cannot inspect software share marker {}: {error}",
+                        marker.display()
+                    ),
+                ));
+            }
+        };
+        if !marker_matches {
+            if marker.exists() {
+                if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                    return Err((
+                        2,
+                        format!(
+                            "software share {share_id} at {} belongs to a different macluster identity; rerun init in an interactive Terminal to confirm replacing only its marker",
+                            share.source_root.display()
+                        ),
+                    ));
+                }
+                let response = prompt_value(
+                    &format!(
+                        "Software share {share_id} at {} has an old macluster marker. Replace only the marker for the new cluster? Shared files are preserved. (Y/N)",
+                        share.source_root.display()
+                    ),
+                    None,
+                    "N",
+                )?;
+                if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    return Err((
+                        1,
+                        format!(
+                            "cluster initialization cancelled because software share {share_id} retained its existing marker"
+                        ),
+                    ));
+                }
+            }
+            replace_local_share_marker(&share.source_root, &share.share_uuid)?;
+        }
+        if !macluster_controller::verify_primary_share_direct(
+            &share.source_root,
+            &share.source_root,
+            &share.share_uuid,
+            "127.0.0.1",
+            true,
+        ) {
+            return Err((
+                1,
+                format!(
+                    "software share {} at {} failed its filesystem and marker check",
+                    share_id,
+                    share.source_root.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_local_share_marker(root: &Path, share_uuid: &str) -> AppResult<()> {
+    let marker = root.join(".macluster-share-id");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err((
+                1,
+                format!(
+                    "software share marker {} must be a regular file",
+                    marker.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err((
+                1,
+                format!(
+                    "cannot inspect software share marker {}: {error}",
+                    marker.display()
+                ),
+            ));
+        }
+    }
+    let temporary = root.join(format!(".macluster-share-id.next-{}", Id128::random()));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        writeln!(file, "{share_uuid}")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &marker)?;
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot replace software share marker {}: {error}",
+                marker.display()
+            ),
+        )
+    })
 }
 
 fn parse_options(args: &[String]) -> AppResult<InitOptions> {
@@ -2257,9 +2411,9 @@ mod tests {
         Id128, InitContext, InitOptions, LOGIN_NODE_ID, LocalInitJournal, RemoteInitJournal,
         RemoteInitPhase, SoftwareRoot, compiler_toolchain_root, local_init_journal_path,
         parse_options, prepare_local_primary_inner, remote_init_config_matches,
-        remote_init_journal_path, remote_init_requires_nfs_setup, render_config, resume_local_init,
-        validate_recovery_journal_conflicts, validate_remote_init_topology,
-        write_local_init_journal, write_remote_init_journal,
+        remote_init_journal_path, remote_init_requires_nfs_setup, render_config,
+        replace_local_share_marker, resume_local_init, validate_recovery_journal_conflicts,
+        validate_remote_init_topology, write_local_init_journal, write_remote_init_journal,
     };
     use macluster_core::config::{ClusterConfig, Transport};
     use std::{
@@ -2277,6 +2431,33 @@ mod tests {
             remote_binary: "/Users/test/bin/macluster".into(),
             share_uuid: "00000000-0000-4000-8000-000000000001".into(),
         }
+    }
+
+    #[test]
+    fn named_share_marker_replacement_preserves_directory_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-share-marker-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".macluster-share-id"), "old-cluster\n").unwrap();
+        fs::write(root.join("keep.txt"), "preserved").unwrap();
+        let replacement = "00000000-0000-4000-8000-000000000222";
+
+        replace_local_share_marker(&root, replacement).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join(".macluster-share-id"))
+                .unwrap()
+                .trim(),
+            replacement
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).unwrap(),
+            "preserved"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

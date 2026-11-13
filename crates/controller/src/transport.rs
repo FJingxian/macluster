@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{self, Cursor, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
@@ -124,6 +124,7 @@ pub trait NodeTransport: Send + Sync + 'static {
     }
 }
 
+#[cfg(test)]
 fn endpoint_probe_error(error: &io::Error) -> Option<bool> {
     let code = error.raw_os_error()?;
     if matches!(
@@ -144,13 +145,26 @@ fn endpoint_probe_error(error: &io::Error) -> Option<bool> {
     }
 }
 
-fn is_explicit_host_unreachable(error: &io::Error) -> bool {
-    error.raw_os_error().is_some_and(|code| {
-        matches!(
-            code,
-            libc::EHOSTUNREACH | libc::ENETUNREACH | libc::EHOSTDOWN
-        )
-    })
+fn system_endpoint_reachable(host: &str, port: u16, timeout: Duration) -> Option<bool> {
+    // macOS Local Network privacy is scoped to the calling executable. A raw
+    // Rust TcpStream may be denied even while the platform SSH client is
+    // healthy, so perform this cheap preflight through the system utility and
+    // leave authentication to the subsequent strict SSH request.
+    let mut command = Command::new("/usr/bin/nc");
+    command
+        .args(["-z", "-G", "1", host, &port.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match run_child_bounded(
+        command,
+        None,
+        timeout.saturating_add(Duration::from_millis(250)),
+    ) {
+        Ok(output) => Some(output.status.success()),
+        Err(TransportError::Timeout) => None,
+        Err(_) => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -709,22 +723,14 @@ impl NodeTransport for ClusterTransport {
         match node.transport {
             Transport::Local => Some(true),
             Transport::Ssh => {
-                let address = node.host.parse::<Ipv4Addr>().ok()?;
-                match TcpStream::connect_timeout(
-                    &SocketAddr::from((address, node.ssh_port.unwrap_or(22))),
-                    timeout,
-                ) {
-                    Ok(_) => Some(true),
-                    Err(error) => endpoint_probe_error(&error),
-                }
+                system_endpoint_reachable(&node.host, node.ssh_port.unwrap_or(22), timeout)
             }
             Transport::Storage => {
-                let address = node.host.parse::<Ipv4Addr>().ok()?;
                 for port in [445, 2049] {
-                    match TcpStream::connect_timeout(&SocketAddr::from((address, port)), timeout) {
-                        Ok(_) => return Some(true),
-                        Err(error) if endpoint_probe_error(&error) == Some(false) => {}
-                        Err(_) => return None,
+                    match system_endpoint_reachable(&node.host, port, timeout) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => return None,
                     }
                 }
                 Some(false)
@@ -735,27 +741,10 @@ impl NodeTransport for ClusterTransport {
     fn host_reachable(&self, node: &NodeConfig, timeout: Duration) -> Option<bool> {
         match node.transport {
             Transport::Local => Some(true),
-            Transport::Ssh => {
-                let address = node.host.parse::<Ipv4Addr>().ok()?;
-                let endpoint = SocketAddr::from((address, node.ssh_port.unwrap_or(22)));
-                if let Err(error) = TcpStream::connect_timeout(&endpoint, timeout)
-                    && is_explicit_host_unreachable(&error)
-                {
-                    return Some(false);
-                }
-                ping_host(node, timeout)
-            }
-            Transport::Storage => {
-                let address = node.host.parse::<Ipv4Addr>().ok()?;
-                for port in [445, 2049] {
-                    match TcpStream::connect_timeout(&SocketAddr::from((address, port)), timeout) {
-                        Ok(_) => return Some(true),
-                        Err(error) if endpoint_probe_error(&error) == Some(false) => {}
-                        Err(_) => return None,
-                    }
-                }
-                ping_host(node, timeout)
-            }
+            Transport::Ssh | Transport::Storage => match self.endpoint_reachable(node, timeout) {
+                Some(true) => Some(true),
+                Some(false) | None => ping_host(node, timeout),
+            },
         }
     }
 
@@ -1410,6 +1399,24 @@ mod tests {
         assert_eq!(
             endpoint_probe_error(&io::Error::from_raw_os_error(libc::EACCES)),
             None
+        );
+    }
+
+    #[test]
+    fn endpoint_reachability_uses_the_system_network_stack_for_hostnames() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut remote = node(Transport::Ssh, "/usr/local/bin/macluster");
+        remote.host = "localhost".into();
+        remote.ssh_port = Some(port);
+        let transport = ClusterTransport::new_with_namespace(
+            PathBuf::from("/tmp/macluster-transport.toml"),
+            "endpoint-reachability-test",
+        );
+
+        assert_eq!(
+            transport.endpoint_reachable(&remote, Duration::from_secs(1)),
+            Some(true)
         );
     }
 

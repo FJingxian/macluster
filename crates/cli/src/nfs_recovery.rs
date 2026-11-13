@@ -17,7 +17,7 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-10";
+const SERVICE_VERSION: &str = "nfs-recovery-11";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 pub(crate) const NFS_MOUNT_OPTIONS: &str = "resvport,intr,rsize=8192,wsize=8192";
@@ -85,6 +85,11 @@ fn installation_check_script(dir: &Path, plist: &Path, service: &str, launchctl:
     checks.join(" && ")
 }
 fn label(target: &Path) -> String {
+    let key = key(target);
+    format!("org.macluster.nfs.{}", &key[..32])
+}
+
+fn legacy_label(target: &Path) -> String {
     format!("org.macluster.nfs.{}", key(target))
 }
 fn quote(s: &str) -> String {
@@ -626,6 +631,10 @@ fn plist_path(target: &Path) -> PathBuf {
     Path::new("/Library/LaunchDaemons").join(format!("{}.plist", label(target)))
 }
 
+fn legacy_plist_path(target: &Path) -> PathBuf {
+    Path::new("/Library/LaunchDaemons").join(format!("{}.plist", legacy_label(target)))
+}
+
 fn refreshed_manifest(
     old: Option<Manifest>,
     source: &str,
@@ -669,6 +678,7 @@ fn install_manifest_matches_endpoint(
 
 fn write_launch_daemon(target: &Path) -> Result<(), String> {
     let path = plist_path(target);
+    let legacy_path = legacy_plist_path(target);
     let temp = path.with_extension("next");
     let mut f = OpenOptions::new()
         .write(true)
@@ -682,6 +692,11 @@ fn write_launch_daemon(target: &Path) -> Result<(), String> {
         .and_then(|_| f.sync_all())
         .map_err(|e| e.to_string())?;
     fs::rename(temp, &path).map_err(|e| e.to_string())?;
+    match fs::remove_file(legacy_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
     bounded(
         "/bin/launchctl",
         &["bootstrap", "system", &path.to_string_lossy()],
@@ -706,13 +721,15 @@ fn write_version(target: &Path) -> Result<(), String> {
     fs::rename(temp, path).map_err(|error| error.to_string())
 }
 fn unload(target: &Path) -> Result<(), String> {
-    let service = format!("system/{}", label(target));
-    match bounded("/bin/launchctl", &["print", &service]) {
-        Ok(_) => {
-            bounded("/bin/launchctl", &["bootout", &service])?;
+    for label in [label(target), legacy_label(target)] {
+        let service = format!("system/{label}");
+        match bounded("/bin/launchctl", &["print", &service]) {
+            Ok(_) => {
+                bounded("/bin/launchctl", &["bootout", &service])?;
+            }
+            Err(error) if error.contains("Could not find service") => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if error.contains("Could not find service") => {}
-        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -876,6 +893,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             unload(target)?;
             for p in [
                 plist_path(target),
+                legacy_plist_path(target),
                 manifest_path,
                 dir.join("status.json"),
                 dir.join("version"),
@@ -1068,7 +1086,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-10");
+        assert_eq!(version, "nfs-recovery-11");
     }
 
     #[test]
@@ -1202,6 +1220,11 @@ mod tests {
         let a = Path::new("/Volumes/a & b");
         let b = Path::new("/Volumes/b");
         assert_ne!(label(a), label(b));
+        assert!(
+            label(a).len() <= 63,
+            "launchd rejects the generated label with Bootstrap I/O error: {}",
+            label(a)
+        );
         assert!(plist(a).contains("a &amp; b"));
         assert!(plist(a).contains("<key>RunAtLoad</key><true/>"));
         assert!(plist(a).contains("<key>StartInterval</key>"));

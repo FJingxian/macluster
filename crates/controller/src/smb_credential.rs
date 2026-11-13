@@ -15,7 +15,7 @@ use thiserror::Error;
 use macluster_core::config::ClusterConfig;
 
 pub const SMB_CREDENTIAL_SOCKET_PATH: &str = "/var/run/org.macluster.smb-credential.sock";
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct CredentialHelperClient {
@@ -88,6 +88,80 @@ impl CredentialHelperClient {
             SmbCredentialReplyBody::Deleted(deleted) => Ok(deleted),
             other => Err(SmbCredentialClientError::UnexpectedReply {
                 operation: "delete",
+                reply: reply_name(&other),
+            }),
+        }
+    }
+
+    pub fn provision_login_keychain(
+        &self,
+        key: &SmbCredentialKey,
+        generation: u64,
+        password: &SecretString,
+    ) -> Result<(), SmbCredentialClientError> {
+        match self.call(SmbCredentialOperation::ProvisionLogin {
+            key: key.clone(),
+            generation,
+            password: password.clone(),
+        })? {
+            SmbCredentialReplyBody::Provisioned => Ok(()),
+            other => Err(SmbCredentialClientError::UnexpectedReply {
+                operation: "provision_login",
+                reply: reply_name(&other),
+            }),
+        }
+    }
+
+    pub fn delete_login_keychain(
+        &self,
+        key: &SmbCredentialKey,
+    ) -> Result<bool, SmbCredentialClientError> {
+        match self.call(SmbCredentialOperation::DeleteLogin { key: key.clone() })? {
+            SmbCredentialReplyBody::Deleted(deleted) => Ok(deleted),
+            other => Err(SmbCredentialClientError::UnexpectedReply {
+                operation: "delete_login",
+                reply: reply_name(&other),
+            }),
+        }
+    }
+
+    pub fn mount_smb(
+        &self,
+        key: &SmbCredentialKey,
+        source: &str,
+        target: &str,
+        logical: &str,
+        logical_target: &str,
+    ) -> Result<(), SmbCredentialClientError> {
+        match self.call(SmbCredentialOperation::MountSmb {
+            key: key.clone(),
+            source: source.to_owned(),
+            target: target.to_owned(),
+            logical: logical.to_owned(),
+            logical_target: logical_target.to_owned(),
+        })? {
+            SmbCredentialReplyBody::Mounted => Ok(()),
+            other => Err(SmbCredentialClientError::UnexpectedReply {
+                operation: "mount_smb",
+                reply: reply_name(&other),
+            }),
+        }
+    }
+
+    pub fn unmount_smb(
+        &self,
+        target: &str,
+        logical: &str,
+        logical_target: &str,
+    ) -> Result<(), SmbCredentialClientError> {
+        match self.call(SmbCredentialOperation::UnmountSmb {
+            target: target.to_owned(),
+            logical: logical.to_owned(),
+            logical_target: logical_target.to_owned(),
+        })? {
+            SmbCredentialReplyBody::Unmounted => Ok(()),
+            other => Err(SmbCredentialClientError::UnexpectedReply {
+                operation: "unmount_smb",
                 reply: reply_name(&other),
             }),
         }
@@ -283,6 +357,9 @@ fn reply_name(reply: &SmbCredentialReplyBody) -> &'static str {
         SmbCredentialReplyBody::Credential(_) => "credential",
         SmbCredentialReplyBody::Missing => "missing",
         SmbCredentialReplyBody::Deleted(_) => "deleted",
+        SmbCredentialReplyBody::Provisioned => "provisioned",
+        SmbCredentialReplyBody::Mounted => "mounted",
+        SmbCredentialReplyBody::Unmounted => "unmounted",
     }
 }
 
@@ -410,6 +487,19 @@ mod tests {
                     SmbCredentialOperation::Ping => {
                         write_reply(&mut stream, SmbCredentialReplyBody::Pong);
                     }
+                    SmbCredentialOperation::ProvisionLogin { password, .. } => {
+                        assert_eq!(password.as_secret(), "test-secret-one");
+                        write_reply(&mut stream, SmbCredentialReplyBody::Provisioned);
+                    }
+                    SmbCredentialOperation::DeleteLogin { .. } => {
+                        write_reply(&mut stream, SmbCredentialReplyBody::Deleted(true));
+                    }
+                    SmbCredentialOperation::MountSmb { .. } => {
+                        write_reply(&mut stream, SmbCredentialReplyBody::Mounted);
+                    }
+                    SmbCredentialOperation::UnmountSmb { .. } => {
+                        write_reply(&mut stream, SmbCredentialReplyBody::Unmounted);
+                    }
                 }
             }
         });
@@ -505,6 +595,99 @@ mod tests {
 
         let client = CredentialHelperClient::new(path, Duration::from_secs(2));
         client.ping().unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn helper_client_provisions_mounts_and_deletes_the_node_credential() {
+        let (root, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut provision_stream, _) = listener.accept().unwrap();
+            match read_request(&mut provision_stream).operation {
+                SmbCredentialOperation::ProvisionLogin {
+                    key: provision_key,
+                    generation,
+                    password,
+                } => {
+                    assert_eq!(provision_key, key());
+                    assert_eq!(generation, 7);
+                    assert_eq!(password.as_secret(), "test-secret");
+                }
+                operation => panic!("unexpected operation: {operation:?}"),
+            }
+            write_reply(&mut provision_stream, SmbCredentialReplyBody::Provisioned);
+            drop(provision_stream);
+
+            let (mut delete_stream, _) = listener.accept().unwrap();
+            match read_request(&mut delete_stream).operation {
+                SmbCredentialOperation::DeleteLogin { key: delete_key } => {
+                    assert_eq!(delete_key, key())
+                }
+                operation => panic!("unexpected operation: {operation:?}"),
+            }
+            write_reply(&mut delete_stream, SmbCredentialReplyBody::Deleted(false));
+            drop(delete_stream);
+
+            let (mut mount_stream, _) = listener.accept().unwrap();
+            match read_request(&mut mount_stream).operation {
+                SmbCredentialOperation::MountSmb {
+                    key: mount_key,
+                    source,
+                    target,
+                    logical,
+                    logical_target,
+                } => {
+                    assert_eq!(mount_key, key());
+                    assert_eq!(source, "//smb-user@192.0.2.20/Partition_2");
+                    assert_eq!(target, "/Users/Shared/.macluster-mounts/share-1");
+                    assert_eq!(logical, "/Users/operator/data");
+                    assert_eq!(logical_target, "/Users/Shared/.macluster-mounts/share-1");
+                }
+                operation => panic!("unexpected operation: {operation:?}"),
+            }
+            write_reply(&mut mount_stream, SmbCredentialReplyBody::Mounted);
+            drop(mount_stream);
+
+            let (mut unmount_stream, _) = listener.accept().unwrap();
+            match read_request(&mut unmount_stream).operation {
+                SmbCredentialOperation::UnmountSmb {
+                    target,
+                    logical,
+                    logical_target,
+                } => {
+                    assert_eq!(target, "/Users/Shared/.macluster-mounts/share-1");
+                    assert_eq!(logical, "/Users/operator/data");
+                    assert_eq!(logical_target, "/Users/Shared/.macluster-mounts/share-1");
+                }
+                operation => panic!("unexpected operation: {operation:?}"),
+            }
+            write_reply(&mut unmount_stream, SmbCredentialReplyBody::Unmounted);
+        });
+
+        let client = CredentialHelperClient::new(path, Duration::from_secs(2));
+        client
+            .provision_login_keychain(&key(), 7, &SecretString::new("test-secret"))
+            .unwrap();
+        assert!(!client.delete_login_keychain(&key()).unwrap());
+        client
+            .mount_smb(
+                &key(),
+                "//smb-user@192.0.2.20/Partition_2",
+                "/Users/Shared/.macluster-mounts/share-1",
+                "/Users/operator/data",
+                "/Users/Shared/.macluster-mounts/share-1",
+            )
+            .unwrap();
+        client
+            .unmount_smb(
+                "/Users/Shared/.macluster-mounts/share-1",
+                "/Users/operator/data",
+                "/Users/Shared/.macluster-mounts/share-1",
+            )
+            .unwrap();
+
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }

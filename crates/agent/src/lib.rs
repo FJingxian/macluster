@@ -1,6 +1,7 @@
 //! SSH stdio agent and detached per-job runner.
 
 pub mod admin;
+pub mod local_loopback;
 pub mod log_sync;
 mod resources;
 pub mod runner;
@@ -302,7 +303,7 @@ fn handle_operation_with_config_path(
             if status.terminal_state.is_some() && status.log_sync_pending {
                 // A publisher failure must not make an otherwise reachable
                 // node look offline. Its pending flag keeps the node reserved.
-                let _ = log_sync::schedule(state_dir, config);
+                let _ = log_sync::schedule(state_dir, config, local_node_id);
             }
             Ok(ResponseBody::Execution(status))
         }
@@ -1380,6 +1381,7 @@ fn node_health_with_providers(
             macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE.to_owned(),
             "config.smb-user-mounts.v1".to_owned(),
             "config.smb-keychain.v1".to_owned(),
+            local_loopback::FEATURE.to_owned(),
         ],
         system_disk_capacity,
         external_disk_capacities,
@@ -1674,46 +1676,71 @@ fn start_job(
     write_store(state_dir, &store).map_err(protocol_failed)?;
 
     let executable = std::env::current_exe().map_err(protocol_failed)?;
-    let mut runner = Command::new(executable);
-    runner
-        .args(["internal", "runner", "--state-dir"])
-        .arg(state_dir)
-        .arg("--job-id")
-        .arg(job_id.to_string())
-        .arg("--start-token")
-        .arg(start_token.to_string())
-        .current_dir(state_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(target_vendor = "apple")]
-    use std::os::unix::process::CommandExt;
-    #[cfg(target_vendor = "apple")]
-    runner.process_group(0);
-    let mut child = match runner.spawn() {
-        Ok(child) => child,
+    let arguments = vec![
+        "internal".into(),
+        "runner".into(),
+        "--state-dir".into(),
+        state_dir.to_string_lossy().into_owned(),
+        "--job-id".into(),
+        job_id.to_string(),
+        "--start-token".into(),
+        start_token.to_string(),
+    ];
+    let launch_result = if local_loopback::required(config, local_node_id) {
+        local_loopback::launch(
+            state_dir,
+            config,
+            local_node_id,
+            local_loopback::CommandSpec {
+                program: executable,
+                arguments,
+                working_directory: state_dir.to_path_buf(),
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "could not start the local job through SSH loopback; enable Remote Login for this account and retry: {error}"
+            )
+        })
+    } else {
+        let mut runner = Command::new(&executable);
+        runner
+            .args(&arguments)
+            .current_dir(state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(target_vendor = "apple")]
+        use std::os::unix::process::CommandExt;
+        #[cfg(target_vendor = "apple")]
+        runner.process_group(0);
+        match runner.spawn() {
+            Ok(mut child) => {
+                let pid = child.id();
+                match wait_for_process_start_identity(pid) {
+                    Some(start_id) => Ok(local_loopback::LaunchedProcess { pid, start_id }),
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err("could not verify detached runner process identity".into())
+                    }
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    let launched = match launch_result {
+        Ok(launched) => launched,
         Err(error) => {
             record.terminal_state = Some(JobState::Failed);
             record.end_reason = Some(format!("could not launch runner: {error}"));
             store.active = Some(record);
             let _ = write_store(state_dir, &store);
-            return Err(ProtocolError::Failed(error.to_string()));
+            return Err(ProtocolError::Failed(error));
         }
     };
-    let runner_pid = child.id();
-    let Some(runner_start_id) = wait_for_process_start_identity(runner_pid) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        record.terminal_state = Some(JobState::Failed);
-        record.end_reason = Some("could not verify detached runner process identity".into());
-        store.active = Some(record);
-        let _ = write_store(state_dir, &store);
-        return Err(ProtocolError::Failed(
-            "could not verify detached runner process identity".into(),
-        ));
-    };
-    record.runner_pid = Some(runner_pid);
-    record.runner_start_id = Some(runner_start_id);
+    record.runner_pid = Some(launched.pid);
+    record.runner_start_id = Some(launched.start_id);
     record.authorized = true;
     store.active = Some(record.clone());
     write_store(state_dir, &store).map_err(protocol_failed)?;

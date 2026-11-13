@@ -2020,6 +2020,7 @@ const REQUIRED_AGENT_FEATURES: &[&str] = &[
     "config.primary-storage-source.v1",
     "config.smb-user-mounts.v1",
     "config.smb-keychain.v1",
+    macluster_agent::local_loopback::FEATURE,
     macluster_protocol::types::NAMESPACED_JOBS_FEATURE,
     macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE,
     "metrics.cpu-temperature.v1",

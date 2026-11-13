@@ -8827,6 +8827,18 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 .publish_snapshot(job_id, Path::new(&shared_root))
                 .map_err(operation_error)
         }
+        Some("loopback-exec") => {
+            let status = macluster_agent::local_loopback::execute(&args[1..])
+                .map_err(|error| (1, error.to_string()))?;
+            if status == 0 {
+                Ok(())
+            } else {
+                Err((
+                    status.max(1),
+                    format!("loopback command exited with status {status}"),
+                ))
+            }
+        }
         Some("local-share-source-check") => {
             let path = option_value(args, "--path")?
                 .ok_or_else(|| (2, "local-share-source-check requires --path PATH".into()))?;
@@ -8981,6 +8993,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "config.primary-storage-source.v1",
                         "config.smb-user-mounts.v1",
                         "config.smb-keychain.v1",
+                        macluster_agent::local_loopback::FEATURE,
                         "metrics.cpu-temperature.v1",
                         "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,

@@ -2,7 +2,7 @@ use macluster_protocol::control::ClientDescriptor;
 use std::{
     collections::BTreeSet,
     io::{self, IsTerminal},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -11,6 +11,11 @@ use crate::node_admin::shell_quote;
 
 const HELPER_ROOT: &str = "/Library/PrivilegedHelperTools";
 const DAEMON_ROOT: &str = "/Library/LaunchDaemons";
+const SMB_BACKING_ROOT: &str = "/Users/Shared/.macluster-mounts";
+
+fn is_managed_smb_backing_alias(path: &Path) -> bool {
+    path.starts_with(SMB_BACKING_ROOT) && path != Path::new(SMB_BACKING_ROOT)
+}
 
 fn source_is_client_local(source_host: &str, client_ip: &str) -> bool {
     source_host == client_ip
@@ -178,8 +183,9 @@ fn client_mount_script(
             let backing_alias = shell_quote(&mount.backing_alias());
             let physical = shell_quote(&mount.physical_target);
             let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
+            let managed_root = shell_quote(SMB_BACKING_ROOT);
             body.push_str(&format!(
-                "if [ -L {logical} ]; then actual=$(/usr/bin/readlink {logical}); [ \"$actual\" = {backing_alias} ] || {{ echo 'SMB logical mount target points elsewhere' >&2; exit 1; }}; elif [ -e {logical} ]; then [ -d {logical} ] || {{ echo 'SMB logical mount target is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A {logical}) || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical mount target is not empty' >&2; exit 1; }}; /bin/rmdir {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then :; else\n  /bin/mkdir -p {physical}\n  /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source_arg} {physical}\nfi\n/bin/mkdir -p \"$(/usr/bin/dirname {logical})\"\nif [ ! -L {logical} ]; then /bin/ln -s {backing_alias} {logical}; fi\n"
+                "if [ -L {logical} ]; then actual=$(/usr/bin/readlink {logical}); if [ \"$actual\" != {backing_alias} ]; then case \"$actual\" in {managed_root}/*) /bin/rm -f {logical} ;; *) echo 'SMB logical mount target points elsewhere' >&2; exit 1 ;; esac; fi; elif [ -e {logical} ]; then [ -d {logical} ] || {{ echo 'SMB logical mount target is not a directory' >&2; exit 1; }}; entries=$(/bin/ls -A {logical}) || exit 1; [ -z \"$entries\" ] || {{ echo 'SMB logical mount target is not empty' >&2; exit 1; }}; /bin/rmdir {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then :; else\n  /bin/mkdir -p {physical}\n  /sbin/mount_smbfs -N -o nopassprompt,nobrowse {source_arg} {physical}\nfi\n/bin/mkdir -p \"$(/usr/bin/dirname {logical})\"\nif [ ! -L {logical} ]; then /bin/ln -s {backing_alias} {logical}; fi\n"
             ));
         }
     }
@@ -200,10 +206,10 @@ fn client_mount_script(
                 ));
             } else {
                 let logical = shell_quote(&mount.logical_target);
-                let alias = shell_quote(&mount.backing_alias());
+                let managed_root = shell_quote(SMB_BACKING_ROOT);
                 let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
                 retired.push_str(&format!(
-                    "if [ -L {logical} ] && [ \"$(/usr/bin/readlink {logical})\" = {alias} ]; then /bin/rm -f {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+                    "if [ -L {logical} ]; then actual=$(/usr/bin/readlink {logical}); case \"$actual\" in {managed_root}/*) /bin/rm -f {logical} ;; esac; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
                 ));
             }
         }
@@ -238,10 +244,10 @@ fn client_remove_script(
             ));
         } else {
             let logical = shell_quote(&mount.logical_target);
-            let alias = shell_quote(&mount.backing_alias());
+            let managed_root = shell_quote(SMB_BACKING_ROOT);
             let physical_match = shell_quote(&format!(" on {} (smbfs", mount.physical_target));
             script.push_str(&format!(
-                "if [ -L {logical} ] && [ \"$(/usr/bin/readlink {logical})\" = {alias} ]; then /bin/rm -f {logical}; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
+                "if [ -L {logical} ]; then actual=$(/usr/bin/readlink {logical}); case \"$actual\" in {managed_root}/*) /bin/rm -f {logical} ;; esac; fi\nif /sbin/mount | /usr/bin/grep -F {physical_match} >/dev/null 2>&1; then /sbin/umount {target_arg}; fi\n"
             ));
         }
     }
@@ -295,6 +301,12 @@ fn overlay_targets(descriptor: &ClientDescriptor, client_ip: &str) -> Result<Vec
                 if actual == std::path::Path::new(&mount.backing_alias()) {
                     // A persisted SMB mount is exposed through this exact
                     // alias. Re-joining must recognize that managed layout.
+                    continue;
+                }
+                if is_managed_smb_backing_alias(&actual) {
+                    // A previous cluster/share identity can leave a managed
+                    // symlink behind. The mount helper will replace it with
+                    // the current backing alias without hiding user files.
                     continue;
                 }
                 return Err(format!(
@@ -825,6 +837,27 @@ mod tests {
             overlay_targets(&descriptor, "192.0.2.10")
                 .unwrap()
                 .is_empty()
+        );
+
+        fs::remove_file(&logical).unwrap();
+        let stale =
+            "/Users/Shared/.macluster-mounts/fa87abfd-de27-5001-a250-5bd4d94365eb/project/nested";
+        std::os::unix::fs::symlink(stale, &logical).unwrap();
+        assert!(
+            overlay_targets(&descriptor, "192.0.2.10")
+                .unwrap()
+                .is_empty(),
+            "a stale macluster-managed SMB alias is safe to replace"
+        );
+        let script = client_mount_script(
+            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            &descriptor,
+            None,
+            "192.0.2.10",
+        );
+        assert!(
+            script.contains("/Users/Shared/.macluster-mounts/"),
+            "the generated mount helper must recognize managed backing aliases"
         );
 
         fs::remove_file(&logical).unwrap();

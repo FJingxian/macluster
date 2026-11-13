@@ -17651,6 +17651,8 @@ fn smb_mount_script(
 fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
     let physical_path = smb_backing_path(&share.share_uuid);
     let physical = shell_quote(&physical_path.to_string_lossy());
+    let logical = shell_quote(&share.mount_root.to_string_lossy());
+    let managed_root = shell_quote("/Users/Shared/.macluster-mounts");
     let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
     let state = format!("\"$HOME/Library/Application Support/macluster/smb/{label}.state\"");
     let (_, full) = smb_share_parts(share)?;
@@ -17670,8 +17672,9 @@ fn smb_unmount_script(share: &ShareConfig) -> AppResult<String> {
             .map_err(|error| (1, format!("cannot encode SMB unmount request: {error}")))?,
     );
     Ok(format!(
-        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then\n  response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nfi\nif [ \"$backing\" != \"$physical\" ] && /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$backing\"; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then\n  response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nfi\nif [ \"$backing\" != \"$physical\" ] && /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$backing\"; fi\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); case \"$actual\" in {managed_root}/*) /bin/rm -f \"$logical\" ;; esac; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
         request = request,
+        managed_root = managed_root,
     ))
 }
 
@@ -26962,6 +26965,10 @@ execution_uid = 501
             super::smb_mount_script("00000000-0000-4000-8000-000000000001", &share, &server)
                 .unwrap();
         let unmount = super::smb_unmount_script(&share).unwrap();
+        assert!(
+            unmount.contains("case \"$actual\" in /Users/Shared/.macluster-mounts/*"),
+            "removal must clean a stale managed logical alias even when no SMB mount remains"
+        );
 
         for script in [mount, unmount] {
             let syntax = Command::new("/bin/sh")

@@ -38,6 +38,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 const SMB_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 const FAILURE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_FAILURES_PER_WINDOW: usize = 8;
+const SMB_BACKING_ROOT: &str = "/Users/Shared/.macluster-mounts";
 
 trait SecretStore: Send + Sync {
     fn get(&self, service: &str, account: &str) -> Result<Option<SecretString>, String>;
@@ -1243,12 +1244,21 @@ fn ensure_smb_logical_alias(logical: &str, logical_target: &str) -> Result<(), S
             if actual == Path::new(logical_target) {
                 return Ok(());
             }
-            return Err(format!(
-                "SMB logical alias {} points to {}, not {}",
-                logical.display(),
-                actual.display(),
-                logical_target
-            ));
+            if is_managed_smb_backing_alias(&actual) {
+                fs::remove_file(logical).map_err(|error| {
+                    format!(
+                        "replace stale SMB logical alias {}: {error}",
+                        logical.display()
+                    )
+                })?;
+            } else {
+                return Err(format!(
+                    "SMB logical alias {} points to {}, not {}",
+                    logical.display(),
+                    actual.display(),
+                    logical_target
+                ));
+            }
         }
         Ok(metadata) if metadata.is_dir() => {
             let mut entries = fs::read_dir(logical).map_err(|error| {
@@ -1300,7 +1310,7 @@ fn remove_smb_logical_alias(logical: &str, logical_target: &str) -> Result<(), S
             let actual = fs::read_link(logical).map_err(|error| {
                 format!("read SMB logical alias {}: {error}", logical.display())
             })?;
-            if actual != Path::new(logical_target) {
+            if actual != Path::new(logical_target) && !is_managed_smb_backing_alias(&actual) {
                 return Err(format!(
                     "refusing to remove foreign SMB logical alias {} -> {}",
                     logical.display(),
@@ -1320,6 +1330,10 @@ fn remove_smb_logical_alias(logical: &str, logical_target: &str) -> Result<(), S
             logical.display()
         )),
     }
+}
+
+fn is_managed_smb_backing_alias(path: &Path) -> bool {
+    path.starts_with(SMB_BACKING_ROOT) && path != Path::new(SMB_BACKING_ROOT)
 }
 
 fn ensure_real_directory_tree(path: &Path) -> Result<(), String> {
@@ -1624,6 +1638,7 @@ mod tests {
         io::{Read, Write},
         os::unix::fs::MetadataExt,
         os::unix::net::UnixStream,
+        path::Path,
         sync::Arc,
     };
 
@@ -1638,10 +1653,11 @@ mod tests {
     use super::{
         CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore, SecretStore,
         SmbMountAction, SmbMountBackend, arp_delete_arguments,
-        direct_storage_subnet_route_arguments, read_pinned_cluster,
-        reconcile_smb_mount_with_backend, record_smb_repair_failure, route_delete_arguments,
-        route_output_is_direct, run_bounded_process_group, serve_client_with, smb_mount_action,
-        smb_mount_arguments, smb_repair_allowed, smb_tcp_endpoint_reachable,
+        direct_storage_subnet_route_arguments, ensure_smb_logical_alias, read_pinned_cluster,
+        reconcile_smb_mount_with_backend, record_smb_repair_failure, remove_smb_logical_alias,
+        route_delete_arguments, route_output_is_direct, run_bounded_process_group,
+        serve_client_with, smb_mount_action, smb_mount_arguments, smb_repair_allowed,
+        smb_tcp_endpoint_reachable,
     };
 
     fn cluster() -> Id128 {
@@ -1961,6 +1977,32 @@ mod tests {
         assert_eq!(backend.mount_calls, 0);
         assert!(backend.active);
         assert!(!backend.readable);
+    }
+
+    #[test]
+    fn managed_stale_smb_alias_is_replaced_and_removed_without_touching_foreign_links() {
+        let root = Path::new("/private/tmp")
+            .join(format!("macluster-smb-stale-alias-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let logical = root.join("project");
+        let stale = "/Users/Shared/.macluster-mounts/fa87abfd-de27-5001-a250-5bd4d94365eb/project";
+        let current =
+            "/Users/Shared/.macluster-mounts/e6fe7c50-8ea9-567c-9238-e7fe1799fbf3/project";
+        std::os::unix::fs::symlink(stale, &logical).unwrap();
+
+        ensure_smb_logical_alias(&logical.to_string_lossy(), current).unwrap();
+        assert_eq!(fs::read_link(&logical).unwrap(), Path::new(current));
+        remove_smb_logical_alias(&logical.to_string_lossy(), current).unwrap();
+        assert!(!logical.exists());
+
+        std::os::unix::fs::symlink("/tmp/foreign-share", &logical).unwrap();
+        let error = remove_smb_logical_alias(&logical.to_string_lossy(), current).unwrap_err();
+        assert!(error.contains("foreign SMB logical alias"), "{error}");
+        assert_eq!(
+            fs::read_link(&logical).unwrap(),
+            Path::new("/tmp/foreign-share")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

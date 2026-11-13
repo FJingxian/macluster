@@ -16864,10 +16864,41 @@ fn list_failed_operations(config_path: &Path, state_dir: &Path) -> AppResult<()>
                 .unwrap_or("Operation did not finish; retry its original mnode command.")
         );
     }
+    if let Ok(path) =
+        macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default_path()
+        && let Ok(lines) = pending_smb_cleanup_lines(&path)
+    {
+        for line in lines {
+            found = true;
+            println!("{line}");
+        }
+    }
     if !found {
         println!("No unfinished node or share operations.");
     }
     Ok(())
+}
+
+fn pending_smb_cleanup_lines(path: &Path) -> io::Result<Vec<String>> {
+    let state = macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::load(path)?;
+    let mut lines = Vec::new();
+    for entry in state.nodes.values() {
+        lines.push(format!("{}  SMB cleanup pending", entry.node_id));
+        for share in &entry.shares {
+            lines.push(format!(
+                "  share {} -> {}",
+                share.share_uuid,
+                share.mount_root.display()
+            ));
+        }
+    }
+    for key in state.masters.values() {
+        lines.push(format!(
+            "{}  SMB master credential cleanup pending",
+            key.server_id
+        ));
+    }
+    Ok(lines)
 }
 
 fn existing_ssh_endpoint_matches(existing: &NodeConfig, endpoint: &NodeEndpoint) -> bool {
@@ -18421,15 +18452,21 @@ fn unregister_smb_share(
             share.server.as_str(),
             node_ssh_endpoint_reachable,
         );
-        let mut deferred_cleanup = unavailable;
+        let mut deferred_cleanup = BTreeSet::new();
         let mut successfully_unmounted = BTreeSet::new();
         let unmount_script = smb_unmount_script(&share)?;
-        for (node_id, node) in smb_client_nodes(&config, share.server.as_str()) {
-            if let Err(error) = run_smb_user_script(node, &unmount_script) {
+        for (node_id, node) in smb_credential_nodes(&config, share.server.as_str()) {
+            if unavailable.contains(node_id.as_str()) {
+                deferred_cleanup.insert(node_id.to_string());
+                queue_deferred_smb_mount_cleanup(node_id.as_str(), &node, &share)?;
+                continue;
+            }
+            if let Err(error) = run_smb_user_script(&node, &unmount_script) {
                 eprintln!("Warning: SMB cleanup on {node_id} was deferred: {error}");
-                deferred_cleanup.insert(node_id.clone());
+                deferred_cleanup.insert(node_id.to_string());
+                queue_deferred_smb_mount_cleanup(node_id.as_str(), &node, &share)?;
             } else {
-                successfully_unmounted.insert(node_id.clone());
+                successfully_unmounted.insert(node_id.to_string());
             }
         }
         let base_candidate = remove_share_sections(&source, &BTreeSet::from([share_id.to_owned()]));
@@ -18501,18 +18538,52 @@ fn unregister_smb_share(
             }
         }
         println!(
-            "Unmounted SMB share {share_id} from {}.",
+            "Removed SMB share mapping {share_id} from {}.",
             mount_root.display()
         );
         if !deferred_cleanup.is_empty() {
             println!(
-                "SMB cleanup is deferred until reconnect on: {}.",
+                "SMB cleanup is pending on: {}; macluster will retry the exact mount automatically.",
                 deferred_cleanup.into_iter().collect::<Vec<_>>().join(", ")
             );
         }
         Ok(())
     })();
     finish_node_maintenance(maintenance, result)
+}
+
+fn deferred_smb_mount_cleanup(
+    node_id: &str,
+    node: &NodeConfig,
+    share: &ShareConfig,
+) -> DeferredSmbCredentialCleanup {
+    DeferredSmbCredentialCleanup {
+        node_id: node_id.to_owned(),
+        machine_uuid: node.machine_uuid.clone(),
+        node: node.clone(),
+        shares: vec![share.clone()],
+        endpoints: Vec::new(),
+        wait_for_unmount: true,
+    }
+}
+
+fn queue_deferred_smb_mount_cleanup(
+    node_id: &str,
+    node: &NodeConfig,
+    share: &ShareConfig,
+) -> AppResult<()> {
+    crate::smb_credentials::queue_global_node_cleanup(deferred_smb_mount_cleanup(
+        node_id, node, share,
+    ))
+    .map_err(|error| {
+        (
+            1,
+            format!(
+                "cannot persist deferred SMB cleanup for {node_id} and share {}: {error}",
+                share.share_uuid
+            ),
+        )
+    })
 }
 
 fn smb_credential_key_for_share(
@@ -27211,6 +27282,79 @@ execution_uid = 501
             assert!(!script.contains("/Library/LaunchDaemons"), "{script}");
             assert!(!script.contains("sudo"), "{script}");
         }
+    }
+
+    #[test]
+    fn failed_smb_unmount_creates_a_persistent_mount_retry_entry() {
+        let node = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
+            execution_uid: Some(501),
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Users/Shared/nas-data".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+            smb_user: Some("smb-user".into()),
+        };
+
+        let entry = super::deferred_smb_mount_cleanup("worker", &node, &share);
+
+        assert_eq!(entry.node_id, "worker");
+        assert_eq!(entry.shares, vec![share]);
+        assert!(entry.endpoints.is_empty());
+        assert!(entry.wait_for_unmount);
+    }
+
+    #[test]
+    fn failed_operations_report_pending_smb_mount_cleanup() {
+        let root = std::env::temp_dir().join(format!("macluster-pending-smb-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("smb-cleanup.json");
+        let node = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
+            execution_uid: Some(501),
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Users/Shared/nas-data".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+            smb_user: Some("smb-user".into()),
+        };
+        let mut pending =
+            macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default();
+        pending.remember_node(super::deferred_smb_mount_cleanup("worker", &node, &share));
+        pending.save(&path).unwrap();
+
+        let lines = super::pending_smb_cleanup_lines(&path).unwrap();
+
+        assert_eq!(
+            lines,
+            [
+                "worker  SMB cleanup pending",
+                "  share 928e8976-c946-509d-9e62-a3ef787664b7 -> /Users/Shared/nas-data"
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

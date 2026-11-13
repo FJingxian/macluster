@@ -916,9 +916,16 @@ pub(crate) fn queue_global_node_cleanup(
     entry: macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
 ) -> Result<(), String> {
     let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
-    let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
+    queue_global_node_cleanup_at(&path, entry)
+}
+
+fn queue_global_node_cleanup_at(
+    path: &std::path::Path,
+    entry: macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
+) -> Result<(), String> {
+    let mut state = GlobalSmbCredentialCleanup::load(path).map_err(|error| error.to_string())?;
     state.remember_node(entry);
-    state.save(&path).map_err(|error| error.to_string())
+    state.save(path).map_err(|error| error.to_string())
 }
 
 pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupReport, String> {
@@ -1491,6 +1498,7 @@ pub(crate) enum NodeKeychainError {
 mod tests {
     use std::{
         collections::BTreeMap,
+        fs,
         io::Cursor,
         path::PathBuf,
         sync::{
@@ -1514,12 +1522,12 @@ mod tests {
 
     use super::{
         CredentialDistributor, CredentialPlan, CredentialWorkflowError, DistributionError,
-        MasterCredentialStore, NodeKeychainCommandRunner, NodeKeychainError, PasswordPrompt,
-        ProvisionReport, ProvisionState, SmbAuthError, SmbAuthFailureKind, SmbAuthenticator,
-        cleanup_smb_credential_if_unused_with, ensure_smb_mount_credential_with,
-        parse_smbutil_shares, provision_before_commit_with, pty_action_name,
-        rollback_smb_credential_plan, security_command, smb_validation_arguments,
-        store_from_reader, validate_mount_with_io,
+        GlobalSmbCredentialCleanup, MasterCredentialStore, NodeKeychainCommandRunner,
+        NodeKeychainError, PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError,
+        SmbAuthFailureKind, SmbAuthenticator, cleanup_smb_credential_if_unused_with,
+        ensure_smb_mount_credential_with, parse_smbutil_shares, provision_before_commit_with,
+        pty_action_name, queue_global_node_cleanup_at, rollback_smb_credential_plan,
+        security_command, smb_validation_arguments, store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -2280,6 +2288,38 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, SmbAuthError::Timeout));
         assert_eq!(timeout_cleanup.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn node_cleanup_queue_persists_a_mount_retry_without_credentials() {
+        let root = std::env::temp_dir().join(format!("macluster-smb-queue-{}", Id128::random()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("smb-cleanup.json");
+        let node = workflow_nodes()[0].1.clone();
+        let share = macluster_core::config::ShareConfig {
+            protocol: macluster_core::storage_uri::StorageProtocol::Smb,
+            server: NodeId::new("nas-01").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Users/Shared/data".into(),
+            share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
+            smb_user: Some("smb-user".into()),
+            allow_existing_contents: false,
+        };
+        let entry = macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup {
+            node_id: "worker-a".into(),
+            machine_uuid: node.machine_uuid.clone(),
+            node,
+            shares: vec![share.clone()],
+            endpoints: Vec::new(),
+            wait_for_unmount: true,
+        };
+
+        queue_global_node_cleanup_at(&path, entry.clone()).unwrap();
+
+        let pending = GlobalSmbCredentialCleanup::load(&path).unwrap();
+        assert_eq!(pending.nodes["worker-a"], entry);
+        assert!(pending.masters.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

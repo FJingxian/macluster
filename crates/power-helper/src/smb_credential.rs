@@ -1170,35 +1170,52 @@ fn unmount_smb(
     logical_target: &str,
 ) -> Result<(), String> {
     let (user, home) = smb_session_account(uid)?;
-    if smb_mount_is_active(target)? {
-        let mut command = Command::new("/bin/launchctl");
-        command
-            .args([
-                "asuser",
-                &uid.to_string(),
-                "/usr/bin/sudo",
-                "-u",
-                &user,
-                "-H",
-                "/sbin/umount",
-                target,
-            ])
-            .env_clear()
-            .env("HOME", &home)
-            .env("USER", &user)
-            .env("LOGNAME", &user)
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("LC_ALL", "C")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let status = run_bounded_process_group(command, Duration::from_secs(5))
-            .map_err(|error| format!("unmount SMB share {target}: {error}"))?;
-        if !status.success() {
-            return Err(format!("unmount SMB share {target} exited with {status}"));
+    unmount_smb_with(logical, logical_target, || {
+        if smb_mount_is_active(target)? {
+            let mut command = Command::new("/bin/launchctl");
+            command
+                .args([
+                    "asuser",
+                    &uid.to_string(),
+                    "/usr/bin/sudo",
+                    "-u",
+                    &user,
+                    "-H",
+                    "/sbin/umount",
+                    target,
+                ])
+                .env_clear()
+                .env("HOME", &home)
+                .env("USER", &user)
+                .env("LOGNAME", &user)
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .env("LC_ALL", "C")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let status = run_bounded_process_group(command, Duration::from_secs(5))
+                .map_err(|error| format!("unmount SMB share {target}: {error}"))?;
+            if !status.success() {
+                return Err(format!("unmount SMB share {target} exited with {status}"));
+            }
         }
+        Ok(())
+    })
+}
+
+fn unmount_smb_with(
+    logical: &str,
+    logical_target: &str,
+    unmount_physical: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let unmount_result = unmount_physical();
+    let alias_result = remove_smb_logical_alias(logical, logical_target);
+    match (unmount_result, alias_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(unmount), Err(alias)) => Err(format!("{unmount}; {alias}")),
     }
-    remove_smb_logical_alias(logical, logical_target)
 }
 
 fn run_bounded_process_group(
@@ -1657,7 +1674,7 @@ mod tests {
         reconcile_smb_mount_with_backend, record_smb_repair_failure, remove_smb_logical_alias,
         route_delete_arguments, route_output_is_direct, run_bounded_process_group,
         serve_client_with, smb_mount_action, smb_mount_arguments, smb_repair_allowed,
-        smb_tcp_endpoint_reachable,
+        smb_tcp_endpoint_reachable, unmount_smb_with,
     };
 
     fn cluster() -> Id128 {
@@ -2001,6 +2018,30 @@ mod tests {
         assert_eq!(
             fs::read_link(&logical).unwrap(),
             Path::new("/tmp/foreign-share")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn busy_smb_unmount_removes_the_managed_logical_alias() {
+        let root =
+            Path::new("/private/tmp").join(format!("macluster-smb-busy-alias-{}", Id128::random()));
+        let physical = root.join("physical");
+        let logical = root.join("logical");
+        fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+
+        let error = unmount_smb_with(
+            &logical.to_string_lossy(),
+            &physical.to_string_lossy(),
+            || Err("operation remained busy after 5 seconds".into()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(
+            fs::symlink_metadata(&logical).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
         fs::remove_dir_all(root).unwrap();
     }

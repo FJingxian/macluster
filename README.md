@@ -169,7 +169,7 @@ macluster submit -Is python --version
 macluster submit -Is pip install -e .
 ```
 
-`submit` forwards exported environment variables and maps registered shared paths. **The software files must also be shared.** An active environment must resolve at the same absolute path on every node. Unshared toolchains are not replaced silently with compute-local software; standard macOS commands remain available. Shell aliases/functions and node-specific HOME, user, temporary-directory, and SSH-agent values are not forwarded.
+`submit` forwards exported environment variables and maps registered shared paths. **The software files must also be shared.** An active environment must resolve at the same absolute path on every node. Unshared toolchains are not replaced silently with compute-local software; standard macOS commands remain available. `HOME` follows the submitting Mac so `~` resolves against the same shared paths; shell aliases/functions and node-specific user, temporary-directory, and SSH-agent values are not forwarded.
 
 Environment variables are stored with jobs: avoid exporting secrets. Avoid concurrent installs into the same shared environment. A software share can hide an existing installation at its mount path; inspect mappings before changing them.
 

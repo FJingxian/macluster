@@ -51,6 +51,7 @@ const INTERACTIVE_FAST_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INTERACTIVE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SUBMISSION_CACHE_ENTRIES: usize = 1024;
 const MAX_SUBMISSION_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const SUBMITTER_HOME_ENV: &str = "MCLUSTER_INTERNAL_SUBMITTER_HOME";
 const REMOTE_INTERACTIVE_EXECUTION_ENV: &[&str] = &[
     "HOME",
     "USER",
@@ -3353,9 +3354,14 @@ fn task_script_uses_build_cache(
 }
 
 fn inherited_task_environment() -> BTreeMap<String, String> {
-    let cargo_build_context = env::var_os("CARGO_MANIFEST_DIR").is_some();
+    inherited_task_environment_from(env::vars_os(), env::var_os("CARGO_MANIFEST_DIR").is_some())
+}
+
+fn inherited_task_environment_from(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+    cargo_build_context: bool,
+) -> BTreeMap<String, String> {
     const NODE_LOCAL_ENV: &[&str] = &[
-        "HOME",
         "USER",
         "LOGNAME",
         "PWD",
@@ -3382,32 +3388,51 @@ fn inherited_task_environment() -> BTreeMap<String, String> {
         "_",
     ];
 
-    env::vars_os()
-        .filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            if NODE_LOCAL_ENV.contains(&key.as_str())
-                || (cargo_build_context
-                    && matches!(
-                        key.as_str(),
-                        "CARGO_HOME"
-                            | "RUSTUP_HOME"
-                            | "RUSTC"
-                            | "DYLD_LIBRARY_PATH"
-                            | "DYLD_FALLBACK_LIBRARY_PATH"
-                    ))
-                || key.starts_with("CARGO_PKG_")
-                || key.starts_with("CARGO_BIN_EXE_")
-                || key.starts_with("ZSH_")
-                || key.starts_with("POWERLEVEL9K_")
-                || key.starts_with("OH_MY_ZSH")
-                || key.starts_with("STARSHIP_")
-                || key.starts_with("MCLUSTER_")
-            {
-                return None;
-            }
-            Some((key, value.into_string().ok()?))
-        })
-        .collect()
+    let mut inherited = BTreeMap::new();
+    let mut carried_home = None;
+    let mut submitter_marker_seen = false;
+    for (key, value) in environment {
+        let Ok(key) = key.into_string() else {
+            continue;
+        };
+        if key == SUBMITTER_HOME_ENV {
+            submitter_marker_seen = true;
+            carried_home = value.into_string().ok();
+            continue;
+        }
+        if NODE_LOCAL_ENV.contains(&key.as_str())
+            || (cargo_build_context
+                && matches!(
+                    key.as_str(),
+                    "CARGO_HOME"
+                        | "RUSTUP_HOME"
+                        | "RUSTC"
+                        | "DYLD_LIBRARY_PATH"
+                        | "DYLD_FALLBACK_LIBRARY_PATH"
+                ))
+            || key.starts_with("CARGO_PKG_")
+            || key.starts_with("CARGO_BIN_EXE_")
+            || key.starts_with("ZSH_")
+            || key.starts_with("POWERLEVEL9K_")
+            || key.starts_with("OH_MY_ZSH")
+            || key.starts_with("STARSHIP_")
+            || key.starts_with("MCLUSTER_")
+        {
+            continue;
+        }
+        if let Ok(value) = value.into_string() {
+            inherited.insert(key, value);
+        }
+    }
+    if submitter_marker_seen {
+        inherited.remove("HOME");
+    } else {
+        carried_home = inherited.remove("HOME");
+    }
+    if let Some(home) = carried_home.filter(|home| Path::new(home).is_absolute()) {
+        inherited.insert("HOME".into(), home);
+    }
+    inherited
 }
 
 #[cfg(test)]
@@ -8120,6 +8145,13 @@ fn remote_interactive_child_environment(
         .iter()
         .map(|(key, value)| (OsString::from(key), OsString::from(value)))
         .collect::<BTreeMap<_, _>>();
+    merged.remove(OsStr::new(SUBMITTER_HOME_ENV));
+    if let Some(home) = requested
+        .get("HOME")
+        .filter(|home| Path::new(home).is_absolute())
+    {
+        merged.insert(OsString::from(SUBMITTER_HOME_ENV), OsString::from(home));
+    }
     for key in REMOTE_INTERACTIVE_EXECUTION_ENV {
         let key = OsStr::new(key);
         if let Some(value) = controller.get(key) {
@@ -9186,6 +9218,7 @@ fn operation_error(error: SubmitError) -> (i32, String) {
 mod tests {
     use std::{
         collections::BTreeMap,
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
         thread,
@@ -9194,18 +9227,18 @@ mod tests {
 
     use super::{
         ACTIVE_ENV_PREFIX_ENV, CARGO_HOME_SEED_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV,
-        NodeMetricRow, aggregate_metrics, build_submission, cached_monitor_samples,
-        can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
-        controller_startup_policy, deferred_nodes_summary, display_width,
-        explain_legacy_power_agent, format_fan_control_table, format_job_details,
-        format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
-        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
-        one_shot_task_count, prepare_task_environment, promote_inline_command,
-        prune_submission_cache, required_named_shares, sampled_node_belongs_in_cluster_rows,
-        selected_local_node_id, should_block_agent_update_for_pending_node_recovery,
-        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
-        should_preflight_agent_update, submission_must_wait_for_agent_update,
-        visible_unassigned_operational_nodes,
+        NodeMetricRow, SUBMITTER_HOME_ENV, aggregate_metrics, build_submission,
+        cached_monitor_samples, can_defer_agent_update_for_work,
+        controller_should_resume_after_agent_update, controller_startup_policy,
+        deferred_nodes_summary, display_width, explain_legacy_power_agent,
+        format_fan_control_table, format_job_details, format_jobs_table, format_power,
+        format_queue_output, interactive_job_ready_to_attach, is_macluster_binary_path,
+        maybe_run_agent_update, metric_row, metric_table_header, one_shot_task_count,
+        prepare_task_environment, promote_inline_command, prune_submission_cache,
+        required_named_shares, sampled_node_belongs_in_cluster_rows, selected_local_node_id,
+        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
+        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
+        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -11020,6 +11053,49 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
+    fn task_environment_inherits_only_the_submitters_home() {
+        let inherited = super::inherited_task_environment_from(
+            [
+                (
+                    OsString::from("HOME"),
+                    OsString::from("/Users/login-client"),
+                ),
+                (OsString::from("USER"), OsString::from("login-client")),
+                (
+                    OsString::from("TMPDIR"),
+                    OsString::from("/private/login-tmp"),
+                ),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            ],
+            false,
+        );
+
+        assert_eq!(inherited["HOME"], "/Users/login-client");
+        assert!(!inherited.contains_key("USER"));
+        assert!(!inherited.contains_key("TMPDIR"));
+    }
+
+    #[test]
+    fn carried_submitter_home_overrides_the_controller_home() {
+        let inherited = super::inherited_task_environment_from(
+            [
+                (OsString::from("HOME"), OsString::from("/Users/controller")),
+                (
+                    OsString::from(SUBMITTER_HOME_ENV),
+                    OsString::from("/Users/login-client"),
+                ),
+                (OsString::from("USER"), OsString::from("controller")),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            ],
+            false,
+        );
+
+        assert_eq!(inherited["HOME"], "/Users/login-client");
+        assert!(!inherited.contains_key(SUBMITTER_HOME_ENV));
+        assert!(!inherited.contains_key("USER"));
+    }
+
+    #[test]
     fn msub_preserves_explicit_shell_parsing_for_remapped_cc_flags() {
         let root = std::env::temp_dir().join(format!(
             "macluster-cc-flags-{}-{}",
@@ -12116,9 +12192,10 @@ ENVIRONMENT
   the same absolute path on every node. Its bin directory takes priority in
   PATH. An unshared or relocated active environment fails instead of falling
   back to compute-local tools. Unshared login-only PATH entries are omitted;
-  standard macOS commands remain available. Tasks do not read compute-node
-  shell startup files or inherit node-local HOME, USER, TMPDIR, or SSH-agent
-  values. Avoid exporting secrets to jobs.
+  standard macOS commands remain available. HOME follows the submitting Mac so
+  ~ resolves against its shared paths. Tasks do not read compute-node startup
+  files or inherit node-local USER, TMPDIR, or SSH-agent values. Avoid
+  exporting secrets to jobs.
 
 EXECUTION
   Interactive jobs need terminal stdin and stdout. Ctrl-C while waiting cancels
@@ -12173,10 +12250,10 @@ mod remote_client_regressions {
     };
 
     use super::{
-        AutomaticJoinCandidate, Id128, InteractiveRequestFile, ensure_remote_command_storage_with,
-        job_uses_remote_cli, queue_uses_remote_cli, remote_command_requires_client_storage,
-        remote_interactive_child_environment, remote_interactive_submission_args,
-        select_automatic_join_candidates,
+        AutomaticJoinCandidate, Id128, InteractiveRequestFile, SUBMITTER_HOME_ENV,
+        ensure_remote_command_storage_with, job_uses_remote_cli, queue_uses_remote_cli,
+        remote_command_requires_client_storage, remote_interactive_child_environment,
+        remote_interactive_submission_args, select_automatic_join_candidates,
     };
 
     fn control_only_profile() -> crate::client_profile::ClientProfile {
@@ -12272,6 +12349,10 @@ mod remote_client_regressions {
 
         let merged = remote_interactive_child_environment(&controller, &requested);
 
+        assert_eq!(
+            merged.get(OsStr::new(SUBMITTER_HOME_ENV)),
+            Some(&OsString::from("/Users/login-client"))
+        );
         assert_eq!(
             merged.get(OsStr::new("HOME")),
             Some(&OsString::from("/Users/controller"))

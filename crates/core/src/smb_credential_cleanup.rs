@@ -96,6 +96,31 @@ impl GlobalSmbCredentialCleanup {
 
     pub fn remember_node(&mut self, entry: DeferredSmbCredentialCleanup) {
         self.version = VERSION;
+        if let Some(pending) = self.nodes.get_mut(&entry.node_id)
+            && pending.machine_uuid == entry.machine_uuid
+        {
+            pending.node = entry.node;
+            pending.wait_for_unmount |= entry.wait_for_unmount;
+            for share in entry.shares {
+                if !pending
+                    .shares
+                    .iter()
+                    .any(|candidate| candidate.share_uuid == share.share_uuid)
+                {
+                    pending.shares.push(share);
+                }
+            }
+            pending
+                .shares
+                .sort_by(|left, right| left.share_uuid.cmp(&right.share_uuid));
+            for endpoint in entry.endpoints {
+                if !pending.endpoints.contains(&endpoint) {
+                    pending.endpoints.push(endpoint);
+                }
+            }
+            pending.endpoints.sort();
+            return;
+        }
         self.nodes.insert(entry.node_id.clone(), entry);
     }
 
@@ -176,5 +201,54 @@ mod tests {
         let decoded: GlobalSmbCredentialCleanup = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, state);
         assert!(!String::from_utf8(encoded).unwrap().contains("password"));
+    }
+
+    #[test]
+    fn repeated_node_cleanup_retains_every_pending_share() {
+        let node = crate::config::NodeConfig {
+            host: "192.0.2.2".into(),
+            transport: crate::config::Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("machine-a".into()),
+            execution_uid: Some(501),
+        };
+        let share = |uuid: &str, root: &str| crate::config::ShareConfig {
+            protocol: crate::storage_uri::StorageProtocol::Smb,
+            server: NodeId::new("nas-01").unwrap(),
+            source_root: root.into(),
+            mount_root: format!("/Users/Shared/{root}").into(),
+            share_uuid: uuid.into(),
+            smb_user: Some("smb-user".into()),
+            allow_existing_contents: false,
+        };
+        let mut state = GlobalSmbCredentialCleanup::default();
+        let entry = |share_uuid: &str, wait_for_unmount: bool| {
+            crate::nfs_reconcile::DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: Some("machine-a".into()),
+                node: node.clone(),
+                shares: vec![share(
+                    share_uuid,
+                    if share_uuid.ends_with("1111") {
+                        "data-a"
+                    } else {
+                        "data-b"
+                    },
+                )],
+                endpoints: Vec::new(),
+                wait_for_unmount,
+            }
+        };
+
+        state.remember_node(entry("00000000-0000-4000-8000-0000000001111", false));
+        state.remember_node(entry("00000000-0000-4000-8000-0000000002222", true));
+
+        let pending = &state.nodes["worker"];
+        assert_eq!(pending.shares.len(), 2);
+        assert!(pending.wait_for_unmount);
     }
 }

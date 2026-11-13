@@ -18187,6 +18187,10 @@ pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> AppRe
                         shares: shares.clone(),
                         endpoints: vec![endpoint.clone()],
                         wait_for_unmount: true,
+                        attempts: 0,
+                        next_retry_unix_ms: 0,
+                        last_error_kind: None,
+                        last_error_summary: None,
                     },
                 );
                 continue;
@@ -18201,6 +18205,10 @@ pub(crate) fn cleanup_smb_credentials_for_reset(config: &ClusterConfig) -> AppRe
                         shares: shares.clone(),
                         endpoints: vec![endpoint.clone()],
                         wait_for_unmount: true,
+                        attempts: 0,
+                        next_retry_unix_ms: 0,
+                        last_error_kind: None,
+                        last_error_summary: None,
                     },
                 );
             }
@@ -18564,6 +18572,10 @@ fn deferred_smb_mount_cleanup(
         shares: vec![share.clone()],
         endpoints: Vec::new(),
         wait_for_unmount: true,
+        attempts: 0,
+        next_retry_unix_ms: 0,
+        last_error_kind: None,
+        last_error_summary: None,
     }
 }
 
@@ -18631,6 +18643,10 @@ fn remember_deferred_smb_credential_cleanup(
             shares: Vec::new(),
             endpoints: Vec::new(),
             wait_for_unmount,
+            attempts: 0,
+            next_retry_unix_ms: 0,
+            last_error_kind: None,
+            last_error_summary: None,
         });
     entry.node = node.clone();
     entry.machine_uuid = node.machine_uuid.clone();
@@ -18703,6 +18719,10 @@ fn cleanup_smb_credentials_for_node_removal(
             shares,
             endpoints: endpoints.into_values().collect(),
             wait_for_unmount,
+            attempts: 0,
+            next_retry_unix_ms: 0,
+            last_error_kind: None,
+            last_error_summary: None,
         });
     (warnings, deferred)
 }

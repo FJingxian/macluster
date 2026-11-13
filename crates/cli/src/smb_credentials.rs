@@ -8,13 +8,14 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_controller::smb_credential::CredentialHelperClient;
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, Transport},
-    smb_credential_cleanup::GlobalSmbCredentialCleanup,
+    nfs_reconcile::SmbCleanupFailureKind,
+    smb_credential_cleanup::{GlobalSmbCredentialCleanup, smb_cleanup_retry_delay},
     smb_credentials_state::{record_generation, remove_endpoint},
     storage_uri::StorageUri,
 };
@@ -936,6 +937,10 @@ pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupR
     }
     let master = CredentialHelperClient::system();
     let mut report = CredentialCleanupReport::default();
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     let master_keys = state.masters.keys().cloned().collect::<Vec<_>>();
     for service in master_keys {
         let Some(key) = state.masters.get(&service).cloned() else {
@@ -954,12 +959,17 @@ pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupR
         let Some(entry) = state.nodes.get(&node_id).cloned() else {
             continue;
         };
+        if entry.next_retry_unix_ms > now_unix_ms {
+            continue;
+        }
+        let mut entry = entry;
         if entry.node.transport == Transport::Ssh
             && !crate::node_admin::node_ssh_endpoint_reachable(&entry.node)
         {
-            report
-                .deferred
-                .push((node_id, "node remains unreachable".into()));
+            let error = "node remains unreachable";
+            record_node_cleanup_failure(&mut entry, error, now_unix_ms);
+            report.deferred.push((node_id.clone(), error.into()));
+            state.nodes.insert(node_id, entry);
             continue;
         }
         let mut failed = false;
@@ -968,31 +978,33 @@ pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupR
                 if let Err(error) =
                     crate::node_admin::unmount_smb_share_for_cleanup(&entry.node, share)
                 {
+                    record_node_cleanup_failure(&mut entry, &error, now_unix_ms);
                     report.deferred.push((node_id.clone(), error));
                     failed = true;
                     break;
                 }
             }
         }
-        for endpoint in &entry.endpoints {
+        for endpoint in entry.endpoints.clone() {
             if failed {
                 break;
             }
             let result = if entry.node.transport == Transport::Local {
                 PtySecurityRunner
-                    .delete(endpoint)
+                    .delete(&endpoint)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             } else {
-                crate::node_admin::delete_smb_credential_on_node(&entry.node, endpoint)
+                crate::node_admin::delete_smb_credential_on_node(&entry.node, &endpoint)
             };
             if let Err(error) = result {
                 failed = true;
+                record_node_cleanup_failure(&mut entry, &error, now_unix_ms);
                 report.deferred.push((node_id.clone(), error));
             } else if entry.node.transport == Transport::Local
                 && let Ok(state_dir) = default_state_dir()
             {
-                let _ = remove_endpoint(&state_dir, endpoint);
+                let _ = remove_endpoint(&state_dir, &endpoint);
             }
         }
         if !failed {
@@ -1000,10 +1012,89 @@ pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupR
             if let Ok(id) = NodeId::new(node_id.clone()) {
                 report.removed_nodes.push(id);
             }
+        } else {
+            state.nodes.insert(node_id, entry);
         }
     }
     state.save(&path).map_err(|error| error.to_string())?;
     Ok(report)
+}
+
+fn record_node_cleanup_failure(
+    entry: &mut macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
+    error: &str,
+    now_unix_ms: u64,
+) {
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.last_error_kind = Some(classify_smb_cleanup_failure(error));
+    entry.last_error_summary = Some(bounded_smb_cleanup_error(error));
+    entry.next_retry_unix_ms = now_unix_ms.saturating_add(
+        smb_cleanup_retry_delay(entry.attempts)
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+}
+
+fn classify_smb_cleanup_failure(error: &str) -> SmbCleanupFailureKind {
+    let error = error.to_ascii_lowercase();
+    if error.contains("busy") {
+        SmbCleanupFailureKind::Busy
+    } else if [
+        "unreachable",
+        "offline",
+        "host is down",
+        "no route to host",
+        "connection refused",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        SmbCleanupFailureKind::Offline
+    } else if ["authentication", "password", "permission denied (publickey"]
+        .iter()
+        .any(|needle| error.contains(needle))
+    {
+        SmbCleanupFailureKind::Authentication
+    } else if [
+        "permission denied",
+        "operation not permitted",
+        "not permitted",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        SmbCleanupFailureKind::Permission
+    } else if [
+        "timed out",
+        "timeout",
+        "unresponsive",
+        "interrupted system call",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        SmbCleanupFailureKind::Unresponsive
+    } else {
+        SmbCleanupFailureKind::Unknown
+    }
+}
+
+fn bounded_smb_cleanup_error(error: &str) -> String {
+    const LIMIT: usize = 512;
+    let mut summary = String::new();
+    for character in error.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if summary.len() + character.len_utf8() > LIMIT {
+            break;
+        }
+        summary.push(character);
+    }
+    summary
 }
 
 pub(crate) fn run_cleanup_command(args: &[String]) -> AppResult<()> {
@@ -1526,8 +1617,9 @@ mod tests {
         NodeKeychainError, PasswordPrompt, ProvisionReport, ProvisionState, SmbAuthError,
         SmbAuthFailureKind, SmbAuthenticator, cleanup_smb_credential_if_unused_with,
         ensure_smb_mount_credential_with, parse_smbutil_shares, provision_before_commit_with,
-        pty_action_name, queue_global_node_cleanup_at, rollback_smb_credential_plan,
-        security_command, smb_validation_arguments, store_from_reader, validate_mount_with_io,
+        pty_action_name, queue_global_node_cleanup_at, record_node_cleanup_failure,
+        rollback_smb_credential_plan, security_command, smb_validation_arguments,
+        store_from_reader, validate_mount_with_io,
     };
 
     #[derive(Default)]
@@ -2312,6 +2404,10 @@ mod tests {
             shares: vec![share.clone()],
             endpoints: Vec::new(),
             wait_for_unmount: true,
+            attempts: 0,
+            next_retry_unix_ms: 0,
+            last_error_kind: None,
+            last_error_summary: None,
         };
 
         queue_global_node_cleanup_at(&path, entry.clone()).unwrap();
@@ -2320,6 +2416,40 @@ mod tests {
         assert_eq!(pending.nodes["worker-a"], entry);
         assert!(pending.masters.is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_failure_records_kind_attempts_and_backoff() {
+        let node = workflow_nodes()[0].1.clone();
+        let mut entry = macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup {
+            node_id: "worker-a".into(),
+            machine_uuid: node.machine_uuid.clone(),
+            node,
+            shares: Vec::new(),
+            endpoints: Vec::new(),
+            wait_for_unmount: true,
+            attempts: 0,
+            next_retry_unix_ms: 0,
+            last_error_kind: None,
+            last_error_summary: None,
+        };
+
+        record_node_cleanup_failure(
+            &mut entry,
+            "unmount SMB share /x: operation remained busy after 10 seconds",
+            10_000,
+        );
+
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(
+            entry.last_error_kind,
+            Some(macluster_core::nfs_reconcile::SmbCleanupFailureKind::Busy)
+        );
+        assert_eq!(entry.next_retry_unix_ms, 25_000);
+        assert_eq!(
+            entry.last_error_summary.as_deref(),
+            Some("unmount SMB share /x: operation remained busy after 10 seconds")
+        );
     }
 
     #[test]

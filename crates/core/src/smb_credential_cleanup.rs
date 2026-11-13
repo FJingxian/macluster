@@ -8,11 +8,21 @@ use std::{
 
 use macluster_protocol::{identifiers::Id128, smb_credential::SmbCredentialKey};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::nfs_reconcile::DeferredSmbCredentialCleanup;
 
 const VERSION: u32 = 1;
 pub const GLOBAL_SMB_CLEANUP_FILE: &str = "smb-credential-cleanup.json";
+
+pub fn smb_cleanup_retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs(match attempts {
+        0 | 1 => 15,
+        2 => 30,
+        3 => 60,
+        _ => 300,
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GlobalSmbCredentialCleanup {
@@ -101,6 +111,18 @@ impl GlobalSmbCredentialCleanup {
         {
             pending.node = entry.node;
             pending.wait_for_unmount |= entry.wait_for_unmount;
+            pending.attempts = pending.attempts.max(entry.attempts);
+            pending.next_retry_unix_ms =
+                match (pending.next_retry_unix_ms, entry.next_retry_unix_ms) {
+                    (0, next) | (next, 0) => next,
+                    (current, next) => current.min(next),
+                };
+            if entry.last_error_kind.is_some() {
+                pending.last_error_kind = entry.last_error_kind;
+            }
+            if entry.last_error_summary.is_some() {
+                pending.last_error_summary = entry.last_error_summary;
+            }
             for share in entry.shares {
                 if !pending
                     .shares
@@ -124,6 +146,12 @@ impl GlobalSmbCredentialCleanup {
         self.nodes.insert(entry.node_id.clone(), entry);
     }
 
+    pub fn has_due_cleanup(&self, now_unix_ms: u64) -> bool {
+        self.nodes
+            .values()
+            .any(|entry| entry.next_retry_unix_ms == 0 || entry.next_retry_unix_ms <= now_unix_ms)
+    }
+
     pub fn remember_master(&mut self, key: SmbCredentialKey) {
         self.version = VERSION;
         self.masters.insert(key.service_name(), key);
@@ -132,7 +160,9 @@ impl GlobalSmbCredentialCleanup {
 
 #[cfg(test)]
 mod tests {
-    use super::GlobalSmbCredentialCleanup;
+    use std::time::Duration;
+
+    use super::{GlobalSmbCredentialCleanup, smb_cleanup_retry_delay};
     use macluster_protocol::{
         identifiers::{Id128, NodeId},
         smb_credential::SmbCredentialKey,
@@ -194,6 +224,10 @@ mod tests {
             }],
             endpoints: vec![key.endpoint()],
             wait_for_unmount: true,
+            attempts: 0,
+            next_retry_unix_ms: 0,
+            last_error_kind: None,
+            last_error_summary: None,
         });
         state.remember_master(key.clone());
 
@@ -241,6 +275,10 @@ mod tests {
                 )],
                 endpoints: Vec::new(),
                 wait_for_unmount,
+                attempts: 0,
+                next_retry_unix_ms: 0,
+                last_error_kind: None,
+                last_error_summary: None,
             }
         };
 
@@ -250,5 +288,45 @@ mod tests {
         let pending = &state.nodes["worker"];
         assert_eq!(pending.shares.len(), 2);
         assert!(pending.wait_for_unmount);
+    }
+
+    #[test]
+    fn cleanup_retry_delay_is_bounded() {
+        assert_eq!(smb_cleanup_retry_delay(1), Duration::from_secs(15));
+        assert_eq!(smb_cleanup_retry_delay(2), Duration::from_secs(30));
+        assert_eq!(smb_cleanup_retry_delay(3), Duration::from_secs(60));
+        assert_eq!(smb_cleanup_retry_delay(4), Duration::from_secs(300));
+        assert_eq!(smb_cleanup_retry_delay(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn future_node_cleanup_is_not_due() {
+        let node = crate::config::NodeConfig {
+            host: "192.0.2.2".into(),
+            transport: crate::config::Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("machine-a".into()),
+            execution_uid: Some(501),
+        };
+        let mut state = GlobalSmbCredentialCleanup::default();
+        state.remember_node(crate::nfs_reconcile::DeferredSmbCredentialCleanup {
+            node_id: "worker".into(),
+            machine_uuid: Some("machine-a".into()),
+            node,
+            shares: Vec::new(),
+            endpoints: Vec::new(),
+            wait_for_unmount: true,
+            attempts: 1,
+            next_retry_unix_ms: 2_000,
+            last_error_kind: Some(crate::nfs_reconcile::SmbCleanupFailureKind::Busy),
+            last_error_summary: Some("mount busy".into()),
+        });
+
+        assert!(!state.has_due_cleanup(1_000));
+        assert!(state.has_due_cleanup(2_000));
     }
 }

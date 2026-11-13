@@ -19,6 +19,7 @@ use macluster_core::{
         DeferredShareMarkerCleanup, DeferredSmbCredentialCleanup,
     },
     scheduler::{NodeEligibility, next_dispatch},
+    smb_credential_cleanup::GlobalSmbCredentialCleanup,
     storage::{ReadOnlyJobStore, Storage, SubmitError},
 };
 use macluster_protocol::control::{ControllerHello, ControllerLifecycle};
@@ -45,7 +46,7 @@ const PROBE_WORKERS: usize = 8;
 const CONTROL_WORKERS: usize = 4;
 const FAN_CONTROL_WORKERS: usize = 2;
 const FAN_CONTROL_NODE_WORKERS: usize = 32;
-const SMB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const SMB_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const FAN_CONTROL_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
@@ -2949,8 +2950,13 @@ fn run_forever_with_control_inner<T: NodeTransport + 'static>(
         }
         let reset_policy = service.refresh_reset_barrier_policy()?;
         let maintenance_active = service.refresh_maintenance_barrier()?;
-        if Instant::now() >= next_smb_cleanup_retry && !maintenance_active {
+        if Instant::now() >= next_smb_cleanup_retry
+            && !maintenance_active
+            && global_smb_cleanup_worker_required()
+        {
             start_global_smb_cleanup_retry();
+        }
+        if Instant::now() >= next_smb_cleanup_retry {
             next_smb_cleanup_retry = Instant::now() + SMB_CLEANUP_RETRY_INTERVAL;
         }
         runtime.poll_workers(service)?;
@@ -3490,6 +3496,20 @@ fn start_global_smb_cleanup_retry() {
         });
 }
 
+fn global_smb_cleanup_worker_required() -> bool {
+    let Ok(path) = GlobalSmbCredentialCleanup::default_path() else {
+        return false;
+    };
+    let Ok(state) = GlobalSmbCredentialCleanup::load(&path) else {
+        return false;
+    };
+    smb_cleanup_worker_required(&state, now_ms())
+}
+
+fn smb_cleanup_worker_required(state: &GlobalSmbCredentialCleanup, now_unix_ms: u64) -> bool {
+    state.has_due_cleanup(now_unix_ms) || !state.masters.is_empty()
+}
+
 fn remove_acknowledged_nfs_cleanup(
     state_dir: &std::path::Path,
     acknowledged: &NfsCleanupAck,
@@ -3564,7 +3584,8 @@ mod tests {
         node_result_is_current, now_ms, pending_queue_heads, probe_delay,
         publish_snapshot_with_transport, reconciliation_config_without_unavailable_smb_servers,
         reset_drain_complete, retry_delay, run_forever, should_measure_job_storage,
-        stage_job_snapshot_with_transport, storage_health_with_transport,
+        smb_cleanup_worker_required, stage_job_snapshot_with_transport,
+        storage_health_with_transport,
     };
     use crate::events::RuntimeSignal;
     use crate::transport::TransportError;
@@ -3572,10 +3593,11 @@ mod tests {
     use macluster_core::maintenance::ResetBarrierPolicy;
     use macluster_core::nfs_reconcile::{
         DEFERRED_SHARE_CLEANUP_FILE, DeferredShareCleanupState, DeferredShareClientCleanup,
-        DeferredShareExportCleanup, DeferredShareMarkerCleanup, client_cleanup_key,
-        export_cleanup_key, marker_cleanup_key,
+        DeferredShareExportCleanup, DeferredShareMarkerCleanup, DeferredSmbCredentialCleanup,
+        client_cleanup_key, export_cleanup_key, marker_cleanup_key,
     };
     use macluster_core::scheduler::next_dispatch;
+    use macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup;
     use macluster_protocol::control::MaintenanceScope;
     use macluster_protocol::{
         control::{
@@ -3601,6 +3623,55 @@ mod tests {
     struct SlowFanTransport {
         started: Arc<AtomicUsize>,
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    #[test]
+    fn smb_cleanup_worker_runs_only_for_due_nodes_or_masters() {
+        let mut state = GlobalSmbCredentialCleanup::default();
+        assert!(!smb_cleanup_worker_required(&state, 1_000));
+
+        state.nodes.insert(
+            "worker".into(),
+            DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: Some("machine".into()),
+                node: macluster_core::config::NodeConfig {
+                    host: "192.0.2.2".into(),
+                    transport: macluster_core::config::Transport::Ssh,
+                    remote_binary: "/usr/local/bin/macluster".into(),
+                    ssh_user: Some("worker".into()),
+                    ssh_port: Some(22),
+                    ssh_identity_file: None,
+                    remote_config: None,
+                    machine_uuid: Some("machine".into()),
+                    execution_uid: Some(501),
+                },
+                shares: Vec::new(),
+                endpoints: Vec::new(),
+                wait_for_unmount: true,
+                attempts: 1,
+                next_retry_unix_ms: 2_000,
+                last_error_kind: None,
+                last_error_summary: None,
+            },
+        );
+        assert!(!smb_cleanup_worker_required(&state, 1_000));
+        assert!(smb_cleanup_worker_required(&state, 2_000));
+
+        state.nodes.clear();
+        state.remember_master(
+            Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+                .map(
+                    |cluster_uuid| macluster_protocol::smb_credential::SmbCredentialKey {
+                        cluster_uuid,
+                        server_id: NodeId::new("nas").unwrap(),
+                        server_host: "192.0.2.20".into(),
+                        account: "worker".into(),
+                    },
+                )
+                .unwrap(),
+        );
+        assert!(smb_cleanup_worker_required(&state, 1_000));
     }
 
     #[derive(Default)]

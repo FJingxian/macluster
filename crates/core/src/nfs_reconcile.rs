@@ -49,6 +49,18 @@ pub struct DeferredShareExportCleanup {
     pub machine_uuid: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmbCleanupFailureKind {
+    Busy,
+    Unresponsive,
+    Offline,
+    Authentication,
+    Permission,
+    #[default]
+    Unknown,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeferredSmbCredentialCleanup {
     pub node_id: String,
@@ -57,6 +69,14 @@ pub struct DeferredSmbCredentialCleanup {
     pub shares: Vec<crate::config::ShareConfig>,
     pub endpoints: Vec<SmbKeychainEndpoint>,
     pub wait_for_unmount: bool,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub next_retry_unix_ms: u64,
+    #[serde(default)]
+    pub last_error_kind: Option<SmbCleanupFailureKind>,
+    #[serde(default)]
+    pub last_error_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -334,6 +354,10 @@ mod tests {
                     account: "smb-user".into(),
                 }],
                 wait_for_unmount: true,
+                attempts: 0,
+                next_retry_unix_ms: 0,
+                last_error_kind: None,
+                last_error_summary: None,
             },
         );
 
@@ -341,6 +365,34 @@ mod tests {
         let decoded: DeferredShareCleanupState = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, state);
         assert!(!String::from_utf8(encoded).unwrap().contains("password"));
+    }
+
+    #[test]
+    fn legacy_smb_cleanup_defaults_retry_fields() {
+        let legacy = serde_json::json!({
+            "node_id": "worker-a",
+            "machine_uuid": "machine-a",
+            "node": {
+                "host": "192.0.2.20",
+                "transport": "ssh",
+                "remote_binary": "/usr/local/bin/macluster",
+                "ssh_user": "worker",
+                "ssh_port": 22,
+                "machine_uuid": "machine-a",
+                "execution_uid": 501
+            },
+            "shares": [],
+            "endpoints": [],
+            "wait_for_unmount": true
+        });
+
+        let decoded: DeferredSmbCredentialCleanup =
+            serde_json::from_value(legacy).expect("legacy cleanup entry");
+
+        assert_eq!(decoded.attempts, 0);
+        assert_eq!(decoded.next_retry_unix_ms, 0);
+        assert_eq!(decoded.last_error_kind, None);
+        assert_eq!(decoded.last_error_summary, None);
     }
 
     #[test]

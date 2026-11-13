@@ -23,21 +23,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentError, AgentRecord, LOG_SYNC_RETRY_DELAY_MS, StateLock, commit_log_sync_result,
-    hydrate_record_storage_identity, now_ms, read_store, runner, write_store,
+    hydrate_record_storage_identity, local_loopback, now_ms, read_store, runner, write_store,
 };
 
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub(super) fn schedule(state_dir: &Path, config: &ClusterConfig) -> Result<(), AgentError> {
+pub(super) fn schedule(
+    state_dir: &Path,
+    config: &ClusterConfig,
+    local_node_id: &str,
+) -> Result<(), AgentError> {
     schedule_with(state_dir, config, |job_id, token| {
-        let mut command = Command::new(std::env::current_exe()?);
+        let executable = std::env::current_exe()?;
+        let arguments = vec![
+            "--state-dir".into(),
+            state_dir.to_string_lossy().into_owned(),
+            "internal".into(),
+            "log-sync".into(),
+            "--job-id".into(),
+            job_id.to_string(),
+            "--start-token".into(),
+            token.to_string(),
+        ];
+        if local_loopback::required(config, local_node_id) {
+            local_loopback::launch(
+                state_dir,
+                config,
+                local_node_id,
+                local_loopback::CommandSpec {
+                    program: executable,
+                    arguments,
+                    working_directory: state_dir.to_path_buf(),
+                },
+            )
+            .map(|_| ())
+            .map_err(io::Error::other)?;
+            return Ok(());
+        }
+        let mut command = Command::new(executable);
         command
-            .arg("--state-dir")
-            .arg(state_dir)
-            .args(["internal", "log-sync", "--job-id"])
-            .arg(job_id.to_string())
-            .arg("--start-token")
-            .arg(token.to_string())
+            .args(arguments)
             .current_dir(state_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

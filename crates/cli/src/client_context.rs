@@ -302,12 +302,49 @@ pub(crate) fn select_remote_profile(
         return Ok(None);
     }
     let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
-    match store.select(explicit).map_err(|error| error.to_string())? {
+    let selected = match store.select(explicit).map_err(|error| error.to_string())? {
         ClientSelection::Explicit(profile)
         | ClientSelection::LastUsed(profile)
-        | ClientSelection::Sole(profile) => Ok(Some(profile)),
-        ClientSelection::None => Ok(None),
+        | ClientSelection::Sole(profile) => Some(profile),
+        ClientSelection::None => None,
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let configured_uuid = if explicit.is_none() {
+        std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|source| ClusterConfig::parse(&source).ok())
+            .map(|config| config.share_uuid)
+    } else {
+        None
+    };
+    if let Some(uuid) = configured_uuid.as_deref()
+        && !selected.cluster_uuid.eq_ignore_ascii_case(uuid)
+    {
+        let profiles = store.load_all().map_err(|error| error.to_string())?;
+        return Ok(Some(prefer_profile_for_configured_cluster(
+            selected,
+            Some(uuid),
+            &profiles,
+        )));
     }
+    Ok(Some(selected))
+}
+
+fn prefer_profile_for_configured_cluster(
+    selected: ClientProfile,
+    configured_uuid: Option<&str>,
+    profiles: &[ClientProfile],
+) -> ClientProfile {
+    configured_uuid
+        .and_then(|uuid| {
+            profiles
+                .iter()
+                .find(|profile| profile.cluster_uuid.eq_ignore_ascii_case(uuid))
+        })
+        .cloned()
+        .unwrap_or(selected)
 }
 
 fn should_consider_remote_profile(
@@ -322,7 +359,15 @@ fn should_consider_remote_profile(
 fn node_command_can_use_remote_profile(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        Some("-l" | "--list" | "--failed" | "-migrate")
+        Some(
+            "-l" | "--list"
+                | "--failed"
+                | "-migrate"
+                | "-mount"
+                | "--mount"
+                | "-umount"
+                | "--umount"
+        )
     )
 }
 
@@ -378,6 +423,8 @@ mod tests {
             vec!["--list"],
             vec!["--failed"],
             vec!["-migrate", "controller:login-01"],
+            vec!["-mount", "smb://nas/data", "--mount-root", "/Volumes/data"],
+            vec!["-umount", "mnt-existing"],
         ] {
             let owned = args
                 .iter()
@@ -385,11 +432,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(node_command_can_use_remote_profile(&owned), "{args:?}");
         }
-        for args in [
-            vec!["-a", "worker@192.0.2.20"],
-            vec!["-rm", "worker"],
-            vec!["-mount", "smb://nas/data"],
-        ] {
+        for args in [vec!["-a", "worker@192.0.2.20"], vec!["-rm", "worker"]] {
             let owned = args
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -401,35 +444,6 @@ mod tests {
     #[test]
     fn stopped_local_controller_allows_the_joined_profile() {
         assert!(should_consider_remote_profile(true, None, false, true));
-    }
-
-    #[test]
-    fn node_admin_with_local_config_uses_the_current_binary() {
-        let root = std::env::temp_dir().join(format!("macluster-context-{}", Id128::random()));
-        fs::create_dir_all(&root).unwrap();
-        let config = root.join("config.toml");
-        fs::write(&config, "config").unwrap();
-
-        let selected = select_remote_profile(
-            &config,
-            "node",
-            &[
-                "-mount".into(),
-                "smb://192.0.2.5/data".into(),
-                "--mount-root".into(),
-                "/Volumes/test_data".into(),
-            ],
-            None,
-            false,
-            true,
-        )
-        .unwrap();
-
-        assert!(
-            selected.is_none(),
-            "a valid local config must run node recovery with this binary"
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -449,6 +463,53 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn implicit_remote_profile_prefers_the_local_config_cluster_uuid() {
+        let selected = test_profile("226e4037-a2ac-5245-ab20-30c5450cfd41");
+        let matching = test_profile("4f51d7b9-6290-5a40-b90b-5bad1cd687ec");
+        let profiles = vec![selected.clone(), matching.clone()];
+
+        let preferred = super::prefer_profile_for_configured_cluster(
+            selected,
+            Some("4f51d7b9-6290-5a40-b90b-5bad1cd687ec"),
+            &profiles,
+        );
+
+        assert_eq!(
+            preferred.cluster_uuid,
+            "4f51d7b9-6290-5a40-b90b-5bad1cd687ec"
+        );
+    }
+
+    fn test_profile(cluster_uuid: &str) -> super::ClientProfile {
+        super::ClientProfile {
+            version: crate::client_profile::CLIENT_PROFILE_VERSION,
+            cluster_uuid: cluster_uuid.into(),
+            cluster_name: "macluster".into(),
+            binding_digest: "b".repeat(64),
+            namespace: cluster_uuid.into(),
+            descriptor_generation: 1,
+            controller_host: "192.0.2.1".into(),
+            controller_user: "mac".into(),
+            controller_port: 22,
+            known_hosts_path: "/tmp/known_hosts".into(),
+            identity_file: "/tmp/id_ed25519".into(),
+            remote_uid: 501,
+            remote_binary: "/opt/homebrew/bin/macluster".into(),
+            remote_config: "/tmp/config.toml".into(),
+            remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: true,
+            nfs_client_id: "client-test".into(),
+            nfs_client_ip: "192.0.2.10".into(),
+            last_used_unix_ms: 1,
+            descriptor: None,
+            mounted_descriptor: None,
+            transition_mount_descriptors: vec![],
+            retired_access: vec![],
+            leave_phase: None,
+        }
     }
 
     #[test]

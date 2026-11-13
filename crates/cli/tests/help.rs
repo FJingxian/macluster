@@ -65,6 +65,12 @@ fn long_help_keeps_operational_details_for_reference() {
 
     let node = help(&["mnode", "--help"]);
     assert!(node.contains("mnode --scan"), "{node}");
+    assert!(
+        node.contains("mnode --repair-nfs NODE_ID [--yes]"),
+        "{node}"
+    );
+    assert!(node.contains("NFS CLIENT RECOVERY"), "{node}");
+    assert!(node.contains("boot-ID safeguards"), "{node}");
     assert!(node.contains("searches only the subnet attached"), "{node}");
     assert!(node.contains("host fingerprint"));
     assert!(node.contains("host-key verification"));
@@ -123,7 +129,13 @@ fn detailed_help_has_clear_examples_and_section_headings() {
         ),
         (
             &["mnode", "--help"][..],
-            &["ADD NODES", "SHARES", "REMOVE NODES", "EXAMPLES"][..],
+            &[
+                "ADD NODES",
+                "SHARES",
+                "NFS CLIENT RECOVERY",
+                "REMOVE NODES",
+                "EXAMPLES",
+            ][..],
         ),
         (
             &["mjob", "--help"][..],

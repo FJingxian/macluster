@@ -15,7 +15,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use macluster_core::{
@@ -78,6 +78,16 @@ struct AgentStore {
     tombstones: Vec<AgentRecord>,
     #[serde(default)]
     log_sync_shutdown: Option<Id128>,
+    #[serde(default)]
+    nfs_reboot_barrier: Option<NfsRebootBarrier>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NfsRebootBarrier {
+    operation_id: String,
+    controller: ControllerEpoch,
+    boot_id: String,
+    requested_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -296,9 +306,28 @@ fn handle_operation_with_config_path(
             }
             Ok(ResponseBody::Execution(status))
         }
-        Operation::Health => node_health(config, local_node_id)
-            .map(ResponseBody::Health)
-            .map_err(|error| ProtocolError::Failed(error.to_string())),
+        Operation::Health => {
+            clear_stale_nfs_reboot_barrier(state_dir, &boot_id())?;
+            node_health(config, local_node_id)
+                .map(ResponseBody::Health)
+                .map_err(|error| ProtocolError::Failed(error.to_string()))
+        }
+        Operation::DiagnoseNfs => macluster_core::nfs_client_probe::diagnose_nfs_client(
+            config,
+            local_node_id,
+            Duration::from_secs(5),
+        )
+        .map(ResponseBody::NfsDiagnosis)
+        .map_err(ProtocolError::Failed),
+        Operation::RebootForNfsRepair { controller } => {
+            if config.is_login_node(local_node_id)
+                || config.storage_server.as_str() == local_node_id
+                || !config.is_compute_node(local_node_id)
+            {
+                return Err(ProtocolError::NotPermitted);
+            }
+            reboot_for_nfs_repair(controller, state_dir).map(|()| ResponseBody::Ack)
+        }
         Operation::ReconcileNfs {
             controller,
             config_toml,
@@ -539,6 +568,99 @@ fn nfs_reconciliation_blocked(store: &AgentStore) -> bool {
             .tombstones
             .iter()
             .any(|record| !record.terminal() || record.log_sync_pending)
+}
+
+fn refresh_nfs_reboot_barrier(store: &mut AgentStore, current_boot_id: &str) {
+    if store
+        .nfs_reboot_barrier
+        .as_ref()
+        .is_some_and(|barrier| barrier.boot_id != current_boot_id)
+    {
+        store.nfs_reboot_barrier = None;
+    }
+}
+
+fn nfs_reboot_blocks_jobs(store: &AgentStore, current_boot_id: &str) -> bool {
+    store
+        .nfs_reboot_barrier
+        .as_ref()
+        .is_some_and(|barrier| barrier.boot_id == current_boot_id)
+}
+
+fn clear_stale_nfs_reboot_barrier(
+    state_dir: &Path,
+    current_boot_id: &str,
+) -> Result<(), ProtocolError> {
+    let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
+    let mut store = read_store(state_dir).map_err(protocol_failed)?;
+    let had_barrier = store.nfs_reboot_barrier.is_some();
+    refresh_nfs_reboot_barrier(&mut store, current_boot_id);
+    if had_barrier && store.nfs_reboot_barrier.is_none() {
+        write_store(state_dir, &store).map_err(protocol_failed)?;
+    }
+    Ok(())
+}
+
+fn reboot_for_nfs_repair_with(
+    controller: ControllerEpoch,
+    state_dir: &Path,
+    current_boot_id: &str,
+    submit_reboot: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<(), ProtocolError> {
+    let barrier = {
+        let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
+        let mut store = read_store(state_dir).map_err(protocol_failed)?;
+        admit_epoch(&mut store, controller).map_err(ProtocolError::Failed)?;
+        refresh_nfs_reboot_barrier(&mut store, current_boot_id);
+        if nfs_reconciliation_blocked(&store) || nfs_reboot_blocks_jobs(&store, current_boot_id) {
+            return Err(ProtocolError::Busy);
+        }
+        let barrier = NfsRebootBarrier {
+            operation_id: Id128::random().to_string(),
+            controller,
+            boot_id: current_boot_id.to_owned(),
+            requested_unix_ms: now_ms(),
+        };
+        store.controller = Some(controller);
+        store.nfs_reboot_barrier = Some(barrier.clone());
+        write_store(state_dir, &store).map_err(protocol_failed)?;
+        barrier
+    };
+    if let Err(error) = submit_reboot(&barrier.operation_id, &barrier.boot_id) {
+        if let Ok(_lock) = StateLock::acquire(state_dir)
+            && let Ok(mut store) = read_store(state_dir)
+            && store
+                .nfs_reboot_barrier
+                .as_ref()
+                .is_some_and(|current| current.operation_id == barrier.operation_id)
+        {
+            store.nfs_reboot_barrier = None;
+            let _ = write_store(state_dir, &store);
+        }
+        return Err(ProtocolError::Failed(error));
+    }
+    Ok(())
+}
+
+fn reboot_for_nfs_repair(
+    controller: ControllerEpoch,
+    state_dir: &Path,
+) -> Result<(), ProtocolError> {
+    let current_boot_id = boot_id();
+    reboot_for_nfs_repair_with(
+        controller,
+        state_dir,
+        &current_boot_id,
+        |operation_id, expected_boot_id| {
+            call_nfs_admin_helper(NfsAdminRequest {
+                operation: NfsAdminOperation::RebootNode {
+                    operation_id: operation_id.to_owned(),
+                    expected_boot_id: expected_boot_id.to_owned(),
+                },
+            })
+            .map_err(|error| error.to_string())
+        },
+    )
 }
 
 const NFS_RECONCILIATION_BATCH_SIZE: usize = 128;
@@ -1384,6 +1506,11 @@ fn start_job(
     let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
     let mut store = read_store(state_dir).map_err(protocol_failed)?;
     admit_epoch(&mut store, controller).map_err(ProtocolError::Failed)?;
+    let current_boot_id = boot_id();
+    refresh_nfs_reboot_barrier(&mut store, &current_boot_id);
+    if nfs_reboot_blocks_jobs(&store, &current_boot_id) {
+        return Err(ProtocolError::Busy);
+    }
     if store.log_sync_shutdown.is_some() {
         return Err(ProtocolError::Busy);
     }
@@ -1681,6 +1808,11 @@ fn status(state_dir: &Path) -> Result<ExecutionStatus, ProtocolError> {
     let recovery = {
         let _lock = StateLock::acquire(state_dir).map_err(protocol_failed)?;
         let mut store = read_store(state_dir).map_err(protocol_failed)?;
+        let had_stale_barrier = store.nfs_reboot_barrier.is_some();
+        refresh_nfs_reboot_barrier(&mut store, &current_boot);
+        if had_stale_barrier && store.nfs_reboot_barrier.is_none() {
+            write_store(state_dir, &store).map_err(protocol_failed)?;
+        }
         let Some(record) = store.active.as_mut() else {
             return Err(ProtocolError::NotFound);
         };
@@ -3033,6 +3165,95 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         store.active.as_mut().unwrap().log_sync_pending = true;
         assert!(nfs_reconciliation_blocked(&store));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nfs_reboot_barrier_rejects_active_execution_and_pending_logs() {
+        for (label, terminal, log_sync_pending) in [
+            ("running", None, false),
+            ("terminal-sync", Some(JobState::Completed), true),
+        ] {
+            let (root, state_dir, _, _) =
+                status_fixture(label, "boot-current", terminal, log_sync_pending);
+            let controller = read_store(&state_dir).unwrap().controller.unwrap();
+            let mut submitted = false;
+
+            let error = reboot_for_nfs_repair_with(
+                controller,
+                &state_dir,
+                "boot-current",
+                |_operation_id, _boot_id| {
+                    submitted = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(error, ProtocolError::Busy);
+            assert!(!submitted);
+            assert!(read_store(&state_dir).unwrap().nfs_reboot_barrier.is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn nfs_reboot_barrier_persists_only_after_idle_and_clears_on_failure() {
+        let (root, state_dir, _, _) = status_fixture(
+            "idle-reboot",
+            "boot-current",
+            Some(JobState::Completed),
+            false,
+        );
+        let controller = read_store(&state_dir).unwrap().controller.unwrap();
+        let mut submitted = None;
+
+        reboot_for_nfs_repair_with(
+            controller,
+            &state_dir,
+            "boot-current",
+            |operation_id, boot_id| {
+                submitted = Some((operation_id.to_owned(), boot_id.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let barrier = read_store(&state_dir)
+            .unwrap()
+            .nfs_reboot_barrier
+            .expect("successful helper submission keeps the barrier");
+        assert_eq!(
+            submitted.as_ref().map(|(id, _)| id),
+            Some(&barrier.operation_id)
+        );
+        assert_eq!(barrier.boot_id, "boot-current");
+        assert!(nfs_reboot_blocks_jobs(
+            &read_store(&state_dir).unwrap(),
+            "boot-current"
+        ));
+
+        let mut store = read_store(&state_dir).unwrap();
+        refresh_nfs_reboot_barrier(&mut store, "boot-next");
+        assert!(store.nfs_reboot_barrier.is_none());
+        fs::remove_dir_all(root).unwrap();
+
+        let (root, state_dir, _, _) = status_fixture(
+            "failed-reboot",
+            "boot-current",
+            Some(JobState::Completed),
+            false,
+        );
+        let controller = read_store(&state_dir).unwrap().controller.unwrap();
+        let error = reboot_for_nfs_repair_with(
+            controller,
+            &state_dir,
+            "boot-current",
+            |_operation_id, _boot_id| Err("helper rejected reboot".into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("helper rejected reboot"));
+        assert!(read_store(&state_dir).unwrap().nfs_reboot_barrier.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -173,6 +173,25 @@ Environment variables are stored with jobs: avoid exporting secrets. Avoid concu
 
 Use an NFS-exportable volume such as APFS; ExFAT cannot be exported. Protected folders and external volumes may require Full Disk Access for `/sbin/nfsd` on the **storage Mac**. After granting it, restart nfsd there and retry enrollment.
 
+### Recover a wedged macOS NFS client
+
+If an NFS mount remains visible but reads fail with `Interrupted system call`
+(`EINTR`), run:
+
+```sh
+macluster node --repair-nfs COMPUTE_NODE_ID
+```
+
+The command uses a bounded five-second probe and offers recovery only for a
+confirmed `EINTR` wedge on an idle SSH compute node. It refuses login,
+controller, storage-only, busy-job, and pending-output states. After `y`, the
+Agent installs an atomic job barrier and the privileged helper schedules one
+boot-ID-bound reboot. Success requires the node to disconnect, reconnect, and
+read every configured NFS marker again.
+
+`--yes` supports explicitly unattended use. It skips only the terminal prompt;
+all wedge, identity, idle, output-sync, and boot-ID checks still apply.
+
 For a NAS or another external storage provider, mount it directly. It is not
 added to the node list:
 
@@ -210,6 +229,12 @@ helper to restore the mount; reconnecting nodes receive a fresh root-only node
 credential from the login Mac's vault.
 An `mnode -a USER@NAS_ADDRESS` attempt is redirected to this direct-mount
 workflow and never enrolls the NAS as a cluster node.
+
+If an SMB mount remains in the mount table but fails readability, macluster
+replaces it once: it performs a bounded unmount, repairs same-subnet route and
+ARP state, reconnects with the stored credential, verifies the mount, and
+restores the logical path. A busy unmount is preserved and reported. Repeated
+failures use bounded backoff rather than repeated forced detaches.
 
 During an interactive reset, an old SSH-managed node without key login prompts
 once for that node account so macluster can install its dedicated reset key and

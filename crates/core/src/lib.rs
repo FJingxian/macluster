@@ -3,6 +3,7 @@
 pub mod agent_update;
 pub mod config;
 pub mod maintenance;
+pub mod nfs_client_probe;
 pub mod nfs_reconcile;
 pub mod scheduler;
 pub mod service;

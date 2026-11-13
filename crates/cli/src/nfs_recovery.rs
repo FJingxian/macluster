@@ -549,10 +549,19 @@ fn read_share_marker_with(
     let output = execute("/bin/cat", &[&marker_text])
         .map_err(|error| format!("cannot read NFS share marker {}: {error}", marker.display()))?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let guidance = if stderr
+            .to_ascii_lowercase()
+            .contains("interrupted system call")
+        {
+            "; macOS NFS client appears wedged; run `mnode --repair-nfs NODE_ID` on the login node"
+        } else {
+            ""
+        };
         return Err(format!(
-            "cannot read NFS share marker {}: {}",
+            "cannot read NFS share marker {}: {}{guidance}",
             marker.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         ));
     }
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -980,6 +989,32 @@ mod tests {
 
         assert!(error.contains("/Users/operator/.cargo/.macluster-share-id"));
         assert!(error.contains("node transport timed out"));
+    }
+
+    #[test]
+    fn an_interrupted_marker_read_points_to_the_interactive_repair_command() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let target = Path::new("/Users/operator/.cargo");
+        let error = read_share_marker_with(target, |program, _args| {
+            if program == "/usr/bin/stat" {
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"Regular File\n".to_vec(),
+                    stderr: Vec::new(),
+                })
+            } else {
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1),
+                    stdout: Vec::new(),
+                    stderr: b"cat: marker: Interrupted system call\n".to_vec(),
+                })
+            }
+        })
+        .expect_err("EINTR must be actionable");
+
+        assert!(error.contains("Interrupted system call"), "{error}");
+        assert!(error.contains("mnode --repair-nfs NODE_ID"), "{error}");
     }
 
     #[test]

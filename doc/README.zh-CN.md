@@ -175,6 +175,24 @@ macluster submit -Is pip install -e .
 
 共享卷需要支持 NFS 导出，例如 APFS；ExFAT 无法导出。受保护目录和外接卷可能需要在**存储 Mac** 上为 `/sbin/nfsd` 开启“完整磁盘访问权限”，授权后在该机重启 nfsd，再重试加入节点。
 
+### 恢复卡死的 macOS NFS 客户端
+
+如果 NFS 挂载仍显示在挂载表中，但文件读取持续返回
+`Interrupted system call`（`EINTR`），执行：
+
+```sh
+macluster node --repair-nfs COMPUTE_NODE_ID
+```
+
+命令使用最长 5 秒的有界探测，只有确认 `EINTR`、目标为 SSH 计算节点且节点
+完全空闲时才提供重启恢复。login/controller、storage-only、运行任务和待同步
+输出都会被拒绝。输入 `y` 后，Agent 会原子设置任务屏障，特权 helper 调度一次
+绑定当前 boot ID 的重启。只有节点断开、重新连接且所有 NFS marker 再次可读时
+才报告成功。
+
+无人值守时可加 `--yes`。它只跳过终端确认，不会跳过 wedge、身份、空闲、
+输出同步和 boot ID 检查。
+
 NAS 或其他外部存储不需要 SSH 和 Agent，直接用 `-mount` 挂载，不会进入节点列表：
 
 ```sh
@@ -190,6 +208,10 @@ macluster node -mount nfs://nas-01/export/data \
 
 URI 中的 server ID 可以是逻辑名称，`--host` 指定对应 IPv4 地址或 DNS 名称；也可以直接在 URI 写 IPv4 或 DNS 名称，CLI 会自动建立稳定的内部别名。首次为某个服务器/账户配置时，只在终端中隐藏输入一次 SMB 密码。controller 会把验证成功的主密码保存在 `/Library/PrivilegedHelperTools/org.macluster.credentials` 的 root 专用凭据 vault 中（目录 `0700`、条目 `0600`），再通过已固定身份的 SSH stdin 分发；节点副本也保存在该 Mac 的 root 专用 vault 中。特权 helper 在目标用户的 launchd 安全上下文中运行 `mount_smbfs`，并通过 PTY 喂入密码。交互式命令没有指定 `--smb-user` 时会先询问用户名，直接留空则使用 `guest`，不保存密码；认证失败最多允许输入三次。共享名不存在时会在密码提示前报错，并列出服务器可发现的第一层共享。相同 SMB source 已经挂在其他路径时，CLI 会询问是否复用它来创建新路径；输入 `n` 会取消且不改变现有挂载。密码不会进入集群配置、SQLite、journal、任务环境、命令参数、临时文件或日志。持久挂载由当前用户的 LaunchAgent 调用 helper 恢复；节点重连时会从 login 节点重新接收 root-only 节点凭据。
 如果误用 `mnode -a USER@NAS_ADDRESS`，命令会改为提示上述直接挂载方式，不会把 NAS 注册成集群节点。
+
+如果 SMB 挂载仍存在于挂载表中但可读性检查失败，macluster 会执行一次自动替换：
+有界卸载、修复同网段路由和 ARP、使用托管凭据重新连接、验证挂载并恢复逻辑路径。
+忙碌挂载会保留并报告错误，不会强制卸载；重复失败采用有界退避，避免重挂风暴。
 
 交互式重置遇到尚未配置密钥登录的旧 SSH 节点时，会只询问一次该节点账户密码，安装 macluster 专用重置密钥后继续精确清理。当前本机保存的旧 machine UUID 不一致不会再阻断本地重置。
 

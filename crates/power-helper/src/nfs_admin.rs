@@ -624,7 +624,9 @@ fn authorized_peer(actual_uid: libc::uid_t, expected_uid: libc::uid_t) -> bool {
 }
 
 fn classify_mount(output: &str, expected_source: &str, target: &str) -> MountStatus {
-    let mut found = None;
+    let mut matches = 0_usize;
+    let mut all_expected = true;
+    let mut first_source = None;
     for line in output.lines() {
         let Some((source, rest)) = line.split_once(" on ") else {
             continue;
@@ -635,20 +637,23 @@ fn classify_mount(output: &str, expected_source: &str, target: &str) -> MountSta
         if mountpoint != target || !filesystem.ends_with(')') {
             continue;
         }
-        if found.is_some() {
-            return MountStatus::Conflict("multiple mounts at the requested path".into());
-        }
+        matches += 1;
+        first_source.get_or_insert_with(|| source.to_owned());
         let fs_type = filesystem
             .strip_suffix(')')
             .and_then(|value| value.split(',').next())
             .map(str::trim);
-        found = Some(if source == expected_source && fs_type == Some("nfs") {
-            MountStatus::Expected
-        } else {
-            MountStatus::Conflict(source.to_owned())
-        });
+        all_expected &= source == expected_source && fs_type == Some("nfs");
     }
-    found.unwrap_or(MountStatus::NotMounted)
+    if matches == 0 {
+        MountStatus::NotMounted
+    } else if all_expected {
+        MountStatus::Expected
+    } else if matches > 1 {
+        MountStatus::Conflict("multiple mounts at the requested path".into())
+    } else {
+        MountStatus::Conflict(first_source.unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +675,17 @@ mod tests {
         assert_eq!(
             classify_mount(
                 expected,
+                "192.0.2.1:/Users/Shared/data",
+                "/Users/Shared/data"
+            ),
+            MountStatus::Expected
+        );
+        assert_eq!(
+            classify_mount(
+                concat!(
+                    "192.0.2.1:/Users/Shared/data on /Users/Shared/data (nfs, nodev)\n",
+                    "192.0.2.1:/Users/Shared/data on /Users/Shared/data (nfs, nodev)\n"
+                ),
                 "192.0.2.1:/Users/Shared/data",
                 "/Users/Shared/data"
             ),

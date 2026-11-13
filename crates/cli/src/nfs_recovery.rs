@@ -788,6 +788,66 @@ fn recover_mount(
     Ok(())
 }
 
+fn cleanup_sibling_recoveries(source: &str, target: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(ROOT).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        let manifest: Manifest = match fs::read(&manifest_path) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if manifest.source != source || manifest.target == target {
+            continue;
+        }
+        let sibling_dir = entry.path();
+        let sibling_guard = lock(&sibling_dir)?;
+        unload(&manifest.target)?;
+        let target_text = manifest.target.to_string_lossy();
+        let _ = bounded(
+            "/usr/sbin/diskutil",
+            &["unmount", "force", target_text.as_ref()],
+        );
+        let _ = bounded("/sbin/umount", &["-f", target_text.as_ref()]);
+        drop(sibling_guard);
+        remove_recovery_files(&manifest.target)?;
+    }
+    Ok(())
+}
+
+fn remove_recovery_files(target: &Path) -> Result<(), String> {
+    let dir = directory(target);
+    for path in [
+        plist_path(target),
+        legacy_plist_path(target),
+        dir.join("manifest.json"),
+        dir.join("status.json"),
+        dir.join("version"),
+        dir.join("version.next"),
+        dir.join("macluster"),
+        dir.join("lock"),
+    ] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match fs::remove_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(())
+}
+
 fn next_delay(failures: u32) -> u64 {
     15u64.saturating_mul(1u64 << failures.saturating_sub(1).min(2))
 }
@@ -820,6 +880,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             let uuid = Id128::parse(&args[3])
                 .map_err(|error| format!("invalid NFS recovery share UUID: {error}"))?
                 .to_string();
+            cleanup_sibling_recoveries(source, target)?;
             if !expected(source, target, &mount_table()?)? {
                 return Err("cannot authorize recovery before the NFS mount is verified".into());
             }
@@ -900,22 +961,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             unload(target)?;
-            for p in [
-                plist_path(target),
-                legacy_plist_path(target),
-                manifest_path,
-                dir.join("status.json"),
-                dir.join("version"),
-                dir.join("version.next"),
-                dir.join("macluster"),
-            ] {
-                match fs::remove_file(p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-            Ok(())
+            remove_recovery_files(target)
         }
         "recover" => {
             // A removed manifest fences queued/late invocations after reset.
@@ -1221,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_foreign_and_stacked_mounts() {
+    fn rejects_foreign_mounts_and_accepts_repairable_duplicate_exports() {
         let target = Path::new("/Volumes/test");
         assert_eq!(
             expected(
@@ -1247,7 +1293,7 @@ mod tests {
                 target,
                 "192.0.2.1:/data on /Volumes/test (nfs)\n192.0.2.1:/data on /Volumes/test (nfs)\n"
             )
-            .is_err()
+            .unwrap()
         );
     }
     #[test]

@@ -7523,7 +7523,8 @@ fn client_unmount_admin_request_with_force(
 }
 
 pub(crate) fn client_mount_status_awk_script() -> &'static str {
-    r#"{
+    r#"BEGIN { all_expected = 1 }
+{
     separator = index($0, " on ");
     if (!separator) next;
     actual_source = substr($0, 1, separator - 1);
@@ -7536,12 +7537,12 @@ pub(crate) fn client_mount_status_awk_script() -> &'static str {
     sub(/\).*/, "", filesystem);
     if (actual_mount != mount) next;
     matches++;
-    if (matches == 1 && actual_source == source && filesystem == "nfs") result = "expected";
-    else result = "other";
+    if (actual_source != source || filesystem != "nfs") all_expected = 0;
 }
 END {
     if (matches == 0) print "none";
-    else if (matches == 1 && result == "expected") print "expected";
+    else if (all_expected && matches == 1) print "expected";
+    else if (all_expected) print "duplicate";
     else print "other";
 }"#
 }
@@ -7874,15 +7875,13 @@ fn client_mount_batch_script(requests: &[ClientMountRequest]) -> Option<String> 
                 awk
             ));
             script.push_str(&format!(
-                "case \"$mount_status\" in expected) /usr/sbin/diskutil unmount force {mount_root} ;; other) echo 'mount changed before stale NFS recovery' >&2; exit 1 ;; none) ;; esac\n"
-            ));
-            script.push_str("mounts=$(/sbin/mount)\n");
-            script.push_str(&format!(
-                "mount_status=$(printf '%s\\n' \"$mounts\" | /usr/bin/awk -v source={} -v mount={} {})\n[ \"$mount_status\" = none ] || {{ echo 'unresponsive NFS mount remained active after forced unmount' >&2; exit 1; }}\n",
+                "case \"$mount_status\" in\n  expected|duplicate)\n    detach_count=0\n    while [ \"$mount_status\" != none ]; do\n      [ \"$detach_count\" -lt 8 ] || {{ echo 'too many stacked NFS mounts at the requested path' >&2; exit 1; }}\n      /usr/sbin/diskutil unmount force {mount_root} || /sbin/umount -f {mount_root} || exit 1\n      detach_count=$((detach_count + 1))\n      mounts=$(/sbin/mount)\n      mount_status=$(printf '%s\\n' \"$mounts\" | /usr/bin/awk -v source={} -v mount={mount_root} {})\n    done\n    ;;\n  other) echo 'mount changed before stale NFS recovery' >&2; exit 1 ;;\n  none) ;;\nesac\n",
                 shell_quote(&request.source),
-                mount_root,
-                awk
+                awk,
             ));
+            script.push_str(
+                "[ \"$mount_status\" = none ] || { echo 'unresponsive NFS mount remained active after forced unmount' >&2; exit 1; }\n",
+            );
         }
         if request.needs_mount {
             if request.needs_privileged_mkdir {
@@ -8096,12 +8095,13 @@ fn apply_privileged_nfs_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(),
     let mut requests = Vec::with_capacity(mounts.len());
     for mount in mounts {
         let target = PathBuf::from(&mount.target);
+        let duplicate_exact = exact_mount_count(&table, &mount.source, &mount.target) > 1;
         let needs_mount = match named_share_mount_status(&table, &mount.source, &mount.target) {
             // The registration flow verifies the UUID on the source server
             // over SSH. The root helper trusts that request and the exact
             // source/target mount record; it must not read NFS data, which can
             // be denied to background helpers by macOS TCC.
-            NamedShareMountStatus::Expected => false,
+            NamedShareMountStatus::Expected => duplicate_exact,
             NamedShareMountStatus::NotMounted => {
                 validate_local_mount_target(&target, mount.allow_existing_contents)?;
                 true
@@ -8121,8 +8121,8 @@ fn apply_privileged_nfs_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(),
             source_alias: mount.alias.as_deref().map(PathBuf::from),
             needs_privileged_mkdir: needs_mount && !target.exists(),
             needs_mount,
-            force_unmount_existing: false,
             allow_existing_contents: mount.allow_existing_contents,
+            force_unmount_existing: duplicate_exact,
         });
     }
     let Some(script) =
@@ -20489,12 +20489,33 @@ pub(crate) enum NamedShareMountStatus {
     MountedElsewhere(String),
 }
 
+fn exact_mount_count(mount_output: &str, expected_source: &str, mount_path: &str) -> usize {
+    mount_output
+        .lines()
+        .filter(|line| {
+            let Some((source, destination_and_type)) = line.split_once(" on ") else {
+                return false;
+            };
+            let Some((destination, filesystem)) = destination_and_type.split_once(" (") else {
+                return false;
+            };
+            let filesystem_type = filesystem
+                .strip_suffix(')')
+                .and_then(|filesystem| filesystem.split(',').next())
+                .map(str::trim);
+            source == expected_source && destination == mount_path && filesystem_type == Some("nfs")
+        })
+        .count()
+}
+
 pub(crate) fn named_share_mount_status(
     mount_output: &str,
     expected_source: &str,
     mount_path: &str,
 ) -> NamedShareMountStatus {
-    let mut found = None;
+    let mut matches = 0_usize;
+    let mut all_expected = true;
+    let mut first_source = None;
     for line in mount_output.lines() {
         let Some((source, destination_and_type)) = line.split_once(" on ") else {
             continue;
@@ -20505,24 +20526,23 @@ pub(crate) fn named_share_mount_status(
         if destination != mount_path || !filesystem.ends_with(')') {
             continue;
         }
-        if found.is_some() {
-            return NamedShareMountStatus::MountedElsewhere(
-                "multiple mounts at the requested path".into(),
-            );
-        }
+        matches += 1;
+        first_source.get_or_insert_with(|| source.to_owned());
         let filesystem_type = filesystem
             .strip_suffix(')')
             .and_then(|filesystem| filesystem.split(',').next())
             .map(str::trim);
-        found = Some(
-            if source == expected_source && filesystem_type == Some("nfs") {
-                NamedShareMountStatus::Expected
-            } else {
-                NamedShareMountStatus::MountedElsewhere(source.to_owned())
-            },
-        );
+        all_expected &= source == expected_source && filesystem_type == Some("nfs");
     }
-    found.unwrap_or(NamedShareMountStatus::NotMounted)
+    if matches == 0 {
+        NamedShareMountStatus::NotMounted
+    } else if all_expected {
+        NamedShareMountStatus::Expected
+    } else if matches > 1 {
+        NamedShareMountStatus::MountedElsewhere("multiple mounts at the requested path".into())
+    } else {
+        NamedShareMountStatus::MountedElsewhere(first_source.unwrap_or_default())
+    }
 }
 
 fn mount_point_permission_error(stderr: &str) -> bool {
@@ -23894,7 +23914,7 @@ exec "$@"
             !script.contains("/bin/cat"),
             "the privileged cleanup script must not read marker files from NFS"
         );
-        assert!(script.contains("filesystem == \"nfs\""));
+        assert!(script.contains("filesystem != \"nfs\""));
         assert!(script.contains("/usr/bin/readlink"));
         assert!(script.contains("/bin/rm"));
         assert!(!script.contains("rm -rf"));
@@ -24348,7 +24368,24 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
     }
 
     #[test]
-    fn cleanup_awk_requires_one_exact_nfs_mount() {
+    fn duplicate_exact_nfs_mounts_are_repairable_instead_of_foreign() {
+        let output = concat!(
+            "192.0.2.1:/expected on /Volumes/macluster (nfs, nodev)\n",
+            "192.0.2.1:/expected on /Volumes/macluster (nfs, nodev)\n"
+        );
+
+        assert_eq!(
+            super::named_share_mount_status(output, "192.0.2.1:/expected", "/Volumes/macluster"),
+            NamedShareMountStatus::Expected
+        );
+        assert_eq!(
+            super::exact_mount_count(output, "192.0.2.1:/expected", "/Volumes/macluster"),
+            2
+        );
+    }
+
+    #[test]
+    fn cleanup_awk_classifies_exact_and_stacked_expected_mounts() {
         let awk = super::shell_quote(client_mount_status_awk_script());
         let run = |mounts: &str| {
             let script = format!(
@@ -24380,6 +24417,13 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
                 "192.0.2.2:/other on /Volumes/macluster (nfs, nodev)"
             )),
             "other"
+        );
+        assert_eq!(
+            run(concat!(
+                "192.0.2.1:/expected on /Volumes/macluster (nfs, nodev)\n",
+                "192.0.2.1:/expected on /Volumes/macluster (nfs, nodev)"
+            )),
+            "duplicate"
         );
         assert_eq!(run(""), "none");
     }

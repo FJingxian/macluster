@@ -1020,7 +1020,7 @@ pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupR
     Ok(report)
 }
 
-fn record_node_cleanup_failure(
+pub(crate) fn record_node_cleanup_failure(
     entry: &mut macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
     error: &str,
     now_unix_ms: u64,
@@ -1036,7 +1036,7 @@ fn record_node_cleanup_failure(
     );
 }
 
-fn classify_smb_cleanup_failure(error: &str) -> SmbCleanupFailureKind {
+pub(crate) fn classify_smb_cleanup_failure(error: &str) -> SmbCleanupFailureKind {
     let error = error.to_ascii_lowercase();
     if error.contains("busy") {
         SmbCleanupFailureKind::Busy

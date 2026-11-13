@@ -158,8 +158,10 @@ impl<T: NodeTransport> ControllerService<T> {
                 .node
                 .as_ref()
                 .is_some_and(|node| deferred_unreachable_nodes.contains(node.as_str()));
-            let output_sync_pending =
-                (job.snapshot_sync_pending || job.log_sync_pending) && !output_sync_deferred;
+            let output_sync_pending = ((job.snapshot_sync_pending
+                && job.state != JobState::Pending)
+                || job.log_sync_pending)
+                && !output_sync_deferred;
             (scoped
                 && matches!(
                     job.state,

@@ -8949,8 +8949,10 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "agent.build-id.v1",
                         METRICS_FAN_SPEED_FEATURE,
                         INTERACTIVE_PTY_FEATURE,
-                        macluster_protocol::types::NAMESPACED_JOBS_FEATURE
-                        , macluster_protocol::resources::TASK_RESOURCE_FEATURE, "agent.idle-handoff.v1"
+                        macluster_protocol::types::NAMESPACED_JOBS_FEATURE,
+                        macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE,
+                        macluster_protocol::resources::TASK_RESOURCE_FEATURE,
+                        "agent.idle-handoff.v1"
                     ]
                 });
                 println!("{}", serde_json::to_string(&report).unwrap());

@@ -296,6 +296,28 @@ fn duplicate_ssh_hosts_and_unsafe_remote_binary_paths_are_rejected() {
 }
 
 #[test]
+fn remote_binary_paths_allow_spaces_but_reject_shell_metacharacters() {
+    let spaced = format!(
+        "{}\n[nodes.spaced]\nhost = \"192.0.2.9\"\ntransport = \"ssh\"\nremote_binary = \"/Users/test/Library/Application Support/macluster/bin/macluster\"",
+        extended_config()
+    );
+    let config = ClusterConfig::parse(&spaced).unwrap();
+    assert_eq!(
+        config.nodes["spaced"].remote_binary,
+        "/Users/test/Library/Application Support/macluster/bin/macluster"
+    );
+
+    let unsafe_path = format!(
+        "{}\n[nodes.unsafe]\nhost = \"192.0.2.10\"\ntransport = \"ssh\"\nremote_binary = \"/Users/test/macluster;touch\"",
+        extended_config()
+    );
+    assert!(matches!(
+        ClusterConfig::parse(&unsafe_path),
+        Err(ConfigError::InvalidRemoteBinary)
+    ));
+}
+
+#[test]
 fn ssh_identity_file_is_parsed_and_used_by_ssh_arguments() {
     let configured = VALID.replace(
         "transport = \"ssh\"",

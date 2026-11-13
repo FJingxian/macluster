@@ -878,7 +878,8 @@ impl RuntimeState {
                     ))
                 }
                 _ if (scoped || scope.is_cluster_wide())
-                    && (job.snapshot_sync_pending || job.log_sync_pending)
+                    && ((job.snapshot_sync_pending && job.state != JobState::Pending)
+                        || job.log_sync_pending)
                     && !job_node_unavailable =>
                 {
                     Some(format!("job {} output synchronization is pending", job.id))
@@ -3468,7 +3469,7 @@ fn maintenance_drain_complete(jobs: &[JobRecord]) -> bool {
         !matches!(
             job.state,
             JobState::Starting | JobState::Running | JobState::Cancelling
-        ) && !job.snapshot_sync_pending
+        ) && !(job.snapshot_sync_pending && job.state != JobState::Pending)
             && !job.log_sync_pending
     })
 }
@@ -6205,8 +6206,12 @@ scheduler = "fifo"
             JobState::Pending,
             false
         )]));
-        assert!(!maintenance_drain_complete(&[reset_test_job(
+        assert!(maintenance_drain_complete(&[reset_test_job(
             JobState::Pending,
+            true
+        )]));
+        assert!(!maintenance_drain_complete(&[reset_test_job(
+            JobState::Completed,
             true
         )]));
         for state in [JobState::Starting, JobState::Running, JobState::Cancelling] {
@@ -6282,6 +6287,21 @@ scheduler = "fifo"
                 .maintenance_blockers(&service, &MaintenanceScope::Cluster)
                 .unwrap()
                 .is_empty()
+        );
+        let queued = submit_pending_snapshot_test_job(&service.storage, &shared_root, None);
+        assert!(queued.snapshot_sync_pending);
+        assert!(
+            runtime
+                .maintenance_blockers(&service, &MaintenanceScope::Cluster)
+                .unwrap()
+                .is_empty(),
+            "a queued job waiting for snapshot publication must resume after Agent maintenance"
+        );
+        assert!(
+            service
+                .reload_quiescent_config(service.config.clone(), &MaintenanceScope::Cluster)
+                .is_ok(),
+            "Agent maintenance must activate the new path while the queued snapshot waits to resume"
         );
         drop(runtime);
         drop(service);

@@ -2021,6 +2021,7 @@ const REQUIRED_AGENT_FEATURES: &[&str] = &[
     "config.smb-user-mounts.v1",
     "config.smb-keychain.v1",
     macluster_protocol::types::NAMESPACED_JOBS_FEATURE,
+    macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE,
     "metrics.cpu-temperature.v1",
     METRICS_FAN_SPEED_FEATURE,
 ];
@@ -6104,7 +6105,7 @@ fn stage_current_agents_for_nodes(
     let local_binary_text = local_binary
         .to_str()
         .ok_or_else(|| (1, "current macluster binary path is not UTF-8".into()))?;
-    if !safe_absolute_remote_path(local_binary_text) {
+    if !safe_absolute_binary_path(local_binary_text) {
         return Err((
             1,
             "current macluster binary path cannot be stored safely in TOML".into(),
@@ -6448,12 +6449,25 @@ fn safe_absolute_remote_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+fn safe_absolute_binary_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && !path.ends_with('/')
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b' ')
+        })
+        && path
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 fn normalize_binary_path(path: &Path) -> AppResult<String> {
     let canonical = path.canonicalize().map_err(io_error)?;
     let binary = canonical
         .to_str()
         .ok_or_else(|| (1, "current macluster binary path is not UTF-8".into()))?;
-    if !safe_absolute_remote_path(binary) {
+    if !safe_absolute_binary_path(binary) {
         return Err((
             1,
             "current macluster binary path cannot be stored safely in TOML".into(),
@@ -24659,6 +24673,15 @@ execution_uid = 501
     }
 
     #[test]
+    fn required_agent_features_include_storage_snapshot_relay() {
+        assert!(
+            super::REQUIRED_AGENT_FEATURES.contains(&"storage.agent-relay.v1"),
+            "old storage Agents must be updated before controller health checks use the relay operations"
+        );
+        assert!(super::missing_required_agent_features(&[]).contains(&"storage.agent-relay.v1"));
+    }
+
+    #[test]
     fn agent_update_batches_changed_privileged_helpers_in_one_admin_script() {
         let script = super::agent_update_admin_script(
             Some("install-power-helper"),
@@ -29068,6 +29091,22 @@ ssh_port = 22
             normalized,
             executable.canonicalize().unwrap().to_string_lossy()
         );
+    }
+
+    #[test]
+    fn binary_paths_allow_spaces_in_macos_application_directories() {
+        let root = test_exports_path();
+        let binary = root
+            .join("Application Support")
+            .join("macluster")
+            .join("macluster");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"binary").unwrap();
+
+        let normalized = normalize_binary_path(&binary).unwrap();
+
+        assert_eq!(normalized, binary.canonicalize().unwrap().to_string_lossy());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn read_exports(path: &PathBuf) -> std::process::Output {

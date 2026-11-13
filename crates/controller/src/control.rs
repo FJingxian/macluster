@@ -651,12 +651,17 @@ impl ControlApi {
     }
 
     fn client_descriptor(&self) -> ClientDescriptor {
+        let controller_binary = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_owned))
+            .unwrap_or_default();
         ClientDescriptor {
             cluster_uuid: self.config.share_uuid.to_ascii_lowercase(),
             cluster_name: self.config.name.clone(),
             default_queue: self.config.default_queue.clone(),
             config_generation: self.hello.config_generation,
             controller_build_id: self.hello.build_id.clone(),
+            controller_binary,
             controller_uid: self.hello.uid,
             capabilities: self.hello.capabilities.clone(),
             primary_mount_root: self.config.shared_root.display().to_string(),

@@ -2090,6 +2090,13 @@ fn agent_capabilities_advertise_runtime_features() {
             .iter()
             .any(|feature| feature == "agent.interactive-pty.v1")
     );
+    assert!(
+        report["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature == "storage.agent-relay.v1")
+    );
 }
 
 #[test]

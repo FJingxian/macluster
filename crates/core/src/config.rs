@@ -255,11 +255,11 @@ pub enum ConfigError {
     #[error("multiple node IDs use the same SSH host '{0}'")]
     DuplicateHost(String),
     #[error(
-        "remote_binary must be a normalized absolute file path using only ASCII letters, digits, slash, dot, underscore, or hyphen"
+        "remote_binary must be a normalized absolute file path using ASCII letters, digits, spaces, slash, dot, underscore, or hyphen"
     )]
     InvalidRemoteBinary,
     #[error(
-        "remote_config must be a normalized absolute file path using only ASCII letters, digits, slash, dot, underscore, or hyphen"
+        "remote_config must be a normalized absolute file path using ASCII letters, digits, spaces, slash, dot, underscore, or hyphen"
     )]
     InvalidRemoteConfig,
     #[error("machine_uuid must be a canonical UUID")]
@@ -904,9 +904,9 @@ fn safe_absolute_remote_file(path: &str) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && !path.ends_with('/')
-        && path
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b' ')
+        })
         && path
             .split('/')
             .skip(1)

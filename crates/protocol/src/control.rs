@@ -26,6 +26,8 @@ pub struct ClientDescriptor {
     pub default_queue: QueueName,
     pub config_generation: u64,
     pub controller_build_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub controller_binary: String,
     pub controller_uid: u32,
     pub capabilities: Vec<String>,
     pub primary_mount_root: String,
@@ -500,6 +502,7 @@ mod client_descriptor_tests {
             default_queue: "compute".parse().unwrap(),
             config_generation: 17,
             controller_build_id: "macluster/test".into(),
+            controller_binary: "/opt/homebrew/bin/macluster".into(),
             controller_uid: 501,
             capabilities: vec![super::MULTI_ENTRY_CLIENT_FEATURE.into()],
             primary_mount_root: "/Users/Shared/macluster".into(),
@@ -529,6 +532,27 @@ mod client_descriptor_tests {
             encoded["capabilities"][0],
             super::MULTI_ENTRY_CLIENT_FEATURE
         );
+    }
+
+    #[test]
+    fn legacy_client_descriptor_defaults_a_missing_controller_binary() {
+        let descriptor: ClientDescriptor = serde_json::from_value(serde_json::json!({
+            "cluster_uuid": "f779bcf5-ea85-5caa-9579-74b395f3cce5",
+            "cluster_name": "legacy",
+            "default_queue": "compute",
+            "config_generation": 1,
+            "controller_build_id": "old",
+            "controller_uid": 501,
+            "capabilities": [],
+            "primary_mount_root": "/Users/Shared/macluster",
+            "primary_source_root": "/Users/Shared/macluster",
+            "primary_source_host": "192.0.2.1",
+            "shares": [],
+            "queues": []
+        }))
+        .unwrap();
+
+        assert!(descriptor.controller_binary.is_empty());
     }
 
     #[test]

@@ -1377,6 +1377,7 @@ fn node_health_with_providers(
             macluster_protocol::resources::TASK_RESOURCE_FEATURE.to_owned(),
             INTERACTIVE_PTY_FEATURE.to_owned(),
             macluster_protocol::types::NAMESPACED_JOBS_FEATURE.to_owned(),
+            macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE.to_owned(),
             "config.smb-user-mounts.v1".to_owned(),
             "config.smb-keychain.v1".to_owned(),
         ],
@@ -4632,6 +4633,12 @@ execution_uid = 501
 
         assert_eq!(health.system_disk_capacity, Some(system));
         assert_eq!(health.external_disk_capacities, vec![external]);
+        assert!(
+            health
+                .features
+                .iter()
+                .any(|feature| feature == macluster_protocol::types::STORAGE_AGENT_RELAY_FEATURE)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

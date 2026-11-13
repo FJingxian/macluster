@@ -643,6 +643,7 @@ mod tests {
             default_queue: "default".parse().unwrap(),
             config_generation: 7,
             controller_build_id: "macluster/0.2.0".into(),
+            controller_binary: String::new(),
             controller_uid: 501,
             capabilities: vec![macluster_protocol::control::MULTI_ENTRY_CLIENT_FEATURE.into()],
             primary_mount_root: "/Users/Shared/macluster".into(),

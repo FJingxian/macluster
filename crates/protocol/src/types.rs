@@ -24,6 +24,7 @@ pub const CARGO_HOME_SEED_ENV: &str = "MCLUSTER_INTERNAL_CARGO_HOME_SEED";
 /// Internal JobSpec marker enabling bounded cleanup of node-local build caches.
 pub const BUILD_CACHE_MAINTENANCE_ENV: &str = "MCLUSTER_INTERNAL_BUILD_CACHE_MAINTENANCE";
 pub const NAMESPACED_JOBS_FEATURE: &str = "agent.namespaced-jobs.v1";
+pub const STORAGE_AGENT_RELAY_FEATURE: &str = "storage.agent-relay.v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

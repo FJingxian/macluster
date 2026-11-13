@@ -41,6 +41,9 @@ impl RemoteContext {
         let mut client = ControlClient::connect_remote(&profile, timeout, ensure_client_storage)
             .map_err(|error| error.to_string())?;
         let mut descriptor = request_descriptor(&mut client)?;
+        if let Some(binary) = remote_binary_for_descriptor(&profile, &descriptor) {
+            profile.remote_binary = binary;
+        }
         if needs_mount_reconciliation(
             profile.mounts_enabled,
             ensure_client_storage,
@@ -229,6 +232,21 @@ fn request_descriptor(client: &mut ControlClient) -> Result<ClientDescriptor, St
         return Err("Controller returned an invalid client descriptor".into());
     };
     Ok(descriptor)
+}
+
+fn remote_binary_for_descriptor(
+    profile: &ClientProfile,
+    descriptor: &ClientDescriptor,
+) -> Option<String> {
+    let candidate = descriptor.controller_binary.trim();
+    let path = Path::new(candidate);
+    (candidate != profile.remote_binary
+        && path.is_absolute()
+        && !candidate.chars().any(char::is_control)
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)))
+    .then(|| candidate.to_owned())
 }
 
 fn needs_mount_reconciliation(
@@ -441,6 +459,7 @@ mod tests {
             default_queue: "default".parse().unwrap(),
             config_generation: 2,
             controller_build_id: "test".into(),
+            controller_binary: String::new(),
             controller_uid: 501,
             capabilities: vec![],
             primary_mount_root: "/Users/Shared/macluster".into(),
@@ -523,6 +542,7 @@ mod tests {
             default_queue: "default".parse().unwrap(),
             config_generation: 8,
             controller_build_id: "new-build".into(),
+            controller_binary: String::new(),
             controller_uid: 501,
             capabilities: vec![],
             primary_mount_root: "/Users/Shared/macluster".into(),
@@ -545,6 +565,63 @@ mod tests {
     }
 
     #[test]
+    fn controller_binary_refreshes_a_joined_profile_after_a_build_change() {
+        let descriptor = macluster_protocol::control::ClientDescriptor {
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            default_queue: "default".parse().unwrap(),
+            config_generation: 2,
+            controller_build_id: "new-build".into(),
+            controller_binary: "/Users/mac/.local/share/macluster/clusters/test/bin/new/macluster"
+                .into(),
+            controller_uid: 501,
+            capabilities: vec![],
+            primary_mount_root: "/Users/Shared/macluster".into(),
+            primary_source_root: "/Users/Shared/macluster".into(),
+            primary_source_host: "192.0.2.1".into(),
+            shares: vec![],
+            queues: vec![],
+        };
+        let profile = super::ClientProfile {
+            version: crate::client_profile::CLIENT_PROFILE_VERSION,
+            cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            cluster_name: "home".into(),
+            binding_digest: "b".repeat(64),
+            namespace: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
+            descriptor_generation: 1,
+            controller_host: "192.0.2.1".into(),
+            controller_user: "mac".into(),
+            controller_port: 22,
+            known_hosts_path: "/tmp/known_hosts".into(),
+            identity_file: "/tmp/id_ed25519".into(),
+            remote_uid: 501,
+            remote_binary: "/opt/homebrew/bin/macluster".into(),
+            remote_config: "/tmp/config.toml".into(),
+            remote_state_dir: "/tmp/state".into(),
+            mounts_enabled: true,
+            nfs_client_id: "client-test".into(),
+            nfs_client_ip: "192.0.2.10".into(),
+            last_used_unix_ms: 1,
+            descriptor: None,
+            mounted_descriptor: None,
+            transition_mount_descriptors: vec![],
+            retired_access: vec![],
+            leave_phase: None,
+        };
+
+        assert_eq!(
+            super::remote_binary_for_descriptor(&profile, &descriptor),
+            Some(descriptor.controller_binary.clone())
+        );
+        let mut invalid = descriptor;
+        invalid.controller_binary = "/tmp/../macluster".into();
+        assert_eq!(
+            super::remote_binary_for_descriptor(&profile, &invalid),
+            None
+        );
+    }
+
+    #[test]
     fn changing_a_mount_source_requires_reconciliation() {
         let descriptor = macluster_protocol::control::ClientDescriptor {
             cluster_uuid: "f779bcf5-ea85-5caa-9579-74b395f3cce5".into(),
@@ -552,6 +629,7 @@ mod tests {
             default_queue: "default".parse().unwrap(),
             config_generation: 8,
             controller_build_id: "same-build".into(),
+            controller_binary: String::new(),
             controller_uid: 501,
             capabilities: vec![],
             primary_mount_root: "/Users/Shared/macluster".into(),

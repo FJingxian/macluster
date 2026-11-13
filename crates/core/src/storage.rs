@@ -313,7 +313,7 @@ impl ReadOnlyJobStore {
     /// terminal job history.
     pub fn has_maintenance_work(&self) -> Result<bool, SubmitError> {
         let sql = if self.schema_version >= 3 {
-            "SELECT state FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') OR snapshot_sync_pending=1 OR log_sync_pending=1 LIMIT 1"
+            "SELECT state FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') OR (snapshot_sync_pending=1 AND state<>'PENDING') OR log_sync_pending=1 LIMIT 1"
         } else {
             "SELECT state FROM jobs WHERE state IN ('STARTING','RUNNING','CANCELLING') LIMIT 1"
         };
@@ -2069,6 +2069,19 @@ mod read_only_tests {
                 .unwrap()
                 .has_maintenance_work()
                 .unwrap()
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .exec("INSERT INTO jobs VALUES('PENDING', 1, 0);")
+            .unwrap();
+        drop(connection);
+        assert!(
+            !ReadOnlyJobStore::open(&root)
+                .unwrap()
+                .has_maintenance_work()
+                .unwrap(),
+            "an unpublished pending snapshot must resume after an Agent update"
         );
         fs::remove_dir_all(root).unwrap();
     }

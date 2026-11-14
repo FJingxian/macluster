@@ -4386,7 +4386,7 @@ fn node_help(full: bool) -> &'static str {
   mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
   mnode -a compute:NODE_ID
   mnode -mount URI --mount-root PATH [--host HOST]
-  mnode -umount MAPPING_ID|SOURCE_URI [--force [--yes]] [--wait [--timeout SECONDS]]
+  mnode -umount MAPPING_ID|SOURCE_URI|PENDING_SHARE_UUID [--force [--yes]] [--wait [--timeout SECONDS]]
   mnode -migrate controller:NODE_ID
   mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
@@ -4421,7 +4421,7 @@ Use `mnode -l --all` to include unreachable compute nodes.
   mnode -mount nfs://NODE/PATH --mount-root PATH [--host HOST] [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH
         [--host HOST] [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
-  mnode -umount MAPPING_ID|SOURCE_URI [--force [--yes]] [--wait [--timeout SECONDS]]
+  mnode -umount MAPPING_ID|SOURCE_URI|PENDING_SHARE_UUID [--force [--yes]] [--wait [--timeout SECONDS]]
   mnode -migrate controller:NODE_ID
   mnode --repair-nfs NODE_ID [--yes]
   mnode -l|--list [NODE_ID] [--all] [--storage]
@@ -17109,6 +17109,15 @@ fn pending_smb_cleanup_lines(path: &Path, now_unix_ms: u64) -> io::Result<Vec<St
             "  attempts {}; {}; {}",
             entry.attempts, kind, retry
         ));
+        let share_ids = entry
+            .shares
+            .iter()
+            .map(|share| share.share_uuid.as_str())
+            .collect::<BTreeSet<_>>();
+        for share_id in share_ids {
+            lines.push(format!("  force: mnode -umount {share_id} --force --yes"));
+            lines.push(format!("  wait: mnode -umount {share_id} --wait"));
+        }
     }
     for key in state.masters.values() {
         lines.push(format!(
@@ -17117,6 +17126,74 @@ fn pending_smb_cleanup_lines(path: &Path, now_unix_ms: u64) -> io::Result<Vec<St
         ));
     }
     Ok(lines)
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct PendingSmbForceOutcome {
+    forced_nodes: Vec<String>,
+    failures: Vec<(String, String)>,
+}
+
+fn pending_smb_cleanup_share_id(
+    journal: &macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup,
+    target: &UmountTarget,
+) -> Option<String> {
+    let UmountTarget::ShareId(share_id) = target else {
+        return None;
+    };
+    Id128::parse(share_id).ok()?;
+    journal
+        .nodes
+        .values()
+        .flat_map(|entry| &entry.shares)
+        .any(|share| share.share_uuid == *share_id)
+        .then(|| share_id.clone())
+}
+
+fn force_pending_smb_share_with(
+    journal: &mut macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup,
+    share_uuid: &str,
+    now_unix_ms: u64,
+    mut force_unmount: impl FnMut(&NodeConfig, &ShareConfig) -> Result<(), String>,
+) -> PendingSmbForceOutcome {
+    let mut outcome = PendingSmbForceOutcome::default();
+    let node_ids = journal.nodes.keys().cloned().collect::<Vec<_>>();
+    for node_id in node_ids {
+        let Some(entry) = journal.nodes.get_mut(&node_id) else {
+            continue;
+        };
+        let mut remaining = Vec::new();
+        let mut forced_here = false;
+        let mut failure_here = None;
+        for share in std::mem::take(&mut entry.shares) {
+            if share.share_uuid != share_uuid {
+                remaining.push(share);
+                continue;
+            }
+            match force_unmount(&entry.node, &share) {
+                Ok(()) => forced_here = true,
+                Err(error) => {
+                    failure_here.get_or_insert_with(|| error.clone());
+                    outcome.failures.push((node_id.clone(), error));
+                    remaining.push(share);
+                }
+            }
+        }
+        entry.shares = remaining;
+        if forced_here {
+            entry.next_retry_unix_ms = 0;
+            if !outcome.forced_nodes.contains(&node_id) {
+                outcome.forced_nodes.push(node_id.clone());
+            }
+        }
+        if let Some(error) = failure_here {
+            crate::smb_credentials::record_node_cleanup_failure(entry, &error, now_unix_ms);
+        }
+        if entry.shares.is_empty() && entry.endpoints.is_empty() {
+            journal.nodes.remove(&node_id);
+        }
+    }
+    outcome
 }
 
 fn wait_for_smb_cleanup_with(
@@ -17736,7 +17813,37 @@ fn umount_storage(
     timeout: Option<u64>,
 ) -> AppResult<()> {
     let config = read_config(config_path)?;
-    let (share_id, share) = resolve_umount_share(&config, &target)?;
+    let (share_id, share) = match resolve_umount_share(&config, &target) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let cleanup_path =
+                macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default_path()
+                    .map_err(io_error)?;
+            let cleanup = macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::load(
+                &cleanup_path,
+            )
+            .map_err(io_error)?;
+            let Some(share_uuid) = pending_smb_cleanup_share_id(&cleanup, &target) else {
+                return Err(error);
+            };
+            if !force && !wait {
+                return Err((
+                    1,
+                    format!(
+                        "SMB share {share_uuid} is already removed from the cluster but its physical mount cleanup is pending; use `mnode -umount {share_uuid} --force --yes` or `--wait`"
+                    ),
+                ));
+            }
+            return cleanup_pending_smb_share(
+                &cleanup_path,
+                &share_uuid,
+                force,
+                assume_yes,
+                wait,
+                timeout,
+            );
+        }
+    };
     if share.protocol == StorageProtocol::Smb {
         return unregister_smb_share(
             config_path,
@@ -17756,6 +17863,73 @@ fn umount_storage(
         ));
     }
     remove_share(config_path, state_dir, &share_id, false)
+}
+
+fn cleanup_pending_smb_share(
+    cleanup_path: &Path,
+    share_uuid: &str,
+    force: bool,
+    assume_yes: bool,
+    wait: bool,
+    timeout: Option<u64>,
+) -> AppResult<()> {
+    let _lock =
+        macluster_core::smb_credential_cleanup::GlobalSmbCleanupLock::exclusive(cleanup_path)
+            .map_err(io_error)?;
+    let mut journal =
+        macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::load(cleanup_path)
+            .map_err(io_error)?;
+    let node_ids = journal
+        .nodes
+        .values()
+        .filter(|entry| {
+            entry
+                .shares
+                .iter()
+                .any(|share| share.share_uuid == share_uuid)
+        })
+        .map(|entry| entry.node_id.clone())
+        .collect::<Vec<_>>();
+    if node_ids.is_empty() {
+        return Err((2, format!("pending SMB cleanup {share_uuid} was not found")));
+    }
+    if force {
+        if !assume_yes && !confirm_force_smb_unmount(&node_ids) {
+            return Err((
+                1,
+                "force SMB cleanup was cancelled; the cleanup journal remains queued".into(),
+            ));
+        }
+        let now_unix_ms = unix_time_ms();
+        let outcome =
+            force_pending_smb_share_with(&mut journal, share_uuid, now_unix_ms, |node, share| {
+                if node.transport == Transport::Ssh && !node_ssh_endpoint_reachable(node) {
+                    return Err(format!("{} is offline", node.host));
+                }
+                unmount_smb_share_for_cleanup_with_force(node, share, true)
+            });
+        journal.save(cleanup_path).map_err(io_error)?;
+        for node_id in &outcome.forced_nodes {
+            println!("Forced SMB cleanup completed on {node_id} for {share_uuid}.");
+        }
+        if !outcome.failures.is_empty() {
+            for (node_id, error) in &outcome.failures {
+                eprintln!("Forced SMB cleanup failed on {node_id}: {error}");
+            }
+            return Err((
+                1,
+                format!(
+                    "forced SMB cleanup failed on {} node(s); the cleanup journal remains queued",
+                    outcome.failures.len()
+                ),
+            ));
+        }
+    }
+    if wait {
+        wait_for_smb_cleanup(share_uuid, Duration::from_secs(timeout.unwrap_or(300)))
+            .map_err(|error| (1, error))?;
+    }
+    Ok(())
 }
 
 fn smb_share_parts(share: &ShareConfig) -> AppResult<(String, String)> {
@@ -23399,27 +23573,27 @@ mod tests {
         client_share_alias_script, config_path_candidate, controller_command_matches,
         controller_migration_peer_sync_error_is_local_only, controller_migration_target_script,
         ensure_controller_recovery_clean, ensure_no_node_maintenance_in_progress,
-        existing_ssh_endpoint_matches, format_node_list, has_committed_config_generation_path,
-        inspect_configured_agent_build, installed_helper_sequence_from_error, list_nodes,
-        local_config_candidate, maintenance_inputs_unchanged, managed_binary_digest,
-        migration_controller_epoch, mount_point_permission_error, named_share_mount_root,
-        named_share_mount_status, named_share_operation_endpoint, named_share_operation_matches,
-        named_share_request_matches, nfs_exports_read_command,
-        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
-        nfs_exports_update_script_for_expected, nfs_mapping, nfs_mount_source,
-        node_admin_recovery_pending, node_nfs_mappings, node_ssh_endpoint_reachable,
-        normalize_binary_path, parse_action, parse_agent_build_probe,
+        existing_ssh_endpoint_matches, force_pending_smb_share_with, format_node_list,
+        has_committed_config_generation_path, inspect_configured_agent_build,
+        installed_helper_sequence_from_error, list_nodes, local_config_candidate,
+        maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
+        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
+        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
+        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
+        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mapping,
+        nfs_mount_source, node_admin_recovery_pending, node_nfs_mappings,
+        node_ssh_endpoint_reachable, normalize_binary_path, parse_action, parse_agent_build_probe,
         parse_nfs_exports_update_baseline, peer_config_sync_pending,
         pending_add_may_have_client_state, pending_add_operation_for_endpoint,
         pending_combined_ssh_add, pending_local_share_retry_node,
-        pending_managed_export_cleanup_plan, plan_ensure_nfs_exports, plan_remove_nfs_exports,
-        power_helper_install_script, power_launch_daemon_plist, preferred_local_host,
-        provider_storage_inventory, queue_candidate_with_node, reachable_configured_node_ids,
-        read_admin_state, remote_config_belongs_to_cluster, remote_execution_status,
-        reset_admin_operations, reset_node_from_endpoint, resume_existing_ssh_add_sync,
-        save_admin_state, shell_quote, should_resume_add_operation, shutdown_confirmation_accepted,
-        unavailable_share_client_nodes, update_recovery, validate_pending_node_identity,
-        validate_storage_root_access,
+        pending_managed_export_cleanup_plan, pending_smb_cleanup_share_id, plan_ensure_nfs_exports,
+        plan_remove_nfs_exports, power_helper_install_script, power_launch_daemon_plist,
+        preferred_local_host, provider_storage_inventory, queue_candidate_with_node,
+        reachable_configured_node_ids, read_admin_state, remote_config_belongs_to_cluster,
+        remote_execution_status, reset_admin_operations, reset_node_from_endpoint,
+        resume_existing_ssh_add_sync, save_admin_state, shell_quote, should_resume_add_operation,
+        shutdown_confirmation_accepted, unavailable_share_client_nodes, update_recovery,
+        validate_pending_node_identity, validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -28103,7 +28277,9 @@ execution_uid = 501
             [
                 "worker  SMB cleanup pending",
                 "  share 928e8976-c946-509d-9e62-a3ef787664b7 -> /Users/Shared/nas-data",
-                "  attempts 2; busy; next retry in 5s"
+                "  attempts 2; busy; next retry in 5s",
+                "  force: mnode -umount 928e8976-c946-509d-9e62-a3ef787664b7 --force --yes",
+                "  wait: mnode -umount 928e8976-c946-509d-9e62-a3ef787664b7 --wait"
             ]
         );
         fs::remove_dir_all(root).unwrap();
@@ -28203,6 +28379,125 @@ execution_uid = 501
             ))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn forcing_one_pending_cleanup_share_preserves_other_shares() {
+        let node = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("worker".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdef".into()),
+            execution_uid: Some(501),
+        };
+        let share = |name: &str, uuid: &str| ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: format!("/{name}").into(),
+            mount_root: format!("/Users/Shared/{name}").into(),
+            share_uuid: uuid.into(),
+            smb_user: Some("worker".into()),
+            allow_existing_contents: false,
+        };
+        let forced = share("busy", "b483b6fb-a355-55c6-bf1c-d4f7a4fe9618");
+        let remaining = share("remaining", "e6fe7c50-8ea9-567c-9238-e7fe1799fbf3");
+        let mut journal =
+            macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default();
+        journal.remember_node(
+            macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: node.machine_uuid.clone(),
+                node: node.clone(),
+                shares: vec![forced.clone(), remaining.clone()],
+                endpoints: Vec::new(),
+                wait_for_unmount: true,
+                attempts: 90,
+                next_retry_unix_ms: 10_000,
+                last_error_kind: Some(macluster_core::nfs_reconcile::SmbCleanupFailureKind::Busy),
+                last_error_summary: Some("operation remained busy".into()),
+            },
+        );
+        let mut calls = Vec::new();
+
+        let outcome = force_pending_smb_share_with(
+            &mut journal,
+            &forced.share_uuid,
+            20_000,
+            |candidate, selected| {
+                calls.push((candidate.host.clone(), selected.share_uuid.clone()));
+                Ok(())
+            },
+        );
+
+        assert_eq!(calls, [("192.0.2.20".into(), forced.share_uuid.clone())]);
+        assert_eq!(outcome.forced_nodes, ["worker"]);
+        assert!(outcome.failures.is_empty());
+        assert_eq!(journal.nodes["worker"].shares, [remaining]);
+        assert_eq!(journal.nodes["worker"].next_retry_unix_ms, 0);
+    }
+
+    #[test]
+    fn pending_cleanup_uuid_resolves_only_when_the_journal_contains_it() {
+        let uuid = "b483b6fb-a355-55c6-bf1c-d4f7a4fe9618";
+        let mut journal =
+            macluster_core::smb_credential_cleanup::GlobalSmbCredentialCleanup::default();
+        journal.nodes.insert(
+            "worker".into(),
+            macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: None,
+                node: NodeConfig {
+                    host: "192.0.2.20".into(),
+                    transport: Transport::Ssh,
+                    remote_binary: "/usr/local/bin/macluster".into(),
+                    ssh_user: Some("worker".into()),
+                    ssh_port: Some(22),
+                    ssh_identity_file: None,
+                    remote_config: None,
+                    machine_uuid: None,
+                    execution_uid: Some(501),
+                },
+                shares: vec![ShareConfig {
+                    protocol: StorageProtocol::Smb,
+                    server: NodeId::new("nas").unwrap(),
+                    source_root: "/busy".into(),
+                    mount_root: "/Users/Shared/busy".into(),
+                    share_uuid: uuid.into(),
+                    smb_user: Some("worker".into()),
+                    allow_existing_contents: false,
+                }],
+                endpoints: Vec::new(),
+                wait_for_unmount: true,
+                attempts: 1,
+                next_retry_unix_ms: 0,
+                last_error_kind: None,
+                last_error_summary: None,
+            },
+        );
+
+        assert_eq!(
+            pending_smb_cleanup_share_id(&journal, &UmountTarget::ShareId(uuid.to_owned()))
+                .as_deref(),
+            Some(uuid)
+        );
+        assert!(
+            pending_smb_cleanup_share_id(
+                &journal,
+                &UmountTarget::ShareId("00000000-0000-4000-8000-000000000001".into())
+            )
+            .is_none()
+        );
+        assert!(
+            pending_smb_cleanup_share_id(
+                &journal,
+                &UmountTarget::Uri(StorageUri::parse("smb://nas/busy").unwrap())
+            )
+            .is_none()
+        );
     }
 
     #[test]

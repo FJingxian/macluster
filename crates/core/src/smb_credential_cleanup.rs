@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -14,6 +17,63 @@ use crate::nfs_reconcile::DeferredSmbCredentialCleanup;
 
 const VERSION: u32 = 1;
 pub const GLOBAL_SMB_CLEANUP_FILE: &str = "smb-credential-cleanup.json";
+
+pub struct GlobalSmbCleanupLock {
+    _file: File,
+}
+
+impl GlobalSmbCleanupLock {
+    pub fn exclusive(path: &Path) -> io::Result<Self> {
+        Self::acquire(path, false)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "SMB cleanup lock is unexpectedly busy",
+            )
+        })
+    }
+
+    pub fn try_exclusive(path: &Path) -> io::Result<Option<Self>> {
+        Self::acquire(path, true)
+    }
+
+    fn acquire(path: &Path, nonblocking: bool) -> io::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SMB cleanup lock has unsafe ownership or permissions",
+            ));
+        }
+        let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+                return Ok(Some(Self { _file: file }));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if nonblocking && error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+}
 
 pub fn smb_cleanup_retry_delay(attempts: u32) -> Duration {
     Duration::from_secs(match attempts {
@@ -163,7 +223,7 @@ impl GlobalSmbCredentialCleanup {
 mod tests {
     use std::time::Duration;
 
-    use super::{GlobalSmbCredentialCleanup, smb_cleanup_retry_delay};
+    use super::{GlobalSmbCleanupLock, GlobalSmbCredentialCleanup, smb_cleanup_retry_delay};
     use macluster_protocol::{
         identifiers::{Id128, NodeId},
         smb_credential::SmbCredentialKey,
@@ -188,6 +248,33 @@ mod tests {
                 0o600
             );
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_journal_lock_is_exclusive_and_reusable() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-global-smb-cleanup-lock-{}",
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(super::GLOBAL_SMB_CLEANUP_FILE);
+
+        let first = GlobalSmbCleanupLock::try_exclusive(&path)
+            .unwrap()
+            .expect("first lock succeeds");
+        assert!(
+            GlobalSmbCleanupLock::try_exclusive(&path)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            GlobalSmbCleanupLock::try_exclusive(&path)
+                .unwrap()
+                .is_some()
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

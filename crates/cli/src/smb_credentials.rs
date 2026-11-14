@@ -15,7 +15,9 @@ use macluster_controller::smb_credential::CredentialHelperClient;
 use macluster_core::{
     config::{ClusterConfig, NodeConfig, Transport},
     nfs_reconcile::SmbCleanupFailureKind,
-    smb_credential_cleanup::{GlobalSmbCredentialCleanup, smb_cleanup_retry_delay},
+    smb_credential_cleanup::{
+        GlobalSmbCleanupLock, GlobalSmbCredentialCleanup, smb_cleanup_retry_delay,
+    },
     smb_credentials_state::{record_generation, remove_endpoint},
     storage_uri::StorageUri,
 };
@@ -908,6 +910,7 @@ fn cleanup_smb_credential_if_unused_with(
 
 pub(crate) fn queue_global_master_cleanup(key: &SmbCredentialKey) -> Result<(), String> {
     let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
+    let _lock = GlobalSmbCleanupLock::exclusive(&path).map_err(|error| error.to_string())?;
     let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
     state.remember_master(key.clone());
     state.save(&path).map_err(|error| error.to_string())
@@ -924,6 +927,7 @@ fn queue_global_node_cleanup_at(
     path: &std::path::Path,
     entry: macluster_core::nfs_reconcile::DeferredSmbCredentialCleanup,
 ) -> Result<(), String> {
+    let _lock = GlobalSmbCleanupLock::exclusive(path).map_err(|error| error.to_string())?;
     let mut state = GlobalSmbCredentialCleanup::load(path).map_err(|error| error.to_string())?;
     state.remember_node(entry);
     state.save(path).map_err(|error| error.to_string())
@@ -977,6 +981,7 @@ fn retry_smb_cleanup_entry_with(
 
 pub(crate) fn retry_global_smb_credential_cleanup() -> Result<CredentialCleanupReport, String> {
     let path = GlobalSmbCredentialCleanup::default_path().map_err(|error| error.to_string())?;
+    let _lock = GlobalSmbCleanupLock::exclusive(&path).map_err(|error| error.to_string())?;
     let mut state = GlobalSmbCredentialCleanup::load(&path).map_err(|error| error.to_string())?;
     if state.nodes.is_empty() && state.masters.is_empty() {
         return Ok(CredentialCleanupReport::default());

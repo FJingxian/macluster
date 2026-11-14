@@ -253,6 +253,16 @@ retried after 15, 30, and 60 seconds, then every 5 minutes. `--force` asks once
 before force-detaching failed nodes; `--yes` skips that prompt for automation.
 `--wait` follows the background retry and defaults to a 300-second limit.
 `macluster node --failed` shows attempts, failure category, and next retry.
+When a mapping has already been removed but its physical mount remains busy,
+the pending share UUID printed by `node --failed` can be targeted directly:
+
+```sh
+macluster node -umount CLEANUP_SHARE_UUID --force --yes
+macluster node -umount CLEANUP_SHARE_UUID --wait
+```
+
+This removes only the named pending cleanup and preserves other entries in
+the same journal record.
 Legacy managed SMB helper state that is no longer in the configuration is
 adopted automatically so an old hidden mount cannot leave a dangling `~` path.
 

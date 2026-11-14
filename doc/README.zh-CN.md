@@ -228,7 +228,16 @@ macluster node -umount mnt-0123456789abcdef --wait --timeout 60
 物理清理会在 15、30、60 秒后重试，之后每 5 分钟重试。`--force` 会在普通
 卸载失败的节点上询问一次是否强制卸载；`--yes` 用于自动化并跳过询问。
 `--wait` 跟踪后台清理，默认最长等待 300 秒。`macluster node --failed`
-显示尝试次数、失败类别和下次重试时间。配置中已经不存在的旧受管 SMB
+显示尝试次数、失败类别和下次重试时间。如果 mapping 已经删除，但底层挂载
+仍然 busy，可以直接用 `mnode --failed` 显示的待清理 share UUID：
+
+```sh
+macluster node -umount CLEANUP_SHARE_UUID --force --yes
+macluster node -umount CLEANUP_SHARE_UUID --wait
+```
+
+该操作只清理指定的待处理共享，不会误删同一 journal 记录中的其他共享。
+配置中已经不存在的旧受管 SMB
 helper state 也会自动纳管，避免旧 hidden mount 留下悬空 `~` 路径。
 
 交互式重置遇到尚未配置密钥登录的旧 SSH 节点时，会只询问一次该节点账户密码，安装 macluster 专用重置密钥后继续精确清理。当前本机保存的旧 machine UUID 不一致不会再阻断本地重置。

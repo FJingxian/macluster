@@ -88,12 +88,103 @@ jobs:
             exit 1
           }
 
-      - name: Ad-hoc sign release binary
+      - name: Import Developer ID certificate when configured
+        env:
+          MACLUSTER_CODESIGN_P12_BASE64: ${{ secrets.MACLUSTER_CODESIGN_P12_BASE64 }}
+          MACLUSTER_CODESIGN_P12_PASSWORD: ${{ secrets.MACLUSTER_CODESIGN_P12_PASSWORD }}
+          MACLUSTER_CODESIGN_IDENTITY: ${{ secrets.MACLUSTER_CODESIGN_IDENTITY }}
+          MACLUSTER_NOTARY_APPLE_ID: ${{ secrets.MACLUSTER_NOTARY_APPLE_ID }}
+          MACLUSTER_NOTARY_PASSWORD: ${{ secrets.MACLUSTER_NOTARY_PASSWORD }}
+          MACLUSTER_NOTARY_TEAM_ID: ${{ secrets.MACLUSTER_NOTARY_TEAM_ID }}
         run: |
-          BIN="target/$TARGET/release/macluster"
-          codesign --force --sign - "$BIN"
-          codesign --verify --strict --verbose=4 "$BIN"
-          codesign -dv --verbose=4 "$BIN"
+          if test -z "$MACLUSTER_CODESIGN_P12_BASE64" \
+            && test -z "$MACLUSTER_CODESIGN_P12_PASSWORD" \
+            && test -z "$MACLUSTER_CODESIGN_IDENTITY"; then
+            echo "MACLUSTER_SIGNING_ENABLED=0" >> "$GITHUB_ENV"
+            echo "Developer ID secrets are not configured; release will use explicit ad-hoc signing."
+            exit 0
+          fi
+          test -n "$MACLUSTER_CODESIGN_P12_BASE64" || {
+            echo "::error::MACLUSTER_CODESIGN_P12_BASE64 is not configured"
+            exit 1
+          }
+          test -n "$MACLUSTER_CODESIGN_P12_PASSWORD" || {
+            echo "::error::MACLUSTER_CODESIGN_P12_PASSWORD is not configured"
+            exit 1
+          }
+          test -n "$MACLUSTER_CODESIGN_IDENTITY" || {
+            echo "::error::MACLUSTER_CODESIGN_IDENTITY is not configured"
+            exit 1
+          }
+          test -n "$MACLUSTER_NOTARY_APPLE_ID" || {
+            echo "::error::MACLUSTER_NOTARY_APPLE_ID is not configured"
+            exit 1
+          }
+          test -n "$MACLUSTER_NOTARY_PASSWORD" || {
+            echo "::error::MACLUSTER_NOTARY_PASSWORD is not configured"
+            exit 1
+          }
+          test -n "$MACLUSTER_NOTARY_TEAM_ID" || {
+            echo "::error::MACLUSTER_NOTARY_TEAM_ID is not configured"
+            exit 1
+          }
+          certificate="$RUNNER_TEMP/macluster-developer-id.p12"
+          keychain="$RUNNER_TEMP/macluster-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "$MACLUSTER_CODESIGN_P12_BASE64" \
+            | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$MACLUSTER_CODESIGN_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain"
+          security find-identity -v -p codesigning "$keychain" \
+            | grep -F "$MACLUSTER_CODESIGN_IDENTITY"
+          {
+            echo "MACLUSTER_SIGNING_ENABLED=1"
+            echo "MACLUSTER_CODESIGN_IDENTITY=$MACLUSTER_CODESIGN_IDENTITY"
+            echo "MACLUSTER_SIGNING_KEYCHAIN=$keychain"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign release with Developer ID
+        if: env.MACLUSTER_SIGNING_ENABLED == '1'
+        run: |
+          python3 scripts/release/sign_macos.py \
+            --binary "target/$TARGET/release/macluster" \
+            --identity "$MACLUSTER_CODESIGN_IDENTITY" \
+            --keychain "$MACLUSTER_SIGNING_KEYCHAIN" \
+            --distribution-only
+          codesign -dv --verbose=4 "target/$TARGET/release/macluster"
+
+      - name: Ad-hoc sign release binary
+        if: env.MACLUSTER_SIGNING_ENABLED != '1'
+        run: |
+          python3 scripts/release/sign_macos.py \
+            --binary "target/$TARGET/release/macluster" \
+            --allow-adhoc
+
+      - name: Notarize Developer ID release
+        if: env.MACLUSTER_SIGNING_ENABLED == '1'
+        env:
+          MACLUSTER_NOTARY_APPLE_ID: ${{ secrets.MACLUSTER_NOTARY_APPLE_ID }}
+          MACLUSTER_NOTARY_PASSWORD: ${{ secrets.MACLUSTER_NOTARY_PASSWORD }}
+          MACLUSTER_NOTARY_TEAM_ID: ${{ secrets.MACLUSTER_NOTARY_TEAM_ID }}
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent \
+            "target/$TARGET/release/macluster" \
+            dist/macluster-notary.zip
+          xcrun notarytool submit dist/macluster-notary.zip \
+            --apple-id "$MACLUSTER_NOTARY_APPLE_ID" \
+            --password "$MACLUSTER_NOTARY_PASSWORD" \
+            --team-id "$MACLUSTER_NOTARY_TEAM_ID" \
+            --wait
 
       - name: Package signed release
         run: |
@@ -116,11 +207,17 @@ jobs:
 
       - name: Create GitHub Release
         run: |
+          if test "$MACLUSTER_SIGNING_ENABLED" = "1"; then
+            signature_en="Developer ID signed and Apple notarized"
+            signature_zh="Developer ID 签名并通过 Apple 公证"
+          else
+            signature_en="ad-hoc signed"
+            signature_zh="ad-hoc 签名"
+          fi
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           ## English
 
-          macluster $RELEASE_TAG is an ad-hoc signed Apple silicon
-          early-access build.
+          macluster $RELEASE_TAG is a $signature_en Apple silicon build.
 
           Homebrew (after the tap is published):
 
@@ -132,8 +229,7 @@ jobs:
 
           ## 简体中文
 
-          macluster $RELEASE_TAG 是 ad-hoc 签名、无需付费开发者证书的
-          Apple silicon 早期版本。
+          macluster $RELEASE_TAG 是 $signature_zh Apple silicon 版本。
 
           Homebrew 安装（tap 发布后）：
 

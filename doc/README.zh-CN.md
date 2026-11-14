@@ -38,10 +38,19 @@ brew upgrade macluster
 在准备作为登录节点的 Mac 上进入仓库执行：
 
 ```sh
-cargo build --release --locked -p macluster-cli
+scripts/release/build_signed_macos.sh
 packaging/scripts/install-user.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+构建脚本优先使用 `Developer ID Application` 证书；没有时使用本机已安装的
+`Apple Development` 证书。它把代码 identifier 固定为
+`org.macluster.macluster`，启用 hardened runtime，并验证 designated
+requirement 不依赖会变化的可执行文件 CDHash。`Apple Development` 足以让
+本机 TCC 身份稳定；公众下载要完全避免 Gatekeeper 警告，仍需要付费的
+Developer ID、公证和[发布说明](releasing.md)中的 secrets。没有 Apple
+签名证书时仍可用 `cargo build --release --locked -p macluster-cli`，产物
+会是 ad-hoc 签名。
 
 将 PATH 这一行加入 shell 配置，方便后续使用。分发时只需复制 `target/release/macluster`，功耗/风扇 helper 已内嵌。运行 macluster 不需要安装 Rust 或 Python；二进制需要支持目标机器的 CPU 架构。
 

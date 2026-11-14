@@ -38,10 +38,21 @@ The tap formula is updated automatically after a GitHub release. Intel Macs and 
 Build and install on the Mac you want to use as the login node:
 
 ```sh
-cargo build --release --locked -p macluster-cli
+scripts/release/build_signed_macos.sh
 packaging/scripts/install-user.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+The build script prefers a `Developer ID Application` identity and otherwise
+uses an installed `Apple Development` identity. It fixes the code identifier to
+`org.macluster.macluster`, enables the hardened runtime, and verifies that the
+designated requirement does not depend on the changing executable CDHash. An
+Apple Development identity is sufficient for stable local TCC identity. Public
+downloads without a Gatekeeper warning require a paid Developer ID membership,
+notarization, and release secrets documented in [releasing.md](doc/releasing.md).
+Developers without an Apple signing identity can still use
+`cargo build --release --locked -p macluster-cli`, which produces an ad-hoc
+signature.
 
 Add the PATH line to your shell configuration. To distribute the app, copy only `target/release/macluster`; the power/fan helper is embedded. Rust and Python are not required to run macluster. Use a binary supporting the target Mac's CPU architecture.
 

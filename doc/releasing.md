@@ -1,8 +1,25 @@
 # Releasing macluster
 
-The release workflow builds the Apple silicon binary, applies an ad-hoc code
-signature, publishes the GitHub Release, and updates the Homebrew tap. No paid
-Apple Developer Program certificate is required for this early-access channel.
+The release workflow supports two channels:
+
+- **Stable local development:** an installed Apple Development identity signs
+  the binary with a stable identifier and designated requirement. A free Apple
+  account/personal team can be enough for a locally built development binary;
+  no provisioning profile is needed for this command-line target.
+- **Public distribution:** a Developer ID Application identity, hardened
+  runtime, secure timestamp, and Apple notarization remove normal Gatekeeper
+  warnings. Developer ID distribution requires Apple Developer Program
+  membership, currently 99 USD per year except approved fee waivers.
+
+Build a stable locally signed binary with:
+
+```sh
+scripts/release/build_signed_macos.sh
+```
+
+Use `--distribution-only` to fail unless a Developer ID Application identity is
+available. Use `--allow-adhoc` only for an explicitly unsigned/early-access
+fallback.
 
 ## Requirements
 
@@ -16,16 +33,24 @@ Configure these repository secrets in `FJingxian/macluster`:
 | Secret | Value |
 | --- | --- |
 | `HOMEBREW_TAP_SSH_KEY` | Private half of the write-enabled tap deploy key |
+| `MACLUSTER_CODESIGN_P12_BASE64` | Base64-encoded Developer ID Application certificate and private key |
+| `MACLUSTER_CODESIGN_P12_PASSWORD` | Password protecting the `.p12` |
+| `MACLUSTER_CODESIGN_IDENTITY` | Full identity shown by `security find-identity`, for example `Developer ID Application: ... (TEAMID)` |
+| `MACLUSTER_NOTARY_APPLE_ID` | Apple Account used by `notarytool` |
+| `MACLUSTER_NOTARY_PASSWORD` | App-specific password for the notary service |
+| `MACLUSTER_NOTARY_TEAM_ID` | Apple Developer team identifier |
 
 Optionally set the repository variable `HOMEBREW_TAP_REPOSITORY`. The default is
 `FJingxian/homebrew-macluster`.
 
 Never commit the tap deploy key.
 
-The current ad-hoc signature allows normal Homebrew installation, but manually
-downloaded binaries may still trigger stronger Gatekeeper warnings. Developer ID
-signing and notarization can be added later without changing the Release or
-Homebrew version format.
+If the five Developer ID/notary secrets are absent, the workflow deliberately
+falls back to an explicit ad-hoc signature. If any signing secret is supplied,
+all signing and notarization values must be complete or the workflow fails.
+Notarization is applied to a ZIP containing the signed command-line binary.
+Apple does not support stapling a notarization ticket directly to a standalone
+command-line executable, so Gatekeeper performs the online notarization lookup.
 
 ## Release process
 

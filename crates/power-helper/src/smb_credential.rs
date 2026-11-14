@@ -872,23 +872,17 @@ fn ensure_same_subnet_storage_route(server_host: &str) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SmbMountAction {
-    Keep,
-    Replace,
-}
-
-fn smb_mount_action(active: bool, readable: bool) -> SmbMountAction {
-    if active && readable {
-        SmbMountAction::Keep
-    } else {
-        SmbMountAction::Replace
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SmbMountReadability {
+    #[default]
+    Readable,
+    Unreadable,
+    TimedOut,
 }
 
 trait SmbMountBackend {
     fn is_active(&mut self, target: &str) -> Result<bool, String>;
-    fn verify_readable(&mut self, target: &str) -> Result<(), String>;
+    fn verify_readable(&mut self, target: &str) -> Result<SmbMountReadability, String>;
     fn unmount(&mut self, target: &str, logical: &str, logical_target: &str) -> Result<(), String>;
     fn mount(&mut self, source: &str, target: &str) -> Result<(), String>;
     fn ensure_alias(&mut self, logical: &str, logical_target: &str) -> Result<(), String>;
@@ -907,7 +901,7 @@ impl SmbMountBackend for RealSmbMountBackend<'_> {
         smb_mount_is_active(target)
     }
 
-    fn verify_readable(&mut self, target: &str) -> Result<(), String> {
+    fn verify_readable(&mut self, target: &str) -> Result<SmbMountReadability, String> {
         verify_smb_mount_readable(self.uid, self.user, self.home, target)
     }
 
@@ -1037,11 +1031,13 @@ fn reconcile_smb_mount_with_backend(
     backend: &mut impl SmbMountBackend,
 ) -> Result<(), String> {
     let active = backend.is_active(target)?;
-    let readable = active && backend.verify_readable(target).is_ok();
-    if smb_mount_action(active, readable) == SmbMountAction::Keep {
-        return backend.ensure_alias(logical, logical_target);
-    }
     if active {
+        match backend.verify_readable(target)? {
+            SmbMountReadability::Readable | SmbMountReadability::TimedOut => {
+                return backend.ensure_alias(logical, logical_target);
+            }
+            SmbMountReadability::Unreadable => {}
+        }
         if !smb_repair_allowed(repair_state, now_ms) {
             return Err(format!(
                 "SMB mount {target} was unreadable; replacement is backing off"
@@ -1052,9 +1048,17 @@ fn reconcile_smb_mount_with_backend(
             return Err(error);
         }
     }
+
     let result = (|| {
         backend.mount(source, target)?;
-        backend.verify_readable(target)?;
+        if !backend.is_active(target)? {
+            return Err(format!(
+                "SMB mount {target} was not present in the system mount table after mount_smbfs succeeded"
+            ));
+        }
+        // A successful mount_smbfs plus an exact mount-table entry is enough
+        // to accept a new mount. Opening an SMB directory here may wait on a
+        // sleeping or busy NAS volume, then roll back a valid mount.
         backend.ensure_alias(logical, logical_target)
     })();
     match result {
@@ -1128,7 +1132,7 @@ fn verify_smb_mount_readable(
     user: &str,
     home: &str,
     target: &str,
-) -> Result<(), String> {
+) -> Result<SmbMountReadability, String> {
     let mut command = Command::new("/bin/launchctl");
     command
         .args([
@@ -1154,14 +1158,13 @@ fn verify_smb_mount_readable(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let status = run_bounded_process_group(command, Duration::from_secs(5))
-        .map_err(|error| format!("verify SMB mount {target}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "SMB mount {target} was created but is not readable (status {status})"
-        ))
+    match run_bounded_process_group(command, Duration::from_secs(5)) {
+        Ok(status) if status.success() => Ok(SmbMountReadability::Readable),
+        Ok(_) => Ok(SmbMountReadability::Unreadable),
+        Err(error) if error.contains("operation remained busy after") => {
+            Ok(SmbMountReadability::TimedOut)
+        }
+        Err(error) => Err(format!("verify SMB mount {target}: {error}")),
     }
 }
 
@@ -1680,11 +1683,11 @@ mod tests {
 
     use super::{
         CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore,
-        SMB_UNMOUNT_TIMEOUT, SecretStore, SmbMountAction, SmbMountBackend, arp_delete_arguments,
-        direct_storage_subnet_route_arguments, ensure_smb_logical_alias, read_pinned_cluster,
-        reconcile_smb_mount_with_backend, record_smb_repair_failure, remove_smb_logical_alias,
-        route_delete_arguments, route_output_is_direct, run_bounded_process_group,
-        serve_client_with, smb_mount_action, smb_mount_arguments, smb_repair_allowed,
+        SMB_UNMOUNT_TIMEOUT, SecretStore, SmbMountBackend, SmbMountReadability,
+        arp_delete_arguments, direct_storage_subnet_route_arguments, ensure_smb_logical_alias,
+        read_pinned_cluster, reconcile_smb_mount_with_backend, record_smb_repair_failure,
+        remove_smb_logical_alias, route_delete_arguments, route_output_is_direct,
+        run_bounded_process_group, serve_client_with, smb_mount_arguments, smb_repair_allowed,
         smb_tcp_endpoint_reachable, smb_unmount_arguments, unmount_smb_with,
     };
 
@@ -1893,18 +1896,31 @@ mod tests {
     }
 
     #[test]
-    fn smb_mount_action_replaces_only_missing_or_unreadable_mounts() {
-        assert_eq!(smb_mount_action(false, false), SmbMountAction::Replace);
-        assert_eq!(smb_mount_action(true, true), SmbMountAction::Keep);
-        assert_eq!(smb_mount_action(true, false), SmbMountAction::Replace);
+    fn active_smb_mount_is_kept_without_reading_remote_contents() {
+        let mut backend = FakeSmbMountBackend {
+            active: true,
+            readability: SmbMountReadability::TimedOut,
+            ..Default::default()
+        };
+
+        reconcile_for_test(&mut backend).unwrap();
+
+        assert_eq!(backend.mount_calls, 0, "do not replace an active mount");
+        assert_eq!(
+            backend.unmount_calls, 0,
+            "a timed out probe is inconclusive"
+        );
+        assert_eq!(backend.verify_calls, 1);
+        assert_eq!(backend.alias_calls, 1);
     }
 
     #[derive(Default)]
     struct FakeSmbMountBackend {
         active: bool,
-        readable: bool,
-        unmount_busy: bool,
+        readability: SmbMountReadability,
+        active_checks: usize,
         verify_calls: usize,
+        unmount_busy: bool,
         unmount_calls: usize,
         mount_calls: usize,
         alias_calls: usize,
@@ -1912,16 +1928,13 @@ mod tests {
 
     impl SmbMountBackend for FakeSmbMountBackend {
         fn is_active(&mut self, _target: &str) -> Result<bool, String> {
+            self.active_checks += 1;
             Ok(self.active)
         }
 
-        fn verify_readable(&mut self, _target: &str) -> Result<(), String> {
+        fn verify_readable(&mut self, _target: &str) -> Result<SmbMountReadability, String> {
             self.verify_calls += 1;
-            if self.readable {
-                Ok(())
-            } else {
-                Err("stale SMB session".into())
-            }
+            Ok(self.readability)
         }
 
         fn unmount(
@@ -1941,7 +1954,6 @@ mod tests {
         fn mount(&mut self, _source: &str, _target: &str) -> Result<(), String> {
             self.mount_calls += 1;
             self.active = true;
-            self.readable = true;
             Ok(())
         }
 
@@ -1951,60 +1963,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stale_active_smb_mount_is_replaced_once() {
+    fn reconcile_for_test(backend: &mut FakeSmbMountBackend) -> Result<(), String> {
         let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
-        let mut backend = FakeSmbMountBackend {
-            active: true,
-            readable: false,
-            ..Default::default()
-        };
-
-        reconcile_smb_mount_with_backend(
+        let result = reconcile_smb_mount_with_backend(
             "//user@nas/share",
             "/mnt/share",
             "/logical/share",
             "/mnt/share",
             &state,
             1_000,
-            &mut backend,
-        )
-        .unwrap();
-
-        assert_eq!(backend.unmount_calls, 1);
-        assert_eq!(backend.mount_calls, 1);
-        assert_eq!(backend.verify_calls, 2);
-        assert_eq!(backend.alias_calls, 1);
-        assert!(backend.active);
-        assert!(backend.readable);
+            backend,
+        );
+        let _ = fs::remove_file(state);
+        result
     }
 
     #[test]
-    fn stale_active_smb_mount_preserves_a_busy_unmount() {
-        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
+    fn new_smb_mount_is_verified_from_mount_table_without_opening_share_contents() {
+        let mut backend = FakeSmbMountBackend::default();
+
+        reconcile_for_test(&mut backend).unwrap();
+
+        assert_eq!(backend.active_checks, 2);
+        assert_eq!(backend.mount_calls, 1);
+        assert_eq!(backend.verify_calls, 0);
+        assert_eq!(backend.alias_calls, 1);
+        assert!(backend.active);
+    }
+
+    #[test]
+    fn definitely_unreadable_active_smb_mount_is_repaired() {
         let mut backend = FakeSmbMountBackend {
             active: true,
-            readable: false,
+            readability: SmbMountReadability::Unreadable,
+            ..Default::default()
+        };
+
+        reconcile_for_test(&mut backend).unwrap();
+
+        assert_eq!(backend.verify_calls, 1);
+        assert_eq!(backend.unmount_calls, 1);
+        assert_eq!(backend.mount_calls, 1);
+        assert_eq!(backend.alias_calls, 1);
+        assert!(backend.active);
+    }
+
+    #[test]
+    fn busy_unmount_after_definite_smb_failure_preserves_the_mount() {
+        let mut backend = FakeSmbMountBackend {
+            active: true,
+            readability: SmbMountReadability::Unreadable,
             unmount_busy: true,
             ..Default::default()
         };
 
-        let error = reconcile_smb_mount_with_backend(
-            "//user@nas/share",
-            "/mnt/share",
-            "/logical/share",
-            "/mnt/share",
-            &state,
-            1_000,
-            &mut backend,
-        )
-        .unwrap_err();
+        let error = reconcile_for_test(&mut backend).unwrap_err();
 
         assert!(error.contains("busy"), "{error}");
         assert_eq!(backend.unmount_calls, 1);
         assert_eq!(backend.mount_calls, 0);
         assert!(backend.active);
-        assert!(!backend.readable);
+    }
+
+    #[test]
+    fn smb_repair_backoff_grows_and_caps() {
+        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
+
+        assert!(smb_repair_allowed(&state, 1_000));
+        record_smb_repair_failure(&state, 1_000).unwrap();
+        assert!(!smb_repair_allowed(&state, 30_000));
+        assert!(smb_repair_allowed(&state, 61_000));
+
+        record_smb_repair_failure(&state, 61_000).unwrap();
+        assert!(!smb_repair_allowed(&state, 180_999));
+        assert!(smb_repair_allowed(&state, 181_000));
+
+        for now in [181_000, 361_000, 661_000, 961_000] {
+            record_smb_repair_failure(&state, now).unwrap();
+        }
+        assert!(!smb_repair_allowed(&state, 1_260_999));
+        assert!(smb_repair_allowed(&state, 1_261_000));
+        fs::remove_file(state).unwrap();
     }
 
     #[test]
@@ -2068,27 +2107,6 @@ mod tests {
             smb_unmount_arguments("/managed/mount", true),
             vec!["-f", "/managed/mount"]
         );
-    }
-
-    #[test]
-    fn smb_repair_backoff_grows_and_caps() {
-        let state = std::env::temp_dir().join(format!("macluster-smb-repair-{}", Id128::random()));
-
-        assert!(smb_repair_allowed(&state, 1_000));
-        record_smb_repair_failure(&state, 1_000).unwrap();
-        assert!(!smb_repair_allowed(&state, 30_000));
-        assert!(smb_repair_allowed(&state, 61_000));
-
-        record_smb_repair_failure(&state, 61_000).unwrap();
-        assert!(!smb_repair_allowed(&state, 180_999));
-        assert!(smb_repair_allowed(&state, 181_000));
-
-        for now in [181_000, 361_000, 661_000, 961_000] {
-            record_smb_repair_failure(&state, now).unwrap();
-        }
-        assert!(!smb_repair_allowed(&state, 1_260_999));
-        assert!(smb_repair_allowed(&state, 1_261_000));
-        fs::remove_file(state).unwrap();
     }
 
     #[test]

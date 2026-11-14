@@ -164,13 +164,13 @@ This is live sampled data, not complete lifetime accounting. See [task resource 
 ## Share projects and environments
 
 ```sh
-# Share a project at the same path on every node.
-macluster node -a "local:$HOME/projects/example" --share-id project \
-  --mount-root "$HOME/projects/example"
+# Mount a project exported by the login Mac at the same path on every node.
+macluster node -mount nfs://login-01/Users/yourname/projects/example \
+  --mount-root /Users/yourname/projects/example
 
-# Share the installation containing your software environment.
-macluster node -a "local:$HOME/mamba" --share-id mamba \
-  --mount-root "$HOME/mamba"
+# Mount the shared software environment.
+macluster node -mount nfs://login-01/Users/yourname/mamba \
+  --mount-root /Users/yourname/mamba
 ```
 
 Activate your environment in the login terminal, enter the shared project, then submit:

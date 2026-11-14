@@ -164,13 +164,13 @@ macluster job --metrics 1 --follow --json
 ## 共享项目和环境
 
 ```sh
-# 在所有节点使用相同的项目路径。
-macluster node -a "local:$HOME/projects/example" --share-id project \
-  --mount-root "$HOME/projects/example"
+# 挂载由 login 节点导出的项目，并在所有节点使用相同路径。
+macluster node -mount nfs://login-01/Users/yourname/projects/example \
+  --mount-root /Users/yourname/projects/example
 
-# 共享包含软件环境的安装目录。
-macluster node -a "local:$HOME/mamba" --share-id mamba \
-  --mount-root "$HOME/mamba"
+# 挂载共享软件环境。
+macluster node -mount nfs://login-01/Users/yourname/mamba \
+  --mount-root /Users/yourname/mamba
 ```
 
 在登录终端激活环境，进入共享项目目录，再提交：

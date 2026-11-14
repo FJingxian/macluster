@@ -45,8 +45,8 @@ use macluster_core::{
 };
 use macluster_protocol::{
     control::{
-        ControlCommand, ControlErrorCode, ControlPayload, MaintenancePhase, MaintenanceScope,
-        MaintenanceStatus, MaintenanceTicket,
+        ClientShareDescriptor, ControlCommand, ControlErrorCode, ControlPayload, MaintenancePhase,
+        MaintenanceScope, MaintenanceStatus, MaintenanceTicket,
     },
     framing::{FrameError, sha256_hex},
     helper_update::{HelperArtifact, HelperComponent, HelperUpdateManifest},
@@ -2479,8 +2479,14 @@ pub(crate) fn node_admin_recovery_pending(
     }
     let state =
         read_admin_state(&journal_path, &canonical, state_dir).map_err(|(_, error)| error)?;
+    let active_config = fs::read(&canonical)
+        .map_err(|error| format!("cannot read active cluster config: {error}"))?;
+    let active_digest = sha256_hex(&active_config).map_err(|error| error.to_string())?;
     // An uncommitted candidate is a private enrollment draft, not a cluster
     // member or a reason to fence updates to the active configuration.
+    // An uncommitted named-share setup is isolated until its mapping is
+    // committed. It remains visible in `mnode --failed` and can be resumed,
+    // but it must not pause submissions or monitoring for the active cluster.
     // Invalid configs retain the conservative recovery behavior.
     let config = read_config(&canonical).ok();
     Ok(state.operations.values().any(|operation| {
@@ -2488,6 +2494,10 @@ pub(crate) fn node_admin_recovery_pending(
             && !config
                 .as_ref()
                 .is_some_and(|config| is_uncommitted_enrollment(config, operation))
+            && !config.as_ref().is_some_and(|config| {
+                is_uncommitted_named_share_setup(config, operation)
+                    && operation.old_config_sha256.as_deref() == Some(active_digest.as_str())
+            })
             && !matches!(
                 operation.phase.as_str(),
                 "READY" | "REMOVED" | "REMOVED_OFFLINE" | "ABORTED"
@@ -2611,7 +2621,7 @@ enum UpdateRecovery {
     Fresh,
     Stage,
     Sync,
-    AbandonUncommittedFailure,
+    AbandonUncommittedUpdate,
 }
 
 fn update_recovery(
@@ -2642,14 +2652,16 @@ fn update_recovery(
         "SYNC_PENDING" if operation.candidate_config_sha256.as_deref() == Some(current_digest) => {
             Ok(UpdateRecovery::Sync)
         }
-        "UPDATE_FAILED"
+        "UPDATE_STAGING" | "UPDATE_FAILED"
             if operation.candidate_config_sha256.is_none()
                 && operation.old_config_sha256.as_deref() != Some(current_digest) =>
         {
-            // No candidate config was activated. A later, independently
-            // committed config change supersedes this failed staging attempt;
-            // preserve the journal as aborted and stage a fresh update.
-            Ok(UpdateRecovery::AbandonUncommittedFailure)
+            // No candidate config was activated. A crash may leave the journal
+            // in UPDATE_STAGING after an independent config change, so treat
+            // that just like a failed pre-commit attempt: preserve its record
+            // and unreferenced staged files, then stage from the active config
+            // instead of blocking every Agent-dependent command.
+            Ok(UpdateRecovery::AbandonUncommittedUpdate)
         }
         phase => Err(format!(
             "all-node update {} is in phase {phase}, but the active config matches neither its old nor candidate digest; inspect {} before retrying",
@@ -3506,7 +3518,7 @@ fn update_all_agents_impl(
         let operation_key = "update:all";
         let mut recovery = update_recovery(state.operations.get(operation_key), &old_digest)
             .map_err(|error| (1, error))?;
-        if recovery == UpdateRecovery::AbandonUncommittedFailure {
+        if recovery == UpdateRecovery::AbandonUncommittedUpdate {
             let mut obsolete = state
                 .operations
                 .get(operation_key)
@@ -3514,7 +3526,7 @@ fn update_all_agents_impl(
                 .clone();
             obsolete.phase = "ABORTED".into();
             obsolete.detail = Some(
-            "failed update had no committed candidate config and was superseded by a later cluster config change; unreferenced staging files were preserved".into(),
+                "interrupted update had no committed candidate config and was superseded by a later cluster config change; unreferenced staging files were preserved".into(),
         );
             state.operations.insert(operation_key.to_owned(), obsolete);
             save_admin_state(&journal_path, &state)?;
@@ -4135,6 +4147,12 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     NodeId::new(node_id.to_owned()).map_err(|error| (2, error.to_string()))?,
                 ));
             }
+            if endpoint.starts_with("local:") {
+                return Err((
+                    2,
+                    "mnode -a no longer creates additional NFS shares; add a share separately with `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+                ));
+            }
             if let Some(storage) = endpoint.strip_prefix("storage:") {
                 if inline.is_some() || args.len() != 2 {
                     return Err((2, storage_provider_mount_help(None, None, None)));
@@ -4152,20 +4170,15 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                 ));
             }
             let mut queue = None;
-            let mut share_id = None;
-            let mut mount_root = None;
             let mut host = None;
-            let mut overlay_existing = false;
             let mut index = if inline.is_some() { 1 } else { 2 };
             while index < args.len() {
                 let option = args[index].as_str();
                 if option == "--overlay-existing" {
-                    if overlay_existing {
-                        return Err((2, "--overlay-existing may only be specified once".into()));
-                    }
-                    overlay_existing = true;
-                    index += 1;
-                    continue;
+                    return Err((
+                        2,
+                        "--overlay-existing applies to storage mounts; use it with `mnode -mount`, not `mnode -a`".into(),
+                    ));
                 }
                 let value = args
                     .get(index + 1)
@@ -4177,18 +4190,16 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                         queue = Some(value);
                     }
                     "--share-id" => {
-                        NodeId::new(value.clone()).map_err(|error| (2, error.to_string()))?;
-                        share_id = Some(value);
+                        return Err((
+                            2,
+                            "NFS shares are managed separately from node registration; use `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+                        ));
                     }
                     "--mount-root" => {
-                        let value = value.trim_end_matches('/').to_owned();
-                        if !safe_absolute_remote_path(&value) {
-                            return Err((
-                                2,
-                                "--mount-root must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_' or '-'".into(),
-                            ));
-                        }
-                        mount_root = Some(value);
+                        return Err((
+                            2,
+                            "--mount-root is a storage-mount option; use it with `mnode -mount`, not `mnode -a`".into(),
+                        ));
                     }
                     "--host" => {
                         host = Some(
@@ -4202,16 +4213,30 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                 index += 2;
             }
             let target = if let Some(local_source) = endpoint.strip_prefix("local") {
-                let source_path = if local_source.is_empty() {
-                    None
-                } else if let Some(path) = local_source.strip_prefix(':') {
-                    Some(path.to_owned())
-                } else {
-                    return Err((2, "local endpoint syntax is local[:SOURCE_PATH]".into()));
-                };
-                AddTarget::Local { source_path, host }
+                if !local_source.is_empty() && !local_source.starts_with(':') {
+                    return Err((
+                        2,
+                        "mnode -a accepts `local` without a path; add storage separately with `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+                    ));
+                }
+                if !local_source.is_empty() {
+                    return Err((
+                        2,
+                    "mnode -a no longer creates additional NFS shares; add a share separately with `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+                    ));
+                }
+                AddTarget::Local {
+                    source_path: None,
+                    host,
+                }
             } else {
                 let parsed = NodeEndpoint::parse(&endpoint).map_err(|error| (2, error))?;
+                if parsed.source_path.is_some() {
+                    return Err((
+                        2,
+                        "mnode -a no longer creates additional NFS shares; add a share separately with `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+                    ));
+                }
                 if parsed.host.is_loopback() {
                     let current_user = std::env::var("USER").unwrap_or_default();
                     if parsed.host != Ipv4Addr::LOCALHOST
@@ -4225,7 +4250,7 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                         ));
                     }
                     AddTarget::Local {
-                        source_path: parsed.source_path,
+                        source_path: None,
                         host,
                     }
                 } else {
@@ -4235,52 +4260,12 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     AddTarget::Ssh(parsed)
                 }
             };
-            let source_path = match &target {
-                AddTarget::Ssh(endpoint) => endpoint.source_path.as_ref(),
-                AddTarget::Local { source_path, .. } => source_path.as_ref(),
-            };
-            if mount_root.is_some() && (source_path.is_none() || share_id.is_none()) {
-                return Err((2, "--mount-root requires SOURCE_PATH and --share-id".into()));
-            }
-            if source_path.is_some() && share_id.is_none() {
-                return Err((
-                    2,
-                    "SOURCE_PATH registers an additional named NFS share and requires --share-id; to mount the configured primary share on this Mac, use `mnode -a local` without :SOURCE_PATH".into(),
-                ));
-            }
-            if source_path.is_none() && share_id.is_some() {
-                return Err((
-                    2,
-                    "--share-id is only valid when SOURCE_PATH is provided".into(),
-                ));
-            }
-            if overlay_existing {
-                let (Some(source), Some(mount)) = (source_path, mount_root.as_deref()) else {
-                    return Err((
-                        2,
-                        "--overlay-existing requires SOURCE_PATH, --share-id, and --mount-root"
-                            .into(),
-                    ));
-                };
-                let normalized_source = source.trim_end_matches('/');
-                if normalized_source != mount {
-                    return Err((
-                        2,
-                        "--overlay-existing requires the same source and mount path".into(),
-                    ));
-                }
-            }
-            if let (Some(source), Some(mount)) = (source_path, mount_root.as_deref())
-                && Path::new(source).is_absolute()
-            {
-                validate_share_alias_paths(Path::new(source), Path::new(mount))?;
-            }
             Ok(Action::Add(AddOptions {
                 target,
                 queue,
-                share_id,
-                mount_root,
-                overlay_existing,
+                share_id: None,
+                mount_root: None,
+                overlay_existing: false,
             }))
         }
         "-rm" | "--remove" => {
@@ -4383,7 +4368,7 @@ fn print_help(full: bool) {
 fn node_help(full: bool) -> &'static str {
     if !full {
         return r#"Usage
-  mnode -a|--add USER@IPv4[:PORT] [OPTIONS]
+  mnode -a|--add USER@IPv4[:PORT] [--queue QUEUE]
   mnode -a compute:NODE_ID
   mnode -mount URI --mount-root PATH [--host HOST]
   mnode -umount MAPPING_ID|SOURCE_URI|PENDING_SHARE_UUID [--force [--yes]] [--wait [--timeout SECONDS]]
@@ -4415,9 +4400,9 @@ Use `mnode -l --all` to include unreachable compute nodes.
     }
 
     r#"Usage
-  mnode -a|--add USER@IPv4[:PORT][:SOURCE_PATH] [OPTIONS]
+  mnode -a|--add USER@IPv4[:PORT] [--queue QUEUE]
   mnode -a compute:NODE_ID
-  mnode -a local[:SOURCE_PATH] [OPTIONS]
+  mnode -a local
   mnode -mount nfs://NODE/PATH --mount-root PATH [--host HOST] [--overlay-existing]
   mnode -mount smb://NODE/SHARE[/PATH] --mount-root PATH
         [--host HOST] [--smb-user ACCOUNT] [--update-credential] [--overlay-existing]
@@ -4434,11 +4419,11 @@ Use `mnode -l --all` to include unreachable compute nodes.
 OPTIONS
   --queue QUEUE       Choose a compute queue.
   --host HOST         Select a login interface or external NAS IPv4/DNS name.
-  --share-id ID       Name an additional NFS share.
-  --mount-root PATH   Choose its client mount path.
+  --mount-root PATH   Choose a storage mapping's client mount path.
   --smb-user ACCOUNT  Choose the SMB account. The password is prompted once.
   --update-credential Replace the validated SMB password and fan it out.
-  --overlay-existing  Keep client files underneath the NFS mount.
+  --overlay-existing  Confirm covering existing target files without a prompt.
+                      Same-path NFS mounts ask for y/n confirmation when omitted.
   --connect USER@IP   Reach a moved node at its current address.
   --force             Force-detach a named share whose client mount is in use.
   --yes               Confirm an unattended idle-node NFS reboot.
@@ -4459,9 +4444,8 @@ EXAMPLES
   mnode -umount mnt-0123456789abcdef --force --yes
   mnode -umount mnt-0123456789abcdef --wait --timeout 60
   mnode --repair-nfs default-001
-  mnode -a user@192.0.2.10:22:/Volumes/data --share-id data
   mnode -a local
-  mnode -a local:/opt/homebrew --share-id homebrew --mount-root /opt/homebrew
+  mnode -mount nfs://192.0.2.10/opt/homebrew --mount-root /opt/homebrew
   mnode -rm default-001
   mnode -l --storage
 
@@ -4497,16 +4481,16 @@ ADD NODES
   directly with `mnode -mount` and provide `--host` when the URI uses a logical
   server ID. `mnode -umount` removes the mapping and its internal provider.
 
-SHARES
-  `local` enrolls this Mac without SSH. Add `:SOURCE_PATH` to share a directory;
-  set --share-id to name it. By default, clients mount it at
-  /Users/Shared/macluster-shares/<share-id>; --mount-root chooses another path.
-  If source and mount paths are the same, mnode asks before hiding files already
-  on clients. y continues; n or Enter cancels. Hidden files reappear after
-  unmount. `--overlay-existing` confirms the same action for non-interactive
-  setup. Use it for Homebrew only when the login Mac's copy should take priority.
-  `mnode -a local` without SOURCE_PATH enrolls this Mac as the login node and
-  mounts the configured primary share.
+STORAGE MAPPINGS
+  Node registration and extra storage mappings are separate operations.
+  Use `mnode -mount nfs://SERVER/PATH --mount-root PATH` to add an NFS mapping;
+  use `mnode -mount smb://SERVER/SHARE --mount-root PATH` for SMB. For a Mac
+  already registered in the cluster, macluster manages its exact NFS exports.
+  For an external NAS, the export must already be enabled on that device;
+  macluster mounts and unmounts only on configured Macs and never changes NAS
+  exports or writes markers into the provider's source directory.
+  `mnode -umount MAPPING_ID` removes the mapping and its configured client
+  mounts. Source data is preserved.
 
 SMB CREDENTIALS
   The first new SMB server/account asks once with hidden input. The controller
@@ -7857,7 +7841,7 @@ fn client_nfs_cleanup_plan(
             label: format!("NFS share {share_id}"),
             allow_existing_contents: share.allow_existing_contents,
         });
-        if share.source_root != share.mount_root {
+        if server.transport != Transport::Storage && share.source_root != share.mount_root {
             aliases.push((share.source_root.clone(), share.mount_root.clone()));
         }
     }
@@ -7902,7 +7886,12 @@ pub(crate) fn pending_managed_export_cleanup_plan(
 ) -> BTreeMap<String, Vec<(Option<String>, NfsExportRequest)>> {
     let mut groups = BTreeMap::new();
     let storage_id = config.storage_server.as_str();
-    if node_id != storage_id {
+    if node_id != storage_id
+        && config
+            .nodes
+            .get(storage_id)
+            .is_some_and(|node| node.transport != Transport::Storage)
+    {
         groups
             .entry(storage_id.to_owned())
             .or_insert_with(Vec::new)
@@ -7918,7 +7907,12 @@ pub(crate) fn pending_managed_export_cleanup_plan(
     }
     for (share_id, share) in &config.shares {
         let server_id = share.server.as_str();
-        if node_id == server_id {
+        if node_id == server_id
+            || config
+                .nodes
+                .get(server_id)
+                .is_some_and(|node| node.transport == Transport::Storage)
+        {
             continue;
         }
         groups
@@ -10579,7 +10573,7 @@ pub(crate) fn ensure_nfs_exports_with_setup(
         Err(error) => (
             managed,
             Err(format!(
-                "could not configure NFS exports on {}: {error}\nResolve the server error shown above, then rerun the same mnode --add command to resume",
+                "could not configure NFS exports on {}: {error}\nResolve the server error shown above, then rerun the same `mnode -mount` command to resume",
                 storage_node.host
             )),
         ),
@@ -12073,8 +12067,32 @@ fn candidate_mount_command(
     mount_root: &Path,
     share_uuid: &str,
 ) -> Result<Option<ClientMountRequest>, String> {
+    candidate_mount_command_with_overlay(
+        node,
+        storage_node,
+        source_root,
+        mount_root,
+        share_uuid,
+        false,
+    )
+}
+
+fn candidate_mount_command_with_overlay(
+    node: &NodeConfig,
+    storage_node: &NodeConfig,
+    source_root: &Path,
+    mount_root: &Path,
+    share_uuid: &str,
+    allow_existing_contents: bool,
+) -> Result<Option<ClientMountRequest>, String> {
     let root = mount_root.to_string_lossy();
     let source = nfs_mount_source(storage_node, source_root);
+    if allow_existing_contents && source_root != mount_root {
+        return Err(
+            "existing target contents may only be overlaid when source and mount paths match"
+                .into(),
+        );
+    }
     let output = ssh_output(node, "/sbin/mount", None).map_err(|(_, error)| error)?;
     if !output.status.success() {
         return Err(command_error("cannot inspect candidate mounts", &output));
@@ -12104,7 +12122,7 @@ fn candidate_mount_command(
                 needs_privileged_mkdir: false,
                 needs_mount: unresponsive,
                 force_unmount_existing: unresponsive,
-                allow_existing_contents: false,
+                allow_existing_contents,
             }));
         }
         NamedShareMountStatus::MountedElsewhere(other) => {
@@ -12142,7 +12160,7 @@ fn candidate_mount_command(
         {
             return Err(command_error("cannot inspect NFS mount point", &output));
         }
-        if output.status.success() && !output.stdout.is_empty() {
+        if !allow_existing_contents && output.status.success() && !output.stdout.is_empty() {
             return Err(format!(
                 "mount point {root} is not empty and is not mounted from {}",
                 storage_node.host
@@ -12157,7 +12175,7 @@ fn candidate_mount_command(
         needs_privileged_mkdir,
         needs_mount: true,
         force_unmount_existing: false,
-        allow_existing_contents: false,
+        allow_existing_contents,
     }))
 }
 
@@ -12528,7 +12546,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             return Err((
                 1,
                 format!(
-                    "share operation {} is in phase {}; rerun its original mnode add command or use `macluster --init` to reset the cluster",
+                    "share operation {} is in phase {}; rerun its original `mnode -mount` command or use `macluster --init` to reset the cluster",
                     operation.id, operation.phase
                 ),
             ));
@@ -12601,7 +12619,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             return Err((
                 1,
                 format!(
-                    "pending share {share_id} is migrating nested share(s) {}; rerun its original mnode add command to finish or use `macluster --init` to reset safely",
+                    "pending share {share_id} is migrating nested share(s) {}; rerun its original `mnode -mount` command to finish or use `macluster --init` to reset safely",
                     replaced.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             ));
@@ -12612,8 +12630,11 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
                 format!("NFS server {server_id} for pending share {share_id} is missing"),
             )
         })?;
+        let external_nfs_server = server.transport == Transport::Storage;
         if pending_share_has_no_remote_side_effects(&operation) {
-            remove_pending_share_marker_if_owned(server, &source_root, share_uuid)?;
+            if !external_nfs_server {
+                remove_pending_share_marker_if_owned(server, &source_root, share_uuid)?;
+            }
             operation.phase = "ABORTED".into();
             operation.detail = Some(
                 "pending named-share setup had no remote side effects and was cancelled".into(),
@@ -12691,7 +12712,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
 
         for (node_id, node, request) in &clients {
             let requests = request.iter().cloned().collect::<Vec<_>>();
-            let aliases = if source_root != mount_root {
+            let aliases = if !external_nfs_server && source_root != mount_root {
                 vec![(source_root.clone(), mount_root.clone())]
             } else {
                 Vec::new()
@@ -12731,17 +12752,23 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             })?;
         }
 
-        let export_requests = config
-            .nodes
-            .iter()
-            .filter(|(node_id, _)| node_id.as_str() != server_id)
-            .map(|(node_id, node)| NfsExportRequest {
-                root: source_root.to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: share_uuid.to_owned(),
-                node_id: node_id.clone(),
-            })
-            .collect::<Vec<_>>();
+        let export_requests = if external_nfs_server {
+            Vec::new()
+        } else {
+            config
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| {
+                    node_id.as_str() != server_id && config.is_operational_node(node_id)
+                })
+                .map(|(node_id, node)| NfsExportRequest {
+                    root: source_root.to_string_lossy().into_owned(),
+                    client_ip: node.host.to_string(),
+                    share_uuid: share_uuid.to_owned(),
+                    node_id: node_id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
         if !export_requests.is_empty() {
             remove_managed_nfs_exports(server, &export_requests, &operation.id).map_err(
                 |error| {
@@ -12753,7 +12780,7 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
             )?;
         }
 
-        if source_root != mount_root {
+        if !external_nfs_server && source_root != mount_root {
             remove_pending_share_alias(server, &mount_root, &source_root, share_id)?;
             for (node_id, node, _) in &clients {
                 remove_pending_share_alias(node, &source_root, &mount_root, share_id).map_err(
@@ -12766,7 +12793,9 @@ fn remove_pending_share(config_path: &Path, state_dir: &Path, share_id: &str) ->
                 )?;
             }
         }
-        remove_pending_share_marker(server, &source_root, share_uuid, share_id)?;
+        if !external_nfs_server {
+            remove_pending_share_marker(server, &source_root, share_uuid, share_id)?;
+        }
 
         operation.phase = "ABORTED".into();
         operation.detail = Some("pending named-share setup was explicitly cancelled".into());
@@ -13346,6 +13375,8 @@ fn remember_deferred_share_cleanup(
             server_host: server.host.to_string(),
             share_uuid: share.share_uuid.clone(),
             machine_uuid,
+            remove_source_alias: server.transport != Transport::Storage
+                && share.source_root != share.mount_root,
         },
     );
     save_deferred_share_cleanup(state_dir, &pending)
@@ -13378,6 +13409,7 @@ fn remember_deferred_client_cleanup_for_removed_node(
                 server_host: storage.host.to_string(),
                 share_uuid: config.share_uuid.clone(),
                 machine_uuid: machine_uuid.clone(),
+                remove_source_alias: false,
             },
         );
         recorded += 1;
@@ -13397,6 +13429,8 @@ fn remember_deferred_client_cleanup_for_removed_node(
                 server_host: server.host.to_string(),
                 share_uuid: share.share_uuid.clone(),
                 machine_uuid: machine_uuid.clone(),
+                remove_source_alias: server.transport != Transport::Storage
+                    && share.source_root != share.mount_root,
             },
         );
         recorded += 1;
@@ -13487,7 +13521,7 @@ fn retry_deferred_removal_cleanup(
                 .collect::<Vec<_>>();
             let aliases = clients
                 .iter()
-                .filter(|entry| entry.source_root != entry.mount_root)
+                .filter(|entry| entry.remove_source_alias)
                 .map(|entry| NfsAlias {
                     path: entry.source_root.clone(),
                     target: entry.mount_root.clone(),
@@ -13714,7 +13748,7 @@ fn retry_deferred_share_client_cleanup(
                 continue;
             }
         };
-        let aliases = if entry.source_root != entry.mount_root {
+        let aliases = if entry.remove_source_alias {
             if let Err(error) = check_managed_nfs_alias(
                 node,
                 &entry.source_root,
@@ -13899,7 +13933,7 @@ fn remove_registered_share(
             return Err((
                 1,
                 format!(
-                    "share {share_id} setup is still in phase {}; rerun its original mnode --add command before removal",
+                    "share {share_id} setup is still in phase {}; rerun its original `mnode -mount` command before removal",
                     share_operation.phase
                 ),
             ));
@@ -14070,18 +14104,13 @@ fn remove_registered_share(
                 ),
             ));
         }
-        let server = config.nodes.get(&server_id).ok_or_else(|| {
-            (
-                1,
-                format!("NFS server {server_id} for share {share_id} is missing"),
-            )
-        })?;
         let recovery = share_removal_recovery(
             &operation,
             &current_digest,
             config.shares.contains_key(share_id),
         )
         .map_err(|error| (1, error))?;
+        let server = config.nodes.get(&server_id);
         if recovery == ShareRemovalRecovery::Done {
             let deferred_clients = retry_deferred_share_client_cleanup(
                 &config_path,
@@ -14132,6 +14161,12 @@ fn remove_registered_share(
         }
 
         if recovery == ShareRemovalRecovery::Sync {
+            // Removing the last mapping also removes its unregistered storage
+            // provider from the candidate config. Recovery after the config
+            // commit must therefore finish peer sync without trying to SSH to
+            // the provider (or requiring its marker/export metadata).
+            let external_nfs_server =
+                server.is_none_or(|node| node.transport == Transport::Storage);
             operation.phase = "SYNC_PENDING".into();
             operation.detail = Some("share is removed locally; synchronizing peer configs".into());
             state
@@ -14146,9 +14181,12 @@ fn remove_registered_share(
                 &state,
                 share_id,
             )?;
-            remember_deferred_share_server_cleanup(
-                state_dir, share_id, &server_id, server, &share, &config, &state,
-            )?;
+            if !external_nfs_server {
+                let server = server.expect("registered NFS servers remain in the config");
+                remember_deferred_share_server_cleanup(
+                    state_dir, share_id, &server_id, server, &share, &config, &state,
+                )?;
+            }
             if let Err(error) =
                 sync_remote_configs_online_nodes(&config, &source_text, state_dir, &operation.id)
             {
@@ -14164,20 +14202,28 @@ fn remove_registered_share(
                     ),
                 ));
             }
-            let deferred_marker_cleanup = retry_deferred_share_marker_cleanup(
-                &config_path,
-                state_dir,
-                &config,
-                &state,
-                share_id,
-            )?;
-            let deferred_export_cleanup = retry_deferred_share_export_cleanup(
-                &config_path,
-                state_dir,
-                &config,
-                &state,
-                share_id,
-            )?;
+            let deferred_marker_cleanup = if external_nfs_server {
+                Vec::new()
+            } else {
+                retry_deferred_share_marker_cleanup(
+                    &config_path,
+                    state_dir,
+                    &config,
+                    &state,
+                    share_id,
+                )?
+            };
+            let deferred_export_cleanup = if external_nfs_server {
+                Vec::new()
+            } else {
+                retry_deferred_share_export_cleanup(
+                    &config_path,
+                    state_dir,
+                    &config,
+                    &state,
+                    share_id,
+                )?
+            };
             operation.phase = "REMOVED".into();
             let mut deferred_details = Vec::new();
             if !deferred_cleanup.is_empty() {
@@ -14201,7 +14247,13 @@ fn remove_registered_share(
             operation.detail = (!deferred_details.is_empty()).then(|| deferred_details.join("; "));
             state.operations.insert(operation_key, operation);
             save_admin_state(&journal_path, &state)?;
-            println!("Removed named NFS share {share_id}; source files were preserved.");
+            if external_nfs_server {
+                println!(
+                    "Removed NFS mapping {share_id}; source data and provider exports were left unchanged."
+                );
+            } else {
+                println!("Removed named NFS share {share_id}; source files were preserved.");
+            }
             if !deferred_cleanup.is_empty() {
                 println!(
                     "Client cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after those nodes reconnect.",
@@ -14222,6 +14274,14 @@ fn remove_registered_share(
             }
             return Ok(());
         }
+
+        let server = server.ok_or_else(|| {
+            (
+                1,
+                format!("NFS server {server_id} for share {share_id} is missing"),
+            )
+        })?;
+        let external_nfs_server = server.transport == Transport::Storage;
 
         if !config.shares.contains_key(share_id) {
             return Err((
@@ -14313,50 +14373,60 @@ fn remove_registered_share(
         }
         let server_offline = offline_nodes.contains(&server_id);
 
-        let mut export_requests = config
-            .nodes
-            .iter()
-            .filter(|(node_id, _)| {
-                node_id.as_str() != server_id && config.is_operational_node(node_id)
-            })
-            .map(|(node_id, node)| NfsExportRequest {
-                root: share.source_root.to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: share_uuid.to_owned(),
-                node_id: node_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        export_requests.extend(
-            crate::client_access::registered_client_share_requests(state_dir, &share)
-                .map_err(|error| {
-                    (
-                        1,
-                        format!(
-                            "cannot inspect login-client export cleanup for share {share_id}: {error}"
-                        ),
-                    )
-                })?,
-        );
-        let missing_source_cleanup_proven = if !export_requests.is_empty() && !server_offline {
-            let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
+        let mut export_requests = if external_nfs_server {
+            Vec::new()
+        } else {
+            config
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| {
+                    node_id.as_str() != server_id && config.is_operational_node(node_id)
+                })
+                .map(|(node_id, node)| NfsExportRequest {
+                    root: share.source_root.to_string_lossy().into_owned(),
+                    client_ip: node.host.to_string(),
+                    share_uuid: share_uuid.to_owned(),
+                    node_id: node_id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        if !external_nfs_server {
+            export_requests.extend(
+                crate::client_access::registered_client_share_requests(state_dir, &share)
+                    .map_err(|error| {
+                        (
+                            1,
+                            format!(
+                                "cannot inspect login-client export cleanup for share {share_id}: {error}"
+                            ),
+                        )
+                    })?,
+            );
+        }
+        let missing_source_cleanup_proven =
+            if !external_nfs_server && !export_requests.is_empty() && !server_offline {
+                let (exports, _) = read_nfs_exports_update_baseline(server).map_err(|(_, error)| {
                 (
                     1,
                     format!("cannot inspect NFS exports before removing share {share_id}: {error}"),
                 )
             })?;
-            plan_remove_nfs_exports(&exports, &export_requests).map_err(|error| {
-                (
-                    1,
-                    format!("cannot safely remove NFS exports for share {share_id}: {error}"),
-                )
-            })?;
-            managed_exports_prove_missing_share_source(&exports, &export_requests)
-        } else {
-            false
-        };
+                plan_remove_nfs_exports(&exports, &export_requests).map_err(|error| {
+                    (
+                        1,
+                        format!("cannot safely remove NFS exports for share {share_id}: {error}"),
+                    )
+                })?;
+                managed_exports_prove_missing_share_source(&exports, &export_requests)
+            } else {
+                false
+            };
 
         let existing_removal = resumed_removal;
-        if server_offline {
+        if external_nfs_server {
+            // External NFS providers own their exports and source filesystem;
+            // only exact client mounts and the mapping are managed here.
+        } else if server_offline {
             eprintln!(
                 "Warning: NFS server {server_id} is offline; its exact export, alias and marker cleanup will be applied automatically when it reconnects."
             );
@@ -14408,7 +14478,7 @@ fn remove_registered_share(
                 );
             }
         }
-        if !server_offline && share.source_root != share.mount_root {
+        if !external_nfs_server && !server_offline && share.source_root != share.mount_root {
             check_managed_nfs_alias(
                 server,
                 &share.mount_root.to_string_lossy(),
@@ -14456,7 +14526,8 @@ fn remove_registered_share(
                 &share.mount_root.to_string_lossy(),
             ) {
                 NamedShareMountStatus::Expected => {
-                    if !server_offline
+                    if !external_nfs_server
+                        && !server_offline
                         && let Err((code, error)) = verify_named_share_mount_for_removal(
                             node,
                             node_id,
@@ -14500,7 +14571,7 @@ fn remove_registered_share(
                 }
             }
             let mut aliases = Vec::new();
-            if share.source_root != share.mount_root {
+            if !external_nfs_server && share.source_root != share.mount_root {
                 check_managed_nfs_alias(
                     node,
                     &share.source_root.to_string_lossy(),
@@ -14581,7 +14652,11 @@ fn remove_registered_share(
             })?;
         }
 
-        operation.detail = Some("removing managed NFS exports, aliases, and source marker".into());
+        operation.detail = Some(if external_nfs_server {
+            "removing exact client NFS mounts and mapping".into()
+        } else {
+            "removing managed NFS exports, aliases, and source marker".into()
+        });
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
@@ -14589,7 +14664,7 @@ fn remove_registered_share(
 
         let mut still_authorized = Vec::new();
         let mut server_cleanup_error = None;
-        if !export_requests.is_empty() && !server_offline {
+        if !external_nfs_server && !export_requests.is_empty() && !server_offline {
             match remove_managed_nfs_exports(server, &export_requests, &operation.id) {
                 Ok(statuses) => {
                     for ((_, node), (_, authorized)) in config
@@ -14609,7 +14684,8 @@ fn remove_registered_share(
                 }
             }
         }
-        if !server_offline
+        if !external_nfs_server
+            && !server_offline
             && server_cleanup_error.is_none()
             && share.source_root != share.mount_root
             && let Err(error) =
@@ -14618,7 +14694,7 @@ fn remove_registered_share(
             server_cleanup_error =
                 Some(format!("managed NFS alias cleanup will retry: {}", error.1));
         }
-        if !server_offline && server_cleanup_error.is_none() {
+        if !external_nfs_server && !server_offline && server_cleanup_error.is_none() {
             match remove_pending_share_marker(server, &share.source_root, share_uuid, share_id) {
                 Ok(()) => forget_deferred_share_marker_cleanup(
                     state_dir,
@@ -14643,7 +14719,8 @@ fn remove_registered_share(
                 }
             }
         }
-        let server_cleanup_deferred = server_offline || server_cleanup_error.is_some();
+        let server_cleanup_deferred =
+            !external_nfs_server && (server_offline || server_cleanup_error.is_some());
 
         operation.phase = "REMOVAL_COMMITTING".into();
         operation.detail = Some(if server_offline {
@@ -14705,20 +14782,28 @@ fn remove_registered_share(
             &state,
             share_id,
         )?;
-        let deferred_marker_cleanup = retry_deferred_share_marker_cleanup(
-            &config_path,
-            state_dir,
-            &candidate_config,
-            &state,
-            share_id,
-        )?;
-        let deferred_export_cleanup = retry_deferred_share_export_cleanup(
-            &config_path,
-            state_dir,
-            &candidate_config,
-            &state,
-            share_id,
-        )?;
+        let deferred_marker_cleanup = if external_nfs_server {
+            Vec::new()
+        } else {
+            retry_deferred_share_marker_cleanup(
+                &config_path,
+                state_dir,
+                &candidate_config,
+                &state,
+                share_id,
+            )?
+        };
+        let deferred_export_cleanup = if external_nfs_server {
+            Vec::new()
+        } else {
+            retry_deferred_share_export_cleanup(
+                &config_path,
+                state_dir,
+                &candidate_config,
+                &state,
+                share_id,
+            )?
+        };
         let source_marker_cleanup_deferred = !deferred_marker_cleanup.is_empty();
         operation.phase = "REMOVED".into();
         let mut deferred_details = Vec::new();
@@ -14743,7 +14828,13 @@ fn remove_registered_share(
         operation.detail = (!deferred_details.is_empty()).then(|| deferred_details.join("; "));
         state.operations.insert(operation_key, operation);
         save_admin_state(&journal_path, &state)?;
-        println!("Removed named NFS share {share_id}; source files were preserved.");
+        if external_nfs_server {
+            println!(
+                "Removed NFS mapping {share_id}; source data and provider exports were left unchanged."
+            );
+        } else {
+            println!("Removed named NFS share {share_id}; source files were preserved.");
+        }
         if !deferred_cleanup.is_empty() {
             println!(
                 "Client cleanup is deferred for: {}. Rerun `mnode -rm share:{share_id}` after those nodes reconnect.",
@@ -14770,7 +14861,7 @@ fn remove_registered_share(
         }
         if !still_authorized.is_empty() {
             println!(
-                "Warning: operator-managed NFS exports still authorize: {}.",
+                "Removed mapping {share_id}, but operator-managed NFS exports still authorize: {}. The export entries were left unchanged; remove them on the NFS server if they are no longer needed.",
                 still_authorized.join(", ")
             );
         }
@@ -15796,7 +15887,6 @@ fn migration_controller_epoch(state_dir: &Path) -> Result<ControllerEpoch, Strin
 fn claim_enrollment_agent(
     node: &NodeConfig,
     node_id: &str,
-    config_path: &Path,
     namespace: &str,
     controller: ControllerEpoch,
 ) -> Result<(), String> {
@@ -15810,18 +15900,29 @@ fn claim_enrollment_agent(
         )
         .map_err(|error| error.to_string());
     }
-    let selected_config = node
-        .remote_config
-        .as_deref()
-        .unwrap_or_else(|| config_path.to_str().unwrap_or("/dev/null"));
+    // Claiming an idle Agent only needs its local state namespace and verified
+    // machine identity. Do not make this handoff depend on a remote config file:
+    // login clients and older enrollments may not have one at the default path.
+    let machine_uuid = match node.machine_uuid.as_deref() {
+        Some(machine_uuid) => machine_uuid.to_owned(),
+        None => remote_machine_uuid(node).map_err(|(_, error)| error)?,
+    };
+    let execution_uid = match node.execution_uid {
+        Some(execution_uid) => execution_uid,
+        None => read_remote_facts(node).map_err(|(_, error)| error)?.uid,
+    };
     let command = shell_join(&[
         &node.remote_binary,
-        "--config",
-        selected_config,
         "internal",
         "claim-agent",
         "--node",
         node_id,
+        "--share-id",
+        namespace,
+        "--machine-uuid",
+        &machine_uuid,
+        "--execution-uid",
+        &execution_uid.to_string(),
         "--controller",
         &controller.controller_uuid.to_string(),
         "--epoch",
@@ -17379,6 +17480,16 @@ fn pending_local_share_retry_node(
 }
 
 fn add_node(config_path: &Path, state_dir: &Path, mut options: AddOptions) -> AppResult<()> {
+    let has_source = match &options.target {
+        AddTarget::Ssh(endpoint) => endpoint.source_path.is_some(),
+        AddTarget::Local { source_path, .. } => source_path.is_some(),
+    };
+    if has_source || options.share_id.is_some() || options.mount_root.is_some() {
+        return Err((
+            2,
+            "mnode -a no longer creates additional NFS shares; add a share separately with `mnode -mount nfs://HOST/PATH --mount-root PATH`".into(),
+        ));
+    }
     confirm_overlay_existing(&mut options)?;
     fs::create_dir_all(state_dir).map_err(io_error)?;
     match options.target {
@@ -17600,9 +17711,10 @@ fn managed_paths_overlap(left: &Path, right: &Path) -> bool {
 fn mount_storage(
     config_path: &Path,
     state_dir: &Path,
-    uri: StorageUri,
-    options: StorageMountOptions,
+    mut uri: StorageUri,
+    mut options: StorageMountOptions,
 ) -> AppResult<()> {
+    confirm_storage_mount_overlay(&uri, &mut options)?;
     let mut config = read_config(config_path)?;
     let requested_or_inferred_host = options
         .server_host
@@ -17618,6 +17730,15 @@ fn mount_storage(
                 .filter(|host| host != uri.server.as_str())
         })
         .unwrap_or_else(|| uri.server.to_string());
+    if !config.nodes.contains_key(uri.server.as_str())
+        && let Some((node_id, _)) = config
+            .nodes
+            .iter()
+            .find(|(_, node)| node.transport != Transport::Storage && node.host == effective_host)
+    {
+        uri.server = NodeId::new(node_id.clone()).map_err(|error| (2, error.to_string()))?;
+        uri.canonical = format!("{}://{}{}", uri.protocol, uri.server, uri.source);
+    }
     if uri.protocol == StorageProtocol::Smb {
         crate::smb_credentials::ensure_smb_share_visible(&effective_host, &uri.source)
             .map_err(|error| (2, error))?;
@@ -17727,6 +17848,41 @@ fn mount_storage(
     )
 }
 
+fn confirm_storage_mount_overlay(
+    uri: &StorageUri,
+    options: &mut StorageMountOptions,
+) -> AppResult<()> {
+    if uri.protocol != StorageProtocol::Nfs
+        || options.overlay_existing
+        || Path::new(&uri.source) != options.mount_root
+    {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err((
+            2,
+            "this same-path NFS mount may hide existing files on client Macs; rerun interactively to confirm, or pass --overlay-existing to confirm non-interactive setup".into(),
+        ));
+    }
+    eprint!(
+        "Mounting {} at {} on the other cluster Macs may hide their existing local files while mounted; the files reappear after unmount. Continue? [y/N]: ",
+        uri.source,
+        options.mount_root.display()
+    );
+    io::stderr().flush().map_err(io_error)?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).map_err(io_error)?;
+    if shutdown_confirmation_accepted(&response) {
+        options.overlay_existing = true;
+        Ok(())
+    } else {
+        Err((
+            1,
+            "same-path NFS mount cancelled before changing cluster state".into(),
+        ))
+    }
+}
+
 fn resolve_umount_share(
     config: &ClusterConfig,
     target: &UmountTarget,
@@ -17754,13 +17910,20 @@ fn resolve_umount_share(
                 })
         }
         UmountTarget::Uri(uri) => {
+            let requested_host = storage_provider_host_from_id(uri.server.as_str());
             let direct = config
                 .shares
                 .iter()
                 .filter(|(_, share)| {
                     share.protocol == uri.protocol
-                        && share.server == uri.server
                         && share.source_root == Path::new(&uri.source)
+                        && (share.server == uri.server
+                            || requested_host.as_deref().is_some_and(|host| {
+                                config
+                                    .nodes
+                                    .get(share.server.as_str())
+                                    .is_some_and(|server| server.host == host)
+                            }))
                 })
                 .map(|(id, share)| (id.clone(), share.clone()))
                 .collect::<Vec<_>>();
@@ -18319,7 +18482,7 @@ fn smb_mount_script(
         mount_request = mount_request,
     );
     let plist_body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>$helper</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>30</integer><key>ProcessType</key><string>Background</string><key>LimitLoadToSessionType</key><string>Aqua</string><key>StandardOutPath</key><string>/tmp/{label}.out</string><key>StandardErrorPath</key><string>/tmp/{label}.err</string></dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>Label</key><string>{label}</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>exec /bin/sh \"\\$HOME/Library/Application Support/macluster/smb/{label}.sh\"</string></array><key>RunAtLoad</key><true/><key>StartInterval</key><integer>30</integer><key>ProcessType</key><string>Background</string><key>LimitLoadToSessionType</key><string>Aqua</string><key>StandardOutPath</key><string>/tmp/{label}.out</string><key>StandardErrorPath</key><string>/tmp/{label}.err</string></dict></plist>\n"
     );
     let script = format!(
         "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts must run in the logged-in user session' >&2; exit 1; }}\nlaunch_agents=\"$HOME/Library/LaunchAgents\"\nsupport=\"$HOME/Library/Application Support/macluster/smb\"\nhelper=\"$support/{label}.sh\"\nplist=\"$launch_agents/{label}.plist\"\n/bin/mkdir -p \"$launch_agents\" \"$support\"\n/bin/cat > \"$helper.next\" <<'MACLUSTER_SMB_HELPER'\n{body}MACLUSTER_SMB_HELPER\n/bin/chmod 700 \"$helper.next\"\n/bin/cat > \"$plist.next\" <<MACLUSTER_SMB_PLIST\n{plist_body}MACLUSTER_SMB_PLIST\n/usr/bin/plutil -lint \"$plist.next\" >/dev/null\n/bin/chmod 600 \"$plist.next\"\nchanged=0\nif [ ! -f \"$helper\" ] || ! /usr/bin/cmp -s \"$helper.next\" \"$helper\"; then changed=1; fi\nif [ ! -f \"$plist\" ] || ! /usr/bin/cmp -s \"$plist.next\" \"$plist\"; then changed=1; fi\nloaded=0\nif /bin/launchctl print \"gui/$uid/{label}\" >/dev/null 2>&1; then loaded=1; fi\nif [ \"$changed\" -eq 1 ]; then\n  /bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\n  /bin/mv -f \"$helper.next\" \"$helper\"\n  /bin/mv -f \"$plist.next\" \"$plist\"\nelse\n  /bin/rm -f \"$helper.next\" \"$plist.next\"\nfi\nif [ \"$changed\" -eq 1 ] || [ \"$loaded\" -eq 0 ]; then /bin/launchctl bootstrap \"gui/$uid\" \"$plist\"; fi\n/bin/sh \"$helper\"\n",
@@ -18359,6 +18522,50 @@ fn smb_unmount_script(share: &ShareConfig, force: bool) -> AppResult<String> {
         request = request,
         managed_root = managed_root,
     ))
+}
+
+fn local_client_smb_context(
+    descriptor: &ClientShareDescriptor,
+) -> Result<(ShareConfig, NodeConfig), String> {
+    if descriptor.protocol != "smb" {
+        return Err("client SMB mount requested for a non-SMB share".into());
+    }
+    let server = NodeConfig {
+        host: descriptor.server_host.clone(),
+        transport: Transport::Local,
+        remote_binary: String::new(),
+        ssh_user: None,
+        ssh_port: None,
+        ssh_identity_file: None,
+        remote_config: None,
+        machine_uuid: None,
+        execution_uid: None,
+    };
+    let share = ShareConfig {
+        protocol: StorageProtocol::Smb,
+        server: descriptor.server.clone(),
+        source_root: PathBuf::from(&descriptor.source_root),
+        mount_root: PathBuf::from(&descriptor.mount_root),
+        share_uuid: descriptor.share_uuid.clone(),
+        smb_user: descriptor.smb_user.clone(),
+        allow_existing_contents: false,
+    };
+    Ok((share, server))
+}
+
+pub(crate) fn mount_client_smb_share(
+    cluster_uuid: &str,
+    descriptor: &ClientShareDescriptor,
+) -> Result<(), String> {
+    let (share, server) = local_client_smb_context(descriptor)?;
+    let script = smb_mount_script(cluster_uuid, &share, &server).map_err(|(_, error)| error)?;
+    run_smb_user_script(&server, &script)
+}
+
+pub(crate) fn unmount_client_smb_share(descriptor: &ClientShareDescriptor) -> Result<(), String> {
+    let (share, server) = local_client_smb_context(descriptor)?;
+    let script = smb_unmount_script(&share, false).map_err(|(_, error)| error)?;
+    run_smb_user_script(&server, &script)
 }
 
 fn run_smb_user_script(node: &NodeConfig, script: &str) -> Result<(), String> {
@@ -19028,7 +19235,8 @@ fn register_smb_share(
         let candidate = append_share_config(&source, share_id, &share)?;
         let candidate_config =
             ClusterConfig::parse(&candidate).map_err(|error| (2, error.to_string()))?;
-        let mut deferred_credential_nodes: BTreeSet<String> = BTreeSet::new();
+        let mut deferred_credential_nodes = BTreeMap::<String, String>::new();
+        let mut helper_ready_nodes = BTreeSet::new();
         if !smb_user_is_guest(&smb_user) {
             let plan = crate::smb_credentials::ensure_smb_mount_credential(
                 &config_path,
@@ -19038,19 +19246,68 @@ fn register_smb_share(
                 &smb_user,
             )?;
             let _credential_generation = plan.credential.generation;
+            helper_ready_nodes.extend(plan.helper_ready_nodes.iter().cloned());
             for (node_id, error) in &plan.report.deferred {
-                eprintln!("Warning: SMB credential update on {node_id} was deferred: {error}");
-                deferred_credential_nodes.insert(node_id.to_string());
+                deferred_credential_nodes.insert(node_id.to_string(), error.clone());
             }
             credential_plan = Some(plan);
         }
-        deferred_clients.extend(deferred_credential_nodes.iter().cloned());
         let mount_script = smb_mount_script(&config.share_uuid, &share, server)?;
+        let helper_operation_id = Id128::random().to_string();
         let mut mounted_any = false;
         for (node_id, node) in smb_client_nodes(&config, uri.server.as_str()) {
-            if deferred_credential_nodes.contains(node_id) {
-                continue;
+            // The credential preflight intentionally skips nodes that fail a
+            // fast TCP reachability probe. A later probe can succeed, so verify
+            // the actual SMB helper again immediately before sending this
+            // versioned mount request. This prevents a reachable node with an
+            // old helper from receiving fields (such as /Volumes aliases) it
+            // cannot validate.
+            if !helper_ready_nodes.contains(node_id) {
+                if let Err(error) = ensure_smb_credential_helper_for_node(
+                    &config,
+                    node_id,
+                    node,
+                    state_dir,
+                    &helper_operation_id,
+                ) {
+                    let credential_note = deferred_credential_nodes
+                        .remove(node_id)
+                        .map(|credential_error| {
+                            format!("; credential distribution is also pending: {credential_error}")
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "Warning: SMB mount on {node_id} was deferred because its helper is not ready: {error}{credential_note}"
+                    );
+                    deferred_clients.insert(node_id.clone());
+                    continue;
+                }
             }
+
+            // If the earlier fast probe skipped helper preparation, credential
+            // distribution may also have been skipped or rejected by the old
+            // helper. Retry it now, after the helper has been verified current.
+            if deferred_credential_nodes.contains_key(node_id) {
+                let retry = credential_plan.as_ref().map(|plan| {
+                    let provision = macluster_protocol::smb_credential::SmbCredentialProvision {
+                        key: plan.key.clone(),
+                        credential: plan.credential.clone(),
+                    };
+                    provision_smb_credential_on_node(node, &provision)
+                });
+                match retry {
+                    Some(Ok(())) => {
+                        deferred_credential_nodes.remove(node_id);
+                    }
+                    Some(Err(error)) => {
+                        deferred_credential_nodes.insert(node_id.clone(), error);
+                        deferred_clients.insert(node_id.clone());
+                        continue;
+                    }
+                    None => continue,
+                }
+            }
+
             if let Err(error) = run_smb_user_script(node, &mount_script) {
                 let cleanup = smb_unmount_script(&share, false)?;
                 let _ = run_smb_user_script(node, &cleanup);
@@ -19059,6 +19316,11 @@ fn register_smb_share(
                 continue;
             }
             mounted_any = true;
+            deferred_clients.remove(node_id);
+        }
+        for (node_id, error) in deferred_credential_nodes {
+            eprintln!("Warning: SMB credential update on {node_id} was deferred: {error}");
+            deferred_clients.insert(node_id);
         }
         let operation_id = Id128::random().to_string();
         if !repairing {
@@ -19665,9 +19927,31 @@ fn register_named_share(
         }
         let queue_name = selected_queue.unwrap_or(config.default_queue.as_str());
         let server = config.nodes.get(&server_id).expect("server was located");
-        let server_facts = read_remote_facts(server)?;
-        let home = checked_remote_path(&server_facts.home)?;
-        let source_root = resolve_share_source(requested_source, &home)?;
+        let external_nfs_server = server.transport == Transport::Storage;
+        let server_facts = if external_nfs_server {
+            None
+        } else {
+            Some(read_remote_facts(server)?)
+        };
+        let source_root = if external_nfs_server {
+            if !Path::new(requested_source).is_absolute()
+                || !safe_absolute_remote_path(requested_source)
+            {
+                return Err((
+                    2,
+                    "external NFS export path must be a normalized absolute path".into(),
+                ));
+            }
+            PathBuf::from(requested_source)
+        } else {
+            let home = checked_remote_path(
+                &server_facts
+                    .as_ref()
+                    .expect("registered Mac server facts are available")
+                    .home,
+            )?;
+            resolve_share_source(requested_source, &home)?
+        };
         let mount_root = named_share_mount_root(share_id, requested_mount_root);
         validate_share_alias_paths(&source_root, &mount_root)?;
         let journal_path = state_dir.join("node-admin.json");
@@ -19726,20 +20010,24 @@ fn register_named_share(
             {
                 continue;
             }
-            let facts = read_remote_facts(node).map_err(|(_, error)| {
-                (
-                    1,
-                    format!("cannot verify execution account on share client {node_id}: {error}"),
-                )
-            })?;
-            if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
-                return Err((
-                    2,
-                    format!(
-                        "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
-                        facts.uid, facts.gid, server_facts.uid, server_facts.gid
-                    ),
-                ));
+            if let Some(server_facts) = &server_facts {
+                let facts = read_remote_facts(node).map_err(|(_, error)| {
+                    (
+                        1,
+                        format!(
+                            "cannot verify execution account on share client {node_id}: {error}"
+                        ),
+                    )
+                })?;
+                if facts.uid != server_facts.uid || facts.gid != server_facts.gid {
+                    return Err((
+                        2,
+                        format!(
+                            "UID/GID mismatch for share {share_id}: node {node_id} uses {}/{}, but server {server_id} uses {}/{}",
+                            facts.uid, facts.gid, server_facts.uid, server_facts.gid
+                        ),
+                    ));
+                }
             }
         }
         let endpoint_key = named_share_operation_endpoint(
@@ -19799,8 +20087,16 @@ fn register_named_share(
         // Reject alias conflicts before recording an operation, writing a source
         // marker, or exporting anything. Replacing child shares has its own checks
         // because their managed alias directories are removed during migration.
+        if external_nfs_server && !replaced_child_shares(&config, &share).is_empty() {
+            return Err((
+                2,
+                "an external NFS mapping cannot replace nested managed shares; unmount the child mappings first".into(),
+            ));
+        }
         if replaced_child_shares(&config, &share).is_empty() {
-            preflight_server_alias(server, &source_root, &mount_root)?;
+            if !external_nfs_server {
+                preflight_server_alias(server, &source_root, &mount_root)?;
+            }
         }
         preflight_share_clients(&config, &share, &deferred_offline_nodes)?;
         for (node_id, node) in &config.nodes {
@@ -19848,8 +20144,7 @@ fn register_named_share(
             }
         }
         operation.phase = "SETUP_PENDING".into();
-        operation.detail =
-            Some("share source, exports and client mounts are being prepared".into());
+        operation.detail = Some("NFS mapping and client mounts are being prepared".into());
         state
             .operations
             .insert(operation_key.clone(), operation.clone());
@@ -19858,7 +20153,9 @@ fn register_named_share(
         let active_nodes = config
             .nodes
             .keys()
-            .filter(|node_id| !deferred_offline_nodes.contains(*node_id))
+            .filter(|node_id| {
+                config.is_operational_node(node_id) && !deferred_offline_nodes.contains(*node_id)
+            })
             .cloned()
             .collect::<BTreeSet<_>>();
         let (staged_source, staged_config) = stage_current_agents_for_nodes(
@@ -19888,41 +20185,42 @@ fn register_named_share(
             .expect("share server remains in candidate config");
         if staged_server.transport == Transport::Ssh {
             let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
-            claim_enrollment_agent(
-                staged_server,
-                &server_id,
-                &config_path,
-                &config.share_uuid,
-                handoff,
-            )
-            .map_err(|error| (1, error))?;
+            claim_enrollment_agent(staged_server, &server_id, &config.share_uuid, handoff)
+                .map_err(|error| (1, error))?;
         }
         migrate_child_shares(&config, &share, &operation.id)?;
-        prepare_share_source(staged_server, &source_root, &marker_uuid)?;
-        let export_requests = config
-            .nodes
-            .iter()
-            .filter(|(node_id, _)| {
-                node_id.as_str() != server_id && config.is_operational_node(node_id)
-            })
-            .map(|(node_id, node)| NfsExportRequest {
-                root: source_root.to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: marker_uuid.clone(),
-                node_id: node_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        let (managed, export_result) = ensure_nfs_exports(server, &export_requests, &operation.id);
-        operation.managed_export |= managed.iter().any(|managed| *managed);
-        if let Err(error) = export_result {
-            operation.detail = Some(error.clone());
-            state
-                .operations
-                .insert(operation_key.clone(), operation.clone());
-            save_admin_state(&journal_path, &state)?;
-            return Err((1, error));
+        let export_requests = if external_nfs_server {
+            Vec::new()
+        } else {
+            prepare_share_source(staged_server, &source_root, &marker_uuid)?;
+            config
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| {
+                    node_id.as_str() != server_id && config.is_operational_node(node_id)
+                })
+                .map(|(node_id, node)| NfsExportRequest {
+                    root: source_root.to_string_lossy().into_owned(),
+                    client_ip: node.host.to_string(),
+                    share_uuid: marker_uuid.clone(),
+                    node_id: node_id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        if !external_nfs_server {
+            let (managed, export_result) =
+                ensure_nfs_exports(server, &export_requests, &operation.id);
+            operation.managed_export |= managed.iter().any(|managed| *managed);
+            if let Err(error) = export_result {
+                operation.detail = Some(error.clone());
+                state
+                    .operations
+                    .insert(operation_key.clone(), operation.clone());
+                save_admin_state(&journal_path, &state)?;
+                return Err((1, error));
+            }
+            prepare_server_alias(server, &source_root, &mount_root)?;
         }
-        prepare_server_alias(server, &source_root, &mount_root)?;
         for (node_id, node) in &config.nodes {
             if node_id == &server_id
                 || !config.is_operational_node(node_id)
@@ -19930,44 +20228,68 @@ fn register_named_share(
             {
                 continue;
             }
-            mount_share_candidate(
-                node,
-                server,
-                &source_root,
-                &mount_root,
-                &marker_uuid,
-                allow_existing_contents,
-            )
-            .map_err(|error| {
+            let mount_result = if external_nfs_server {
+                mount_external_nfs_share_candidate(
+                    node,
+                    server,
+                    &source_root,
+                    &mount_root,
+                    &marker_uuid,
+                    allow_existing_contents,
+                )
+            } else {
+                mount_share_candidate(
+                    node,
+                    server,
+                    &source_root,
+                    &mount_root,
+                    &marker_uuid,
+                    allow_existing_contents,
+                )
+            };
+            mount_result.map_err(|error| {
                 (
                     1,
                     format!("could not mount share {share_id} on {node_id}: {error}"),
                 )
             })?;
         }
-        verify_named_share_mount(
-            server,
-            &server_id,
-            &server_id,
-            &server.host,
-            &source_root,
-            &mount_root,
-            &marker_uuid,
-        )?;
+        if !external_nfs_server {
+            verify_named_share_mount(
+                server,
+                &server_id,
+                &server_id,
+                &server.host,
+                &source_root,
+                &mount_root,
+                &marker_uuid,
+            )?;
+        }
         for (node_id, node) in &config.nodes {
             if config.is_operational_node(node_id)
                 && node_id != &server_id
                 && !deferred_offline_nodes.contains(node_id)
             {
-                verify_named_share_mount(
-                    node,
-                    node_id,
-                    &server_id,
-                    &server.host,
-                    &source_root,
-                    &mount_root,
-                    &marker_uuid,
-                )?;
+                if external_nfs_server {
+                    verify_candidate_mount(node, server, &source_root, &mount_root).map_err(
+                        |error| {
+                            (
+                                1,
+                                format!("share {share_id} mount verification failed on {node_id}: {error}"),
+                            )
+                        },
+                    )?;
+                } else {
+                    verify_named_share_mount(
+                        node,
+                        node_id,
+                        &server_id,
+                        &server.host,
+                        &source_root,
+                        &mount_root,
+                        &marker_uuid,
+                    )?;
+                }
             }
         }
         let current = fs::read(&config_path).map_err(io_error)?;
@@ -20012,7 +20334,7 @@ fn register_named_share(
             return Err((
                 1,
                 format!(
-                    "share {share_id} is committed locally, but peer config sync is pending: {error}. Rerun the same mnode add command to resume."
+                    "share {share_id} is committed locally, but peer config sync is pending: {error}. Rerun the same `mnode -mount` command to resume."
                 ),
             ));
         }
@@ -20036,7 +20358,7 @@ fn register_named_share(
             );
         } else {
             println!(
-                "NFS share {share_id} is available at {} on reachable nodes; setup is deferred for {}. Rerun the same mnode --add command after those nodes reconnect.",
+                "NFS mapping {share_id} is available at {} on reachable nodes; setup is deferred for {}. Rerun the same `mnode -mount` command after those nodes reconnect.",
                 mount_root.display(),
                 deferred_offline_nodes
                     .iter()
@@ -20063,6 +20385,7 @@ fn repair_named_share(
 ) -> AppResult<()> {
     let server_id = share.server.as_str();
     let server = &config.nodes[server_id];
+    let external_nfs_server = server.transport == Transport::Storage;
     let active_nodes = config
         .nodes
         .keys()
@@ -20071,18 +20394,20 @@ fn repair_named_share(
         })
         .cloned()
         .collect::<BTreeSet<_>>();
-    preflight_server_alias(server, &share.source_root, &share.mount_root)?;
-    // The configured data source must still exist with its original identity.
-    // Do not recreate a missing source as an empty replacement for user data.
-    verify_named_share_mount(
-        server,
-        server_id,
-        server_id,
-        &server.host,
-        &share.source_root,
-        &share.source_root,
-        &share.share_uuid,
-    )?;
+    if !external_nfs_server {
+        preflight_server_alias(server, &share.source_root, &share.mount_root)?;
+        // The configured data source must still exist with its original identity.
+        // Do not recreate a missing source as an empty replacement for user data.
+        verify_named_share_mount(
+            server,
+            server_id,
+            server_id,
+            &server.host,
+            &share.source_root,
+            &share.source_root,
+            &share.share_uuid,
+        )?;
+    }
     preflight_share_clients(config, share, deferred_offline_nodes)?;
     for (node_id, node) in &config.nodes {
         if config.is_operational_node(node_id) && !deferred_offline_nodes.contains(node_id) {
@@ -20151,23 +20476,26 @@ fn repair_named_share(
     save_admin_state(journal_path, state)?;
 
     let result = (|| -> AppResult<()> {
-        prepare_server_alias(server, &share.source_root, &share.mount_root)?;
-        let export_requests = config
-            .nodes
-            .iter()
-            .filter(|(node_id, _)| {
-                node_id.as_str() != server_id && config.is_operational_node(node_id)
-            })
-            .map(|(node_id, node)| NfsExportRequest {
-                root: share.source_root.to_string_lossy().into_owned(),
-                client_ip: node.host.to_string(),
-                share_uuid: share.share_uuid.clone(),
-                node_id: node_id.clone(),
-            })
-            .collect::<Vec<_>>();
-        let (managed, export_result) = ensure_nfs_exports(server, &export_requests, &operation.id);
-        operation.managed_export |= managed.iter().any(|managed| *managed);
-        export_result.map_err(|error| (1, error))?;
+        if !external_nfs_server {
+            prepare_server_alias(server, &share.source_root, &share.mount_root)?;
+            let export_requests = config
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| {
+                    node_id.as_str() != server_id && config.is_operational_node(node_id)
+                })
+                .map(|(node_id, node)| NfsExportRequest {
+                    root: share.source_root.to_string_lossy().into_owned(),
+                    client_ip: node.host.to_string(),
+                    share_uuid: share.share_uuid.clone(),
+                    node_id: node_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            let (managed, export_result) =
+                ensure_nfs_exports(server, &export_requests, &operation.id);
+            operation.managed_export |= managed.iter().any(|managed| *managed);
+            export_result.map_err(|error| (1, error))?;
+        }
         for (node_id, node) in &config.nodes {
             if node_id == server_id
                 || !config.is_operational_node(node_id)
@@ -20175,15 +20503,26 @@ fn repair_named_share(
             {
                 continue;
             }
-            mount_share_candidate(
-                node,
-                server,
-                &share.source_root,
-                &share.mount_root,
-                &share.share_uuid,
-                share.allow_existing_contents,
-            )
-            .map_err(|error| {
+            let mount_result = if external_nfs_server {
+                mount_external_nfs_share_candidate(
+                    node,
+                    server,
+                    &share.source_root,
+                    &share.mount_root,
+                    &share.share_uuid,
+                    share.allow_existing_contents,
+                )
+            } else {
+                mount_share_candidate(
+                    node,
+                    server,
+                    &share.source_root,
+                    &share.mount_root,
+                    &share.share_uuid,
+                    share.allow_existing_contents,
+                )
+            };
+            mount_result.map_err(|error| {
                 (
                     1,
                     format!("cannot repair share {share_id} on {node_id}: {error}"),
@@ -20194,15 +20533,25 @@ fn repair_named_share(
             if !config.is_operational_node(node_id) || deferred_offline_nodes.contains(node_id) {
                 continue;
             }
-            verify_named_share_mount(
-                node,
-                node_id,
-                server_id,
-                &server.host,
-                &share.source_root,
-                &share.mount_root,
-                &share.share_uuid,
-            )?;
+            if external_nfs_server {
+                verify_candidate_mount(node, server, &share.source_root, &share.mount_root)
+                    .map_err(|error| {
+                        (
+                            1,
+                            format!("external NFS share {share_id} verification failed on {node_id}: {error}"),
+                        )
+                    })?;
+            } else {
+                verify_named_share_mount(
+                    node,
+                    node_id,
+                    server_id,
+                    &server.host,
+                    &share.source_root,
+                    &share.mount_root,
+                    &share.share_uuid,
+                )?;
+            }
         }
         operation.phase = "SYNC_PENDING".into();
         state.operations.insert(key.clone(), operation.clone());
@@ -20239,12 +20588,12 @@ fn repair_named_share(
     save_admin_state(journal_path, state)?;
     if deferred_offline_nodes.is_empty() {
         println!(
-            "NFS share {share_id} is verified and available at {} on every configured node; missing exports, mounts and aliases were repaired.",
+            "NFS mapping {share_id} is verified and available at {} on every configured node.",
             share.mount_root.display()
         );
     } else {
         println!(
-            "NFS share {share_id} is verified and available at {} on reachable nodes; setup is deferred for {}. Rerun the same mnode --add command after those nodes reconnect.",
+            "NFS mapping {share_id} is verified and available at {} on reachable nodes; setup is deferred for {}. It will be retried when those nodes reconnect.",
             share.mount_root.display(),
             deferred_offline_nodes
                 .iter()
@@ -20517,7 +20866,7 @@ fn migrate_child_shares(
         .map_err(|error| {
             (
                 1,
-                format!("cannot retire child share mounts on {node_id}: {error}. Rerun the same mnode add command to resume."),
+                format!("cannot retire child share mounts on {node_id}: {error}. Rerun the same `mnode -mount` command to resume."),
             )
         })?;
         let script = child_share_cleanup_directories_script(config, parent, &ids, &server.host);
@@ -20945,7 +21294,7 @@ fn validate_share_alias_paths(source: &Path, mount: &Path) -> AppResult<()> {
         return Err((
             2,
             format!(
-                "share source {} and mount path {} overlap: one contains the other. Use the source directory itself as --mount-root, or a separate path outside it; check SOURCE_PATH for accidentally repeated path components",
+                "NFS source {} and --mount-root {} overlap: one contains the other. Use the URI source path itself as --mount-root, or choose a separate target outside it; check the nfs:// URI for repeated path components",
                 source.display(),
                 mount.display()
             ),
@@ -20970,7 +21319,7 @@ fn preflight_server_alias(server: &NodeConfig, source: &Path, mount: &Path) -> A
         return Err((
             2,
             format!(
-                "share mount alias {} already exists and does not point to source {}; refusing to replace the existing directory or link. Use the intended source directory as both SOURCE_PATH and --mount-root when sharing it at the same path",
+                "NFS mount target {} already exists and does not point to source {}; refusing to replace the existing directory or link. Use the URI source path as --mount-root to mount at the same path, or choose a separate target",
                 mount.display(),
                 source.display()
             ),
@@ -21068,14 +21417,16 @@ fn preflight_share_clients(
                 format!("share client preflight failed on {node_id}: {error}"),
             )
         })?;
-        preflight_client_share_alias(node, &share.source_root, &share.mount_root).map_err(
-            |error| {
-                (
-                    2,
-                    format!("share source path preflight failed on {node_id}: {error}"),
-                )
-            },
-        )?;
+        if server.transport != Transport::Storage {
+            preflight_client_share_alias(node, &share.source_root, &share.mount_root).map_err(
+                |error| {
+                    (
+                        2,
+                        format!("share source path preflight failed on {node_id}: {error}"),
+                    )
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -21232,6 +21583,38 @@ fn mount_share_candidate(
         )?;
     }
     verify_named_share_mount_on_client(node, server, source_root, mount_root)
+}
+
+fn mount_external_nfs_share_candidate(
+    node: &NodeConfig,
+    server: &NodeConfig,
+    source_root: &Path,
+    mount_root: &Path,
+    share_uuid: &str,
+    allow_existing_contents: bool,
+) -> Result<(), String> {
+    let request = candidate_mount_command_with_overlay(
+        node,
+        server,
+        source_root,
+        mount_root,
+        share_uuid,
+        allow_existing_contents,
+    )?;
+    if let Some(request) = request {
+        run_client_mount_batch(
+            node,
+            std::slice::from_ref(&request),
+            None,
+            &format!(
+                "mount external NFS export {}:{} at {}",
+                server.host,
+                source_root.display(),
+                mount_root.display()
+            ),
+        )?;
+    }
+    verify_candidate_mount(node, server, source_root, mount_root)
 }
 
 fn prepare_share_mount_request_with_overlay(
@@ -21690,13 +22073,7 @@ fn configure_node_nfs_resources_with_claim(
         if let Some(controller) = claim {
             // All mount planning and consent above are read-only. Claim under
             // the Agent lock before exports, unmounts, or local data change.
-            claim_enrollment_agent(
-                node,
-                node_id,
-                Path::new("/dev/null"),
-                &config.share_uuid,
-                controller,
-            )?;
+            claim_enrollment_agent(node, node_id, &config.share_uuid, controller)?;
         }
         if power_setup
             .as_ref()
@@ -22852,14 +23229,8 @@ fn add_ssh_node(
                     .unwrap_or_else(|| Id128::random().to_string());
                 check_remote_idle(existing_node, existing_id, &config_path)?;
                 let handoff = enrollment_controller_epoch(state_dir).map_err(|error| (1, error))?;
-                claim_enrollment_agent(
-                    existing_node,
-                    existing_id,
-                    &config_path,
-                    &config.share_uuid,
-                    handoff,
-                )
-                .map_err(|error| (1, error))?;
+                claim_enrollment_agent(existing_node, existing_id, &config.share_uuid, handoff)
+                    .map_err(|error| (1, error))?;
                 let power_setup = prepare_power_helper_with_trust(
                     existing_node,
                     facts.uid,
@@ -23449,7 +23820,7 @@ fn add_existing_ssh_node_to_queue(
         .nodes
         .get(node_id)
         .ok_or_else(|| (2, "node is not configured".into()))?;
-    claim_enrollment_agent(node, node_id, config_path, &config.share_uuid, handoff)
+    claim_enrollment_agent(node, node_id, &config.share_uuid, handoff)
         .map_err(|error| (1, error))?;
     let operation_key = format!("queue:{node_id}:{queue_name}");
     let old_digest =
@@ -27414,7 +27785,7 @@ execution_uid = 501
     }
 
     #[test]
-    fn named_share_rejects_nested_source_and_mount_before_enrollment() {
+    fn node_add_rejects_legacy_share_paths_before_enrollment() {
         for (source, mount) in [
             (
                 "/Users/operator/project/Users/operator/project",
@@ -27435,13 +27806,12 @@ execution_uid = 501
                 Ok(_) => panic!("nested source and alias must be rejected before enrollment"),
             };
             assert_eq!(error.0, 2);
-            assert!(error.1.contains(source), "{error:?}");
-            assert!(error.1.contains(mount), "{error:?}");
+            assert!(error.1.contains("mnode -mount"), "{error:?}");
         }
     }
 
     #[test]
-    fn named_share_accepts_same_source_mount_and_separate_prefix_siblings() {
+    fn node_add_no_longer_accepts_named_share_paths() {
         for mount in ["/Users/operator/project", "/Users/operator/project-copy"] {
             let args = [
                 "-a",
@@ -27452,7 +27822,9 @@ execution_uid = 501
                 mount,
             ]
             .map(str::to_owned);
-            assert!(parse_action(&args).is_ok());
+            let error = parse_action(&args).expect_err("storage mapping belongs to -mount");
+            assert_eq!(error.0, 2);
+            assert!(error.1.contains("mnode -mount"), "{error:?}");
         }
     }
 
@@ -28107,6 +28479,14 @@ execution_uid = 501
         assert!(script.contains("if [ \"$logical\" != \"$alias\" ]; then [ -L \"$logical\" ]"));
         assert!(script.contains("Library/LaunchAgents"));
         assert!(script.contains("org.macluster.smb."));
+        assert!(
+            !script.contains("<string>$helper</string>"),
+            "launchd does not expand shell variables in ProgramArguments"
+        );
+        assert!(script.contains("<string>-c</string>"));
+        assert!(
+            script.contains("exec /bin/sh \"\\$HOME/Library/Application Support/macluster/smb/")
+        );
         assert!(script.contains("/usr/bin/cmp -s"));
         assert!(script.contains("launchctl print \"gui/$uid/"));
         assert!(script.contains(
@@ -30969,7 +31349,7 @@ ssh_port = 22
     }
 
     #[test]
-    fn parse_action_accepts_custom_mount_root_for_local_share() {
+    fn parse_action_rejects_legacy_local_share_syntax() {
         let args = [
             "-a",
             "local:/Users/operator/mamba/envs/analysis",
@@ -30980,72 +31360,27 @@ ssh_port = 22
         ]
         .map(str::to_owned);
 
-        let Action::Add(options) = parse_action(&args).expect("parse custom mount root") else {
-            panic!("expected node add action");
-        };
-        assert_eq!(
-            options.mount_root.as_deref(),
-            Some("/Users/operator/mamba/envs/analysis")
-        );
+        let error = parse_action(&args).expect_err("node add must not create storage mappings");
+        assert_eq!(error.0, 2);
+        assert!(error.1.contains("mnode -mount"), "{error:?}");
     }
 
     #[test]
-    fn parse_action_rejects_non_absolute_mount_root() {
-        for path in [
-            "relative/path",
-            "/",
-            "/Users//Shared/tools",
-            "/Users/Shared/../tools",
-            "/Users/Shared/./tools",
-            "/Users/user name/tools",
+    fn parse_action_keeps_storage_options_out_of_node_add() {
+        for args in [
+            vec!["-a", "local", "--share-id", "tools"],
+            vec!["-a", "local", "--mount-root", "/Users/Shared/tools"],
+            vec!["-a", "local", "--overlay-existing"],
         ] {
-            let args = [
-                "-a",
-                "local:/Users/Shared/tools",
-                "--share-id",
-                "tools",
-                "--mount-root",
-                path,
-            ]
-            .map(str::to_owned);
-
-            let error = match parse_action(&args) {
-                Err(error) => error,
-                Ok(_) => panic!("invalid mount root {path} must be rejected"),
-            };
-
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let error = parse_action(&args).expect_err("storage options belong to -mount");
             assert_eq!(error.0, 2);
-            assert!(
-                error.1.contains("normalized absolute path"),
-                "path {path}: {}",
-                error.1
-            );
+            assert!(error.1.contains("mnode -mount"), "{error:?}");
         }
     }
 
     #[test]
     fn share_directory_inputs_accept_trailing_slashes() {
-        for endpoint in [
-            "local:/Users/operator/mamba/",
-            "operator@192.0.2.20:/Users/operator/mamba/",
-        ] {
-            for mount in ["/Users/operator/mamba/", "/Users/operator/mamba///"] {
-                let args = ["-a", endpoint, "--share-id", "mamba", "--mount-root", mount]
-                    .map(str::to_owned);
-                let Action::Add(options) = parse_action(&args).unwrap() else {
-                    panic!("expected add action");
-                };
-                assert_eq!(options.mount_root.as_deref(), Some("/Users/operator/mamba"));
-                let source = match options.target {
-                    super::AddTarget::Local { source_path, .. } => source_path.unwrap(),
-                    super::AddTarget::Ssh(endpoint) => endpoint.source_path.unwrap(),
-                };
-                assert_eq!(
-                    super::resolve_share_source(&source, "/Users/operator").unwrap(),
-                    PathBuf::from("/Users/operator/mamba")
-                );
-            }
-        }
         for source in ["~/mamba/", "./mamba///"] {
             assert_eq!(
                 super::resolve_share_source(source, "/Users/operator").unwrap(),
@@ -31067,25 +31402,20 @@ ssh_port = 22
         };
 
         assert_eq!(error.0, 2);
-        assert!(
-            error.1.contains("SOURCE_PATH and --share-id"),
-            "{}",
-            error.1
-        );
+        assert!(error.1.contains("storage-mount option"), "{}", error.1);
     }
 
     #[test]
-    fn parse_action_without_mount_root_keeps_existing_named_share_syntax() {
+    fn parse_action_rejects_named_share_syntax_on_node_add() {
         let args = ["-a", "local:/Users/Shared/tools", "--share-id", "tools"].map(str::to_owned);
 
-        let Action::Add(options) = parse_action(&args).expect("parse existing share syntax") else {
-            panic!("expected node add action");
-        };
-        assert!(options.mount_root.is_none());
+        let error = parse_action(&args).expect_err("named share syntax belongs to -mount");
+        assert_eq!(error.0, 2);
+        assert!(error.1.contains("mnode -mount"), "{error:?}");
     }
 
     #[test]
-    fn parse_action_accepts_explicit_overlay_of_same_path_named_share() {
+    fn parse_action_rejects_overlay_option_on_node_add() {
         let args = [
             "-a",
             "local:/opt/homebrew",
@@ -31097,16 +31427,13 @@ ssh_port = 22
         ]
         .map(str::to_owned);
 
-        let result = parse_action(&args);
-
-        assert!(
-            result.is_ok(),
-            "explicit software-directory overlay should be accepted: {result:?}"
-        );
+        let error = parse_action(&args).expect_err("overlay is a mount option");
+        assert_eq!(error.0, 2);
+        assert!(error.1.contains("mnode -mount"), "{error:?}");
     }
 
     #[test]
-    fn same_path_share_requires_yes_before_overlay_is_enabled() {
+    fn legacy_node_add_overlay_syntax_is_rejected() {
         let args = [
             "-a",
             "local:/opt/homebrew",
@@ -31116,57 +31443,45 @@ ssh_port = 22
             "/opt/homebrew",
         ]
         .map(str::to_owned);
-        let Action::Add(mut options) = parse_action(&args).expect("parse share request") else {
-            panic!("expected node add action");
-        };
-
-        assert!(super::overlay_confirmation_required(&options));
-        assert!(super::apply_overlay_confirmation(&mut options, "y\n").is_ok());
-        assert!(options.overlay_existing);
-
-        let Action::Add(mut options) = parse_action(&args).expect("parse share request") else {
-            panic!("expected node add action");
-        };
-        let error = super::apply_overlay_confirmation(&mut options, "\n").unwrap_err();
-        assert!(error.1.contains("cancelled"), "{error:?}");
-        assert!(!options.overlay_existing);
+        let error = parse_action(&args).expect_err("storage must be mounted separately");
+        assert_eq!(error.0, 2);
+        assert!(error.1.contains("mnode -mount"), "{error:?}");
     }
 
     #[test]
-    fn same_path_overlay_confirmation_is_not_needed_for_other_mounts_or_explicit_flag() {
+    fn storage_overlay_option_is_accepted_on_mount_commands() {
         let different_mount = [
-            "-a",
-            "local:/opt/homebrew",
-            "--share-id",
-            "homebrew",
+            "-mount",
+            "nfs://login-01/opt/homebrew",
             "--mount-root",
             "/Users/Shared/homebrew",
         ]
         .map(str::to_owned);
-        let Action::Add(options) = parse_action(&different_mount).expect("parse share request")
+        let Action::Mount { options, .. } =
+            parse_action(&different_mount).expect("parse storage mapping")
         else {
-            panic!("expected node add action");
+            panic!("expected mount action");
         };
-        assert!(!super::overlay_confirmation_required(&options));
+        assert!(!options.overlay_existing);
 
         let explicit = [
-            "-a",
-            "local:/opt/homebrew",
-            "--share-id",
-            "homebrew",
+            "-mount",
+            "nfs://login-01/opt/homebrew",
             "--mount-root",
             "/opt/homebrew",
             "--overlay-existing",
         ]
         .map(str::to_owned);
-        let Action::Add(options) = parse_action(&explicit).expect("parse explicit overlay") else {
-            panic!("expected node add action");
+        let Action::Mount { options, .. } =
+            parse_action(&explicit).expect("parse explicit overlay")
+        else {
+            panic!("expected mount action");
         };
-        assert!(!super::overlay_confirmation_required(&options));
+        assert!(options.overlay_existing);
     }
 
     #[test]
-    fn parse_action_rejects_overlay_when_source_and_mount_differ() {
+    fn overlay_flag_is_rejected_on_node_add_even_with_different_paths() {
         let args = [
             "-a",
             "local:/opt/homebrew",
@@ -31178,17 +31493,10 @@ ssh_port = 22
         ]
         .map(str::to_owned);
 
-        let error = match parse_action(&args) {
-            Err(error) => error,
-            Ok(_) => panic!("overlay must not redirect an unrelated source path"),
-        };
+        let error = parse_action(&args).expect_err("overlay option belongs to -mount");
 
         assert_eq!(error.0, 2);
-        assert!(
-            error.1.contains("same source and mount path"),
-            "{}",
-            error.1
-        );
+        assert!(error.1.contains("mnode -mount"), "{error:?}");
     }
 
     #[test]
@@ -32430,18 +32738,21 @@ execution_uid = 501
     }
 
     #[test]
-    fn superseded_failed_update_without_candidate_is_abandoned_safely() {
+    fn superseded_uncommitted_update_without_candidate_is_abandoned_safely() {
         let mut operation = update_operation("UPDATE_FAILED", "old", "candidate");
         operation.candidate_config_sha256 = None;
         assert_eq!(
             update_recovery(Some(&operation), "new-config").unwrap(),
-            UpdateRecovery::AbandonUncommittedFailure
+            UpdateRecovery::AbandonUncommittedUpdate
         );
         operation.candidate_config_sha256 = Some("candidate".into());
         assert!(update_recovery(Some(&operation), "new-config").is_err());
         operation.phase = "UPDATE_STAGING".into();
         operation.candidate_config_sha256 = None;
-        assert!(update_recovery(Some(&operation), "new-config").is_err());
+        assert_eq!(
+            update_recovery(Some(&operation), "new-config").unwrap(),
+            UpdateRecovery::AbandonUncommittedUpdate
+        );
     }
 
     #[test]

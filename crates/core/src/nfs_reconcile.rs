@@ -25,6 +25,16 @@ pub struct DeferredShareClientCleanup {
     pub server_host: String,
     pub share_uuid: String,
     pub machine_uuid: Option<String>,
+    /// Whether cleanup should remove the source-prefix symlink created for
+    /// macOS-managed shares. External NFS providers do not create that link.
+    #[serde(default = "default_remove_source_alias")]
+    pub remove_source_alias: bool,
+}
+
+fn default_remove_source_alias() -> bool {
+    // Older cleanup journals only represented macOS-managed shares, which
+    // created this alias when source and mount paths differed.
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -460,6 +470,7 @@ mod tests {
                         server_host: "192.0.2.1".into(),
                         share_uuid: "uuid-old".into(),
                         machine_uuid: Some("machine-1".into()),
+                        remove_source_alias: true,
                     },
                 ),
                 (
@@ -472,6 +483,7 @@ mod tests {
                         server_host: "192.0.2.1".into(),
                         share_uuid: "uuid-new".into(),
                         machine_uuid: Some("machine-1".into()),
+                        remove_source_alias: true,
                     },
                 ),
             ]
@@ -535,6 +547,7 @@ mod tests {
             server_host: "192.0.2.1".into(),
             share_uuid: "uuid-old".into(),
             machine_uuid: Some("machine-1".into()),
+            remove_source_alias: true,
         };
 
         assert!(state.remove_client_cleanup_exact(&old));
@@ -553,6 +566,7 @@ mod tests {
             server_host: "192.0.2.1".into(),
             share_uuid: "uuid-old".into(),
             machine_uuid: Some("machine-1".into()),
+            remove_source_alias: true,
         };
         let mut replaced = expected.clone();
         replaced.source_root = "/srv/replaced".into();
@@ -589,6 +603,7 @@ mod tests {
             server_host: "192.0.2.1".into(),
             share_uuid: "uuid-client".into(),
             machine_uuid: Some("machine-worker".into()),
+            remove_source_alias: true,
         };
         state
             .entries
@@ -629,6 +644,7 @@ mod tests {
             server_host: "192.0.2.1".into(),
             share_uuid: "uuid-first".into(),
             machine_uuid: Some("machine-worker".into()),
+            remove_source_alias: true,
         };
         state
             .entries
@@ -643,6 +659,7 @@ mod tests {
             server_host: "192.0.2.1".into(),
             share_uuid: "uuid-second".into(),
             machine_uuid: Some("machine-worker".into()),
+            remove_source_alias: true,
         };
         state.entries.insert(
             client_cleanup_key("second", "worker", "uuid-second"),
@@ -679,6 +696,7 @@ mod tests {
                 server_host: "192.0.2.1".into(),
                 share_uuid: "uuid-old".into(),
                 machine_uuid: Some("machine-worker".into()),
+                remove_source_alias: true,
             },
         );
         old.save_to_dir(&root).unwrap();
@@ -717,6 +735,7 @@ mod tests {
                 server_host: "192.0.2.1".into(),
                 share_uuid: "uuid-data".into(),
                 machine_uuid: Some("machine-worker".into()),
+                remove_source_alias: true,
             },
         );
         state.save_to_dir(&root).unwrap();

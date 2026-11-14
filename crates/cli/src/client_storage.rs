@@ -120,6 +120,27 @@ pub(crate) fn mount_layout_matches(
             .collect::<BTreeSet<_>>()
 }
 
+pub(crate) fn nfs_mount_layout_matches(
+    left: &ClientDescriptor,
+    right: &ClientDescriptor,
+    client_ip: &str,
+) -> bool {
+    mounts(left, client_ip)
+        .into_iter()
+        .filter(ClientMount::is_nfs)
+        .collect::<BTreeSet<_>>()
+        == mounts(right, client_ip)
+            .into_iter()
+            .filter(ClientMount::is_nfs)
+            .collect::<BTreeSet<_>>()
+}
+
+pub(crate) fn has_nfs_mounts(descriptor: &ClientDescriptor, client_ip: &str) -> bool {
+    mounts(descriptor, client_ip)
+        .iter()
+        .any(ClientMount::is_nfs)
+}
+
 pub(crate) fn distinct_mount_layouts<'a>(
     descriptors: impl IntoIterator<Item = &'a ClientDescriptor>,
     client_ip: &str,
@@ -163,7 +184,10 @@ fn client_mount_script(
     let helper = format!("{HELPER_ROOT}/{label}.sh");
     let plist = format!("{DAEMON_ROOT}/{label}.plist");
     let mut body = "#!/bin/sh\nset -eu\n".to_owned();
-    for mount in mounts(descriptor, client_ip) {
+    for mount in mounts(descriptor, client_ip)
+        .into_iter()
+        .filter(ClientMount::is_nfs)
+    {
         let source_arg = shell_quote(&mount.source);
         let target_arg = shell_quote(&mount.physical_target);
         if mount.is_nfs() {
@@ -194,7 +218,10 @@ fn client_mount_script(
     );
     let mut retired = String::new();
     if let Some(previous) = previous {
-        for mount in retired_mounts(previous, descriptor, client_ip) {
+        for mount in retired_mounts(previous, descriptor, client_ip)
+            .into_iter()
+            .filter(ClientMount::is_nfs)
+        {
             let target_arg = shell_quote(&mount.physical_target);
             if mount.is_nfs() {
                 let expected_mount = shell_quote(&format!(
@@ -232,7 +259,10 @@ fn client_remove_script(
     let mut script = format!(
         "#!/bin/sh\nset -eu\n/bin/launchctl bootout system/{label} >/dev/null 2>&1 || true\n"
     );
-    for mount in mounts(descriptor, client_ip) {
+    for mount in mounts(descriptor, client_ip)
+        .into_iter()
+        .filter(ClientMount::is_nfs)
+    {
         let target_arg = shell_quote(&mount.physical_target);
         if mount.is_nfs() {
             let expected_mount = shell_quote(&format!(
@@ -421,6 +451,14 @@ fn missing_mounts(
         .collect()
 }
 
+fn smb_alias_is_ready(mount: &ClientMount) -> bool {
+    if !mount.is_smb() || mount.logical_target == mount.backing_alias() {
+        return true;
+    }
+    std::fs::read_link(&mount.logical_target)
+        .is_ok_and(|actual| actual == Path::new(&mount.backing_alias()))
+}
+
 pub(crate) fn verify_client_mounts(
     descriptor: &ClientDescriptor,
     required_shares: Option<&[String]>,
@@ -500,6 +538,9 @@ pub(crate) fn install_client_mounts(
     descriptor: &ClientDescriptor,
     client_ip: &str,
 ) -> Result<(), String> {
+    if !has_nfs_mounts(descriptor, client_ip) {
+        return Ok(());
+    }
     confirm_overlays(descriptor, client_ip)?;
     run_client_mount_script(client_mount_script(
         cluster_uuid,
@@ -515,6 +556,18 @@ pub(crate) fn replace_client_mounts(
     descriptor: &ClientDescriptor,
     client_ip: &str,
 ) -> Result<(), String> {
+    for share in previous.shares.iter().filter(|share| {
+        share.protocol == "smb"
+            && !descriptor
+                .shares
+                .iter()
+                .any(|current| current.protocol == "smb" && current == *share)
+    }) {
+        crate::node_admin::unmount_client_smb_share(share)?;
+    }
+    if !has_nfs_mounts(previous, client_ip) && !has_nfs_mounts(descriptor, client_ip) {
+        return Ok(());
+    }
     confirm_overlays(descriptor, client_ip)?;
     run_client_mount_script(client_mount_script(
         cluster_uuid,
@@ -544,19 +597,73 @@ pub(crate) fn remove_client_mounts(
     descriptor: &ClientDescriptor,
     client_ip: &str,
 ) -> Result<(), String> {
-    let script = client_remove_script(cluster_uuid, descriptor, client_ip);
-    let status = std::process::Command::new("/usr/bin/sudo")
-        .args(["/bin/sh", "-c", &script])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "client mount removal exited with {}",
-            status.code().unwrap_or(1)
-        ))
+    let mut smb_cleanup_error = None;
+    for share in descriptor
+        .shares
+        .iter()
+        .filter(|share| share.protocol == "smb" && share.server_host != client_ip)
+    {
+        if let Err(error) = crate::node_admin::unmount_client_smb_share(share) {
+            smb_cleanup_error.get_or_insert_with(|| error);
+        }
     }
+    if has_nfs_mounts(descriptor, client_ip) {
+        let script = client_remove_script(cluster_uuid, descriptor, client_ip);
+        let status = std::process::Command::new("/usr/bin/sudo")
+            .args(["/bin/sh", "-c", &script])
+            .status()
+            .map_err(|error| error.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "client mount removal exited with {}",
+                status.code().unwrap_or(1)
+            ));
+        }
+    }
+    smb_cleanup_error.map_or(Ok(()), Err)
+}
+
+pub(crate) fn ensure_required_smb_mounts(
+    descriptor: &ClientDescriptor,
+    required_shares: Option<&[String]>,
+    client_ip: &str,
+) -> Result<(), String> {
+    let mount_table = Command::new("/sbin/mount")
+        .output()
+        .map_err(|error| format!("cannot inspect current mounts: {error}"))?;
+    if !mount_table.status.success() {
+        return Err(format!(
+            "cannot inspect current mounts: {}",
+            String::from_utf8_lossy(&mount_table.stderr).trim()
+        ));
+    }
+    let mount_table = String::from_utf8_lossy(&mount_table.stdout);
+    for mount in required_mounts(descriptor, required_shares, client_ip) {
+        if !mount.is_smb()
+            || (mount_table_has_exact(&mount_table, &mount) && smb_alias_is_ready(&mount))
+        {
+            continue;
+        }
+        let share = descriptor
+            .shares
+            .iter()
+            .find(|share| share.share_uuid == mount.share_uuid)
+            .ok_or_else(|| {
+                format!(
+                    "SMB share {} is missing from the controller descriptor",
+                    mount.share_uuid
+                )
+            })?;
+        crate::node_admin::mount_client_smb_share(&descriptor.cluster_uuid, share).map_err(
+            |error| {
+                format!(
+                    "cannot mount required SMB storage {} at {}: {error}",
+                    share.id, share.mount_root
+                )
+            },
+        )?;
+    }
+    verify_client_mounts(descriptor, required_shares, client_ip)
 }
 
 #[cfg(test)]
@@ -664,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn smb_share_mounts_its_share_and_exposes_the_requested_subpath() {
+    fn smb_shares_are_not_mounted_by_the_privileged_nfs_service() {
         let mut descriptor = descriptor();
         descriptor.shares.push(ClientShareDescriptor {
             id: "smb-project".into(),
@@ -683,11 +790,9 @@ mod tests {
             "192.0.2.10",
         );
 
-        assert!(script.contains("mount_smbfs"));
-        assert!(script.contains("//smb-user@192.0.2.20/data"));
-        assert!(script.contains("/Volumes/project"));
-        assert!(script.contains("ln -s"));
-        assert!(!script.contains("password"));
+        assert!(!script.contains("mount_smbfs"));
+        assert!(!script.contains("//smb-user@192.0.2.20/data"));
+        assert!(!script.contains("/Volumes/project"));
         assert_eq!(
             missing_mounts(
                 &descriptor,
@@ -884,17 +989,6 @@ mod tests {
                 .is_empty(),
             "a stale macluster-managed SMB alias is safe to replace"
         );
-        let script = client_mount_script(
-            "f779bcf5-ea85-5caa-9579-74b395f3cce5",
-            &descriptor,
-            None,
-            "192.0.2.10",
-        );
-        assert!(
-            script.contains("/Users/Shared/.macluster-mounts/"),
-            "the generated mount helper must recognize managed backing aliases"
-        );
-
         fs::remove_file(&logical).unwrap();
         std::os::unix::fs::symlink("/tmp/unrelated", &logical).unwrap();
         assert!(

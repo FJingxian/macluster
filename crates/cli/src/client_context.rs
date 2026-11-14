@@ -33,34 +33,10 @@ pub(crate) fn stage_current_binary_for_remote_profile(
     let source = source.canonicalize().map_err(|error| error.to_string())?;
     let bytes = fs::read(&source).map_err(|error| error.to_string())?;
     let local_digest = sha256_hex(&bytes).map_err(|error| error.to_string())?;
-    let host_alias = format!("macluster-{}", profile.cluster_uuid);
-    let known_hosts = format!("UserKnownHostsFile={}", profile.known_hosts_path);
-    let host_key_alias = format!("HostKeyAlias={host_alias}");
     let mut ssh = Command::new("/usr/bin/ssh");
-    ssh.args([
-        "-T",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        &known_hosts,
-        "-o",
-        &host_key_alias,
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-i",
-        &profile.identity_file,
-        "-p",
-        &profile.controller_port.to_string(),
-        "-l",
-        &profile.controller_user,
-        &profile.controller_host,
-    ]);
+    // Share the SSH master with the immediately following remote submission
+    // preflight. This adds a version check without another TCP/SSH handshake.
+    ssh.args(crate::remote_admin::routine_ssh_args(profile, false));
     let query = ssh
         .arg(format!(
             "/usr/bin/shasum -a 256 {} 2>/dev/null || true",
@@ -82,6 +58,9 @@ pub(crate) fn stage_current_binary_for_remote_profile(
         profile.remote_binary,
         Id128::random()
     );
+    let host_alias = format!("macluster-{}", profile.cluster_uuid);
+    let known_hosts = format!("UserKnownHostsFile={}", profile.known_hosts_path);
+    let host_key_alias = format!("HostKeyAlias={host_alias}");
     let mut scp = Command::new("/usr/bin/scp");
     scp.args([
         "-q",
@@ -101,9 +80,16 @@ pub(crate) fn stage_current_binary_for_remote_profile(
         "ConnectTimeout=5",
         "-o",
         "IdentitiesOnly=yes",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=300",
         "-i",
         &profile.identity_file,
     ]);
+    if let Ok(control_path) = crate::remote_transport::control_socket_path(profile) {
+        scp.args(["-o", &format!("ControlPath={control_path}")]);
+    }
     scp.arg(&source).arg(format!(
         "{}@{}:{}",
         profile.controller_user, profile.controller_host, staging
@@ -111,7 +97,7 @@ pub(crate) fn stage_current_binary_for_remote_profile(
     let copied = scp.output().map_err(|error| error.to_string())?;
     if !copied.status.success() {
         return Err(format!(
-            "could not stage the current macluster binary for controller migration: {}",
+            "could not stage the current macluster binary on the controller: {}",
             String::from_utf8_lossy(&copied.stderr).trim()
         ));
     }
@@ -123,31 +109,8 @@ pub(crate) fn stage_current_binary_for_remote_profile(
         crate::node_admin::shell_quote(&profile.remote_binary),
     );
     let mut ssh = Command::new("/usr/bin/ssh");
-    ssh.args([
-        "-T",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        &known_hosts,
-        "-o",
-        &host_key_alias,
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-i",
-        &profile.identity_file,
-        "-p",
-        &profile.controller_port.to_string(),
-        "-l",
-        &profile.controller_user,
-        &profile.controller_host,
-        &install,
-    ]);
+    ssh.args(crate::remote_admin::routine_ssh_args(profile, false));
+    ssh.arg(&install);
     let installed = ssh.output().map_err(|error| error.to_string())?;
     if !installed.status.success() {
         return Err(format!(
@@ -193,7 +156,7 @@ impl RemoteContext {
             let mut installed = profile.installed_mount_descriptor().cloned();
             for attempt in 0..3 {
                 let mounts_changed = installed.as_ref().is_none_or(|previous| {
-                    !crate::client_storage::mount_layout_matches(
+                    !crate::client_storage::nfs_mount_layout_matches(
                         previous,
                         &descriptor,
                         &profile.nfs_client_ip,
@@ -210,7 +173,7 @@ impl RemoteContext {
                 }
                 for descriptor in installed.iter().chain(std::iter::once(&descriptor)) {
                     if !profile.transition_mount_descriptors.iter().any(|existing| {
-                        crate::client_storage::mount_layout_matches(
+                        crate::client_storage::nfs_mount_layout_matches(
                             existing,
                             descriptor,
                             &profile.nfs_client_ip,
@@ -395,10 +358,15 @@ fn needs_mount_reconciliation(
     current: &ClientDescriptor,
     client_ip: &str,
 ) -> bool {
-    mounts_enabled
-        && storage_command
+    if !mounts_enabled || !storage_command {
+        return false;
+    }
+    let installed_has_nfs = installed
+        .is_some_and(|installed| crate::client_storage::has_nfs_mounts(installed, client_ip));
+    let current_has_nfs = crate::client_storage::has_nfs_mounts(current, client_ip);
+    (installed_has_nfs || current_has_nfs)
         && installed.is_none_or(|installed| {
-            !crate::client_storage::mount_layout_matches(installed, current, client_ip)
+            !crate::client_storage::nfs_mount_layout_matches(installed, current, client_ip)
         })
 }
 
@@ -422,8 +390,9 @@ pub(crate) fn select_remote_profile(
         return Ok(None);
     }
     // A local node-admin config is the recovery authority even while its
-    // controller is stopped. Forwarding to a stale remote CLI would prevent
-    // reset, mount, and node repair from running with the binary in hand.
+    // controller is stopped, but only when its Local node is this Mac. A
+    // config copied from another cluster host must not make this login client
+    // run controller operations against the wrong machine.
     if command == "node"
         && explicit.is_none()
         && !config_explicit
@@ -432,15 +401,46 @@ pub(crate) fn select_remote_profile(
     {
         return Ok(None);
     }
-    if !should_consider_remote_profile(
+    let local_config_matches = if config_path.exists() && explicit.is_none() && !config_explicit {
+        match std::fs::read_to_string(config_path)
+            .map_err(|error| error.to_string())
+            .and_then(|source| ClusterConfig::parse(&source).map_err(|error| error.to_string()))
+        {
+            Ok(config) => crate::app::local_machine_uuid()
+                .map(|local_uuid| local_config_matches_machine(&config, &local_uuid))
+                .unwrap_or(true),
+            Err(_) => true,
+        }
+    } else {
+        true
+    };
+    if !should_consider_remote_profile_for_identity(
         config_path.exists(),
         explicit,
         config_explicit,
         local_controller_stopped,
+        local_config_matches,
     ) {
         return Ok(None);
     }
     let store = ClientProfileStore::current().map_err(|error| error.to_string())?;
+    let configured_uuid = if explicit.is_none() {
+        std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|source| ClusterConfig::parse(&source).ok())
+            .map(|config| config.share_uuid)
+    } else {
+        None
+    };
+    if !local_config_matches {
+        let Some(uuid) = configured_uuid.as_deref() else {
+            return Ok(None);
+        };
+        let profiles = store.load_all().map_err(|error| error.to_string())?;
+        return Ok(profiles
+            .into_iter()
+            .find(|profile| profile.cluster_uuid.eq_ignore_ascii_case(uuid)));
+    }
     let selected = match store.select(explicit).map_err(|error| error.to_string())? {
         ClientSelection::Explicit(profile)
         | ClientSelection::LastUsed(profile)
@@ -449,14 +449,6 @@ pub(crate) fn select_remote_profile(
     };
     let Some(selected) = selected else {
         return Ok(None);
-    };
-    let configured_uuid = if explicit.is_none() {
-        std::fs::read_to_string(config_path)
-            .ok()
-            .and_then(|source| ClusterConfig::parse(&source).ok())
-            .map(|config| config.share_uuid)
-    } else {
-        None
     };
     if let Some(uuid) = configured_uuid.as_deref()
         && !selected.cluster_uuid.eq_ignore_ascii_case(uuid)
@@ -493,6 +485,36 @@ fn should_consider_remote_profile(
     local_controller_stopped: bool,
 ) -> bool {
     explicit.is_some() || !config_explicit && (!config_exists || local_controller_stopped)
+}
+
+fn should_consider_remote_profile_for_identity(
+    config_exists: bool,
+    explicit: Option<&str>,
+    config_explicit: bool,
+    local_controller_stopped: bool,
+    local_config_matches: bool,
+) -> bool {
+    should_consider_remote_profile(
+        config_exists && local_config_matches,
+        explicit,
+        config_explicit,
+        local_controller_stopped,
+    )
+}
+
+fn local_config_matches_machine(config: &ClusterConfig, local_machine_uuid: &str) -> bool {
+    let mut local_nodes = config
+        .nodes
+        .values()
+        .filter(|node| node.transport == Transport::Local);
+    let Some(local_node) = local_nodes.next() else {
+        return false;
+    };
+    local_nodes.next().is_none()
+        && local_node
+            .machine_uuid
+            .as_deref()
+            .is_some_and(|registered| registered.eq_ignore_ascii_case(local_machine_uuid))
 }
 
 fn node_command_can_use_remote_profile(args: &[String]) -> bool {
@@ -585,6 +607,53 @@ mod tests {
     #[test]
     fn stopped_local_controller_allows_the_joined_profile() {
         assert!(should_consider_remote_profile(true, None, false, true));
+    }
+
+    #[test]
+    fn foreign_local_node_identity_allows_matching_joined_profile() {
+        assert!(super::should_consider_remote_profile_for_identity(
+            true, None, false, false, false,
+        ));
+        assert!(!super::should_consider_remote_profile_for_identity(
+            true, None, true, false, false,
+        ));
+    }
+
+    #[test]
+    fn active_config_is_local_only_when_its_local_machine_uuid_matches() {
+        let config = macluster_core::config::ClusterConfig::parse(
+            r#"
+[cluster]
+name = "test-cluster"
+login_node = "test-node"
+default_queue = "default"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "00000000-0000-4000-8000-000000000001"
+storage_server = "test-node"
+protocol_version = 1
+
+[queues.default]
+nodes = []
+scheduler = "fifo"
+
+[nodes.test-node]
+host = "192.0.2.2"
+transport = "local"
+remote_binary = "/Users/tester/.local/bin/macluster"
+machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+execution_uid = 501
+"#,
+        )
+        .unwrap();
+
+        assert!(super::local_config_matches_machine(
+            &config,
+            "01234567-89ab-cdef-0123-456789abcdef"
+        ));
+        assert!(!super::local_config_matches_machine(
+            &config,
+            "fedcba98-7654-3210-fedc-ba9876543210"
+        ));
     }
 
     #[test]

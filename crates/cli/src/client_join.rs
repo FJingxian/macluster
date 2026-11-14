@@ -371,7 +371,6 @@ pub(crate) fn join_cluster_expected_with_binary(
                 // An explicit join is also a repair operation. Always run the
                 // idempotent mount helper even when the cached layout matches,
                 // because the helper or a mount may have disappeared.
-                profile.mounted_descriptor = Some(descriptor.clone());
                 store.save(&profile).map_err(|error| error.to_string())?;
                 let result = if let Some(previous) = previous.as_ref() {
                     crate::client_storage::replace_client_mounts(
@@ -393,6 +392,8 @@ pub(crate) fn join_cluster_expected_with_binary(
                         endpoint.user, endpoint.host, endpoint.port
                     )
                 })?;
+                profile.mounted_descriptor = Some(descriptor.clone());
+                store.save(&profile).map_err(|error| error.to_string())?;
             }
         }
         resume_retired_access(&store, &mut profile, false)?;

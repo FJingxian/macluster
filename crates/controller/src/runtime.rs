@@ -1813,7 +1813,7 @@ impl RuntimeState {
         let client_aliases = cleanup
             .clients
             .iter()
-            .filter(|entry| entry.source_root != entry.mount_root)
+            .filter(|entry| entry.remove_source_alias)
             .map(|entry| NfsAlias {
                 path: entry.source_root.clone(),
                 target: entry.mount_root.clone(),
@@ -4619,6 +4619,7 @@ scheduler = "fifo"
             server_host: "192.0.2.9".into(),
             share_uuid: "00000000-0000-4000-8000-000000000009".into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+            remove_source_alias: true,
         };
         let marker = DeferredShareMarkerCleanup {
             share_id: "old_data".into(),
@@ -4984,6 +4985,7 @@ scheduler = "fifo"
             server_host: "192.0.2.9".into(),
             share_uuid: "00000000-0000-4000-8000-000000000009".into(),
             machine_uuid: Some("01234567-89ab-cdef-0123-456789abcdee".into()),
+            remove_source_alias: true,
         };
         let mut journal = DeferredShareCleanupState::default();
         journal.entries.insert(

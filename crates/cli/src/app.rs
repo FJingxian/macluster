@@ -801,11 +801,31 @@ fn remote_command(
         },
     )?;
     if command == "submit" {
+        crate::client_context::stage_current_binary_for_remote_profile(&profile).map_err(
+            |error| {
+                (
+                    1,
+                    format!(
+                        "could not sync the current macluster CLI to the controller before submission: {error}"
+                    ),
+                )
+            },
+        )?;
         run_remote_submit_preflight(&profile)?;
     }
     let ensure_client_storage = remote_command_requires_client_storage(command, args);
     let mut remote = crate::client_context::RemoteContext::connect(profile, ensure_client_storage)
         .map_err(|error| (1, error))?;
+    if command == "node" && remote_node_command_requires_binary_sync(args) {
+        crate::client_context::stage_current_binary_for_remote_profile(&remote.profile).map_err(
+            |error| {
+                (
+                    1,
+                    format!("could not sync the current macluster CLI to the controller: {error}"),
+                )
+            },
+        )?;
+    }
     match command {
         "submit" => remote_submit(&mut remote, args),
         "queue" if queue_uses_remote_cli(args) => {
@@ -940,6 +960,15 @@ fn run_remote_cli(
     }
 }
 
+fn remote_node_command_requires_binary_sync(args: &[String]) -> bool {
+    args.first().is_some_and(|argument| {
+        matches!(
+            argument.as_str(),
+            "-mount" | "--mount" | "-umount" | "--umount" | "-migrate" | "--migrate"
+        )
+    })
+}
+
 fn job_uses_remote_cli(args: &[String]) -> bool {
     args.iter()
         .any(|argument| matches!(argument.as_str(), "--log" | "--metrics"))
@@ -977,10 +1006,31 @@ fn remote_submit(
         ));
     }
     let options = promote_inline_command(parse_submit_args(args).map_err(cli_error)?);
+    let config = remote.submission_config();
+    let current_dir = env::var_os("PWD")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| env::current_dir().ok());
+    let inherited_env = env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect::<BTreeMap<_, _>>();
+    let smb_candidates = smb_shares_referenced_by_submit_options(
+        &config,
+        &options,
+        current_dir.as_deref(),
+        &inherited_env,
+    );
+    if !smb_candidates.is_empty() {
+        crate::client_storage::ensure_required_smb_mounts(
+            &remote.descriptor,
+            Some(&smb_candidates),
+            &remote.profile.nfs_client_ip,
+        )
+        .map_err(|error| (1, error))?;
+    }
     if options.interactive {
-        let config = remote.submission_config();
         let (spec, _) = build_submission(&config, &options)?;
-        crate::client_storage::verify_client_mounts(
+        crate::client_storage::ensure_required_smb_mounts(
             &remote.descriptor,
             spec.required_shares.as_deref(),
             &remote.profile.nfs_client_ip,
@@ -1024,9 +1074,8 @@ fn remote_submit(
             Err((code, "remote interactive job failed".into()))
         };
     }
-    let config = remote.submission_config();
     let (mut spec, script) = build_submission(&config, &options)?;
-    crate::client_storage::verify_client_mounts(
+    crate::client_storage::ensure_required_smb_mounts(
         &remote.descriptor,
         spec.required_shares.as_deref(),
         &remote.profile.nfs_client_ip,
@@ -1389,6 +1438,14 @@ fn controller_build_mismatch(global: &GlobalOptions, state_dir: &Path) -> bool {
 }
 
 fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
+    if command == "node"
+        && (args.is_empty()
+            || args
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "-h" | "--help")))
+    {
+        return false;
+    }
     if command == "controller"
         && args
             .iter()
@@ -1476,6 +1533,14 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
     if matches!(command, "internal" | "agent" | "init") || is_node_network_scan(command, args) {
+        return false;
+    }
+    if command == "node"
+        && (args.is_empty()
+            || args
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "-h" | "--help")))
+    {
         return false;
     }
     if command == "fans"
@@ -3253,6 +3318,79 @@ fn build_submission(
     Ok((spec, script))
 }
 
+fn smb_shares_referenced_by_submit_options(
+    config: &ClusterConfig,
+    options: &SubmitOptions,
+    current_dir: Option<&Path>,
+    inherited_env: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let mut path_hints = current_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut text_hints = Vec::<String>::new();
+    if let Some(command) = options.wrap.as_deref() {
+        text_hints.push(command.to_owned());
+    }
+    text_hints.extend(options.env.values().cloned());
+    text_hints.extend(inherited_env.values().cloned());
+
+    for path in [
+        options.cwd.as_deref(),
+        options.script.as_deref(),
+        options.stdout_path.as_deref(),
+        options.stderr_path.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        text_hints.push(path.to_string_lossy().into_owned());
+        if let Some(path) = submission_path_hint(path, current_dir, home.as_deref()) {
+            path_hints.push(path);
+        }
+    }
+
+    config
+        .shares
+        .iter()
+        .filter_map(|(share_id, share)| {
+            if share.protocol != macluster_core::storage_uri::StorageProtocol::Smb {
+                return None;
+            }
+            let referenced = [&share.mount_root, &share.source_root].iter().any(|root| {
+                path_hints
+                    .iter()
+                    .any(|candidate| candidate == *root || candidate.starts_with(root))
+                    || text_hints
+                        .iter()
+                        .any(|text| text_contains_path_token(text, root.to_string_lossy().as_ref()))
+            });
+            referenced.then(|| share_id.clone())
+        })
+        .collect()
+}
+
+fn submission_path_hint(
+    path: &Path,
+    current_dir: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let text = path.to_string_lossy();
+    let expanded = if let Some(rest) = text.strip_prefix("~/") {
+        home?.join(rest)
+    } else if text == "~" {
+        home?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    if expanded.is_absolute() {
+        Some(expanded)
+    } else {
+        current_dir.map(|current_dir| current_dir.join(expanded))
+    }
+}
+
 fn promote_inline_command(mut options: SubmitOptions) -> SubmitOptions {
     let Some(script) = options.script.as_ref() else {
         return options;
@@ -3866,7 +4004,7 @@ fn validate_active_environment(config: &ClusterConfig, raw_prefix: &Path) -> App
         return Err((
             2,
             format!(
-                "active environment {} is outside every configured shared path; register it with `mnode -a local:PATH --share-id ID --mount-root PATH`",
+                "active environment {} is outside every configured shared path; mount its software root with `mnode -mount nfs://LOGIN_NODE/PATH --mount-root PATH`",
                 raw_prefix.display()
             ),
         ));
@@ -4934,7 +5072,7 @@ fn unshared_build_path_error(variable: &str, path: &Path) -> (i32, String) {
     (
         2,
         format!(
-            "build environment variable {variable} references unshared path {}; register its software/toolchain root with `mnode -a local:PATH --share-id ID --mount-root PATH`",
+            "build environment variable {variable} references unshared path {}; mount its software/toolchain root with `mnode -mount nfs://LOGIN_NODE/PATH --mount-root PATH`",
             path.display()
         ),
     )
@@ -8456,8 +8594,18 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             Ok(())
         }
         Some("claim-agent") => {
-            let node_id = option_value(args, "--node")?
+            let _node_id = option_value(args, "--node")?
                 .ok_or_else(|| (2, "claim-agent requires --node".into()))?;
+            let namespace = option_value(args, "--share-id")?
+                .ok_or_else(|| (2, "claim-agent requires --share-id".into()))?;
+            let expected_machine_uuid = option_value(args, "--machine-uuid")?
+                .ok_or_else(|| (2, "claim-agent requires --machine-uuid".into()))?;
+            Id128::parse(&expected_machine_uuid)
+                .map_err(|error| (2, format!("claim-agent machine UUID is invalid: {error}")))?;
+            let expected_execution_uid = option_value(args, "--execution-uid")?
+                .ok_or_else(|| (2, "claim-agent requires --execution-uid".into()))?
+                .parse::<u32>()
+                .map_err(|_| (2, "claim-agent execution UID must be an integer".into()))?;
             let uuid = option_value(args, "--controller")?
                 .ok_or_else(|| (2, "claim-agent requires --controller".into()))?;
             let epoch = option_value(args, "--epoch")?
@@ -8470,21 +8618,23 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                 ),
                 epoch,
             };
-            let config = load_config(global.config.as_deref()).map_err(config_error)?;
-            let node = config
-                .nodes
-                .get(&node_id)
-                .ok_or_else(|| (2, "claim-agent node is absent from config".into()))?;
-            macluster_agent::validate_node_identity(
-                node,
-                &local_machine_uuid().map_err(|error| (1, error))?,
-                unsafe { libc::geteuid() },
-            )
-            .map_err(|error| (1, error))?;
+            let actual_machine_uuid = local_machine_uuid().map_err(|error| (1, error))?;
+            if !expected_machine_uuid.eq_ignore_ascii_case(&actual_machine_uuid) {
+                return Err((
+                    1,
+                    "machine UUID does not match the registered node identity".into(),
+                ));
+            }
+            if expected_execution_uid != unsafe { libc::geteuid() } {
+                return Err((
+                    1,
+                    "execution UID does not match the registered node identity".into(),
+                ));
+            }
             let state = global
                 .state_dir
                 .unwrap_or_else(macluster_agent::default_state_dir);
-            macluster_agent::admin::claim_idle(&state, controller, &config.share_uuid)
+            macluster_agent::admin::claim_idle(&state, controller, &namespace)
                 .map_err(|error| (1, error.to_string()))
         }
         Some("archive-agent-state") => {
@@ -9243,7 +9393,8 @@ mod tests {
         required_named_shares, sampled_node_belongs_in_cluster_rows, selected_local_node_id,
         should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
         should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
+        smb_shares_referenced_by_submit_options, submission_must_wait_for_agent_update,
+        visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -9397,6 +9548,26 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
+    fn pre_submission_smb_detection_finds_a_share_used_as_a_command_argument() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\ndefault_queue=\"default\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\n[nodes.nas-01]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.external-disk]\nprotocol=\"smb\"\nserver=\"nas-01\"\nsource_root=\"/external-disk\"\nmount_root=\"/Volumes/external-disk\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n",
+        )
+        .unwrap();
+        let options = promote_inline_command(
+            crate::arguments::parse_submit_args(["-Is", "ls", "/Volumes/external-disk"]).unwrap(),
+        );
+
+        let shares = smb_shares_referenced_by_submit_options(
+            &config,
+            &options,
+            Some(Path::new("/Users/operator/project")),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(shares, ["external-disk"]);
+    }
+
+    #[test]
     fn generic_share_path_is_not_required_by_an_unrelated_env_substring() {
         let config = ClusterConfig::parse(
             "[cluster]\nname=\"test\"\ndefault_queue=\"default\"\nlogin_node=\"login\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.default]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.2\"\ntransport=\"ssh\"\n[nodes.nas-01]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.nas-data]\nprotocol=\"smb\"\nserver=\"nas-01\"\nsource_root=\"/data\"\nmount_root=\"/Users/Shared/nas-data\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n",
@@ -9525,12 +9696,17 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
                 "{command} {args:?} must bypass build preflight"
             );
         }
-        for command in ["submit", "kill", "node", "controller"] {
+        for command in ["submit", "kill", "controller"] {
             assert!(
                 should_preflight_agent_update(command, &[]),
                 "{command} must run build preflight"
             );
         }
+        assert!(
+            !should_preflight_agent_update("node", &[]),
+            "bare mnode should print help without validating or updating the cluster"
+        );
+        assert!(!super::should_refresh_node_addresses("node", &[]));
         for command in ["job", "queue"] {
             assert!(
                 !should_preflight_agent_update(command, &[]),
@@ -9597,6 +9773,22 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
+    fn remote_storage_mutations_require_the_current_controller_cli() {
+        for flag in ["-mount", "--mount", "-umount", "--umount", "-migrate"] {
+            assert!(
+                super::remote_node_command_requires_binary_sync(&[flag.into()]),
+                "remote node operation {flag} must use the current CLI build"
+            );
+        }
+        for flag in ["-l", "--list", "--failed", "--scan"] {
+            assert!(
+                !super::remote_node_command_requires_binary_sync(&[flag.into()]),
+                "read-only node operation {flag} should not stage a CLI binary"
+            );
+        }
+    }
+
+    #[test]
     fn controller_migration_uses_its_own_target_preflight() {
         assert!(!should_preflight_agent_update(
             "node",
@@ -9637,11 +9829,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             "node",
             &[
                 "-a".into(),
-                "local:/Users/test/share".into(),
-                "--share-id".into(),
-                "data".into(),
-                "--mount-root".into(),
-                "/Users/test/share".into(),
+                "local".into(),
                 "--host".into(),
                 "192.0.2.9".into(),
             ],

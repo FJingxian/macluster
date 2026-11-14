@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -558,6 +558,7 @@ pub(crate) struct CredentialPlan {
     pub credential: StoredSmbCredential,
     pub newly_created: bool,
     pub report: ProvisionReport,
+    pub helper_ready_nodes: BTreeSet<String>,
 }
 
 pub(crate) fn ensure_smb_mount_credential(
@@ -596,6 +597,7 @@ pub(crate) fn ensure_smb_mount_credential(
     let _ = local_node;
     let nodes = crate::node_admin::smb_credential_nodes(&config, uri.server.as_str());
     let helper_operation = Id128::random().to_string();
+    let mut helper_ready_nodes = BTreeSet::new();
     for (node_id, node) in &nodes {
         if node.transport == Transport::Ssh && !crate::node_admin::node_ssh_endpoint_reachable(node)
         {
@@ -616,6 +618,7 @@ pub(crate) fn ensure_smb_mount_credential(
                 ),
             )
         })?;
+        helper_ready_nodes.insert(node_id.to_string());
     }
     let prompt = TerminalPasswordPrompt;
     let authenticator = PtySmbAuthenticator {
@@ -623,7 +626,7 @@ pub(crate) fn ensure_smb_mount_credential(
     };
     let master = CredentialHelperClient::system();
     let distributor = SshCredentialDistributor;
-    ensure_smb_mount_credential_with(
+    let mut plan = ensure_smb_mount_credential_with(
         &config,
         uri,
         account,
@@ -634,7 +637,9 @@ pub(crate) fn ensure_smb_mount_credential(
         &master,
         &distributor,
     )
-    .map_err(|error| (1, error.to_string()))
+    .map_err(|error| (1, error.to_string()))?;
+    plan.helper_ready_nodes = helper_ready_nodes;
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -738,6 +743,7 @@ fn ensure_smb_mount_credential_with(
         credential,
         newly_created,
         report,
+        helper_ready_nodes: BTreeSet::new(),
     })
 }
 

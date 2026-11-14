@@ -308,7 +308,7 @@ fn revoke_script(public_key: &str) -> String {
     )
 }
 
-fn routine_ssh_args(profile: &ClientProfile, tty: bool) -> Vec<String> {
+pub(crate) fn routine_ssh_args(profile: &ClientProfile, tty: bool) -> Vec<String> {
     let mut args = vec![
         if tty { "-tt".into() } else { "-T".into() },
         "-oLogLevel=ERROR".into(),

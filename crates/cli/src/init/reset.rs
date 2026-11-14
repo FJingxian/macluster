@@ -905,7 +905,7 @@ impl ResetPlan {
                 &share.share_uuid,
                 share_id,
             );
-            if share.source_root != share.mount_root {
+            if server.transport != Transport::Storage && share.source_root != share.mount_root {
                 plan.aliases.push(AliasSpec {
                     server_id: share.server.to_string(),
                     server: server.clone(),
@@ -1250,7 +1250,7 @@ impl ResetPlan {
                         share_uuid,
                         &share_id,
                     );
-                    if source_root != mount_root {
+                    if server.transport != Transport::Storage && source_root != mount_root {
                         self.aliases.push(AliasSpec {
                             server_id: server_id.clone(),
                             server: server.clone(),
@@ -1300,13 +1300,15 @@ impl ResetPlan {
             source_root.to_path_buf(),
             share_uuid.to_owned(),
         );
-        self.markers.entry(key).or_insert_with(|| MarkerSpec {
-            server_id: server_id.to_owned(),
-            server: server.clone(),
-            source_root: source_root.to_path_buf(),
-            share_uuid: share_uuid.to_owned(),
-            label: label.to_owned(),
-        });
+        if server.transport != Transport::Storage {
+            self.markers.entry(key).or_insert_with(|| MarkerSpec {
+                server_id: server_id.to_owned(),
+                server: server.clone(),
+                source_root: source_root.to_path_buf(),
+                share_uuid: share_uuid.to_owned(),
+                label: label.to_owned(),
+            });
+        }
         for (node_id, node) in &self.nodes {
             if node_id == server_id {
                 continue;
@@ -1320,19 +1322,21 @@ impl ResetPlan {
                 mount_root: mount_root.to_path_buf(),
                 label: label.to_owned(),
             });
-            self.exports
-                .entry(server_id.to_owned())
-                .or_insert_with(|| ExportGroup {
-                    server: server.clone(),
-                    specs: Vec::new(),
-                })
-                .specs
-                .push(ManagedExportSpec {
-                    share_uuid: share_uuid.to_owned(),
-                    node_id: node_id.clone(),
-                    source_root: source_root.to_string_lossy().into_owned(),
-                    client_ip: node.host.clone(),
-                });
+            if server.transport != Transport::Storage {
+                self.exports
+                    .entry(server_id.to_owned())
+                    .or_insert_with(|| ExportGroup {
+                        server: server.clone(),
+                        specs: Vec::new(),
+                    })
+                    .specs
+                    .push(ManagedExportSpec {
+                        share_uuid: share_uuid.to_owned(),
+                        node_id: node_id.clone(),
+                        source_root: source_root.to_string_lossy().into_owned(),
+                        client_ip: node.host.clone(),
+                    });
+            }
         }
     }
 
@@ -1373,7 +1377,7 @@ impl ResetPlan {
                     mount_root: share.mount_root.clone(),
                     label: share_id.clone(),
                 });
-                if share.source_root != share.mount_root {
+                if server.transport != Transport::Storage && share.source_root != share.mount_root {
                     self.aliases.push(AliasSpec {
                         server_id: node_id.to_owned(),
                         server: node.clone(),

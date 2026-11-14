@@ -73,6 +73,8 @@ use crate::nfs_recovery::{NFS_MOUNT_LOCK_PATH, NFS_MOUNT_OPTIONS, NFS_MOUNT_TIME
 pub(crate) type AppResult<T> = Result<T, (i32, String)>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REMOTE_FACTS_SSH_ATTEMPTS: usize = 2;
+const REMOTE_FACTS_SSH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const NFS_SOURCE_PREFLIGHT_LIMIT: Duration = Duration::from_secs(5);
 const MAINTENANCE_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const NFS_EXPORTS_PATH: &str = "/etc/exports";
@@ -6176,11 +6178,36 @@ fn remote_node_check(node: &NodeConfig, node_id: &str) -> AppResult<NodeCheck> {
 
 pub(crate) fn read_remote_facts(node: &NodeConfig) -> AppResult<RemoteFacts> {
     let command = "printf 'OS='; /usr/bin/uname -s; printf 'ARCH='; /usr/bin/uname -m; printf 'VERSION='; /usr/bin/sw_vers -productVersion; printf 'UID='; /usr/bin/id -u; printf 'GID='; /usr/bin/id -g; printf 'HOME='; /usr/bin/printenv HOME; printf 'FREE_KB='; /bin/df -Pk \"$HOME\" | /usr/bin/tail -1 | /usr/bin/awk '{print $4}'";
-    let output = ssh_output(node, command, None)?;
+    let output = remote_facts_ssh_output(node, command)?;
     if !output.status.success() {
         return Err((1, command_error("SSH preflight failed", &output)));
     }
     parse_remote_facts(&output)
+}
+
+fn remote_facts_ssh_output(node: &NodeConfig, command: &str) -> AppResult<Output> {
+    for attempt in 0..REMOTE_FACTS_SSH_ATTEMPTS {
+        let output = ssh_output(node, command, None)?;
+        if attempt + 1 == REMOTE_FACTS_SSH_ATTEMPTS || !ssh_preflight_kex_reset(&output) {
+            return Ok(output);
+        }
+        thread::sleep(REMOTE_FACTS_SSH_RETRY_DELAY);
+    }
+    unreachable!("remote facts SSH attempts always return on the final attempt")
+}
+
+fn ssh_preflight_kex_reset(output: &Output) -> bool {
+    if output.status.code() != Some(255) {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    [
+        "kex_exchange_identification:",
+        "connection reset by peer",
+        "connection closed by remote host",
+    ]
+    .iter()
+    .any(|reason| stderr.contains(reason))
 }
 
 fn parse_remote_facts(output: &Output) -> AppResult<RemoteFacts> {
@@ -24000,7 +24027,7 @@ mod tests {
         net::TcpListener,
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
-        process::{Command, Stdio},
+        process::{Command, Output, Stdio},
         sync::{Arc, Mutex},
         thread,
         time::Duration,
@@ -25832,6 +25859,101 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
         assert!(
             args.iter().all(|arg| !arg.starts_with("-oControl")),
             "{args:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_preflight_retries_only_pre_auth_transport_resets() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(255 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert!(super::ssh_preflight_kex_reset(&output(
+            "kex_exchange_identification: read: Connection reset by peer"
+        )));
+        assert!(super::ssh_preflight_kex_reset(&output(
+            "Connection closed by remote host"
+        )));
+        assert!(!super::ssh_preflight_kex_reset(&output(
+            "Permission denied (publickey,password,keyboard-interactive)."
+        )));
+        assert!(!super::ssh_preflight_kex_reset(&output(
+            "Host key verification failed."
+        )));
+    }
+
+    #[test]
+    fn remote_facts_preflight_retries_a_transient_ssh_handshake_reset() {
+        use std::{
+            os::fd::AsRawFd,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_accepted = accepted.clone();
+        let server_stop = stop.clone();
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        server_accepted.fetch_add(1, Ordering::AcqRel);
+                        let reset = libc::linger {
+                            l_onoff: 1,
+                            l_linger: 0,
+                        };
+                        unsafe {
+                            libc::setsockopt(
+                                stream.as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_LINGER,
+                                &reset as *const _ as *const libc::c_void,
+                                std::mem::size_of_val(&reset) as libc::socklen_t,
+                            );
+                        }
+                        drop(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let node = NodeConfig {
+            host: "127.0.0.1".into(),
+            transport: Transport::Ssh,
+            remote_binary: "macluster".into(),
+            ssh_user: Some("tester".into()),
+            ssh_port: Some(port),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+
+        let result = super::read_remote_facts(&node);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+
+        let (_, error) = result.expect_err("the test SSH endpoint always resets its connection");
+        assert!(
+            error.contains("kex_exchange_identification")
+                || error.contains("Connection reset by peer")
+                || error.contains("Connection closed by remote host"),
+            "unexpected SSH failure: {error}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::Acquire),
+            2,
+            "retry a transient pre-auth SSH reset once, then fail promptly"
         );
     }
 

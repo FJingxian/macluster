@@ -242,7 +242,7 @@ impl SmbCredentialOperation {
                 key.validate()?;
                 validate_smb_mount_source(key, source)?;
                 validate_smb_mount_target(target)?;
-                validate_smb_logical_alias(logical, logical_target)
+                validate_smb_logical_alias(logical, logical_target, target)
             }
             Self::UnmountSmb {
                 target,
@@ -251,7 +251,7 @@ impl SmbCredentialOperation {
                 force: _,
             } => {
                 validate_smb_mount_target(target)?;
-                validate_smb_logical_alias(logical, logical_target)
+                validate_smb_logical_alias(logical, logical_target, target)
             }
         }
     }
@@ -342,6 +342,8 @@ pub enum SmbCredentialValidationError {
     InvalidMountSource,
     #[error("SMB mount target is outside the managed mount directory")]
     InvalidMountTarget,
+    #[error("SMB logical alias must be a safe path under /Users or /Volumes")]
+    InvalidLogicalAlias,
 }
 
 fn validate_smb_mount_source(
@@ -354,11 +356,9 @@ fn validate_smb_mount_source(
         .ok_or(SmbCredentialValidationError::InvalidMountSource)?;
     if remainder.is_empty()
         || source.len() > 1024
-        || remainder.starts_with('/')
-        || remainder.ends_with('/')
-        || remainder.contains("//")
-        || remainder.contains("/../")
-        || remainder.ends_with("/..")
+        || remainder
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
         || remainder.bytes().any(|byte| byte.is_ascii_control())
     {
         return Err(SmbCredentialValidationError::InvalidMountSource);
@@ -372,6 +372,8 @@ fn validate_smb_mount_target(target: &str) -> Result<(), SmbCredentialValidation
         .strip_prefix(PREFIX)
         .ok_or(SmbCredentialValidationError::InvalidMountTarget)?;
     if name.is_empty()
+        || name == "."
+        || name == ".."
         || target.len() > 1024
         || name.contains('/')
         || !name
@@ -383,26 +385,69 @@ fn validate_smb_mount_target(target: &str) -> Result<(), SmbCredentialValidation
     Ok(())
 }
 
+fn validate_smb_logical_target(
+    target: &str,
+    mount_target: &str,
+) -> Result<(), SmbCredentialValidationError> {
+    const PREFIX: &str = "/Users/Shared/.macluster-mounts/";
+    let remainder = target
+        .strip_prefix(PREFIX)
+        .ok_or(SmbCredentialValidationError::InvalidLogicalAlias)?;
+    let managed_mount_name = mount_target
+        .strip_prefix(PREFIX)
+        .ok_or(SmbCredentialValidationError::InvalidMountTarget)?;
+    let (mount_name, subpath) = remainder
+        .split_once('/')
+        .map_or((remainder, None), |(mount_name, subpath)| {
+            (mount_name, Some(subpath))
+        });
+    if remainder.is_empty()
+        || target.len() > 1024
+        || mount_name != managed_mount_name
+        || subpath.is_some_and(|subpath| {
+            subpath.is_empty()
+                || subpath
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == "..")
+        })
+        || target.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(SmbCredentialValidationError::InvalidLogicalAlias);
+    }
+    if mount_name.is_empty()
+        || mount_name == "."
+        || mount_name == ".."
+        || !mount_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(SmbCredentialValidationError::InvalidLogicalAlias);
+    }
+    Ok(())
+}
+
 fn validate_smb_logical_alias(
     logical: &str,
     logical_target: &str,
+    mount_target: &str,
 ) -> Result<(), SmbCredentialValidationError> {
     if logical == logical_target {
-        return Ok(());
+        return validate_smb_logical_target(logical_target, mount_target);
     }
     let remainder = logical
         .strip_prefix("/Users/")
-        .ok_or(SmbCredentialValidationError::InvalidMountTarget)?;
+        .or_else(|| logical.strip_prefix("/Volumes/"))
+        .ok_or(SmbCredentialValidationError::InvalidLogicalAlias)?;
     if remainder.is_empty()
         || logical.len() > 1024
-        || logical.contains("//")
-        || remainder.contains("/../")
-        || remainder.ends_with("/..")
+        || remainder
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
         || logical.bytes().any(|byte| byte.is_ascii_control())
     {
-        return Err(SmbCredentialValidationError::InvalidMountTarget);
+        return Err(SmbCredentialValidationError::InvalidLogicalAlias);
     }
-    validate_smb_mount_target(logical_target)
+    validate_smb_logical_target(logical_target, mount_target)
 }
 
 fn validate_account(account: &str) -> Result<(), SmbCredentialValidationError> {
@@ -539,6 +584,42 @@ mod tests {
         };
         assert!(wrong_target.validate().is_err());
 
+        let traversal_mount_target = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/..".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/..".into(),
+        };
+        assert!(traversal_mount_target.validate().is_err());
+
+        let traversal_logical_target = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/..".into(),
+        };
+        assert!(traversal_logical_target.validate().is_err());
+
+        let traversal_source = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/../etc".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(traversal_source.validate().is_err());
+
+        let unrelated_logical_target = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Users/operator/data".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-2/private".into(),
+        };
+        assert!(unrelated_logical_target.validate().is_err());
+
         let wrong_alias = SmbCredentialOperation::MountSmb {
             key: key(),
             source: "//smb-user@192.0.2.20/Partition_2".into(),
@@ -548,6 +629,42 @@ mod tests {
         };
         assert!(wrong_alias.validate().is_err());
 
+        let unsafe_direct_alias = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/Partition_2".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/tmp/data".into(),
+            logical_target: "/tmp/data".into(),
+        };
+        assert!(unsafe_direct_alias.validate().is_err());
+
+        let volumes_alias = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/cluster-user".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Volumes/cluster-user".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(volumes_alias.validate().is_ok());
+
+        let volumes_subpath_alias = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/data/project".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Volumes/data/project".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1/project".into(),
+        };
+        assert!(volumes_subpath_alias.validate().is_ok());
+
+        let system_alias = SmbCredentialOperation::MountSmb {
+            key: key(),
+            source: "//smb-user@192.0.2.20/cluster-user".into(),
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/etc/cluster-user".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+        };
+        assert!(system_alias.validate().is_err());
+
         let unmount = SmbCredentialOperation::UnmountSmb {
             target: "/Users/Shared/.macluster-mounts/share-1".into(),
             logical: "/Users/operator/data".into(),
@@ -555,6 +672,14 @@ mod tests {
             force: false,
         };
         assert!(unmount.validate().is_ok());
+
+        let volumes_unmount = SmbCredentialOperation::UnmountSmb {
+            target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            logical: "/Volumes/cluster-user".into(),
+            logical_target: "/Users/Shared/.macluster-mounts/share-1".into(),
+            force: false,
+        };
+        assert!(volumes_unmount.validate().is_ok());
     }
 
     #[test]

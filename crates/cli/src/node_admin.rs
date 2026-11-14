@@ -18238,6 +18238,41 @@ fn smb_existing_mount_awk_script() -> &'static str {
     }"#
 }
 
+fn smb_mount_request(
+    cluster_uuid: &str,
+    share: &ShareConfig,
+    server: &NodeConfig,
+) -> AppResult<SmbCredentialRequest> {
+    let (share_name, full) = smb_share_parts(share)?;
+    let smb_user = share.smb_user.as_deref().ok_or_else(|| {
+        (
+            2,
+            "SMB share has no configured account; rerun mnode -mount with --smb-user".into(),
+        )
+    })?;
+    let physical_path = smb_backing_path(&share.share_uuid);
+    let logical_path = share.mount_root.clone();
+    let (_, subpath) = full.split_once('/').unwrap_or((full.as_str(), ""));
+    Ok(SmbCredentialRequest::new(
+        SmbCredentialOperation::MountSmb {
+            key: SmbCredentialKey {
+                cluster_uuid: Id128::parse(cluster_uuid).map_err(|error| (2, error.to_string()))?,
+                server_id: share.server.clone(),
+                server_host: server.host.clone(),
+                account: smb_user.to_owned(),
+            },
+            source: format!("//{smb_user}@{}/{}", server.host, share_name),
+            target: physical_path.to_string_lossy().into_owned(),
+            logical: logical_path.to_string_lossy().into_owned(),
+            logical_target: if subpath.is_empty() {
+                physical_path.to_string_lossy().into_owned()
+            } else {
+                physical_path.join(subpath).to_string_lossy().into_owned()
+            },
+        },
+    ))
+}
+
 fn smb_mount_script(
     cluster_uuid: &str,
     share: &ShareConfig,
@@ -18273,23 +18308,7 @@ fn smb_mount_script(
         share.source_root.display(),
         share.mount_root.display()
     );
-    let key = SmbCredentialKey {
-        cluster_uuid: Id128::parse(cluster_uuid).map_err(|error| (2, error.to_string()))?,
-        server_id: share.server.clone(),
-        server_host: server.host.clone(),
-        account: smb_user.to_owned(),
-    };
-    let mount_request = SmbCredentialRequest::new(SmbCredentialOperation::MountSmb {
-        key,
-        source: source_value,
-        target: physical_path.to_string_lossy().into_owned(),
-        logical: logical_path.to_string_lossy().into_owned(),
-        logical_target: if subpath.is_empty() {
-            physical_path.to_string_lossy().into_owned()
-        } else {
-            physical_path.join(subpath).to_string_lossy().into_owned()
-        },
-    });
+    let mount_request = smb_mount_request(cluster_uuid, share, server)?;
     let mount_request = shell_quote(
         &serde_json::to_string(&mount_request)
             .map_err(|error| (1, format!("cannot encode SMB mount request: {error}")))?,
@@ -28053,6 +28072,25 @@ execution_uid = 501
             allow_existing_contents: false,
             smb_user: Some("smb-user".into()),
         };
+        let request =
+            super::smb_mount_request("00000000-0000-4000-8000-000000000001", &share, &server)
+                .unwrap();
+        request.validate().unwrap();
+        let macluster_protocol::smb_credential::SmbCredentialOperation::MountSmb {
+            target,
+            logical,
+            logical_target,
+            ..
+        } = request.operation
+        else {
+            panic!("expected an SMB mount request");
+        };
+        assert_eq!(
+            target,
+            "/Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7"
+        );
+        assert_eq!(logical, "/Volumes/project");
+        assert_eq!(logical_target, format!("{target}/project"));
         let script =
             super::smb_mount_script("00000000-0000-4000-8000-000000000001", &share, &server)
                 .unwrap();

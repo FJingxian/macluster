@@ -30,6 +30,14 @@ fn main() {
 
 fn source_build_id(workspace: &Path, version: &str) -> String {
     let files = tracked_source_files(workspace).unwrap_or_else(|| source_files(workspace));
+    // The build identity is a content hash of these files. Cargo's directory
+    // change tracking is not recursive on every supported toolchain, so emit
+    // a watch for each hashed source file as well as the workspace-level
+    // directories registered in main(). Without this, nested source changes
+    // can rebuild a binary that still advertises the previous build identity.
+    for file in &files {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     hash_bytes(&mut hash, version.as_bytes());
     for file in files {

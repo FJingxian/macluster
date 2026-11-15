@@ -386,6 +386,23 @@ fn remount_with_managed_io_options(
         ],
     );
     if let Err(error) = unmount {
+        if is_mount_lock_busy_error(&error) {
+            return match named_share_mount_status(
+                &execute("/sbin/mount", &[])?,
+                source,
+                &target.to_string_lossy(),
+            ) {
+                NamedShareMountStatus::Expected => Ok(false),
+                NamedShareMountStatus::NotMounted => Err(format!(
+                    "cannot safely upgrade NFS mount {} while another recovery holds the mount lock: {error}",
+                    target.display()
+                )),
+                NamedShareMountStatus::MountedElsewhere(other) => Err(format!(
+                    "mount point {} changed to {other} while upgrading NFS options",
+                    target.display()
+                )),
+            };
+        }
         if !is_mount_busy_error(&error) {
             return Err(format!(
                 "cannot safely upgrade NFS mount {}: {error}",
@@ -507,6 +524,12 @@ fn is_mount_busy_error(error: &str) -> bool {
     ["resource busy", "device busy", "mount point is busy"]
         .iter()
         .any(|needle| error.contains(needle))
+}
+fn is_mount_lock_busy_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("already locked")
+        || error.contains("timed out waiting for lock")
+        || (error.contains("lockf") && error.contains("resource temporarily unavailable"))
 }
 fn recreate_empty_mountpoint(
     source: &str,
@@ -1494,6 +1517,34 @@ mod tests {
 
         assert_eq!(unmount_attempts, 1, "try one ordinary unmount");
         assert_eq!(mount_attempts, 0, "do not mount over an in-use filesystem");
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn helper_refresh_continues_when_another_recovery_holds_the_mount_lock() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-lock-held-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let source = "192.0.2.1:/data";
+        let result = refresh_if_not_responding(source, &target, false, &mut |program, _args| {
+            match program {
+                "/sbin/mount" => Ok(format!("{source} on {} (nfs)\n", target.display())),
+                "/usr/bin/nfsstat" => Ok(format!(
+                    "{} from {source}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=8192,wsize=8192,readahead=16\n  Status flags: 0x0\n",
+                    target.display()
+                )),
+                "/usr/bin/lockf" => Err(format!("lockf: {NFS_MOUNT_LOCK_PATH}: already locked")),
+                _ => panic!("unexpected command {program}"),
+            }
+        });
+
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "a competing periodic recovery must defer only the I/O remount, not helper refresh"
+        );
         fs::remove_dir(target).unwrap();
     }
 

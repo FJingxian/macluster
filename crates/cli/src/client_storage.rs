@@ -743,7 +743,9 @@ mod tests {
         assert!(script.contains("192.0.2.1:/Users/Shared/macluster"));
         assert!(script.contains("192.0.2.1:/opt/homebrew"));
         assert!(script.contains("/Library/LaunchDaemons/org.macluster.client-mount."));
-        assert!(script.contains("/sbin/mount_nfs -o resvport"));
+        assert!(script.contains(
+            "/sbin/mount_nfs -o tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
+        ));
     }
 
     #[test]

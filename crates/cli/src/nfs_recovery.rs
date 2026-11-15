@@ -17,10 +17,15 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-11";
+const SERVICE_VERSION: &str = "nfs-recovery-12";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
-pub(crate) const NFS_MOUNT_OPTIONS: &str = "resvport,intr,rsize=8192,wsize=8192";
+// Verified on the Thunderbolt bridge: 64 KiB I/O with a 128-request read-ahead
+// window materially improves large sequential NFS reads over the old 8 KiB
+// defaults. Keep TCP explicit but allow the client and storage server to
+// negotiate the NFS version, preserving compatibility with v4-only providers.
+pub(crate) const NFS_MOUNT_OPTIONS: &str =
+    "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -265,6 +270,124 @@ fn nfs_mount_is_not_responding(output: &str, target: &Path) -> bool {
     }
     false
 }
+fn nfs_mount_parameters(output: &str, target: &Path) -> Option<String> {
+    let prefix = format!("{} from ", target.display());
+    let mut in_target = false;
+    let mut in_current_parameters = false;
+    let mut parameters = String::new();
+    for line in output.lines() {
+        if line.contains(" from ") {
+            in_target = line.starts_with(&prefix);
+            in_current_parameters = false;
+            continue;
+        }
+        if !in_target {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("Current mount parameters:") {
+            in_current_parameters = true;
+            parameters.push_str(rest);
+            continue;
+        }
+        if in_current_parameters {
+            let line = line.trim();
+            if line.starts_with("Status flags:") || line.starts_with("--") {
+                break;
+            }
+            if !line.is_empty() {
+                parameters.push(' ');
+                parameters.push_str(line);
+            }
+        }
+    }
+    (!parameters.trim().is_empty()).then_some(parameters)
+}
+
+fn nfs_mount_needs_io_upgrade(output: &str, target: &Path) -> bool {
+    let Some(parameters) = nfs_mount_parameters(output, target) else {
+        // Unknown `nfsstat` layouts are not a reason to disturb an otherwise
+        // healthy mount. New mounts still receive the managed options below.
+        return false;
+    };
+    let has_option = |expected: &str| {
+        parameters
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .any(|option| option == expected)
+    };
+    !["rsize=65536", "wsize=65536", "readahead=128"]
+        .into_iter()
+        .all(has_option)
+}
+
+fn remount_with_managed_io_options(
+    source: &str,
+    target: &Path,
+    allow_existing_contents: bool,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
+) -> Result<bool, String> {
+    let target_text = target.to_string_lossy();
+    let unmount = execute(
+        "/usr/bin/lockf",
+        &[
+            "-t",
+            NFS_MOUNT_TIMEOUT_SECS,
+            "-k",
+            "-w",
+            NFS_MOUNT_LOCK_PATH,
+            "/sbin/umount",
+            &target_text,
+        ],
+    );
+    if let Err(error) = unmount {
+        if !is_mount_busy_error(&error) {
+            return Err(format!(
+                "cannot safely upgrade NFS mount {}: {error}",
+                target.display()
+            ));
+        }
+        // An active job or open file still uses this mount. Leave it intact;
+        // the LaunchDaemon will retry after it becomes idle. Never use -f for
+        // a throughput-only remount.
+        match named_share_mount_status(
+            &execute("/sbin/mount", &[])?,
+            source,
+            &target.to_string_lossy(),
+        ) {
+            NamedShareMountStatus::Expected => return Ok(false),
+            NamedShareMountStatus::NotMounted => {}
+            NamedShareMountStatus::MountedElsewhere(other) => {
+                return Err(format!(
+                    "mount point {} changed to {other} while upgrading NFS options",
+                    target.display()
+                ));
+            }
+        }
+    }
+
+    match named_share_mount_status(
+        &execute("/sbin/mount", &[])?,
+        source,
+        &target.to_string_lossy(),
+    ) {
+        NamedShareMountStatus::NotMounted => {}
+        NamedShareMountStatus::Expected => {
+            return Err(format!(
+                "NFS mount {} remained active after a successful ordinary unmount",
+                target.display()
+            ));
+        }
+        NamedShareMountStatus::MountedElsewhere(other) => {
+            return Err(format!(
+                "mount point {} changed to {other} while upgrading NFS options",
+                target.display()
+            ));
+        }
+    }
+
+    ensure_mount(source, target, allow_existing_contents, execute)?;
+    Ok(true)
+}
+
 fn ensure_mount(
     source: &str,
     target: &Path,
@@ -502,11 +625,14 @@ fn refresh_if_not_responding(
     }
     // macOS ships nfsstat in /usr/bin (unlike several BSD/Linux layouts).
     let status = execute("/usr/bin/nfsstat", &["-m"])?;
-    if !nfs_mount_is_not_responding(&status, target) {
-        return Ok(false);
+    if nfs_mount_is_not_responding(&status, target) {
+        force_refresh_mount(source, target, allow_existing_contents, execute)?;
+        return Ok(true);
     }
-    force_refresh_mount(source, target, allow_existing_contents, execute)?;
-    Ok(true)
+    if nfs_mount_needs_io_upgrade(&status, target) {
+        return remount_with_managed_io_options(source, target, allow_existing_contents, execute);
+    }
+    Ok(false)
 }
 /// Read a share marker as the owning account. These paths can be NFS mounts;
 /// never read them directly in the privileged process because a stalled NFS
@@ -1167,7 +1293,158 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-11");
+        assert_eq!(version, "nfs-recovery-12");
+    }
+
+    #[test]
+    fn legacy_managed_mount_is_remounted_with_verified_io_parameters() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-upgrade-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+        let mut mounted = true;
+        let mut parameters = "vers=3,tcp,rsize=8192,wsize=8192,readahead=16";
+        let mut unmounts = 0;
+        let mut mounts = 0;
+
+        recover_mount(&manifest, |program, args| match program {
+            "/sbin/mount" => Ok(if mounted {
+                format!("{} on {} (nfs)\n", manifest.source, target.display())
+            } else {
+                String::new()
+            }),
+            "/usr/bin/nfsstat" => Ok(format!(
+                "{} from {}\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
+                target.display(),
+                manifest.source
+            )),
+            "/usr/bin/lockf" => {
+                if args.contains(&"/sbin/umount") {
+                    assert!(!args.contains(&"-f"), "tuning must never force unmount");
+                    unmounts += 1;
+                    mounted = false;
+                    Ok(String::new())
+                } else {
+                    let mount_nfs = args
+                        .iter()
+                        .position(|argument| *argument == "/sbin/mount_nfs")
+                        .expect("upgrade must remount using mount_nfs");
+                    assert_eq!(
+                        &args[mount_nfs..mount_nfs + 3],
+                        &[
+                            "/sbin/mount_nfs",
+                            "-o",
+                            "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
+                        ]
+                    );
+                    mounts += 1;
+                    mounted = true;
+                    parameters = "vers=3,tcp,rsize=65536,wsize=65536,readahead=128";
+                    Ok(String::new())
+                }
+            }
+            _ => panic!("unexpected command {program}"),
+        })
+        .unwrap();
+
+        assert_eq!(
+            unmounts, 1,
+            "legacy options should trigger one safe unmount"
+        );
+        assert_eq!(
+            mounts, 1,
+            "legacy options should trigger one optimized remount"
+        );
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn busy_legacy_mount_is_left_intact_until_it_is_idle() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-busy-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+        let mut unmount_attempts = 0;
+        let mut mount_attempts = 0;
+
+        recover_mount(&manifest, |program, args| match program {
+            "/sbin/mount" => Ok(format!(
+                "{} on {} (nfs)\n",
+                manifest.source,
+                target.display()
+            )),
+            "/usr/bin/nfsstat" => Ok(format!(
+                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=8192,wsize=8192,readahead=16\n  Status flags: 0x0\n",
+                target.display(),
+                manifest.source
+            )),
+            "/usr/bin/lockf" => {
+                if args.contains(&"/sbin/umount") {
+                    assert!(!args.contains(&"-f"), "busy migration must not force unmount");
+                    unmount_attempts += 1;
+                    Err("umount: Resource busy".into())
+                } else {
+                    mount_attempts += 1;
+                    Ok(String::new())
+                }
+            }
+            _ => panic!("unexpected command {program}"),
+        })
+        .unwrap();
+
+        assert_eq!(unmount_attempts, 1, "try one ordinary unmount");
+        assert_eq!(mount_attempts, 0, "do not mount over an in-use filesystem");
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn optimized_mount_is_not_recycled_by_periodic_recovery() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-current-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+
+        recover_mount(&manifest, |program, _args| match program {
+            "/sbin/mount" => Ok(format!(
+                "{} on {} (nfs)\n",
+                manifest.source,
+                target.display()
+            )),
+            "/usr/bin/nfsstat" => Ok(format!(
+                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=65536,wsize=65536,readahead=128\n  Status flags: 0x0\n",
+                target.display(),
+                manifest.source
+            )),
+            "/usr/bin/lockf" => panic!("a tuned mount must not be remounted"),
+            _ => panic!("unexpected command {program}"),
+        })
+        .unwrap();
+
+        fs::remove_dir(target).unwrap();
     }
 
     #[test]

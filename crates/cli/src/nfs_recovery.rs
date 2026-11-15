@@ -17,9 +17,10 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-12";
+const SERVICE_VERSION: &str = "nfs-recovery-15";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
+const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
 // Verified on the Thunderbolt bridge: 64 KiB I/O with a 128-request read-ahead
 // window materially improves large sequential NFS reads over the old 8 KiB
 // defaults. Keep TCP explicit but allow the client and storage server to
@@ -44,6 +45,19 @@ struct Status {
     failures: u32,
     retry_after: u64,
     error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountRefresh {
+    NoChange,
+    Refreshed,
+    IoUpgradeDeferred,
+}
+
+fn record_deferred_io_upgrade(status: &mut Status, now: u64) {
+    status.failures = status.failures.max(1);
+    status.retry_after = now.saturating_add(DEFERRED_IO_UPGRADE_RETRY_SECS);
+    status.error = Some("NFS I/O option upgrade deferred because the mount is busy".into());
 }
 fn key(target: &Path) -> String {
     sha256_hex(target.as_os_str().as_encoded_bytes()).expect("SHA256")
@@ -688,21 +702,29 @@ fn refresh_if_not_responding(
     target: &Path,
     allow_existing_contents: bool,
     execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
-) -> Result<bool, String> {
+) -> Result<MountRefresh, String> {
     let mounts = execute("/sbin/mount", &[])?;
     if !expected(source, target, &mounts)? {
-        return Ok(false);
+        return Ok(MountRefresh::NoChange);
     }
     // macOS ships nfsstat in /usr/bin (unlike several BSD/Linux layouts).
     let status = execute("/usr/bin/nfsstat", &["-m"])?;
     if nfs_mount_is_not_responding(&status, target) {
         force_refresh_mount(source, target, allow_existing_contents, execute)?;
-        return Ok(true);
+        return Ok(MountRefresh::Refreshed);
     }
     if nfs_mount_needs_io_upgrade(&status, target) {
-        return remount_with_managed_io_options(source, target, allow_existing_contents, execute);
+        return match remount_with_managed_io_options(
+            source,
+            target,
+            allow_existing_contents,
+            execute,
+        )? {
+            true => Ok(MountRefresh::Refreshed),
+            false => Ok(MountRefresh::IoUpgradeDeferred),
+        };
     }
-    Ok(false)
+    Ok(MountRefresh::NoChange)
 }
 /// Read a share marker as the owning account. These paths can be NFS mounts;
 /// never read them directly in the privileged process because a stalled NFS
@@ -967,7 +989,7 @@ fn safe_mount_target(target: &Path, allow_existing_contents: bool) -> Result<(),
 fn recover_mount(
     manifest: &Manifest,
     mut execute: impl FnMut(&str, &[&str]) -> Result<String, String>,
-) -> Result<(), String> {
+) -> Result<MountRefresh, String> {
     let target = &manifest.target;
     ensure_mount(
         &manifest.source,
@@ -980,8 +1002,7 @@ fn recover_mount(
         target,
         manifest.allow_existing_contents,
         &mut execute,
-    )?;
-    Ok(())
+    )
 }
 
 fn cleanup_sibling_recoveries(source: &str, target: &Path) -> Result<(), String> {
@@ -1188,7 +1209,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 }
             });
             match &result {
-                Ok(()) => {
+                Ok(MountRefresh::IoUpgradeDeferred) => {
+                    record_deferred_io_upgrade(&mut status, now);
+                    write_json(&dir.join("status.json"), &status)?;
+                    return Ok(());
+                }
+                Ok(_) => {
                     if status.failures == 0 {
                         return Ok(());
                     }
@@ -1201,7 +1227,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             write_json(&dir.join("status.json"), &status)?;
-            result
+            result.map(|_| ())
         }
         _ => unreachable!(),
     }
@@ -1400,7 +1426,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-12");
+        assert_eq!(version, "nfs-recovery-15");
     }
 
     #[test]
@@ -1422,7 +1448,7 @@ mod tests {
         let mut unmounts = 0;
         let mut mounts = 0;
 
-        recover_mount(&manifest, |program, args| match program {
+        let outcome = recover_mount(&manifest, |program, args| match program {
             "/sbin/mount" => Ok(if mounted {
                 format!("{} on {} (nfs)\n", manifest.source, target.display())
             } else {
@@ -1462,6 +1488,7 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(outcome, MountRefresh::Refreshed);
         assert_eq!(
             unmounts, 1,
             "legacy options should trigger one safe unmount"
@@ -1490,7 +1517,7 @@ mod tests {
         let mut unmount_attempts = 0;
         let mut mount_attempts = 0;
 
-        recover_mount(&manifest, |program, args| match program {
+        let outcome = recover_mount(&manifest, |program, args| match program {
             "/sbin/mount" => Ok(format!(
                 "{} on {} (nfs)\n",
                 manifest.source,
@@ -1515,6 +1542,7 @@ mod tests {
         })
         .unwrap();
 
+        assert_eq!(outcome, MountRefresh::IoUpgradeDeferred);
         assert_eq!(unmount_attempts, 1, "try one ordinary unmount");
         assert_eq!(mount_attempts, 0, "do not mount over an in-use filesystem");
         fs::remove_dir(target).unwrap();
@@ -1542,10 +1570,21 @@ mod tests {
 
         assert_eq!(
             result.unwrap(),
-            false,
+            MountRefresh::IoUpgradeDeferred,
             "a competing periodic recovery must defer only the I/O remount, not helper refresh"
         );
         fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn deferred_nfs_io_upgrade_is_backed_off_for_five_minutes() {
+        let mut status = Status::default();
+
+        record_deferred_io_upgrade(&mut status, 1_000);
+
+        assert_eq!(status.retry_after, 1_300);
+        assert_eq!(status.failures, 1);
+        assert!(status.error.as_deref().unwrap().contains("deferred"));
     }
 
     #[test]

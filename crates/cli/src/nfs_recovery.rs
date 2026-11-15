@@ -17,7 +17,7 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-18";
+const SERVICE_VERSION: &str = "nfs-recovery-19";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
@@ -742,6 +742,16 @@ fn refresh_if_not_responding(
     }
     Ok(MountRefresh::NoChange)
 }
+
+fn refresh_managed_mount_for_explicit_update(
+    source: &str,
+    target: &Path,
+    allow_existing_contents: bool,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
+) -> Result<MountRefresh, String> {
+    refresh_if_not_responding(source, target, allow_existing_contents, true, execute)
+}
+
 /// Read a share marker as the owning account. These paths can be NFS mounts;
 /// never read them directly in the privileged process because a stalled NFS
 /// filesystem can block that process in the kernel indefinitely.
@@ -1132,11 +1142,10 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             let execution_uid = args[4]
                 .parse::<u32>()
                 .map_err(|_| "invalid NFS recovery execution UID".to_owned())?;
-            refresh_if_not_responding(
+            refresh_managed_mount_for_explicit_update(
                 source,
                 target,
                 allow_existing_contents,
-                false,
                 &mut |program, args| bounded(program, args),
             )?;
             if manifest_path.exists() {
@@ -1185,6 +1194,12 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 &uuid,
                 execution_uid,
                 allow_existing_contents,
+            )?;
+            refresh_managed_mount_for_explicit_update(
+                source,
+                target,
+                allow_existing_contents,
+                &mut |program, args| bounded(program, args),
             )?;
             unload(target)?;
             write_json(&manifest_path, &manifest)?;
@@ -1455,7 +1470,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-18");
+        assert_eq!(version, "nfs-recovery-19");
     }
 
     #[test]
@@ -1477,44 +1492,49 @@ mod tests {
         let mut unmounts = 0;
         let mut mounts = 0;
 
-        let outcome = recover_mount_with_io_upgrade(&manifest, true, |program, args| match program {
-            "/sbin/mount" => Ok(if mounted {
-                format!("{} on {} (nfs)\n", manifest.source, target.display())
-            } else {
-                String::new()
-            }),
-            "/usr/bin/nfsstat" => Ok(format!(
-                "{} from {}\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
-                target.display(),
-                manifest.source
-            )),
-            "/usr/bin/lockf" => {
-                if args.contains(&"/sbin/umount") {
-                    assert!(!args.contains(&"-f"), "tuning must never force unmount");
-                    unmounts += 1;
-                    mounted = false;
-                    Ok(String::new())
+        let outcome = refresh_managed_mount_for_explicit_update(
+            &manifest.source,
+            &manifest.target,
+            manifest.allow_existing_contents,
+            &mut |program, args| match program {
+                "/sbin/mount" => Ok(if mounted {
+                    format!("{} on {} (nfs)\n", manifest.source, target.display())
                 } else {
-                    let mount_nfs = args
-                        .iter()
-                        .position(|argument| *argument == "/sbin/mount_nfs")
-                        .expect("upgrade must remount using mount_nfs");
-                    assert_eq!(
-                        &args[mount_nfs..mount_nfs + 3],
-                        &[
-                            "/sbin/mount_nfs",
-                            "-o",
-                            "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
-                        ]
-                    );
-                    mounts += 1;
-                    mounted = true;
-                    parameters = "vers=3,tcp,rsize=65536,wsize=65536,readahead=128";
-                    Ok(String::new())
+                    String::new()
+                }),
+                "/usr/bin/nfsstat" => Ok(format!(
+                    "{} from {}\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
+                    target.display(),
+                    manifest.source
+                )),
+                "/usr/bin/lockf" => {
+                    if args.contains(&"/sbin/umount") {
+                        assert!(!args.contains(&"-f"), "tuning must never force unmount");
+                        unmounts += 1;
+                        mounted = false;
+                        Ok(String::new())
+                    } else {
+                        let mount_nfs = args
+                            .iter()
+                            .position(|argument| *argument == "/sbin/mount_nfs")
+                            .expect("upgrade must remount using mount_nfs");
+                        assert_eq!(
+                            &args[mount_nfs..mount_nfs + 3],
+                            &[
+                                "/sbin/mount_nfs",
+                                "-o",
+                                "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
+                            ]
+                        );
+                        mounts += 1;
+                        mounted = true;
+                        parameters = "vers=3,tcp,rsize=65536,wsize=65536,readahead=128";
+                        Ok(String::new())
+                    }
                 }
-            }
-            _ => panic!("unexpected command {program}"),
-        })
+                _ => panic!("unexpected command {program}"),
+            },
+        )
         .unwrap();
 
         assert_eq!(outcome, MountRefresh::Refreshed);

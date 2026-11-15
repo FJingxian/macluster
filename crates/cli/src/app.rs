@@ -8846,7 +8846,16 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
         }
         Some("capabilities") => {
             if args.iter().any(|arg| arg == "--json") {
-                let report = serde_json::json!({
+                let sources = option_values(args, "--nfs-recovery-source")?;
+                let targets = option_values(args, "--nfs-recovery-target")?;
+                if sources.len() != targets.len() {
+                    return Err((
+                        2,
+                        "internal capabilities requires one NFS recovery source for each target"
+                            .into(),
+                    ));
+                }
+                let mut report = serde_json::json!({
                     "build_id": macluster_protocol::BUILD_ID,
                     "protocol_version": PROTOCOL_VERSION,
                     "features": [
@@ -8868,6 +8877,19 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
                         "agent.idle-handoff.v1"
                     ]
                 });
+                if !sources.is_empty() {
+                    let configured = sources
+                        .into_iter()
+                        .zip(targets)
+                        .map(|(source, target)| (source, PathBuf::from(target)))
+                        .collect::<Vec<_>>();
+                    if let Some(current) = crate::nfs_recovery::active_installations_current(
+                        &configured,
+                        &macluster_metrics::mounted_nfs_filesystems(),
+                    ) {
+                        report["nfs_recovery_current"] = serde_json::json!(current);
+                    }
+                }
                 println!("{}", serde_json::to_string(&report).unwrap());
                 Ok(())
             } else {
@@ -9034,6 +9056,24 @@ fn option_value(args: &[String], option: &str) -> AppResult<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn option_values(args: &[String], option: &str) -> AppResult<Vec<String>> {
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == option {
+            let value = args
+                .get(index + 1)
+                .cloned()
+                .ok_or_else(|| (2, format!("missing value for {option}")))?;
+            values.push(value);
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(values)
 }
 
 fn load_config(override_path: Option<&Path>) -> Result<ClusterConfig, String> {

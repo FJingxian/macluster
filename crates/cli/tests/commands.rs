@@ -19,6 +19,7 @@ use macluster_cli::run_with;
 use macluster_controller::wake::ControllerWake;
 use macluster_core::storage::Storage;
 use macluster_protocol::framing::sha256_hex;
+use macluster_protocol::identifiers::Id128;
 use macluster_protocol::types::JobState;
 
 #[test]
@@ -352,6 +353,28 @@ fn capabilities_report_primary_storage_source_support() {
             .iter()
             .any(|feature| feature == "config.primary-storage-source.v1")
     );
+}
+
+#[test]
+fn capabilities_report_nfs_recovery_status_for_requested_targets() {
+    let target =
+        std::env::temp_dir().join(format!("macluster-uninstalled-nfs-{}", Id128::random()));
+    let output = macluster_command()
+        .args([
+            "internal",
+            "capabilities",
+            "--json",
+            "--nfs-recovery-source",
+            "192.0.2.1:/tools",
+            "--nfs-recovery-target",
+        ])
+        .arg(&target)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["nfs_recovery_current"], true);
 }
 
 #[test]

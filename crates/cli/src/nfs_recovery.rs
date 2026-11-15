@@ -49,13 +49,60 @@ fn key(target: &Path) -> String {
     sha256_hex(target.as_os_str().as_encoded_bytes()).expect("SHA256")
 }
 fn directory(target: &Path) -> PathBuf {
-    Path::new(ROOT).join(key(target))
+    directory_at(Path::new(ROOT), target)
+}
+fn directory_at(root: &Path, target: &Path) -> PathBuf {
+    root.join(key(target))
 }
 pub(crate) fn version_marker_path(target: &Path) -> PathBuf {
     directory(target).join("version")
 }
 pub(crate) fn helper_version() -> String {
     SERVICE_VERSION.to_owned()
+}
+
+/// Check the recovery service version only for configured NFS mounts that are
+/// currently active. `getfsstat(MNT_NOWAIT)` supplies the mount inventory so a
+/// health probe does not access an unresponsive network filesystem.
+///
+/// `None` means the version marker could not be inspected; callers should not
+/// treat an unreadable marker as proof that an update is required.
+pub(crate) fn active_installations_current(
+    configured: &[(String, PathBuf)],
+    mounted: &[(String, String)],
+) -> Option<bool> {
+    active_installations_current_at(Path::new(ROOT), configured, mounted)
+}
+
+fn active_installations_current_at(
+    root: &Path,
+    configured: &[(String, PathBuf)],
+    mounted: &[(String, String)],
+) -> Option<bool> {
+    for (source, target) in configured {
+        if !mounted.iter().any(|(mounted_source, mounted_target)| {
+            mounted_source == source && mounted_target == target.to_string_lossy().as_ref()
+        }) {
+            continue;
+        }
+        let marker = directory_at(root, target).join("version");
+        let metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Some(false);
+        }
+        let version = match fs::read_to_string(marker) {
+            Ok(version) => version,
+            Err(_) => return None,
+        };
+        if version.trim_end() != SERVICE_VERSION {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 pub(crate) fn installation_probe_script(target: &Path) -> String {
     installation_check_script(
@@ -1140,6 +1187,43 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_recovery_version_is_only_reported_for_an_active_configured_mount() {
+        let root = std::env::temp_dir().join(format!("nfs-version-probe-{}", Id128::random()));
+        let target = PathBuf::from("/Users/operator/tools");
+        let source = "192.0.2.1:/tools".to_owned();
+        let directory = directory_at(&root, &target);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("version"), "nfs-recovery-old\n").unwrap();
+
+        assert_eq!(
+            active_installations_current_at(&root, &[(source.clone(), target.clone())], &[]),
+            Some(true),
+            "a stale helper for an unmounted share must not trigger recurring updates"
+        );
+        assert_eq!(
+            active_installations_current_at(
+                &root,
+                &[(source.clone(), target.clone())],
+                &[(source.clone(), target.to_string_lossy().into_owned())],
+            ),
+            Some(false),
+            "an active share with a stale helper must trigger the normal Agent update workflow"
+        );
+
+        fs::write(directory.join("version"), format!("{}\n", helper_version())).unwrap();
+        assert_eq!(
+            active_installations_current_at(
+                &root,
+                &[(source.clone(), target.clone())],
+                &[(source.clone(), target.to_string_lossy().into_owned())],
+            ),
+            Some(true)
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn a_stalled_network_marker_read_returns_a_path_specific_timeout() {

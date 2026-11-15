@@ -2123,6 +2123,8 @@ struct CapabilityReport {
     features: Vec<String>,
     #[serde(default)]
     build_id: Option<String>,
+    #[serde(default)]
+    nfs_recovery_current: Option<bool>,
 }
 
 const REQUIRED_AGENT_FEATURES: &[&str] = &[
@@ -3013,16 +3015,34 @@ fn missing_required_agent_features(features: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-fn probe_configured_agent_features(node: &NodeConfig) -> AgentFeatureState {
+fn probe_configured_agent_features(
+    node: &NodeConfig,
+    nfs_mounts: &[(String, PathBuf)],
+) -> AgentFeatureState {
+    let mut args = vec![
+        "internal".to_owned(),
+        "capabilities".to_owned(),
+        "--json".to_owned(),
+    ];
+    for (source, target) in nfs_mounts {
+        args.push("--nfs-recovery-source".to_owned());
+        args.push(source.clone());
+        args.push("--nfs-recovery-target".to_owned());
+        args.push(target.to_string_lossy().into_owned());
+    }
     let output = if node.transport == Transport::Local {
         let mut command = Command::new(&node.remote_binary);
-        command.args(["internal", "capabilities", "--json"]);
+        command.args(&args);
         match run_child(command, None, Duration::from_secs(5)) {
             Ok(output) => output,
             Err(_) => return AgentFeatureState::Unknown,
         }
     } else {
-        let command = shell_join(&[&node.remote_binary, "internal", "capabilities", "--json"]);
+        let mut remote_args = Vec::with_capacity(args.len() + 1);
+        remote_args.push(node.remote_binary.clone());
+        remote_args.extend(args);
+        let remote_args = remote_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let command = shell_join(&remote_args);
         match ssh_output(node, &command, None) {
             Ok(output) => output,
             Err(_) => return AgentFeatureState::Unknown,
@@ -3040,6 +3060,7 @@ fn probe_configured_agent_features(node: &NodeConfig) -> AgentFeatureState {
     };
     if report.build_id.as_deref() == Some(macluster_protocol::BUILD_ID)
         && missing_required_agent_features(&report.features).is_empty()
+        && report.nfs_recovery_current != Some(false)
     {
         AgentFeatureState::Current
     } else {
@@ -3059,7 +3080,14 @@ fn bounded_agent_feature_probes(
             .filter(|(node_id, node)| {
                 node.transport != Transport::Storage && !confirmed_offline.contains(*node_id)
             })
-            .map(|(node_id, node)| (node_id.clone(), node.clone()))
+            .map(|(node_id, node)| {
+                let nfs_mounts = client_nfs_cleanup_plan(config, node_id)
+                    .0
+                    .into_iter()
+                    .map(|mount| (mount.source, mount.mount_root))
+                    .collect::<Vec<_>>();
+                (node_id.clone(), node.clone(), nfs_mounts)
+            })
             .collect::<VecDeque<_>>(),
     );
     let worker_count = MAX_PROBES.min(queue.lock().map_or(0, |queue| queue.len()));
@@ -3071,10 +3099,12 @@ fn bounded_agent_feature_probes(
                     let mut missing = Vec::new();
                     loop {
                         let task = queue.lock().ok().and_then(|mut queue| queue.pop_front());
-                        let Some((node_id, node)) = task else {
+                        let Some((node_id, node, nfs_mounts)) = task else {
                             break;
                         };
-                        if probe_configured_agent_features(&node) == AgentFeatureState::Missing {
+                        if probe_configured_agent_features(&node, &nfs_mounts)
+                            == AgentFeatureState::Missing
+                        {
                             missing.push(node_id);
                         }
                     }

@@ -43,6 +43,20 @@ pub fn sample_disk_capacities() -> (Option<DiskCapacity>, Vec<DiskCapacity>) {
     }
 }
 
+/// Return the NFS source and mount point pairs from the kernel mount table.
+/// On macOS this uses `getfsstat(MNT_NOWAIT)`, so inspecting a disconnected
+/// server never performs I/O against the mounted filesystem.
+pub fn mounted_nfs_filesystems() -> Vec<(String, String)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        macos::mounted_nfs_filesystems()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Vec::new()
+    }
+}
+
 pub fn unavailable(sampled_unix_ms: u64, reason: &str) -> MetricSnapshot {
     let mut errors = BTreeMap::new();
     errors.insert("sampler".into(), reason.into());
@@ -574,6 +588,43 @@ mod macos {
         CStr::from_bytes_until_nul(bytes)
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    fn statfs_mount_source(filesystem: &libc::statfs) -> String {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                filesystem.f_mntfromname.as_ptr().cast::<u8>(),
+                filesystem.f_mntfromname.len(),
+            )
+        };
+        CStr::from_bytes_until_nul(bytes)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    fn statfs_filesystem_type(filesystem: &libc::statfs) -> String {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                filesystem.f_fstypename.as_ptr().cast::<u8>(),
+                filesystem.f_fstypename.len(),
+            )
+        };
+        CStr::from_bytes_until_nul(bytes)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn mounted_nfs_filesystems() -> Vec<(String, String)> {
+        mounted_filesystems()
+            .into_iter()
+            .filter(|filesystem| statfs_filesystem_type(filesystem) == "nfs")
+            .map(|filesystem| {
+                (
+                    statfs_mount_source(&filesystem),
+                    statfs_mount_point(&filesystem),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn is_external_volume_mount(mount_point: &str) -> bool {

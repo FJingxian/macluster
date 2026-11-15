@@ -17,7 +17,7 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-17";
+const SERVICE_VERSION: &str = "nfs-recovery-18";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
@@ -63,7 +63,8 @@ enum MountRefresh {
 fn record_deferred_io_upgrade(status: &mut Status, now: u64) {
     status.failures = status.failures.max(1);
     status.retry_after = now.saturating_add(DEFERRED_IO_UPGRADE_RETRY_SECS);
-    status.error = Some("NFS I/O option upgrade deferred because the mount is busy".into());
+    status.error =
+        Some("NFS I/O option upgrade deferred to avoid recycling a healthy mount".into());
 }
 fn key(target: &Path) -> String {
     sha256_hex(target.as_os_str().as_encoded_bytes()).expect("SHA256")
@@ -1003,6 +1004,17 @@ fn safe_mount_target(target: &Path, allow_existing_contents: bool) -> Result<(),
 }
 fn recover_mount(
     manifest: &Manifest,
+    execute: impl FnMut(&str, &[&str]) -> Result<String, String>,
+) -> Result<MountRefresh, String> {
+    // LaunchDaemon recovery is periodic and can overlap direct file access
+    // that is invisible to the controller. It must never unmount a healthy
+    // filesystem just to change throughput options.
+    recover_mount_with_io_upgrade(manifest, false, execute)
+}
+
+fn recover_mount_with_io_upgrade(
+    manifest: &Manifest,
+    allow_io_upgrade: bool,
     mut execute: impl FnMut(&str, &[&str]) -> Result<String, String>,
 ) -> Result<MountRefresh, String> {
     let target = &manifest.target;
@@ -1016,7 +1028,7 @@ fn recover_mount(
         &manifest.source,
         target,
         manifest.allow_existing_contents,
-        true,
+        allow_io_upgrade,
         &mut execute,
     )
 }
@@ -1443,7 +1455,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-17");
+        assert_eq!(version, "nfs-recovery-18");
     }
 
     #[test]
@@ -1465,7 +1477,7 @@ mod tests {
         let mut unmounts = 0;
         let mut mounts = 0;
 
-        let outcome = recover_mount(&manifest, |program, args| match program {
+        let outcome = recover_mount_with_io_upgrade(&manifest, true, |program, args| match program {
             "/sbin/mount" => Ok(if mounted {
                 format!("{} on {} (nfs)\n", manifest.source, target.display())
             } else {
@@ -1566,8 +1578,8 @@ mod tests {
             }
         };
 
-        let first = recover_mount(&manifest, &mut execute).unwrap();
-        let second = recover_mount(&manifest, &mut execute).unwrap();
+        let first = recover_mount_with_io_upgrade(&manifest, true, &mut execute).unwrap();
+        let second = recover_mount_with_io_upgrade(&manifest, true, &mut execute).unwrap();
         drop(execute);
 
         assert_eq!(first, MountRefresh::Refreshed);
@@ -1594,7 +1606,7 @@ mod tests {
         let mut unmount_attempts = 0;
         let mut mount_attempts = 0;
 
-        let outcome = recover_mount(&manifest, |program, args| match program {
+        let outcome = recover_mount_with_io_upgrade(&manifest, true, |program, args| match program {
             "/sbin/mount" => Ok(format!(
                 "{} on {} (nfs)\n",
                 manifest.source,
@@ -1683,6 +1695,39 @@ mod tests {
         );
 
         assert_eq!(result.unwrap(), MountRefresh::IoUpgradeDeferred);
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn periodic_recovery_does_not_unmount_a_healthy_legacy_mount_to_tune_io() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-periodic-no-tune-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let source = "192.0.2.1:/data";
+        let manifest = Manifest {
+            source: source.into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+
+        let result = recover_mount(&manifest, |program, _args| match program {
+            "/sbin/mount" => Ok(format!("{source} on {} (nfs)\n", target.display())),
+            "/usr/bin/nfsstat" => Ok(format!(
+                "{} from {source}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=8192,wsize=8192,readahead=16\n  Status flags: 0x0\n",
+                target.display()
+            )),
+            "/usr/bin/lockf" => {
+                panic!("periodic recovery must not unmount a healthy NFS mount to tune I/O")
+            }
+            _ => panic!("unexpected command {program}"),
+        })
+        .unwrap();
+
+        assert_eq!(result, MountRefresh::IoUpgradeDeferred);
         fs::remove_dir(target).unwrap();
     }
 

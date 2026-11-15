@@ -17,7 +17,7 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-15";
+const SERVICE_VERSION: &str = "nfs-recovery-16";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
@@ -701,6 +701,7 @@ fn refresh_if_not_responding(
     source: &str,
     target: &Path,
     allow_existing_contents: bool,
+    allow_io_upgrade: bool,
     execute: &mut impl FnMut(&str, &[&str]) -> Result<String, String>,
 ) -> Result<MountRefresh, String> {
     let mounts = execute("/sbin/mount", &[])?;
@@ -714,6 +715,9 @@ fn refresh_if_not_responding(
         return Ok(MountRefresh::Refreshed);
     }
     if nfs_mount_needs_io_upgrade(&status, target) {
+        if !allow_io_upgrade {
+            return Ok(MountRefresh::IoUpgradeDeferred);
+        }
         return match remount_with_managed_io_options(
             source,
             target,
@@ -1001,6 +1005,7 @@ fn recover_mount(
         &manifest.source,
         target,
         manifest.allow_existing_contents,
+        true,
         &mut execute,
     )
 }
@@ -1108,6 +1113,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
                 source,
                 target,
                 allow_existing_contents,
+                false,
                 &mut |program, args| bounded(program, args),
             )?;
             if manifest_path.exists() {
@@ -1426,7 +1432,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-15");
+        assert_eq!(version, "nfs-recovery-16");
     }
 
     #[test]
@@ -1556,8 +1562,12 @@ mod tests {
             .join(format!("nfs-options-lock-held-{}", Id128::random()));
         fs::create_dir(&target).unwrap();
         let source = "192.0.2.1:/data";
-        let result = refresh_if_not_responding(source, &target, false, &mut |program, _args| {
-            match program {
+        let result = refresh_if_not_responding(
+            source,
+            &target,
+            false,
+            true,
+            &mut |program, _args| match program {
                 "/sbin/mount" => Ok(format!("{source} on {} (nfs)\n", target.display())),
                 "/usr/bin/nfsstat" => Ok(format!(
                     "{} from {source}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=8192,wsize=8192,readahead=16\n  Status flags: 0x0\n",
@@ -1565,14 +1575,43 @@ mod tests {
                 )),
                 "/usr/bin/lockf" => Err(format!("lockf: {NFS_MOUNT_LOCK_PATH}: already locked")),
                 _ => panic!("unexpected command {program}"),
-            }
-        });
+            },
+        );
 
         assert_eq!(
             result.unwrap(),
             MountRefresh::IoUpgradeDeferred,
             "a competing periodic recovery must defer only the I/O remount, not helper refresh"
         );
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn helper_install_does_not_block_on_a_busy_legacy_mount_upgrade() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-install-deferred-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let source = "192.0.2.1:/data";
+
+        let result = refresh_if_not_responding(
+            source,
+            &target,
+            false,
+            false,
+            &mut |program, _args| match program {
+                "/sbin/mount" => Ok(format!("{source} on {} (nfs)\n", target.display())),
+                "/usr/bin/nfsstat" => Ok(format!(
+                    "{} from {source}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=8192,wsize=8192,readahead=16\n  Status flags: 0x0\n",
+                    target.display()
+                )),
+                "/usr/bin/lockf" => panic!("helper installation must not block on an I/O remount"),
+                _ => panic!("unexpected command {program}"),
+            },
+        );
+
+        assert_eq!(result.unwrap(), MountRefresh::IoUpgradeDeferred);
         fs::remove_dir(target).unwrap();
     }
 

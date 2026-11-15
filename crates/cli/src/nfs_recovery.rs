@@ -17,14 +17,20 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-16";
+const SERVICE_VERSION: &str = "nfs-recovery-17";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
-// Verified on the Thunderbolt bridge: 64 KiB I/O with a 128-request read-ahead
-// window materially improves large sequential NFS reads over the old 8 KiB
-// defaults. Keep TCP explicit but allow the client and storage server to
-// negotiate the NFS version, preserving compatibility with v4-only providers.
+// macOS and some NFS servers negotiate lower values than the requested mount
+// options. These are the effective limits observed on the managed cluster;
+// retrying an upgrade below them can cause periodic unmounts without changing
+// the live mount parameters.
+const MIN_EFFECTIVE_NFS_BLOCK_SIZE: u32 = 32 * 1024;
+const MIN_EFFECTIVE_NFS_READAHEAD: u32 = 16;
+// Request 64 KiB I/O with a 128-request read-ahead window. macOS or the server
+// may negotiate smaller effective values; the threshold above prevents
+// repeatedly recycling mounts when that happens. Keep TCP explicit but allow
+// the client and server to negotiate NFS version for provider compatibility.
 pub(crate) const NFS_MOUNT_OPTIONS: &str =
     "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -370,14 +376,19 @@ fn nfs_mount_needs_io_upgrade(output: &str, target: &Path) -> bool {
         // healthy mount. New mounts still receive the managed options below.
         return false;
     };
-    let has_option = |expected: &str| {
+    let numeric_option = |name: &str| {
         parameters
             .split(|character: char| character == ',' || character.is_whitespace())
-            .any(|option| option == expected)
+            .find_map(|option| option.strip_prefix(name)?.strip_prefix('='))
+            .and_then(|value| value.parse::<u32>().ok())
     };
-    !["rsize=65536", "wsize=65536", "readahead=128"]
-        .into_iter()
-        .all(has_option)
+    [
+        ("rsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
+        ("wsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
+        ("readahead", MIN_EFFECTIVE_NFS_READAHEAD),
+    ]
+    .into_iter()
+    .any(|(name, minimum)| numeric_option(name).is_some_and(|actual| actual < minimum))
 }
 
 fn remount_with_managed_io_options(
@@ -1432,7 +1443,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-16");
+        assert_eq!(version, "nfs-recovery-17");
     }
 
     #[test]
@@ -1503,6 +1514,66 @@ mod tests {
             mounts, 1,
             "legacy options should trigger one optimized remount"
         );
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn macos_negotiated_io_limits_do_not_trigger_repeated_remounts() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-options-negotiated-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let source = "192.0.2.1:/data";
+        let manifest = Manifest {
+            source: source.into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+        let mut mounted = true;
+        let mut parameters = "vers=3,tcp,rsize=8192,wsize=8192,readahead=16";
+        let mut unmounts = 0;
+        let mut mounts = 0;
+        let mut execute = |program: &str, args: &[&str]| {
+            match program {
+                "/sbin/mount" => Ok(if mounted {
+                    format!("{} on {} (nfs)\n", manifest.source, target.display())
+                } else {
+                    String::new()
+                }),
+                "/usr/bin/nfsstat" => Ok(format!(
+                    "{} from {}\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
+                    target.display(),
+                    manifest.source
+                )),
+                "/usr/bin/lockf" if args.contains(&"/sbin/umount") => {
+                    unmounts += 1;
+                    mounted = false;
+                    Ok(String::new())
+                }
+                "/usr/bin/lockf" if args.contains(&"/sbin/mount_nfs") => {
+                    mounts += 1;
+                    mounted = true;
+                    // The macOS NFS client negotiates lower effective values
+                    // than the 64 KiB / 128 options requested by macluster.
+                    parameters = "vers=3,tcp,rsize=32768,wsize=32768,readahead=16";
+                    Ok(String::new())
+                }
+                "/usr/bin/lockf" => panic!("unexpected lockf operation: {args:?}"),
+                _ => panic!("unexpected command {program}"),
+            }
+        };
+
+        let first = recover_mount(&manifest, &mut execute).unwrap();
+        let second = recover_mount(&manifest, &mut execute).unwrap();
+        drop(execute);
+
+        assert_eq!(first, MountRefresh::Refreshed);
+        assert_eq!(second, MountRefresh::NoChange);
+        assert_eq!(unmounts, 1, "the legacy mount is upgraded only once");
+        assert_eq!(mounts, 1, "the legacy mount is remounted only once");
         fs::remove_dir(target).unwrap();
     }
 

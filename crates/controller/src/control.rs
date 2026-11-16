@@ -778,6 +778,7 @@ impl ControlApi {
                 ));
             }
             MaintenanceScope::Nodes(nodes) => nodes,
+            MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_) => return Ok(()),
         };
         let scoped = scoped_nodes
             .iter()

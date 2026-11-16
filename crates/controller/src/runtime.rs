@@ -852,7 +852,11 @@ impl RuntimeState {
         scope: &MaintenanceScope,
     ) -> Result<Vec<String>, ControllerError> {
         let mut blockers = Vec::new();
-        if self.fan_control_pool.pending > 0 {
+        if !matches!(
+            scope,
+            MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_)
+        ) && self.fan_control_pool.pending > 0
+        {
             blockers.push("a fan-control operation is still in flight".into());
         }
         let deferred_nodes = scope
@@ -865,7 +869,8 @@ impl RuntimeState {
                 || matches!(scope, MaintenanceScope::Nodes(nodes) if node.is_some_and(|node| nodes.contains(node)))
         };
         for job in service.storage.list_active_jobs()? {
-            let scoped = in_scope(job.node.as_ref());
+            let scoped = in_scope(job.node.as_ref())
+                || service.share_maintenance_blocks_job(scope, &job.spec);
             let job_node_unavailable = job.node.as_ref().is_some_and(|node_id| {
                 deferred_nodes.contains(node_id.as_str())
                     || self.nodes.get(node_id.as_str()).is_some_and(|node| {
@@ -955,6 +960,9 @@ impl RuntimeState {
                 .cloned()
                 .collect::<std::collections::HashSet<_>>(),
             MaintenanceScope::Nodes(nodes) => nodes.iter().map(ToString::to_string).collect(),
+            MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_) => {
+                HashSet::new()
+            }
         };
         self.nodes.retain(|node_id, _| {
             service.config.nodes.contains_key(node_id) && !affected.contains(node_id)
@@ -2645,6 +2653,23 @@ impl RuntimeState {
         }
         let now = Instant::now();
         let mut availability = self.availability(service, now);
+        if let Some(scope @ MaintenanceScope::NamedShare(id)) = &service.maintenance_scope {
+            let reason = format!("waiting for maintenance of shared storage '{id}'");
+            for job in &jobs {
+                if job.state == JobState::Pending
+                    && service.share_maintenance_blocks_job(scope, &job.spec)
+                    && job.waiting_reason.as_deref() != Some(reason.as_str())
+                {
+                    service
+                        .storage
+                        .set_waiting_reason(job.id, Some(reason.clone()))?;
+                }
+            }
+            jobs.retain(|job| {
+                job.state != JobState::Pending
+                    || !service.share_maintenance_blocks_job(scope, &job.spec)
+            });
+        }
         let mut pending_heads = pending_queue_heads(&jobs);
         let cursor = self.queue_cursor % queues.len();
         for offset in 0..queues.len() {

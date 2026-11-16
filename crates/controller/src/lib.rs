@@ -127,8 +127,22 @@ impl<T: NodeTransport> ControllerService<T> {
             Some(MaintenanceScope::Nodes(nodes)) => {
                 nodes.iter().any(|node| node.as_str() == node_id)
             }
-            None => false,
+            Some(MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_)) | None => {
+                false
+            }
         }
+    }
+
+    pub(crate) fn share_maintenance_blocks_job(
+        &self,
+        scope: &MaintenanceScope,
+        spec: &macluster_protocol::types::JobSpec,
+    ) -> bool {
+        let MaintenanceScope::NamedShare(id) = scope else {
+            return false;
+        };
+        self.config
+            .job_may_use_named_share(id, spec.required_shares.as_deref())
     }
 
     /// Commit a validated candidate config after the runtime has confirmed the
@@ -144,6 +158,7 @@ impl<T: NodeTransport> ControllerService<T> {
         let affected = |node: Option<&NodeId>| match scope {
             MaintenanceScope::Cluster | MaintenanceScope::ClusterExceptUnreachable(_) => true,
             MaintenanceScope::Nodes(nodes) => node.is_some_and(|node| nodes.contains(node)),
+            MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_) => false,
         };
         let deferred_unreachable_nodes = scope
             .deferred_unreachable_nodes()
@@ -152,7 +167,8 @@ impl<T: NodeTransport> ControllerService<T> {
             .collect::<HashSet<_>>();
         let jobs = self.storage.list_jobs(None)?;
         if jobs.iter().any(|job| {
-            let scoped = affected(job.node.as_ref());
+            let scoped =
+                affected(job.node.as_ref()) || self.share_maintenance_blocks_job(scope, &job.spec);
             let output_sync_deferred = job
                 .node
                 .as_ref()
@@ -183,6 +199,7 @@ impl<T: NodeTransport> ControllerService<T> {
                 MaintenanceScope::Nodes(nodes) => {
                     nodes.iter().any(|node| node.as_str() == id.as_str())
                 }
+                MaintenanceScope::NamedShare(_) | MaintenanceScope::StorageProvider(_) => false,
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -415,6 +432,12 @@ impl<T: NodeTransport> ControllerService<T> {
         }
 
         let mut jobs = self.storage.list_reconcile_jobs()?;
+        if let Some(scope) = &self.maintenance_scope {
+            jobs.retain(|job| {
+                job.state != JobState::Pending
+                    || !self.share_maintenance_blocks_job(scope, &job.spec)
+            });
+        }
         for queue_name in self.config.queues.keys() {
             let queue_config = self
                 .config

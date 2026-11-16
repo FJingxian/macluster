@@ -45,6 +45,58 @@ pub fn validate_scope_config_change(
     if scope.is_cluster_wide() {
         return Ok(());
     }
+    let mut expected = old.clone();
+    match scope {
+        MaintenanceScope::NamedShare(id) => {
+            if let (Some(before), Some(after)) = (old.shares.get(id), next.shares.get(id))
+                && (before.protocol != after.protocol
+                    || before.server != after.server
+                    || before.mount_root != after.mount_root
+                    || before.source_root != after.source_root)
+            {
+                return Err(
+                    "named-share maintenance cannot replace a mapping's source or target".into(),
+                );
+            }
+            let after = next.shares.get(id);
+            expected.shares.remove(id);
+            if let Some(share) = after {
+                expected.shares.insert(id.clone(), share.clone());
+            }
+            return if &expected == next {
+                Ok(())
+            } else {
+                Err("named-share maintenance can only change its selected mapping".into())
+            };
+        }
+        MaintenanceScope::StorageProvider(id) => {
+            use macluster_core::config::Transport;
+            let before = old.nodes.get(id.as_str());
+            if old.shares.values().any(|share| &share.server == id)
+                || &old.storage_server == id
+                || before.is_some_and(|node| node.transport != Transport::Storage)
+            {
+                return if old == next {
+                    Ok(())
+                } else {
+                    Err("cannot change an in-use storage provider without draining".into())
+                };
+            }
+            if let Some(node) = next
+                .nodes
+                .get(id.as_str())
+                .filter(|node| node.transport == Transport::Storage)
+            {
+                expected.nodes.insert(id.to_string(), node.clone());
+            }
+            return if &expected == next {
+                Ok(())
+            } else {
+                Err("storage registration can only add or update its external provider".into())
+            };
+        }
+        _ => {}
+    }
     let MaintenanceScope::Nodes(nodes) = scope else {
         unreachable!("cluster-wide scopes returned above")
     };
@@ -530,7 +582,9 @@ fn canonicalize_scope(
     configured_nodes: &BTreeSet<NodeId>,
 ) -> Result<(), MaintenanceError> {
     let nodes = match scope {
-        MaintenanceScope::Cluster => return Ok(()),
+        MaintenanceScope::Cluster
+        | MaintenanceScope::NamedShare(_)
+        | MaintenanceScope::StorageProvider(_) => return Ok(()),
         MaintenanceScope::ClusterExceptUnreachable(nodes) => nodes,
         MaintenanceScope::Nodes(nodes) => nodes,
     };
@@ -923,6 +977,14 @@ mod tests {
             },
         );
         assert!(validate_scope_config_change(&old, &named_share_change, &arm_a).is_err());
+        let share_scope = MaintenanceScope::NamedShare("datasets".into());
+        assert!(validate_scope_config_change(&old, &named_share_change, &share_scope).is_ok());
+        assert!(validate_scope_config_change(&named_share_change, &old, &share_scope).is_ok());
+        assert!(validate_scope_config_change(&old, &next, &share_scope).is_err());
+        assert!(named_share_change.job_may_use_named_share("datasets", None));
+        assert!(!named_share_change.job_may_use_named_share("datasets", Some(&[])));
+        assert!(named_share_change.job_may_use_named_share("datasets", Some(&["datasets".into()])));
+
         assert!(
             validate_scope_config_change(&old, &named_share_change, &MaintenanceScope::Cluster)
                 .is_ok()

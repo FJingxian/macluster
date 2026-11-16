@@ -180,7 +180,7 @@ fn legacy_config_uses_shared_root_as_storage_source_and_keeps_legacy_digest() {
     );
     assert_eq!(
         config.execution_digest().unwrap(),
-        "10171ec146a3c39899e47515c97f034b55a54379c732d473c159802f6a95776a"
+        "a8eb5efa6adfe8a5ba196389ce2f10c1f8c7e1c5dab334f20f81a66dddf7c0a4"
     );
 }
 

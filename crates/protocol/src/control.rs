@@ -89,6 +89,8 @@ pub enum MaintenanceScope {
     /// state-changing operations still block maintenance.
     ClusterExceptUnreachable(Vec<NodeId>),
     Nodes(Vec<NodeId>),
+    NamedShare(String),
+    StorageProvider(NodeId),
 }
 
 impl MaintenanceScope {
@@ -99,7 +101,7 @@ impl MaintenanceScope {
     pub fn deferred_unreachable_nodes(&self) -> &[NodeId] {
         match self {
             Self::ClusterExceptUnreachable(nodes) => nodes,
-            Self::Cluster | Self::Nodes(_) => &[],
+            Self::Cluster | Self::Nodes(_) | Self::NamedShare(_) | Self::StorageProvider(_) => &[],
         }
     }
 }

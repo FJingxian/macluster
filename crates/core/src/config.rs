@@ -837,6 +837,33 @@ impl ClusterConfig {
 
     /// Hash normalized scheduling and storage state, omitting per-host SSH and
     /// executable/config paths so managed peer copies produce the same digest.
+    /// An unknown dependency list may use any existing mapping. Include
+    /// mappings that share a backing SMB volume or overlapping NFS export.
+    pub fn job_may_use_named_share(&self, id: &str, required: Option<&[String]>) -> bool {
+        let Some(target) = self.shares.get(id) else {
+            return false;
+        };
+        required.is_none_or(|required| {
+            required.iter().any(|key| {
+                key == id
+                    || self.shares.get(key).is_some_and(|share| {
+                        share.protocol == target.protocol
+                            && share.server == target.server
+                            && match target.protocol {
+                                StorageProtocol::Smb => {
+                                    share.source_root.components().nth(1)
+                                        == target.source_root.components().nth(1)
+                                }
+                                StorageProtocol::Nfs => {
+                                    share.source_root.starts_with(&target.source_root)
+                                        || target.source_root.starts_with(&share.source_root)
+                                }
+                            }
+                    })
+            })
+        })
+    }
+
     pub fn execution_digest(&self) -> Result<String, ConfigError> {
         let mut rows = vec![format!(
             "cluster\0{}\0{}\0{}\0{}\0{}\0{}",

@@ -569,6 +569,9 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         }
     }
     let mut hidden_node_notice_printed = false;
+    if command == "submit" && !submit_help_requested(&args) {
+        parse_submit_args(&args).map_err(cli_error)?;
+    }
     if should_preflight_agent_update(&command, &args)
         && !address_migration_deferred
         && is_macluster_executable()
@@ -2500,8 +2503,31 @@ fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -
     } else if !script.is_empty() {
         spec.snapshot = Some(snapshot_reference(&script)?);
     }
-    if !loaded_from_cache {
-        save_submission_cache(&state_root, request_id, &spec, &script)?;
+    let local_agent_update_pending = match config.as_ref() {
+        Some(config) => crate::node_admin::configured_agent_build_mismatch_local(
+            config,
+            &state_root.join("msub-cache"),
+        )
+        .map_err(|(code, error)| {
+            (
+                code,
+                format!("cannot inspect configured Agent builds: {error}"),
+            )
+        })?,
+        None => false,
+    };
+    if local_agent_update_pending
+        && crate::node_admin::agent_update_blocked_by_work(&state_root).map_err(|error| {
+            (
+                1,
+                format!("cannot determine whether Agent update is safe: {error}"),
+            )
+        })?
+    {
+        return Err((
+            1,
+            "active jobs or output sync remain before Agent update; no job was submitted. Retry `msub` after the work drains.".into(),
+        ));
     }
     if spec.mode == JobMode::Interactive
         && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
@@ -2534,6 +2560,9 @@ fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -
     let mut online = online_controller(&config_file, &state_root, spec.mode == JobMode::Batch)?;
     let controller_ready_at = Instant::now();
     let submit_started_at = Instant::now();
+    if !loaded_from_cache {
+        save_submission_cache(&state_root, request_id, &spec, &script)?;
+    }
     let record = if let Some(controller) = &mut online {
         submit_online(controller, request_id, spec, &script)?
     } else {

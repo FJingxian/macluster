@@ -50,27 +50,6 @@ impl ClientMount {
     }
 }
 
-fn smb_mount(share: &macluster_protocol::control::ClientShareDescriptor) -> ClientMount {
-    let path = share.source_root.trim_start_matches('/');
-    let (share_name, subpath) = path.split_once('/').unwrap_or((path, ""));
-    let authority = share
-        .smb_user
-        .as_deref()
-        .map(|user| format!("{user}@{}", share.server_host))
-        .unwrap_or_else(|| share.server_host.clone());
-    ClientMount {
-        protocol: "smb".into(),
-        source: format!("//{authority}/{share_name}"),
-        physical_target: format!(
-            "/Users/Shared/.macluster-mounts/{}",
-            share.share_uuid.trim()
-        ),
-        logical_target: share.mount_root.clone(),
-        alias_suffix: (!subpath.is_empty()).then(|| subpath.to_owned()),
-        share_uuid: share.share_uuid.clone(),
-    }
-}
-
 fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<ClientMount> {
     let mut mounts = Vec::new();
     if !source_is_client_local(&descriptor.primary_source_host, client_ip) {
@@ -90,20 +69,16 @@ fn mounts(descriptor: &ClientDescriptor, client_ip: &str) -> Vec<ClientMount> {
         descriptor
             .shares
             .iter()
-            .filter(|share| !source_is_client_local(&share.server_host, client_ip))
-            .map(|share| {
-                if share.protocol == "smb" {
-                    smb_mount(share)
-                } else {
-                    ClientMount {
-                        protocol: "nfs".into(),
-                        source: format!("{}:{}", share.server_host, share.source_root),
-                        physical_target: share.mount_root.clone(),
-                        logical_target: share.mount_root.clone(),
-                        alias_suffix: None,
-                        share_uuid: share.share_uuid.clone(),
-                    }
-                }
+            .filter(|share| {
+                share.protocol != "smb" && !source_is_client_local(&share.server_host, client_ip)
+            })
+            .map(|share| ClientMount {
+                protocol: "nfs".into(),
+                source: format!("{}:{}", share.server_host, share.source_root),
+                physical_target: share.mount_root.clone(),
+                logical_target: share.mount_root.clone(),
+                alias_suffix: None,
+                share_uuid: share.share_uuid.clone(),
             }),
     );
     mounts
@@ -772,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn smb_shares_are_not_mounted_by_the_privileged_nfs_service() {
+    fn external_smb_shares_are_deferred_to_compute_agents() {
         let mut descriptor = descriptor();
         descriptor.shares.push(ClientShareDescriptor {
             id: "smb-project".into(),
@@ -802,17 +777,14 @@ mod tests {
                 "192.0.2.10",
             )
             .len(),
-            1
+            0
         );
         let wrong_source = "//other-server/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
-        assert_eq!(
-            missing_mounts(&descriptor, wrong_source, None, "192.0.2.10"),
-            vec!["/Volumes/project".to_owned()]
-        );
+        assert!(missing_mounts(&descriptor, wrong_source, None, "192.0.2.10").is_empty());
         let mounted_smb = "//smb-user@192.0.2.20/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
         assert!(
             missing_mounts(&descriptor, mounted_smb, None, "192.0.2.10").is_empty(),
-            "authenticated SMB source must match after both actual and expected usernames are normalized"
+            "login clients must not wait for compute-only SMB mounts"
         );
     }
 
@@ -830,10 +802,9 @@ mod tests {
             smb_user: Some("smb-user".into()),
         });
         let suffix_only_match = "//smb-user@evil-192.0.2.20/data on /Users/Shared/.macluster-mounts/928e8976-c946-509d-9e62-a3ef787664b7 (smbfs, nodev)\n192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n192.0.2.1:/opt/homebrew on /opt/homebrew (nfs)\n";
-        assert_eq!(
-            missing_mounts(&descriptor, suffix_only_match, None, "192.0.2.10"),
-            vec!["/Volumes/project".to_owned()],
-            "SMB host/share matching must not accept a source whose endpoint only shares a suffix"
+        assert!(
+            missing_mounts(&descriptor, suffix_only_match, None, "192.0.2.10").is_empty(),
+            "login clients must not inspect compute-only SMB mounts"
         );
     }
 
@@ -953,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn smb_logical_symlink_is_accepted_only_when_it_points_to_backing_storage() {
+    fn login_client_never_inspects_external_smb_logical_targets() {
         let root =
             std::env::temp_dir().join(format!("macluster-client-smb-overlay-{}", Id128::random()));
         fs::create_dir_all(&root).unwrap();
@@ -993,8 +964,10 @@ mod tests {
         fs::remove_file(&logical).unwrap();
         std::os::unix::fs::symlink("/tmp/unrelated", &logical).unwrap();
         assert!(
-            overlay_targets(&descriptor, "192.0.2.10").is_err(),
-            "an unrelated SMB logical symlink must not be replaced"
+            overlay_targets(&descriptor, "192.0.2.10")
+                .unwrap()
+                .is_empty(),
+            "login clients must leave compute-only SMB paths untouched"
         );
         fs::remove_dir_all(root).unwrap();
     }

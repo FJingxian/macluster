@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::{
     collections::VecDeque,
-    ffi::CStr,
+    ffi::{CStr, CString},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
@@ -662,7 +662,7 @@ fn process_request(
     }
 }
 
-fn smb_session_account(uid: libc::uid_t) -> Result<(String, String), String> {
+fn smb_session_account(uid: libc::uid_t) -> Result<(String, String, libc::gid_t), String> {
     if uid == 0 {
         return Err("SMB session operations require a non-root user".into());
     }
@@ -682,7 +682,216 @@ fn smb_session_account(uid: libc::uid_t) -> Result<(String, String), String> {
     {
         return Err("SMB session account metadata is invalid".into());
     }
-    Ok((user, home))
+    Ok((user, home, unsafe { (*account).pw_gid }))
+}
+
+fn merge_smb_multichannel_disabled(existing: &str, server: &str) -> String {
+    let server = server.trim();
+    let mut output = String::new();
+    let mut in_selected_server = false;
+    let mut found_selected_server = false;
+
+    let push_line = |output: &mut String, line: &str| {
+        output.push_str(line);
+        output.push('\n');
+    };
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let section = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .map(str::trim);
+        if let Some(section) = section {
+            in_selected_server = section.eq_ignore_ascii_case(server);
+            found_selected_server |= in_selected_server;
+            push_line(&mut output, line);
+            if in_selected_server {
+                push_line(&mut output, "# macluster: bridge SMB multichannel disabled");
+                push_line(&mut output, "mc_on=no");
+            }
+            continue;
+        }
+        let key = trimmed
+            .split_once('=')
+            .map(|(key, _)| key.trim())
+            .unwrap_or(trimmed);
+        if in_selected_server
+            && (key.eq_ignore_ascii_case("mc_on")
+                || trimmed == "# macluster: bridge SMB multichannel disabled")
+        {
+            continue;
+        }
+        push_line(&mut output, line);
+    }
+
+    if !found_selected_server {
+        if !output.is_empty() && !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push('[');
+        output.push_str(server);
+        output.push_str("]\n# macluster: bridge SMB multichannel disabled\nmc_on=no\n");
+    }
+    output
+}
+
+fn route_output_interface(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("interface:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn smb_server_route_uses_bridge(server_host: &str) -> bool {
+    let Ok(output) = Command::new("/sbin/route")
+        .args(["-n", "get", "-host", server_host])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && route_output_interface(&String::from_utf8_lossy(&output.stdout))
+            .is_some_and(|interface| interface.starts_with("bridge"))
+}
+
+fn bridge_smb_config_marker(home: &str, target: &str) -> Result<PathBuf, String> {
+    let name = Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 128
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+        .ok_or_else(|| format!("managed SMB target has no safe marker name: {target}"))?;
+    Ok(Path::new(home)
+        .join("Library/Application Support/macluster/smb")
+        .join(format!("org.macluster.smb.{name}.nsmb-bridge-disabled")))
+}
+
+fn write_smb_bridge_marker(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: &str,
+    target: &str,
+) -> Result<(), String> {
+    let marker = bridge_smb_config_marker(home, target)?;
+    let parent = marker
+        .parent()
+        .ok_or_else(|| "SMB bridge marker has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create SMB bridge marker directory: {error}"))?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("inspect SMB bridge marker directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid {
+        return Err("SMB bridge marker directory has unsafe ownership or type".into());
+    }
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata)
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != uid =>
+        {
+            return Err("SMB bridge marker has unsafe ownership or type".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect SMB bridge marker: {error}")),
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker)
+        .map_err(|error| format!("open SMB bridge marker: {error}"))?;
+    file.write_all(b"bridge SMB multichannel disabled\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write SMB bridge marker: {error}"))?;
+    set_owned_file(&marker, uid, gid)
+}
+
+fn ensure_bridge_smb_multichannel_disabled(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: &str,
+    server_host: &str,
+) -> Result<bool, String> {
+    if !smb_server_route_uses_bridge(server_host) {
+        return Ok(false);
+    }
+    write_bridge_smb_multichannel_config(uid, gid, home, server_host)
+}
+
+fn write_bridge_smb_multichannel_config(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: &str,
+    server_host: &str,
+) -> Result<bool, String> {
+    let preferences = Path::new(home).join("Library/Preferences");
+    let metadata = fs::symlink_metadata(&preferences)
+        .map_err(|error| format!("inspect SMB preferences directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != uid {
+        return Err("SMB preferences directory has unsafe ownership or type".into());
+    }
+    let path = preferences.join("nsmb.conf");
+    let existing = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != uid
+                || metadata.len() > 1024 * 1024
+            {
+                return Err("SMB preferences file has unsafe ownership, type, or size".into());
+            }
+            fs::read_to_string(&path).map_err(|error| format!("read SMB preferences: {error}"))?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("inspect SMB preferences: {error}")),
+    };
+    let updated = merge_smb_multichannel_disabled(&existing, server_host);
+    if updated == existing {
+        return Ok(false);
+    }
+    let temporary = preferences.join(format!(".nsmb.conf.macluster-{}.tmp", Id128::random()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| format!("create SMB preferences update: {error}"))?;
+        file.write_all(updated.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("write SMB preferences update: {error}"))?;
+        set_owned_file(&temporary, uid, gid)?;
+        fs::rename(&temporary, &path)
+            .map_err(|error| format!("commit SMB preferences update: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| true)
+}
+
+fn set_owned_file(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "SMB preferences path contains a NUL byte".to_owned())?;
+    if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
+        return Err(format!(
+            "set SMB preferences ownership: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn smb_mount_arguments(
@@ -1083,7 +1292,7 @@ fn mount_smb_from_vault(
     logical_target: &str,
 ) -> Result<(), String> {
     key.validate().map_err(|error| error.to_string())?;
-    let (user, home) = smb_session_account(uid)?;
+    let (user, home, gid) = smb_session_account(uid)?;
     let target_path = Path::new(target);
     let metadata = fs::symlink_metadata(target_path)
         .map_err(|error| format!("inspect SMB mount target {target}: {error}"))?;
@@ -1099,6 +1308,25 @@ fn mount_smb_from_vault(
         vault,
         key,
     };
+    let bridge_route = smb_server_route_uses_bridge(&key.server_host);
+    let marker = bridge_smb_config_marker(&home, target)?;
+    let config_changed = if bridge_route {
+        ensure_bridge_smb_multichannel_disabled(uid, gid, &home, &key.server_host)?
+    } else {
+        false
+    };
+    if bridge_route && (!marker.exists() || config_changed) {
+        let _ = fs::remove_file(&marker);
+        if backend.is_active(target)? {
+            if let Err(error) = backend.unmount(target, logical, logical_target) {
+                backend.ensure_alias(logical, logical_target)?;
+                eprintln!(
+                    "macluster: deferred SMB bridge multichannel refresh for {target}: {error}"
+                );
+                return Ok(());
+            }
+        }
+    }
     reconcile_smb_mount_with_backend(
         source,
         target,
@@ -1107,7 +1335,11 @@ fn mount_smb_from_vault(
         &smb_repair_state_path(target),
         unix_time_ms(),
         &mut backend,
-    )
+    )?;
+    if bridge_route {
+        write_smb_bridge_marker(uid, gid, &home, target)?;
+    }
+    Ok(())
 }
 
 fn smb_mount_is_active(target: &str) -> Result<bool, String> {
@@ -1710,11 +1942,12 @@ mod tests {
         CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore,
         SMB_UNMOUNT_TIMEOUT, SecretStore, SmbMountBackend, SmbMountReadability,
         arp_delete_arguments, confirm_unmount_completion, direct_storage_subnet_route_arguments,
-        ensure_smb_logical_alias, read_pinned_cluster, reconcile_smb_mount_with_backend,
-        record_smb_repair_failure, remove_smb_logical_alias, route_delete_arguments,
-        route_output_is_direct, run_bounded_process_group, serve_client_with, smb_mount_arguments,
-        smb_repair_allowed, smb_tcp_endpoint_reachable, smb_unmount_arguments,
-        smb_unmount_invocation, unmount_smb_with,
+        ensure_smb_logical_alias, merge_smb_multichannel_disabled, read_pinned_cluster,
+        reconcile_smb_mount_with_backend, record_smb_repair_failure, remove_smb_logical_alias,
+        route_delete_arguments, route_output_interface, route_output_is_direct,
+        run_bounded_process_group, serve_client_with, smb_mount_arguments, smb_repair_allowed,
+        smb_tcp_endpoint_reachable, smb_unmount_arguments, smb_unmount_invocation,
+        unmount_smb_with, write_bridge_smb_multichannel_config,
     };
 
     fn cluster() -> Id128 {
@@ -1787,6 +2020,82 @@ mod tests {
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bridge_smb_configuration_disables_only_the_selected_server_multichannel() {
+        let existing = "[default]\nnotify_off=yes\n\n[192.0.2.20]\nminauth=ntlmv2\nmc_on = yes\n\n[192.0.2.21]\nmc_on=yes\n";
+
+        let merged = merge_smb_multichannel_disabled(existing, "192.0.2.20");
+
+        assert_eq!(merged.matches("[192.0.2.20]").count(), 1);
+        assert!(
+            merged
+                .contains("[192.0.2.20]\n# macluster: bridge SMB multichannel disabled\nmc_on=no")
+        );
+        assert!(merged.contains("minauth=ntlmv2"));
+        assert!(merged.contains("[default]\nnotify_off=yes"));
+        assert!(merged.contains("[192.0.2.21]\nmc_on=yes"));
+        assert!(!merged.contains("mc_on = yes"));
+    }
+
+    #[test]
+    fn bridge_smb_configuration_appends_a_server_without_discarding_comments() {
+        let existing = "# user-owned SMB settings\n[default]\nnotify_off=yes\n";
+
+        let merged = merge_smb_multichannel_disabled(existing, "192.0.2.20");
+
+        assert!(merged.starts_with(existing));
+        assert!(merged.ends_with(
+            "\n[192.0.2.20]\n# macluster: bridge SMB multichannel disabled\nmc_on=no\n"
+        ));
+    }
+
+    #[test]
+    fn bridge_smb_configuration_is_idempotent() {
+        let existing = "[192.0.2.20]\n# macluster: bridge SMB multichannel disabled\nmc_on=no\n";
+
+        assert_eq!(
+            merge_smb_multichannel_disabled(existing, "192.0.2.20"),
+            existing
+        );
+    }
+
+    #[test]
+    fn bridge_smb_configuration_writes_a_user_owned_preferences_file_once() {
+        let root = std::env::temp_dir().join(format!("macluster-nsmb-{}", Id128::random()));
+        let preferences = root.join("Library/Preferences");
+        fs::create_dir_all(&preferences).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        assert!(
+            write_bridge_smb_multichannel_config(uid, gid, root.to_str().unwrap(), "192.0.2.20")
+                .unwrap()
+        );
+        assert!(
+            !write_bridge_smb_multichannel_config(uid, gid, root.to_str().unwrap(), "192.0.2.20")
+                .unwrap()
+        );
+        let path = preferences.join("nsmb.conf");
+        let contents = fs::read_to_string(&path).unwrap();
+        let metadata = fs::metadata(path).unwrap();
+        assert!(
+            contents.contains(
+                "[192.0.2.20]\n# macluster: bridge SMB multichannel disabled\nmc_on=no\n"
+            ),
+            "{contents}"
+        );
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_output_identifies_the_bridge_interface() {
+        let route = "route to: 192.0.2.20\ndestination: 192.0.2.20\n  interface: bridge0\n";
+
+        assert_eq!(route_output_interface(route), Some("bridge0"));
     }
 
     #[test]

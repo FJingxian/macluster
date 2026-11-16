@@ -377,6 +377,39 @@ fn finish_node_maintenance_with_success_notice<T>(
     }
 }
 
+fn maintenance_completes_removed_named_share(
+    state: &MaintenanceClientState,
+    config: &ClusterConfig,
+    mapping_id: &str,
+) -> bool {
+    !config.shares.contains_key(mapping_id)
+        && state.operation.contains("share removal")
+        && state.scope == MaintenanceScope::NamedShare(mapping_id.to_owned())
+}
+
+fn resume_completed_named_share_removal(
+    config_path: &Path,
+    state_dir: &Path,
+    mapping_id: &str,
+) -> AppResult<bool> {
+    let config = read_config(config_path)?;
+    if config.shares.contains_key(mapping_id) {
+        return Ok(false);
+    }
+    let state_path = state_dir.join("maintenance-client.json");
+    let Some(state) = read_maintenance_client_state(&state_path)? else {
+        return Ok(false);
+    };
+    if !maintenance_completes_removed_named_share(&state, &config, mapping_id) {
+        return Ok(false);
+    }
+    let guard =
+        acquire_node_maintenance_scoped(config_path, state_dir, &state.operation, state.scope)?;
+    finish_node_maintenance(guard, Ok(()))?;
+    eprintln!("Recovered completed removal of storage mapping {mapping_id}.");
+    Ok(true)
+}
+
 pub fn ensure_no_node_maintenance_in_progress(
     config_path: &Path,
     state_dir: &Path,
@@ -2158,6 +2191,14 @@ pub fn run(config_path: PathBuf, state_dir: PathBuf, args: &[String]) -> AppResu
         return Ok(());
     }
     let action = parse_action(args)?;
+    if let Action::Umount {
+        target: UmountTarget::ShareId(mapping_id),
+        ..
+    } = &action
+        && resume_completed_named_share_removal(&config_path, &state_dir, mapping_id)?
+    {
+        return Ok(());
+    }
     match action {
         Action::List { all, storage, node } => {
             list_nodes(&config_path, &state_dir, all, storage, node.as_ref())
@@ -4551,6 +4592,9 @@ STORAGE MAPPINGS
   For an external NAS, the export must already be enabled on that device;
   macluster mounts and unmounts only on configured Macs and never changes NAS
   exports or writes markers into the provider's source directory.
+  Authenticated SMB mappings are mounted by compute Agents. Login-only clients
+  may submit paths in the mapping without exposing their control connection to
+  the macOS SMB client.
   `mnode -umount MAPPING_ID` removes the mapping and its configured client
   mounts. Source data is preserved.
 
@@ -16548,6 +16592,12 @@ fn node_nfs_mappings(
         state(health.map(|health| health.primary_share_ready)),
     )];
     for (name, share) in &config.shares {
+        if share.protocol == StorageProtocol::Smb
+            && node_id != share.server.as_str()
+            && !config.is_compute_node(node_id)
+        {
+            continue;
+        }
         mappings.push(nfs_mapping(
             node_id,
             if name == "primary" {
@@ -18972,9 +19022,12 @@ fn smb_mount_script(
         shell_quote(&format!("/{subpath}"))
     };
     let source = shell_quote(&source_value);
+    let server_host = shell_quote(&server.host);
     let existing_mount_awk = shell_quote(smb_existing_mount_awk_script());
     let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
     let state_file = format!("\"$HOME/Library/Application Support/macluster/smb/{label}.state\"");
+    let bridge_marker =
+        format!("\"$HOME/Library/Application Support/macluster/smb/{label}.nsmb-bridge-disabled\"");
     let state_body = format!(
         "{}\n{}\n{}\n",
         share.share_uuid.trim(),
@@ -18987,7 +19040,7 @@ fn smb_mount_script(
             .map_err(|error| (1, format!("cannot encode SMB mount request: {error}")))?,
     );
     let body = format!(
-        "#!/bin/sh\nset -eu\nphysical={physical}\nphysical_alias={physical_alias}\nlogical={logical}\nstate={state_file}\nsource={source}\nexisting=$(/sbin/mount | /usr/bin/awk -v source=\"$source\" {existing_mount_awk})\nif [ -n \"$existing\" ]; then backing=$existing; alias=\"$backing\"{alias_suffix}; else backing=$physical; alias=$physical_alias; fi\nif [ -z \"$existing\" ]; then\n  /bin/mkdir -p \"$physical\"\n  response=$(/usr/bin/printf '%s' {mount_request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"mounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper mount failed: %s\\n' \"$response\" >&2; exit 1; }}\nfi\nif [ \"$logical\" != \"$alias\" ]; then [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ] || {{ echo 'SMB logical path is not the managed alias' >&2; exit 1; }}; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$state\")\"\nprintf '%s%s\\n' {state_text} \"$backing\" > \"$state.next\"\n/bin/chmod 600 \"$state.next\"\n/bin/mv -f \"$state.next\" \"$state\"\n",
+        "#!/bin/sh\nset -eu\nphysical={physical}\nphysical_alias={physical_alias}\nlogical={logical}\nstate={state_file}\nmarker={bridge_marker}\nsource={source}\nserver_host={server_host}\nroute_interface=$(/sbin/route -n get -host \"$server_host\" 2>/dev/null | /usr/bin/awk '$1 == \"interface:\" {{ print $2; exit }}' || true)\nbridge_refresh=0\ncase \"$route_interface\" in\n  bridge*) if [ ! -f \"$marker\" ]; then bridge_refresh=1; fi ;;\nesac\nexisting=$(/sbin/mount | /usr/bin/awk -v source=\"$source\" {existing_mount_awk})\nif [ -z \"$existing\" ] || {{ [ \"$existing\" = \"$physical\" ] && [ \"$bridge_refresh\" -eq 1 ]; }}; then\n  /bin/mkdir -p \"$physical\"\n  response=$(/usr/bin/printf '%s' {mount_request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"mounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper mount failed: %s\\n' \"$response\" >&2; exit 1; }}\n  existing=$(/sbin/mount | /usr/bin/awk -v source=\"$source\" {existing_mount_awk})\nfi\nif [ -n \"$existing\" ]; then backing=$existing; alias=\"$backing\"{alias_suffix}; else backing=$physical; alias=$physical_alias; fi\nif [ \"$logical\" != \"$alias\" ]; then [ -L \"$logical\" ] && [ \"$(/usr/bin/readlink \"$logical\")\" = \"$alias\" ] || {{ echo 'SMB logical path is not the managed alias' >&2; exit 1; }}; fi\n/bin/mkdir -p \"$(/usr/bin/dirname \"$state\")\"\nprintf '%s%s\\n' {state_text} \"$backing\" > \"$state.next\"\n/bin/chmod 600 \"$state.next\"\n/bin/mv -f \"$state.next\" \"$state\"\n",
         state_text = shell_quote(&state_body),
         mount_request = mount_request,
     );
@@ -19032,7 +19085,7 @@ fn smb_unmount_script(share: &ShareConfig, force: bool) -> AppResult<String> {
             .map_err(|error| (1, format!("cannot encode SMB unmount request: {error}")))?,
     );
     Ok(format!(
-        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif [ \"$backing\" = \"$physical\" ]; then\n  mounts=$(/sbin/mount)\n  if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n    if [ {try_owner_unmount} = 1 ]; then\n      /usr/bin/perl -e 'alarm 5; exec @ARGV or die $!' /sbin/umount \"$physical\" || true\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n      response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n    /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then echo 'SMB mount remains active after unmount' >&2; exit 1; fi\n  fi\nfi\nexpected_alias=\"$backing\"{alias_suffix}\nresponse=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n/usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); if [ \"$actual\" = \"$expected_alias\" ]; then /bin/rm -f \"$logical\" 2>/dev/null || true; fi; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif [ \"$backing\" = \"$physical\" ]; then\n  mounts=$(/sbin/mount)\n  if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n    if [ {try_owner_unmount} = 1 ]; then\n      /usr/bin/perl -e 'alarm 5; exec @ARGV or die $!' /sbin/umount \"$physical\" || true\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n      response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n    /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then echo 'SMB mount remains active after unmount' >&2; exit 1; fi\n  fi\nfi\nexpected_alias=\"$backing\"{alias_suffix}\nresponse=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n/usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); if [ \"$actual\" = \"$expected_alias\" ]; then /bin/rm -f \"$logical\" 2>/dev/null || true; fi; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/Application Support/macluster/smb/{label}.nsmb-bridge-disabled\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
         try_owner_unmount = u8::from(!force),
         request = request,
         alias_suffix = alias_suffix,
@@ -19134,14 +19187,19 @@ fn reconcile_local_smb_shares_with_home(
     if !config.nodes.contains_key(local_node_id) {
         return Err((2, format!("node '{local_node_id}' is not configured")));
     }
-    let desired = config
-        .shares
-        .values()
-        .filter(|share| {
-            share.protocol == StorageProtocol::Smb && share.server.as_str() != local_node_id
-        })
-        .map(|share| (share.share_uuid.to_ascii_lowercase(), share))
-        .collect::<BTreeMap<_, _>>();
+    let local_is_compute = config.is_compute_node(local_node_id);
+    let desired = if local_is_compute {
+        config
+            .shares
+            .values()
+            .filter(|share| {
+                share.protocol == StorageProtocol::Smb && share.server.as_str() != local_node_id
+            })
+            .map(|share| (share.share_uuid.to_ascii_lowercase(), share))
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
     let state_dir = home.join("Library/Application Support/macluster/smb");
     match fs::read_dir(&state_dir) {
         Ok(entries) => {
@@ -19212,6 +19270,9 @@ fn reconcile_local_smb_shares_with_home(
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err((1, format!("cannot inspect SMB state: {error}"))),
+    }
+    if !local_is_compute {
+        return Ok(());
     }
     for (share_id, share) in &config.shares {
         if share.protocol != StorageProtocol::Smb || share.server.as_str() == local_node_id {
@@ -24483,26 +24544,28 @@ fn add_existing_ssh_node_to_queue(
 mod tests {
     use super::{
         Action, AdminState, AgentBuildCompatibility, AgentBuildState, AgentStagePurpose, AppResult,
-        ClientMountRequest, ClientUnmountRequest, ClusterConfig, ConfigError, NFS_DAEMON_PATH,
-        NamedShareMountStatus, NodeEndpoint, NodeListRow, NodeNfsMapping, NodeOperation,
-        NodeShareCapacity, NodeStorageInventory, ShareConfig, UmountTarget, UpdateRecovery,
-        abort_duplicate_pristine_adds, acquire_maintenance_client_lock, acquire_node_maintenance,
-        acquire_node_maintenance_with, acquire_node_maintenance_with_confirmation_using,
-        add_node_admin_ssh_pool_args, admin_shell_command, agent_update_completion_summary,
-        agent_update_maintenance_scope, agent_update_recovery_pending, aggregate_nfs_mappings,
-        cached_node_list_state, candidate_admin_script, classify_configured_agents,
-        cleanup_node_from_endpoint, client_mount_admin_request, client_mount_batch_script,
-        client_mount_status_awk_script, client_nfs_cleanup_batch_script, client_nfs_cleanup_plan,
-        client_share_alias_script, config_path_candidate, controller_command_matches,
+        ClientMountRequest, ClientUnmountRequest, ClusterConfig, ConfigError,
+        MaintenanceClientState, NFS_DAEMON_PATH, NamedShareMountStatus, NodeEndpoint, NodeListRow,
+        NodeNfsMapping, NodeOperation, NodeShareCapacity, NodeStorageInventory, ShareConfig,
+        UmountTarget, UpdateRecovery, abort_duplicate_pristine_adds,
+        acquire_maintenance_client_lock, acquire_node_maintenance, acquire_node_maintenance_with,
+        acquire_node_maintenance_with_confirmation_using, add_node_admin_ssh_pool_args,
+        admin_shell_command, agent_update_completion_summary, agent_update_maintenance_scope,
+        agent_update_recovery_pending, aggregate_nfs_mappings, cached_node_list_state,
+        candidate_admin_script, classify_configured_agents, cleanup_node_from_endpoint,
+        client_mount_admin_request, client_mount_batch_script, client_mount_status_awk_script,
+        client_nfs_cleanup_batch_script, client_nfs_cleanup_plan, client_share_alias_script,
+        config_path_candidate, controller_command_matches,
         controller_migration_peer_sync_error_is_local_only, controller_migration_target_script,
         ensure_controller_recovery_clean, ensure_no_node_maintenance_in_progress,
         existing_ssh_endpoint_matches, force_pending_smb_share_with, format_node_list,
         has_committed_config_generation_path, inspect_configured_agent_build,
         installed_helper_sequence_from_error, list_nodes, local_config_candidate,
-        maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
-        mount_point_permission_error, named_share_mount_root, named_share_mount_status,
-        named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
-        nfs_client_sudoers_content, nfs_client_sudoers_install_script, nfs_exports_read_command,
+        maintenance_completes_removed_named_share, maintenance_inputs_unchanged,
+        managed_binary_digest, migration_controller_epoch, mount_point_permission_error,
+        named_share_mount_root, named_share_mount_status, named_share_operation_endpoint,
+        named_share_operation_matches, named_share_request_matches, nfs_client_sudoers_content,
+        nfs_client_sudoers_install_script, nfs_exports_read_command,
         nfs_exports_update_baseline_read_command, nfs_exports_update_script,
         nfs_exports_update_script_for_expected, nfs_mapping, nfs_mount_source,
         node_admin_recovery_pending, node_nfs_mappings, node_ssh_endpoint_reachable,
@@ -24525,6 +24588,7 @@ mod tests {
     use macluster_core::nfs_reconcile::DeferredShareCleanupState;
     use macluster_core::storage::{ReadOnlyJobStore, Storage};
     use macluster_core::storage_uri::{StorageProtocol, StorageUri};
+    use macluster_protocol::control::MaintenanceScope;
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
     use macluster_protocol::nfs_admin::{NfsAdminOperation, NfsAdminRequest, NfsMount};
@@ -24880,6 +24944,40 @@ exec "$@"
             None,
             Some(config_before),
             Some(journal_before)
+        ));
+    }
+
+    #[test]
+    fn removed_mapping_matches_its_interrupted_named_share_removal() {
+        let config = parse_build_test_config();
+        let state = MaintenanceClientState {
+            version: 1,
+            binding_digest: "binding".into(),
+            operation: "SMB share removal".into(),
+            scope: MaintenanceScope::NamedShare("mnt-removed".into()),
+            operation_id: Id128::random(),
+            initial_config_digest: None,
+            initial_journal_digest: None,
+            candidate_config_digest: Some("candidate".into()),
+            candidate_journal_digest: Some("journal".into()),
+        };
+
+        assert!(maintenance_completes_removed_named_share(
+            &state,
+            &config,
+            "mnt-removed"
+        ));
+        assert!(!maintenance_completes_removed_named_share(
+            &state,
+            &config,
+            "mnt-other"
+        ));
+        let mut wrong_scope = state.clone();
+        wrong_scope.operation = "SMB share setup".into();
+        assert!(!maintenance_completes_removed_named_share(
+            &wrong_scope,
+            &config,
+            "mnt-removed"
         ));
     }
 
@@ -27295,6 +27393,67 @@ execution_uid = 501
     }
 
     #[test]
+    fn smb_mapping_health_ignores_non_compute_login_clients() {
+        let mut config = parse_build_test_config();
+        for queue in config.queues.values_mut() {
+            queue.nodes.retain(|node| node.as_str() != "login");
+        }
+        config.shares.insert(
+            "project".into(),
+            ShareConfig {
+                protocol: StorageProtocol::Smb,
+                server: NodeId::new("nas").unwrap(),
+                source_root: "/data".into(),
+                mount_root: "/Volumes/data".into(),
+                share_uuid: "00000000-0000-4000-8000-000000000003".into(),
+                smb_user: Some("smb-user".into()),
+                allow_existing_contents: false,
+            },
+        );
+        config.nodes.insert(
+            "nas".into(),
+            NodeConfig {
+                host: "192.0.2.20".into(),
+                transport: Transport::Storage,
+                remote_binary: String::new(),
+                ssh_user: None,
+                ssh_port: None,
+                ssh_identity_file: None,
+                remote_config: None,
+                machine_uuid: None,
+                execution_uid: None,
+            },
+        );
+        let health = NodeHealth {
+            machine_uuid: config.nodes["arm-a"]
+                .machine_uuid
+                .clone()
+                .unwrap_or_default(),
+            execution_uid: 501,
+            build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+            logical_cpus: None,
+            execution_digest: config.execution_digest().unwrap(),
+            primary_share_ready: true,
+            shares: BTreeMap::from([("project".into(), true)]),
+            features: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(
+            node_nfs_mappings(&config, "login", None)
+                .iter()
+                .all(|mapping| mapping.protocol != StorageProtocol::Smb)
+        );
+        assert_eq!(
+            node_nfs_mappings(&config, "arm-a", Some(&health))
+                .into_iter()
+                .find(|mapping| mapping.name == "project")
+                .map(|mapping| mapping.state),
+            Some("READY")
+        );
+    }
+
+    #[test]
     fn storage_mapping_uses_the_provider_state_when_a_client_report_is_stale() {
         let ready = nfs_mapping(
             "login",
@@ -29270,6 +29429,41 @@ execution_uid = 501
     }
 
     #[test]
+    fn bridge_smb_mount_script_refreshes_existing_sessions_until_multichannel_is_disabled() {
+        let server = NodeConfig {
+            host: "192.0.2.20".into(),
+            transport: Transport::Ssh,
+            remote_binary: "/usr/local/bin/macluster".into(),
+            ssh_user: Some("nas".into()),
+            ssh_port: Some(22),
+            ssh_identity_file: None,
+            remote_config: None,
+            machine_uuid: None,
+            execution_uid: None,
+        };
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/data".into(),
+            mount_root: "/Volumes/data".into(),
+            share_uuid: "928e8976-c946-509d-9e62-a3ef787664b7".into(),
+            allow_existing_contents: false,
+            smb_user: Some("smb-user".into()),
+        };
+
+        let script =
+            super::smb_mount_script("00000000-0000-4000-8000-000000000001", &share, &server)
+                .unwrap();
+
+        assert!(script.contains("/sbin/route -n get -host"));
+        assert!(script.contains("case \"$route_interface\" in"));
+        assert!(script.contains("bridge*)"));
+        assert!(script.contains("nsmb-bridge-disabled"));
+        assert!(script.contains("[ \"$existing\" = \"$physical\" ]"));
+        assert!(script.contains("[ \"$bridge_refresh\" -eq 1 ]"));
+    }
+
+    #[test]
     fn smb_mount_script_accepts_a_share_without_a_subpath() {
         let server = NodeConfig {
             host: "192.0.2.20".into(),
@@ -29389,6 +29583,10 @@ execution_uid = 501
         assert!(
             unmount.contains("SMB mount remains active after unmount"),
             "the state may be cleared only after the helper confirms the physical mount is gone"
+        );
+        assert!(
+            unmount.contains(".nsmb-bridge-disabled"),
+            "removal must clear the per-mapping bridge configuration marker"
         );
 
         for script in [mount, unmount] {
@@ -29849,6 +30047,29 @@ execution_uid = 501
         assert!(!support.join(format!("{label}.state")).exists());
         assert!(!support.join(format!("{label}.sh")).exists());
         assert!(!agents.join(format!("{label}.plist")).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smb_reconciliation_does_not_mount_external_shares_on_non_compute_login() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-login-smb-skip-{}", Id128::random()));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let config = root.join("config.toml");
+        fs::write(
+            &config,
+            "[cluster]\nname=\"test\"\nlogin_node=\"login\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"f779bcf5-ea85-5caa-9579-74b395f3cce5\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"worker\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.worker]\nhost=\"192.0.2.10\"\ntransport=\"ssh\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdea\"\nexecution_uid=501\n[nodes.missing-nas]\nhost=\"192.0.2.20\"\ntransport=\"storage\"\n[shares.project]\nprotocol=\"smb\"\nserver=\"missing-nas\"\nsource_root=\"/data\"\nmount_root=\"/Volumes/data\"\nshare_uuid=\"928e8976-c946-509d-9e62-a3ef787664b7\"\nsmb_user=\"smb-user\"\n",
+        )
+        .unwrap();
+
+        super::reconcile_local_smb_shares_with_home(&config, "login", &home).unwrap();
+
+        assert!(
+            !home
+                .join("Library/Application Support/macluster/smb")
+                .exists()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -30,6 +30,14 @@ fn percent_encoded_paths_decode_to_one_canonical_identity() {
 }
 
 #[test]
+fn nfs_paths_may_contain_at_sign_directory_names() {
+    let uri = StorageUri::parse("nfs://nas-01/mnt/@usb/sdb2").unwrap();
+
+    assert_eq!(uri.source, "/mnt/@usb/sdb2");
+    assert_eq!(uri.canonical, "nfs://nas-01/mnt/@usb/sdb2");
+}
+
+#[test]
 fn uri_rejects_noncanonical_or_ambiguous_inputs() {
     for value in [
         "nfs://default-001",

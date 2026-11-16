@@ -273,7 +273,7 @@ pub enum ConfigError {
     #[error("multiple node IDs refer to the same machine UUID '{0}'")]
     DuplicateMachineUuid(String),
     #[error(
-        "share paths must be normalized absolute paths using only ASCII letters, digits, slash, dot, underscore, or hyphen"
+        "share paths must be normalized absolute paths using only ASCII letters, digits, slash, dot, underscore, hyphen, at sign, or spaces"
     )]
     InvalidSharePath,
     #[error("share '{share}' mount path overlaps another managed path '{path}'")]
@@ -932,7 +932,7 @@ fn safe_absolute_remote_file(path: &str) -> bool {
         && path.len() > 1
         && !path.ends_with('/')
         && path.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b' ')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b' ' | b'@')
         })
         && path
             .split('/')
@@ -1319,5 +1319,23 @@ mod address_ssh_tests {
         assert!(args("192.0.2.1").contains(&"-oUserKnownHostsFile=/dev/null".into()));
         assert!(args("192.0.2.1").contains(&"-oStrictHostKeyChecking=yes".into()));
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod storage_path_tests {
+    use super::ClusterConfig;
+
+    #[test]
+    fn external_nfs_source_can_use_macos_at_sign_directory_names() {
+        let config = ClusterConfig::parse(
+            "[cluster]\nname=\"test\"\ndefault_queue=\"q\"\nshared_root=\"/Users/Shared/macluster\"\nshare_uuid=\"00000000-0000-4000-8000-000000000001\"\nstorage_server=\"login\"\nprotocol_version=1\n[queues.q]\nnodes=[\"login\"]\nscheduler=\"fifo\"\n[nodes.login]\nhost=\"192.0.2.1\"\ntransport=\"local\"\nmachine_uuid=\"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid=501\n[nodes.nas]\nhost=\"192.0.2.5\"\ntransport=\"storage\"\n[shares.usb]\nprotocol=\"nfs\"\nserver=\"nas\"\nsource_root=\"/mnt/@usb/sdb2\"\nmount_root=\"/Volumes/usb\"\nshare_uuid=\"00000000-0000-4000-8000-000000000002\"\n",
+        )
+        .expect("the NFS source path contains a valid @ directory");
+
+        assert_eq!(
+            config.shares["usb"].source_root.to_string_lossy(),
+            "/mnt/@usb/sdb2"
+        );
     }
 }

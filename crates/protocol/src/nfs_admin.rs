@@ -329,9 +329,9 @@ fn validate_path(path: &str, label: &str) -> Result<(), String> {
                 std::path::Component::CurDir | std::path::Component::ParentDir
             )
         })
-        || !path
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        || !path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'@')
+        })
         || path.contains("//")
     {
         return Err(format!("{label} must be a normalized absolute path"));
@@ -413,6 +413,7 @@ fn valid_node_id(value: &str) -> bool {
 mod tests {
     use super::{
         NfsAdminOperation, NfsAdminRequest, NfsExportCleanup, NfsMount, validate_export_transition,
+        validate_path,
     };
 
     #[test]
@@ -733,6 +734,25 @@ mod tests {
             },
         };
         assert!(invalid_alias.validate(501).is_err());
+    }
+
+    #[test]
+    fn nfs_admin_paths_accept_at_sign_directory_names() {
+        let request = NfsAdminRequest {
+            operation: NfsAdminOperation::Mount {
+                mounts: vec![NfsMount {
+                    source: "192.0.2.5:/mnt/@usb/sdb2".into(),
+                    target: "/Volumes/ext4-nas".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
+                    alias: None,
+                    allow_existing_contents: false,
+                }],
+            },
+        };
+
+        request.validate(501).unwrap();
+        assert!(validate_path("/mnt/@usb/sdb2", "NFS export path").is_ok());
+        assert!(validate_path("/mnt/@usb/../sdb2", "NFS export path").is_err());
     }
 
     fn valid_mount_request() -> NfsAdminRequest {

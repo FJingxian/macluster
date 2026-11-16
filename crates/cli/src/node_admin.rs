@@ -91,7 +91,7 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-17";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-18";
 const POWER_HELPER_REVISION: &str = "power-4";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
 const NFS_CLIENT_SUDOERS_PATH: &str = "/private/etc/sudoers.d/macluster_nfs_client";
@@ -4069,7 +4069,7 @@ fn parse_action(args: &[String]) -> AppResult<Action> {
                     if !safe_absolute_remote_path(&value) {
                         return Err((
                             2,
-                            "--mount-root must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_' or '-'".into(),
+                            "--mount-root must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_', '-', '@' or spaces".into(),
                         ));
                     }
                     mount_root = Some(PathBuf::from(value));
@@ -6719,7 +6719,7 @@ pub(crate) fn checked_remote_path(path: &str) -> AppResult<String> {
     if !safe_absolute_remote_path(path) {
         return Err((
             2,
-            "remote HOME must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_' or '-'".into(),
+            "remote HOME must be a normalized absolute path containing only ASCII letters, digits, '/', '.', '_', '-' or '@'".into(),
         ));
     }
     Ok(path.to_owned())
@@ -6854,9 +6854,9 @@ fn safe_absolute_remote_path(path: &str) -> bool {
     path.starts_with('/')
         && path.len() > 1
         && !path.ends_with('/')
-        && path
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        && path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'@')
+        })
         && path
             .split('/')
             .skip(1)
@@ -24578,10 +24578,10 @@ mod tests {
         preferred_local_host, provider_storage_inventory, queue_candidate_with_node,
         reachable_configured_node_ids, read_admin_state, remote_config_belongs_to_cluster,
         remote_execution_status, reset_admin_operations, reset_node_from_endpoint,
-        resume_existing_ssh_add_sync, save_admin_state, shell_quote, should_resume_add_operation,
-        shutdown_confirmation_accepted, unavailable_share_client_nodes, update_recovery,
-        validate_nfs_client_admin_invocation, validate_pending_node_identity,
-        validate_storage_root_access,
+        resume_existing_ssh_add_sync, safe_absolute_remote_path, save_admin_state, shell_quote,
+        should_resume_add_operation, shutdown_confirmation_accepted,
+        unavailable_share_client_nodes, update_recovery, validate_nfs_client_admin_invocation,
+        validate_pending_node_identity, validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -24607,6 +24607,12 @@ mod tests {
 
     fn test_exports_path() -> PathBuf {
         std::env::temp_dir().join(format!("macluster-exports-{}.test", Id128::random()))
+    }
+
+    #[test]
+    fn external_nfs_path_accepts_at_sign_directory_names() {
+        assert!(safe_absolute_remote_path("/mnt/@usb/sdb2"));
+        assert!(!safe_absolute_remote_path("/mnt/@usb/../sdb2"));
     }
 
     #[test]
@@ -33103,6 +33109,10 @@ ssh_port = 22
 
     #[test]
     fn nfs_admin_cli_revision_comparison_accepts_newer_implementations() {
+        assert!(
+            super::nfs_admin_cli_revision_at_least(super::NFS_ADMIN_CLI_REVISION, "nfs-admin-18"),
+            "path-grammar changes require a privileged helper revision bump"
+        );
         assert!(super::nfs_admin_cli_revision_at_least(
             "nfs-admin-7",
             "nfs-admin-1"

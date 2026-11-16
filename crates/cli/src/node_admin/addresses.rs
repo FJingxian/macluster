@@ -1693,11 +1693,15 @@ mod tests {
                 mac: None,
             },
         ];
-        let selected = select_explicit_interface(Some("198.51.100.5".parse().unwrap()), &interfaces)
-            .unwrap()
-            .unwrap();
+        let selected =
+            select_explicit_interface(Some("198.51.100.5".parse().unwrap()), &interfaces)
+                .unwrap()
+                .unwrap();
         assert_eq!(selected.interface, "en0");
-        assert_eq!(selected.address, "198.51.100.5".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(
+            selected.address,
+            "198.51.100.5".parse::<Ipv4Addr>().unwrap()
+        );
         assert!(
             select_explicit_interface(Some("192.0.2.2".parse().unwrap()), &interfaces)
                 .unwrap_err()

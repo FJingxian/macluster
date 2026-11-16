@@ -30,10 +30,10 @@ use macluster_protocol::{
     framing::{MAX_SNAPSHOT_BYTES, sha256_hex, write_frame},
     identifiers::{Id128, NodeId, QueueName, RequestId, StartToken},
     types::{
-        ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, CARGO_HOME_SEED_ENV,
-        EXPLICIT_TASK_PATH_ENV, FanPolicy, INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSpec,
-        JobState, METRICS_FAN_SPEED_FEATURE, MetricSnapshot, PROTOCOL_VERSION, SnapshotRef,
-        VERBOSE_TASK_LOG_ENV, VERBOSE_TASK_LOG_ROOT_ENV,
+        ACTIVE_ENV_PREFIX_ENV, BUILD_CACHE_MAINTENANCE_ENV, EXPLICIT_TASK_PATH_ENV, FanPolicy,
+        INTERACTIVE_PTY_FEATURE, JobMode, JobRecord, JobSpec, JobState, METRICS_FAN_SPEED_FEATURE,
+        MetricSnapshot, PROTOCOL_VERSION, SnapshotRef, VERBOSE_TASK_LOG_ENV,
+        VERBOSE_TASK_LOG_ROOT_ENV,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -964,7 +964,13 @@ fn remote_node_command_requires_binary_sync(args: &[String]) -> bool {
     args.first().is_some_and(|argument| {
         matches!(
             argument.as_str(),
-            "-mount" | "--mount" | "-umount" | "--umount" | "-migrate" | "--migrate"
+            "-l" | "--list"
+                | "-mount"
+                | "--mount"
+                | "-umount"
+                | "--umount"
+                | "-migrate"
+                | "--migrate"
         )
     })
 }
@@ -3272,9 +3278,6 @@ fn build_submission(
     } else {
         task_env.remove(BUILD_CACHE_MAINTENANCE_ENV);
     }
-    if !task_script_uses_cargo_cache(&script, merged.interactive, &task_env) {
-        task_env.remove(CARGO_HOME_SEED_ENV);
-    }
     if merged.verbose {
         task_env.insert(VERBOSE_TASK_LOG_ENV.into(), "1".into());
         task_env.insert(
@@ -3620,35 +3623,18 @@ fn prepare_task_environment_with_policy(
         .map(|prefix| validate_active_environment(config, prefix))
         .transpose()?;
 
-    // A configured login-node Cargo share is the only safe way to reuse its
-    // registry cache from compute nodes. Select it for ordinary online builds
-    // too; previously this happened only in offline mode, so normal msub
-    // builds silently started with an empty per-node Cargo registry.
-    if !explicit_env_keys.iter().any(|key| key == "CARGO_HOME") {
-        let inherited_cargo_home = task_env
-            .get("CARGO_HOME")
-            .filter(|value| !value.is_empty())
-            .map(Path::new);
-        let inherited_shared = inherited_cargo_home
-            .filter(|path| path.is_absolute())
-            .and_then(|path| remap_shared_path(config, path));
-        let configured_shared = if inherited_shared.is_none() {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .and_then(|home| configured_shared_cargo_home(config, &home))
-                .and_then(|path| remap_shared_path(config, &path))
-        } else {
-            None
-        };
-        if let Some(compute_path) = inherited_shared.or(configured_shared) {
-            // Keep Cargo's writable cache node-local. The Agent seeds it once
-            // from the login node's shared registry/Git download cache.
-            task_env.remove("CARGO_HOME");
-            task_env.insert(
-                CARGO_HOME_SEED_ENV.into(),
-                compute_path.to_string_lossy().into_owned(),
-            );
-        }
+    // Resolve Cargo's implicit home from the submitting user's environment.
+    // A remote submission may be prepared on a controller with a different HOME.
+    if !task_env.contains_key("CARGO_HOME")
+        && let Some(cargo_home) = task_env
+            .get("HOME")
+            .map(Path::new)
+            .and_then(|home| configured_shared_cargo_home(config, home))
+    {
+        task_env.insert(
+            "CARGO_HOME".into(),
+            cargo_home.to_string_lossy().into_owned(),
+        );
     }
 
     if let Some(prefix) = selected_prefix.as_deref()
@@ -5121,6 +5107,13 @@ fn remap_environment_paths(config: &ClusterConfig, key: &str, value: &str) -> St
         "CARGO_TARGET_DIR",
         "CCACHE_DIR",
         "SCCACHE_DIR",
+        "PIP_CONFIG_FILE",
+        "PIP_CACHE_DIR",
+        "PIP_CERT",
+        "PIP_CLIENT_CERT",
+        "PIP_TARGET",
+        "PIP_PREFIX",
+        "XDG_CONFIG_HOME",
     ];
 
     if value.is_empty() {
@@ -8310,6 +8303,7 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             crate::node_admin::discover_legacy_smb_orphans(&config_path, &state_dir)
         }
         Some("nfs-admin") => internal_nfs_admin(&args[1..]),
+        Some("nfs-client-admin") => internal_nfs_client_admin(&args[1..]),
         Some("control-proxy") => {
             let config_path = resolved_config_path(global.config.as_deref());
             let state_dir = state_root(global.state_dir.as_deref())?;
@@ -9045,6 +9039,55 @@ fn internal_nfs_admin(args: &[String]) -> AppResult<()> {
     Ok(())
 }
 
+fn internal_nfs_client_admin(args: &[String]) -> AppResult<()> {
+    if args.len() != 2 || args[0] != "--peer-uid" {
+        return Err((
+            2,
+            "internal nfs-client-admin requires --peer-uid UID".into(),
+        ));
+    }
+    let peer_uid = args[1].parse::<u32>().map_err(|_| {
+        (
+            2,
+            "internal nfs-client-admin peer UID must be numeric".into(),
+        )
+    })?;
+    let invoking_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let mut request_bytes = Vec::new();
+    io::stdin()
+        .take(macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut request_bytes)
+        .map_err(|error| (1, format!("cannot read NFS client request: {error}")))?;
+    let reply = if request_bytes.len() > macluster_protocol::nfs_admin::MAX_NFS_ADMIN_REQUEST_BYTES
+    {
+        macluster_protocol::nfs_admin::NfsAdminReply::failure(
+            macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
+            "NFS client request exceeds the 1 MiB limit",
+        )
+    } else {
+        match serde_json::from_slice::<macluster_protocol::nfs_admin::NfsAdminRequest>(
+            &request_bytes,
+        ) {
+            Ok(request) => crate::node_admin::apply_privileged_nfs_client_admin_request(
+                request,
+                peer_uid,
+                invoking_uid,
+            ),
+            Err(error) => macluster_protocol::nfs_admin::NfsAdminReply::failure(
+                macluster_protocol::nfs_admin::NFS_ADMIN_SERVICE_VERSION,
+                format!("invalid NFS client request: {error}"),
+            ),
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&reply).map_err(|error| (1, error.to_string()))?
+    );
+    Ok(())
+}
+
 fn option_value(args: &[String], option: &str) -> AppResult<Option<String>> {
     for (index, argument) in args.iter().enumerate() {
         if argument == option {
@@ -9421,20 +9464,19 @@ mod tests {
     };
 
     use super::{
-        ACTIVE_ENV_PREFIX_ENV, CARGO_HOME_SEED_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV,
-        NodeMetricRow, SUBMITTER_HOME_ENV, aggregate_metrics, build_submission,
-        cached_monitor_samples, can_defer_agent_update_for_work,
-        controller_should_resume_after_agent_update, controller_startup_policy,
-        deferred_nodes_summary, display_width, explain_legacy_power_agent,
-        format_fan_control_table, format_job_details, format_jobs_table, format_power,
-        format_queue_output, interactive_job_ready_to_attach, is_macluster_binary_path,
-        maybe_run_agent_update, metric_row, metric_table_header, one_shot_task_count,
-        prepare_task_environment, promote_inline_command, prune_submission_cache,
-        required_named_shares, sampled_node_belongs_in_cluster_rows, selected_local_node_id,
-        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
-        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
-        smb_shares_referenced_by_submit_options, submission_must_wait_for_agent_update,
-        visible_unassigned_operational_nodes,
+        ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
+        SUBMITTER_HOME_ENV, aggregate_metrics, build_submission, cached_monitor_samples,
+        can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
+        controller_startup_policy, deferred_nodes_summary, display_width,
+        explain_legacy_power_agent, format_fan_control_table, format_job_details,
+        format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
+        is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
+        one_shot_task_count, prepare_task_environment, promote_inline_command,
+        prune_submission_cache, required_named_shares, sampled_node_belongs_in_cluster_rows,
+        selected_local_node_id, should_block_agent_update_for_pending_node_recovery,
+        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
+        should_preflight_agent_update, smb_shares_referenced_by_submit_options,
+        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
     };
     use macluster_core::config::ClusterConfig;
     use macluster_protocol::{
@@ -9813,14 +9855,20 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn remote_storage_mutations_require_the_current_controller_cli() {
+    fn remote_node_listing_syncs_the_current_cli_for_current_output_layout() {
         for flag in ["-mount", "--mount", "-umount", "--umount", "-migrate"] {
             assert!(
                 super::remote_node_command_requires_binary_sync(&[flag.into()]),
                 "remote node operation {flag} must use the current CLI build"
             );
         }
-        for flag in ["-l", "--list", "--failed", "--scan"] {
+        for flag in ["-l", "--list"] {
+            assert!(
+                super::remote_node_command_requires_binary_sync(&[flag.into()]),
+                "remote node listing {flag} must use the current formatter"
+            );
+        }
+        for flag in ["--failed", "--scan"] {
             assert!(
                 !super::remote_node_command_requires_binary_sync(&[flag.into()]),
                 "read-only node operation {flag} should not stage a CLI binary"
@@ -11080,7 +11128,7 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn msub_seeds_shared_cargo_cache_and_remaps_rustup_homes() {
+    fn msub_preserves_shared_cargo_and_pip_environment() {
         use std::fs;
 
         let root = std::env::temp_dir().join(format!(
@@ -11092,13 +11140,24 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
         let active = software_root.join("envs/rust");
         fs::create_dir_all(active.join("bin")).unwrap();
         fs::write(active.join("bin/python"), "python").unwrap();
-        let (config, _, _) = environment_fixture(&root, &software_root);
+        let worker_root = root.join("worker-mamba");
+        let (config, _, _) = environment_fixture(&root, &worker_root);
+        fs::create_dir_all(software_root.join(".cargo")).unwrap();
         let environment = BTreeMap::from([
             (
                 "PATH".into(),
                 format!("{}:/usr/bin:/bin", active.join("bin").display()),
             ),
-            ("CONDA_PREFIX".into(), active.to_string_lossy().into_owned()),
+            ("HOME".into(), software_root.to_string_lossy().into_owned()),
+            (
+                "PIP_CONFIG_FILE".into(),
+                software_root.join("pip.conf").display().to_string(),
+            ),
+            (
+                "PIP_CACHE_DIR".into(),
+                software_root.join("pip-cache").display().to_string(),
+            ),
+            ("PIP_NO_INDEX".into(), "1".into()),
             (
                 "CARGO_HOME".into(),
                 software_root.join(".cargo").to_string_lossy().into_owned(),
@@ -11113,20 +11172,32 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             ),
         ]);
 
+        let mut implicit = environment.clone();
+        implicit.remove("CARGO_HOME");
         let task_env = prepare_task_environment(&config, environment, BTreeMap::new()).unwrap();
-
-        assert!(!task_env.contains_key("CARGO_HOME"));
+        let implicit = prepare_task_environment(&config, implicit, BTreeMap::new()).unwrap();
+        assert_eq!(implicit["CARGO_HOME"], task_env["CARGO_HOME"]);
         assert_eq!(
-            task_env[CARGO_HOME_SEED_ENV],
-            software_root.join(".cargo").to_string_lossy()
+            task_env["PIP_CONFIG_FILE"],
+            worker_root.join("pip.conf").to_string_lossy()
+        );
+        assert_eq!(
+            task_env["PIP_CACHE_DIR"],
+            worker_root.join("pip-cache").to_string_lossy()
+        );
+        assert_eq!(task_env["PIP_NO_INDEX"], "1");
+
+        assert_eq!(
+            task_env["CARGO_HOME"],
+            worker_root.join(".cargo").to_string_lossy()
         );
         assert_eq!(
             task_env["RUSTUP_HOME"],
-            software_root.join(".rustup").to_string_lossy()
+            worker_root.join(".rustup").to_string_lossy()
         );
         assert_eq!(
             task_env["CARGO_TARGET_DIR"],
-            software_root.join("target").to_string_lossy()
+            worker_root.join("target").to_string_lossy()
         );
         assert_eq!(
             super::remap_environment_paths(&config, "CARGO_TARGET_DIR", "target"),

@@ -17,7 +17,7 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-18";
+const SERVICE_VERSION: &str = "nfs-recovery-20";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
@@ -27,12 +27,16 @@ const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
 // the live mount parameters.
 const MIN_EFFECTIVE_NFS_BLOCK_SIZE: u32 = 32 * 1024;
 const MIN_EFFECTIVE_NFS_READAHEAD: u32 = 16;
-// Request 64 KiB I/O with a 128-request read-ahead window. macOS or the server
+// Request 1 MiB reads with a 128-request read-ahead window. Keep writes at
+// 64 KiB until larger writes have been benchmarked. macOS or the server
 // may negotiate smaller effective values; the threshold above prevents
 // repeatedly recycling mounts when that happens. Keep TCP explicit but allow
 // the client and server to negotiate NFS version for provider compatibility.
+// A hard mount can leave a task blocked in an uninterruptible vnode lookup
+// after the node's interface address changes. Bound retries so the task fails
+// visibly and the recovery service can reconnect instead of wedging the node.
 pub(crate) const NFS_MOUNT_OPTIONS: &str =
-    "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128";
+    "tcp,soft,resvport,intr,timeo=50,retrans=3,rsize=1048576,wsize=65536,readahead=128";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -195,7 +199,6 @@ pub(crate) fn install_script(
     )
 }
 
-#[cfg(test)]
 pub(crate) fn refresh_script(
     source: &str,
     target: &Path,
@@ -377,19 +380,26 @@ fn nfs_mount_needs_io_upgrade(output: &str, target: &Path) -> bool {
         // healthy mount. New mounts still receive the managed options below.
         return false;
     };
+    let options = parameters
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .collect::<Vec<_>>();
     let numeric_option = |name: &str| {
-        parameters
-            .split(|character: char| character == ',' || character.is_whitespace())
+        options
+            .iter()
+            .copied()
             .find_map(|option| option.strip_prefix(name)?.strip_prefix('='))
             .and_then(|value| value.parse::<u32>().ok())
     };
-    [
-        ("rsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
-        ("wsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
-        ("readahead", MIN_EFFECTIVE_NFS_READAHEAD),
-    ]
-    .into_iter()
-    .any(|(name, minimum)| numeric_option(name).is_some_and(|actual| actual < minimum))
+    !options.contains(&"soft")
+        || numeric_option("timeo").is_some_and(|actual| actual < 50)
+        || numeric_option("retrans").is_some_and(|actual| actual < 3)
+        || [
+            ("rsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
+            ("wsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
+            ("readahead", MIN_EFFECTIVE_NFS_READAHEAD),
+        ]
+        .into_iter()
+        .any(|(name, minimum)| numeric_option(name).is_some_and(|actual| actual < minimum))
 }
 
 fn remount_with_managed_io_options(
@@ -681,10 +691,7 @@ fn force_refresh_mount(
     let mounts = execute("/sbin/mount", &[])?;
     match named_share_mount_status(&mounts, source, &target.to_string_lossy()) {
         NamedShareMountStatus::Expected => {
-            execute(
-                "/usr/sbin/diskutil",
-                &["unmount", "force", &target.to_string_lossy()],
-            )?;
+            execute("/sbin/umount", &["-f", &target.to_string_lossy()])?;
             let after_unmount = execute("/sbin/mount", &[])?;
             match named_share_mount_status(&after_unmount, source, &target.to_string_lossy()) {
                 NamedShareMountStatus::NotMounted => {}
@@ -1056,10 +1063,6 @@ fn cleanup_sibling_recoveries(source: &str, target: &Path) -> Result<(), String>
         let sibling_guard = lock(&sibling_dir)?;
         unload(&manifest.target)?;
         let target_text = manifest.target.to_string_lossy();
-        let _ = bounded(
-            "/usr/sbin/diskutil",
-            &["unmount", "force", target_text.as_ref()],
-        );
         let _ = bounded("/sbin/umount", &["-f", target_text.as_ref()]);
         drop(sibling_guard);
         remove_recovery_files(&manifest.target)?;
@@ -1188,6 +1191,9 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
             )?;
             unload(target)?;
             write_json(&manifest_path, &manifest)?;
+            recover_mount_with_io_upgrade(&manifest, true, &mut |program: &str, args: &[&str]| {
+                bounded(program, args)
+            })?;
             if !dir.join("status.json").exists() {
                 write_json(&dir.join("status.json"), &Status::default())?;
             }
@@ -1265,6 +1271,16 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_nfs_mounts_use_bounded_retries_after_a_network_change() {
+        let options = NFS_MOUNT_OPTIONS.split(',').collect::<Vec<_>>();
+
+        assert!(options.contains(&"soft"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"intr"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"timeo=50"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"retrans=3"), "{NFS_MOUNT_OPTIONS}");
+    }
 
     #[test]
     fn stale_recovery_version_is_only_reported_for_an_active_configured_mount() {
@@ -1455,7 +1471,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-18");
+        assert_eq!(version, "nfs-recovery-20");
     }
 
     #[test]
@@ -1504,12 +1520,12 @@ mod tests {
                         &[
                             "/sbin/mount_nfs",
                             "-o",
-                            "tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
+                            NFS_MOUNT_OPTIONS
                         ]
                     );
                     mounts += 1;
                     mounted = true;
-                    parameters = "vers=3,tcp,rsize=65536,wsize=65536,readahead=128";
+                    parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128";
                     Ok(String::new())
                 }
             }
@@ -1526,6 +1542,56 @@ mod tests {
             mounts, 1,
             "legacy options should trigger one optimized remount"
         );
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn explicit_refresh_upgrades_a_hard_mount_to_bounded_retries() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-hard-mount-upgrade-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let manifest = Manifest {
+            source: "192.0.2.1:/data".into(),
+            target: target.clone(),
+            uuid: Id128::random().to_string(),
+            execution_uid: 501,
+            allow_existing_contents: false,
+        };
+        let mut mounted = true;
+        let mut parameters = "vers=3,tcp,hard,intr,timeo=10,rsize=65536,wsize=65536,readahead=128";
+        let mut unmounts = 0;
+
+        let outcome =
+            recover_mount_with_io_upgrade(&manifest, true, |program, args| match program {
+                "/sbin/mount" => Ok(if mounted {
+                    format!("{} on {} (nfs)\n", manifest.source, target.display())
+                } else {
+                    String::new()
+                }),
+                "/usr/bin/nfsstat" => Ok(format!(
+                    "{} from {}\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
+                    target.display(),
+                    manifest.source
+                )),
+                "/usr/bin/lockf" => {
+                    if args.contains(&"/sbin/umount") {
+                        unmounts += 1;
+                        mounted = false;
+                        Ok(String::new())
+                    } else {
+                        mounted = true;
+                        parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128";
+                        Ok(String::new())
+                    }
+                }
+                _ => panic!("unexpected command {program}"),
+            })
+            .unwrap();
+
+        assert_eq!(outcome, MountRefresh::Refreshed);
+        assert_eq!(unmounts, 1);
         fs::remove_dir(target).unwrap();
     }
 
@@ -1570,7 +1636,7 @@ mod tests {
                     mounted = true;
                     // The macOS NFS client negotiates lower effective values
                     // than the 64 KiB / 128 options requested by macluster.
-                    parameters = "vers=3,tcp,rsize=32768,wsize=32768,readahead=16";
+                    parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=32768,wsize=32768,readahead=16";
                     Ok(String::new())
                 }
                 "/usr/bin/lockf" => panic!("unexpected lockf operation: {args:?}"),
@@ -1764,7 +1830,7 @@ mod tests {
                 target.display()
             )),
             "/usr/bin/nfsstat" => Ok(format!(
-                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,rsize=65536,wsize=65536,readahead=128\n  Status flags: 0x0\n",
+                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128\n  Status flags: 0x0\n",
                 target.display(),
                 manifest.source
             )),
@@ -1773,6 +1839,43 @@ mod tests {
         })
         .unwrap();
 
+        fs::remove_dir(target).unwrap();
+    }
+
+    #[test]
+    fn new_nfs_mount_uses_managed_throughput_io_options() {
+        let target = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nfs-managed-options-{}", Id128::random()));
+        fs::create_dir(&target).unwrap();
+        let source = "192.0.2.1:/data";
+        let mut mounted = false;
+        let mut execute = |program: &str, args: &[&str]| -> Result<String, String> {
+            match program {
+                "/sbin/mount" => Ok(if mounted {
+                    format!("{source} on {} (nfs)\n", target.display())
+                } else {
+                    String::new()
+                }),
+                "/usr/bin/lockf" => {
+                    let mount_nfs = args
+                        .iter()
+                        .position(|argument| *argument == "/sbin/mount_nfs")
+                        .expect("lockf must invoke mount_nfs");
+                    assert_eq!(
+                        &args[mount_nfs..mount_nfs + 3],
+                        &["/sbin/mount_nfs", "-o", NFS_MOUNT_OPTIONS]
+                    );
+                    mounted = true;
+                    Ok(String::new())
+                }
+                _ => panic!("unexpected command {program}"),
+            }
+        };
+
+        ensure_mount(source, &target, false, &mut execute).unwrap();
+        drop(execute);
         fs::remove_dir(target).unwrap();
     }
 
@@ -2305,11 +2408,10 @@ mod tests {
                     manifest.source
                 )
             }),
-            "/usr/sbin/diskutil" => {
-                assert_eq!(args.first(), Some(&"unmount"));
-                assert_eq!(args.get(1), Some(&"force"));
+            "/sbin/umount" => {
+                assert_eq!(args.first(), Some(&"-f"));
                 assert_eq!(
-                    args.get(2),
+                    args.get(1),
                     Some(&manifest.target.to_string_lossy().as_ref())
                 );
                 unmounts += 1;
@@ -2367,7 +2469,7 @@ mod tests {
                 manifest.target.display(),
                 manifest.source
             )),
-            "/usr/sbin/diskutil" => {
+            "/sbin/umount" => {
                 unmounts += 1;
                 mounted = false;
                 Ok(String::new())

@@ -6,7 +6,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::identifiers::{Id128, NodeId};
 
-pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-25";
+pub const SMB_CREDENTIAL_SERVICE_VERSION: &str = "smb-credential-26";
+const SMB_CREDENTIAL_SERVICE_VERSION_25: &str = "smb-credential-25";
 const SMB_CREDENTIAL_SERVICE_VERSION_24: &str = "smb-credential-24";
 const SMB_CREDENTIAL_SERVICE_VERSION_23: &str = "smb-credential-23";
 pub const MAX_SMB_CREDENTIAL_BYTES: usize = 4096;
@@ -275,6 +276,7 @@ impl SmbCredentialRequest {
         if !matches!(
             self.service_version.as_str(),
             SMB_CREDENTIAL_SERVICE_VERSION
+                | SMB_CREDENTIAL_SERVICE_VERSION_25
                 | SMB_CREDENTIAL_SERVICE_VERSION_24
                 | SMB_CREDENTIAL_SERVICE_VERSION_23
         ) {
@@ -469,8 +471,9 @@ fn validate_account(account: &str) -> Result<(), SmbCredentialValidationError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SMB_CREDENTIAL_BYTES, MAX_SMB_CREDENTIAL_FRAME_BYTES, SecretString, SmbCredentialKey,
-        SmbCredentialOperation, SmbCredentialProvision, SmbCredentialRequest, StoredSmbCredential,
+        MAX_SMB_CREDENTIAL_BYTES, MAX_SMB_CREDENTIAL_FRAME_BYTES, SMB_CREDENTIAL_SERVICE_VERSION,
+        SecretString, SmbCredentialKey, SmbCredentialOperation, SmbCredentialProvision,
+        SmbCredentialRequest, StoredSmbCredential,
     };
     use crate::{
         identifiers::{Id128, NodeId},
@@ -704,10 +707,17 @@ mod tests {
 
     #[test]
     fn request_accepts_previous_service_version_during_self_upgrade() {
-        let mut request = SmbCredentialRequest::new(SmbCredentialOperation::Ping);
-        request.service_version = "smb-credential-23".into();
+        assert_eq!(SMB_CREDENTIAL_SERVICE_VERSION, "smb-credential-26");
+        for previous in [
+            "smb-credential-25",
+            "smb-credential-24",
+            "smb-credential-23",
+        ] {
+            let mut request = SmbCredentialRequest::new(SmbCredentialOperation::Ping);
+            request.service_version = previous.into();
 
-        assert!(request.validate().is_ok());
+            assert!(request.validate().is_ok(), "{previous}");
+        }
     }
 
     #[test]

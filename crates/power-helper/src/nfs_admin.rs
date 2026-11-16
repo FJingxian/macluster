@@ -24,6 +24,7 @@ const SOCKET: &str = "/var/run/org.macluster.nfs-admin.sock";
 const ADMIN_CLI: &str = "/Library/PrivilegedHelperTools/org.macluster.macluster";
 const REBOOT_AUDIT_ROOT: &str = "/var/db/macluster/nfs-reboot";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const UNMOUNT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ADMIN_STDERR_BYTES: usize = 256 * 1024;
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -347,8 +348,11 @@ fn helper_update_response_action(
 
 fn preflight_mounts(request: &NfsAdminRequest) -> Result<(), String> {
     let mounts = match &request.operation {
-        NfsAdminOperation::Mount { mounts } | NfsAdminOperation::Unmount { mounts, .. } => mounts,
+        NfsAdminOperation::Mount { mounts }
+        | NfsAdminOperation::RefreshMounts { mounts }
+        | NfsAdminOperation::Unmount { mounts, .. } => mounts,
         NfsAdminOperation::Ping
+        | NfsAdminOperation::EnsureClientMountSudoers
         | NfsAdminOperation::RemoveMarker { .. }
         | NfsAdminOperation::CheckMarker { .. }
         | NfsAdminOperation::CheckAlias { .. }
@@ -404,7 +408,14 @@ fn run_root_admin_cli(request: &[u8], peer_uid: libc::uid_t) -> Result<NfsAdminR
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_child_bounded(command, request, REQUEST_TIMEOUT)?;
+    let timeout = serde_json::from_slice::<NfsAdminRequest>(request)
+        .ok()
+        .map(|request| match request.operation {
+            NfsAdminOperation::Unmount { .. } => UNMOUNT_REQUEST_TIMEOUT,
+            _ => REQUEST_TIMEOUT,
+        })
+        .unwrap_or(REQUEST_TIMEOUT);
+    let output = run_child_bounded(command, request, timeout)?;
     let reply: NfsAdminReply = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!(
             "trusted NFS admin command returned no protocol response ({}): {} ({error})",

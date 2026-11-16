@@ -672,6 +672,7 @@ mod tests {
         client_mount_script, client_remove_script, distinct_mount_layouts, missing_mounts,
         mount_layout_matches, overlay_targets, retired_mounts,
     };
+    use crate::nfs_recovery::NFS_MOUNT_OPTIONS;
     use macluster_protocol::control::{
         ClientDescriptor, ClientQueueDescriptor, ClientShareDescriptor,
     };
@@ -743,9 +744,7 @@ mod tests {
         assert!(script.contains("192.0.2.1:/Users/Shared/macluster"));
         assert!(script.contains("192.0.2.1:/opt/homebrew"));
         assert!(script.contains("/Library/LaunchDaemons/org.macluster.client-mount."));
-        assert!(script.contains(
-            "/sbin/mount_nfs -o tcp,resvport,intr,rsize=65536,wsize=65536,readahead=128"
-        ));
+        assert!(script.contains(&format!("/sbin/mount_nfs -o {NFS_MOUNT_OPTIONS}")));
     }
 
     #[test]
@@ -845,7 +844,7 @@ mod tests {
             &descriptor(),
             "192.0.2.10",
         );
-        assert!(script.contains("org.macluster.client-mount.240edfcc"));
+        assert!(script.contains("org.macluster.client-mount.f779bcf5-ea85-5caa-9579-74b395f3cce5"));
         assert!(script.contains("/Users/Shared/macluster"));
         assert!(script.contains("/opt/homebrew"));
     }

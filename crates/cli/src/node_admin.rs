@@ -91,9 +91,10 @@ const NFS_ADMIN_VERSION_PATH: &str =
 /// Bump when the root-owned NFS admin implementation changes. This revision
 /// is independent from the wire protocol version and forces helper refreshes
 /// on every affected Mac.
-const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-14";
+const NFS_ADMIN_CLI_REVISION: &str = "nfs-admin-17";
 const POWER_HELPER_REVISION: &str = "power-4";
 const NFS_ADMIN_SOCKET_PATH: &str = "/var/run/org.macluster.nfs-admin.sock";
+const NFS_CLIENT_SUDOERS_PATH: &str = "/private/etc/sudoers.d/macluster_nfs_client";
 const SMB_CREDENTIAL_SOCKET_PATH: &str = "/var/run/org.macluster.smb-credential.sock";
 const POWER_LAUNCHD_PATH: &str = "/Library/LaunchDaemons/org.macluster.helper.plist";
 const POWER_LAUNCHD_LABEL: &str = "org.macluster.helper";
@@ -2462,6 +2463,33 @@ fn is_uncommitted_named_share_setup(config: &ClusterConfig, operation: &NodeOper
     )
 }
 
+fn is_uncommitted_named_share_removal(config: &ClusterConfig, operation: &NodeOperation) -> bool {
+    if operation.action != "share-remove" || operation.phase != "REMOVAL_PENDING" {
+        return false;
+    }
+    let Ok((share_id, server_id, source_root, mount_root, allow_existing_contents)) =
+        parse_pending_named_share_endpoint(&operation.endpoint)
+    else {
+        return false;
+    };
+    let Some(share) = config.shares.get(&share_id) else {
+        return false;
+    };
+    operation.machine_uuid.as_deref() == Some(share.share_uuid.as_str())
+        && named_share_operation_matches(
+            operation,
+            &share_id,
+            &server_id,
+            &source_root,
+            &mount_root,
+            allow_existing_contents,
+        )
+        && share.server.as_str() == server_id
+        && share.source_root == source_root
+        && share.mount_root == mount_root
+        && share.allow_existing_contents == allow_existing_contents
+}
+
 fn pending_share_has_no_remote_side_effects(operation: &NodeOperation) -> bool {
     operation.action == "share"
         && operation.phase == "SETUP_PENDING"
@@ -2488,9 +2516,9 @@ pub(crate) fn node_admin_recovery_pending(
     let active_digest = sha256_hex(&active_config).map_err(|error| error.to_string())?;
     // An uncommitted candidate is a private enrollment draft, not a cluster
     // member or a reason to fence updates to the active configuration.
-    // An uncommitted named-share setup is isolated until its mapping is
-    // committed. It remains visible in `mnode --failed` and can be resumed,
-    // but it must not pause submissions or monitoring for the active cluster.
+    // An uncommitted named-share setup/removal is isolated until its mapping
+    // commits. It remains visible in `mnode --failed` and can be resumed, but
+    // it must not pause unrelated submissions or monitoring for the cluster.
     // Invalid configs retain the conservative recovery behavior.
     let config = read_config(&canonical).ok();
     Ok(state.operations.values().any(|operation| {
@@ -2499,8 +2527,9 @@ pub(crate) fn node_admin_recovery_pending(
                 .as_ref()
                 .is_some_and(|config| is_uncommitted_enrollment(config, operation))
             && !config.as_ref().is_some_and(|config| {
-                is_uncommitted_named_share_setup(config, operation)
-                    && operation.old_config_sha256.as_deref() == Some(active_digest.as_str())
+                operation.old_config_sha256.as_deref() == Some(active_digest.as_str())
+                    && (is_uncommitted_named_share_setup(config, operation)
+                        || is_uncommitted_named_share_removal(config, operation))
             })
             && !matches!(
                 operation.phase.as_str(),
@@ -2549,8 +2578,9 @@ fn node_admin_operation_blocks_agent_update(
         )
         && !is_uncommitted_enrollment(config, operation)
         && !is_superseded_local_enrollment_refresh(config, config_digest, operation)
-        && !(is_uncommitted_named_share_setup(config, operation)
-            && operation.old_config_sha256.as_deref() == Some(config_digest))
+        && !(operation.old_config_sha256.as_deref() == Some(config_digest)
+            && (is_uncommitted_named_share_setup(config, operation)
+                || is_uncommitted_named_share_removal(config, operation)))
         && !can_resume_config_sync_during_agent_update(operation, config_digest, update_operation)
 }
 
@@ -6015,7 +6045,15 @@ fn register_storage_provider(
         config_path,
         state_dir,
         "storage provider registration",
-        MaintenanceScope::Cluster,
+        if read_config(config_path)?
+            .shares
+            .values()
+            .any(|share| &share.server == node_id)
+        {
+            MaintenanceScope::Cluster
+        } else {
+            MaintenanceScope::StorageProvider(node_id.clone())
+        },
     )?;
     let result = (|| -> AppResult<()> {
         MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
@@ -7180,6 +7218,7 @@ fn prepare_power_helper_with_admin_revision(
             required_admin_revision,
             trust.map(|trust| (staged_trust_key.as_deref().unwrap(), trust)),
             foreign_cluster_id,
+            execution_uid,
         );
         Ok(PowerHelperSetup {
             script,
@@ -7531,6 +7570,7 @@ fn power_helper_install_script_with_admin_revision(
         admin_cli_revision,
         None,
         None,
+        501,
     )
 }
 
@@ -7541,12 +7581,20 @@ fn power_helper_install_script_with_updater(
     admin_cli_revision: &str,
     trust: Option<(&str, &UpdateTrust)>,
     foreign_cluster_id: Option<&str>,
+    execution_uid: u32,
 ) -> String {
     let staged_binary = shell_quote(staged_binary);
     let staged_plist = shell_quote(staged_plist);
     let helper_digest = shell_quote(helper_digest);
     let admin_cli_revision = shell_quote(admin_cli_revision);
     let power_revision = shell_quote(POWER_HELPER_REVISION);
+    let client_sudoers_install = match nfs_client_sudoers_install_script(execution_uid) {
+        Ok(script) => format!("/bin/sh -c {}", shell_quote(&script)),
+        Err(error) => format!(
+            "echo {} >&2; exit 1",
+            shell_quote(&format!("cannot install NFS client authorization: {error}"))
+        ),
+    };
     let (trust_install, trust_cleanup) = if let Some((staged_key, trust)) = trust {
         let staged_key = shell_quote(staged_key);
         let cluster_id = shell_quote(&trust.cluster_id);
@@ -7631,6 +7679,7 @@ while [ ! -S /var/run/org.macluster.power.sock ] || [ ! -S {NFS_ADMIN_SOCKET_PAT
 done
 {trust_install}
 {trust_cleanup}
+{client_sudoers_install}
 "#
     )
 }
@@ -7694,23 +7743,27 @@ struct ClientUnmountRequest {
 }
 
 fn client_mount_admin_request(requests: &[ClientMountRequest]) -> NfsAdminRequest {
-    NfsAdminRequest {
-        operation: NfsAdminOperation::Mount {
-            mounts: requests
-                .iter()
-                .map(|request| NfsMount {
-                    source: request.source.clone(),
-                    target: request.mount_root.to_string_lossy().into_owned(),
-                    share_uuid: request.share_uuid.clone(),
-                    alias: request
-                        .source_alias
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                    allow_existing_contents: request.allow_existing_contents,
-                })
-                .collect(),
-        },
-    }
+    let mounts = requests
+        .iter()
+        .map(|request| NfsMount {
+            source: request.source.clone(),
+            target: request.mount_root.to_string_lossy().into_owned(),
+            share_uuid: request.share_uuid.clone(),
+            alias: request
+                .source_alias
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            allow_existing_contents: request.allow_existing_contents,
+        })
+        .collect::<Vec<_>>();
+    let operation = if requests.iter().all(|request| {
+        !request.needs_mount && !request.needs_privileged_mkdir && !request.force_unmount_existing
+    }) {
+        NfsAdminOperation::RefreshMounts { mounts }
+    } else {
+        NfsAdminOperation::Mount { mounts }
+    };
+    NfsAdminRequest { operation }
 }
 
 fn client_unmount_admin_request(
@@ -7788,7 +7841,7 @@ fn client_nfs_cleanup_batch_script_with_force(
     force: bool,
 ) -> String {
     let awk = shell_quote(client_mount_status_awk_script());
-    let force_flag = if force { " force" } else { "" };
+    let force_flag = if force { " -f" } else { "" };
     let mut script = String::from("set -eu\n");
     for request in requests {
         script.push_str(&crate::nfs_recovery::cleanup_script(
@@ -7822,7 +7875,7 @@ fn client_nfs_cleanup_batch_script_with_force(
                 ))
             ));
             script.push_str(&format!(
-                "/usr/sbin/diskutil unmount{force_flag} {}\n",
+                "/sbin/umount{force_flag} {}\n",
                 shell_quote(&request.mount_root.to_string_lossy())
             ));
             script.push_str("fi\n");
@@ -7886,6 +7939,9 @@ fn client_nfs_cleanup_plan(
         });
     }
     for (share_id, share) in &config.shares {
+        if share.protocol != StorageProtocol::Nfs {
+            continue;
+        }
         let server_id = share.server.as_str();
         if node_id == server_id {
             continue;
@@ -7903,6 +7959,48 @@ fn client_nfs_cleanup_plan(
         }
     }
     (requests, aliases)
+}
+
+fn missing_client_nfs_mount_requests(
+    config: &ClusterConfig,
+    node_id: &str,
+    mount_table: &str,
+) -> Result<Vec<ClientMountRequest>, String> {
+    let (mounts, aliases) = client_nfs_cleanup_plan(config, node_id);
+    let mut requests = Vec::new();
+    for mount in mounts {
+        match named_share_mount_status(
+            mount_table,
+            &mount.source,
+            &mount.mount_root.to_string_lossy(),
+        ) {
+            NamedShareMountStatus::Expected => continue,
+            NamedShareMountStatus::MountedElsewhere(source) => {
+                return Err(format!(
+                    "configured NFS mount {} is occupied by {source}; refusing automatic recovery",
+                    mount.mount_root.display()
+                ));
+            }
+            NamedShareMountStatus::NotMounted => {}
+        }
+        let source_alias = aliases
+            .iter()
+            .find(|(_, target)| target == &mount.mount_root)
+            .map(|(alias, _)| alias.clone());
+        requests.push(ClientMountRequest {
+            source: mount.source,
+            mount_root: mount.mount_root,
+            share_uuid: mount.share_uuid,
+            source_alias,
+            // mkdir -p is harmless for an existing directory and also lets
+            // the privileged helper recover a mount whose mountpoint vanished.
+            needs_privileged_mkdir: true,
+            needs_mount: true,
+            force_unmount_existing: false,
+            allow_existing_contents: mount.allow_existing_contents,
+        });
+    }
+    Ok(requests)
 }
 
 fn pending_add_may_have_client_state(operation: &NodeOperation) -> bool {
@@ -8112,7 +8210,7 @@ fn client_mount_batch_script(requests: &[ClientMountRequest]) -> Option<String> 
                 awk
             ));
             script.push_str(&format!(
-                "case \"$mount_status\" in\n  expected|duplicate)\n    detach_count=0\n    while [ \"$mount_status\" != none ]; do\n      [ \"$detach_count\" -lt 8 ] || {{ echo 'too many stacked NFS mounts at the requested path' >&2; exit 1; }}\n      /usr/sbin/diskutil unmount force {mount_root} || /sbin/umount -f {mount_root} || exit 1\n      detach_count=$((detach_count + 1))\n      mounts=$(/sbin/mount)\n      mount_status=$(printf '%s\\n' \"$mounts\" | /usr/bin/awk -v source={} -v mount={mount_root} {})\n    done\n    ;;\n  other) echo 'mount changed before stale NFS recovery' >&2; exit 1 ;;\n  none) ;;\nesac\n",
+                "case \"$mount_status\" in\n  expected|duplicate)\n    detach_count=0\n    while [ \"$mount_status\" != none ]; do\n      [ \"$detach_count\" -lt 8 ] || {{ echo 'too many stacked NFS mounts at the requested path' >&2; exit 1; }}\n      /sbin/umount -f {mount_root} || exit 1\n      detach_count=$((detach_count + 1))\n      mounts=$(/sbin/mount)\n      mount_status=$(printf '%s\\n' \"$mounts\" | /usr/bin/awk -v source={} -v mount={mount_root} {})\n    done\n    ;;\n  other) echo 'mount changed before stale NFS recovery' >&2; exit 1 ;;\n  none) ;;\nesac\n",
                 shell_quote(&request.source),
                 awk,
             ));
@@ -8128,11 +8226,12 @@ fn client_mount_batch_script(requests: &[ClientMountRequest]) -> Option<String> 
                 script.push_str(
                     "# Existing local files remain underneath this explicitly configured NFS share.\n",
                 );
-            } else {
-                script.push_str(&format!(
-                    "entries=$(/bin/ls -A {mount_root}) || exit 1\n[ -z \"$entries\" ] || {{ echo 'mount point is not empty after preflight' >&2; exit 1; }}\n"
-                ));
             }
+            // `apply_privileged_nfs_mounts` already checks the target path and
+            // its contents in Rust before this script is generated. Do not
+            // enumerate it again with a child utility: macOS FDA is granted
+            // per executable, so `/bin/ls` may be denied even when the
+            // authorized macluster helper can inspect the directory.
             script.push_str(&format!(
                 "/usr/bin/lockf -t {NFS_MOUNT_TIMEOUT_SECS} -k -w {NFS_MOUNT_LOCK_PATH} /sbin/mount_nfs -o {NFS_MOUNT_OPTIONS} {} {mount_root}\n",
                 shell_quote(&request.source),
@@ -8165,13 +8264,24 @@ fn persistent_mount_batch_script_with_binary(
     script.push_str(&mount_batch_rollback_script(requests));
     script.push_str(&client_mount_batch_script(requests).unwrap_or_default());
     for request in requests {
-        script.push_str(&crate::nfs_recovery::install_script(
-            &request.source,
-            &request.mount_root,
-            &request.share_uuid,
-            execution_uid,
-            request.allow_existing_contents,
-        ));
+        let recovery_script = if request.needs_mount {
+            crate::nfs_recovery::install_script(
+                &request.source,
+                &request.mount_root,
+                &request.share_uuid,
+                execution_uid,
+                request.allow_existing_contents,
+            )
+        } else {
+            crate::nfs_recovery::refresh_script(
+                &request.source,
+                &request.mount_root,
+                &request.share_uuid,
+                execution_uid,
+                request.allow_existing_contents,
+            )
+        };
+        script.push_str(&recovery_script);
     }
     (!script.is_empty()).then_some(script)
 }
@@ -8210,7 +8320,7 @@ fn mount_batch_rollback_script(requests: &[ClientMountRequest]) -> String {
             awk
         ));
         script.push_str(&format!(
-            "        case \"$mount_status\" in expected) if ! /usr/sbin/diskutil unmount force {}; then echo {}; fi ;; other) echo {} ;; none) ;; esac\n",
+            "        case \"$mount_status\" in expected) if ! /sbin/umount -f {}; then echo {}; fi ;; other) echo {} ;; none) ;; esac\n",
             shell_quote(&request.mount_root.to_string_lossy()),
             shell_quote(&format!(
                 "rollback could not detach failed NFS mount {}",
@@ -8238,7 +8348,14 @@ pub(crate) fn apply_privileged_nfs_admin_request(
         request.validate(peer_uid)?;
         match request.operation {
             NfsAdminOperation::Ping => Ok(()),
+            NfsAdminOperation::EnsureClientMountSudoers => {
+                let script = nfs_client_sudoers_install_script(peer_uid)?;
+                run_privileged_nfs_script(&script, "installing passwordless NFS client authorization")
+            }
             NfsAdminOperation::Mount { mounts } => apply_privileged_nfs_mounts(&mounts, peer_uid),
+            NfsAdminOperation::RefreshMounts { mounts } => {
+                apply_privileged_nfs_refresh_mounts(&mounts, peer_uid)
+            }
             NfsAdminOperation::Unmount {
                 mounts,
                 aliases,
@@ -8292,6 +8409,125 @@ pub(crate) fn apply_privileged_nfs_admin_request(
     }
 }
 
+/// Validate and execute the deliberately narrow `sudo -n` entry point used by
+/// SSH clients. It cannot service exports, marker, updater, reboot, or helper
+/// administration requests through the per-user sudoers grant.
+pub(crate) fn apply_privileged_nfs_client_admin_request(
+    request: NfsAdminRequest,
+    peer_uid: u32,
+    invoking_uid: Option<u32>,
+) -> NfsAdminReply {
+    let result = (|| {
+        if unsafe { libc::geteuid() } != 0 {
+            return Err("privileged NFS client command must run as root".to_owned());
+        }
+        validate_nfs_client_admin_invocation(&request, peer_uid, invoking_uid)?;
+        match request.operation {
+            NfsAdminOperation::Mount { mounts } => apply_privileged_nfs_mounts(&mounts, peer_uid),
+            NfsAdminOperation::RefreshMounts { mounts } => {
+                apply_privileged_nfs_refresh_mounts(&mounts, peer_uid)
+            }
+            NfsAdminOperation::Unmount {
+                mounts,
+                aliases,
+                force,
+            } => apply_privileged_nfs_unmounts(&mounts, &aliases, force),
+            _ => Err("NFS client command only accepts mount and unmount requests".into()),
+        }
+    })();
+    match result {
+        Ok(()) => NfsAdminReply::success(NFS_ADMIN_SERVICE_VERSION),
+        Err(error) => NfsAdminReply::failure(NFS_ADMIN_SERVICE_VERSION, error),
+    }
+}
+
+fn validate_nfs_client_admin_invocation(
+    request: &NfsAdminRequest,
+    peer_uid: u32,
+    invoking_uid: Option<u32>,
+) -> Result<(), String> {
+    if peer_uid == 0 || invoking_uid != Some(peer_uid) {
+        return Err("NFS client sudo invocation does not match the enrolled account".into());
+    }
+    if !matches!(
+        &request.operation,
+        NfsAdminOperation::Mount { .. }
+            | NfsAdminOperation::RefreshMounts { .. }
+            | NfsAdminOperation::Unmount { .. }
+    ) {
+        return Err("NFS client command only accepts mount, refresh, and unmount requests".into());
+    }
+    request.validate(peer_uid)
+}
+
+fn nfs_client_sudoers_content(peer_uid: u32) -> Result<String, String> {
+    if peer_uid == 0 {
+        return Err("NFS client sudoers policy requires a non-root account".into());
+    }
+    Ok(format!(
+        "# Managed by macluster; do not edit.\n#{peer_uid} ALL=(root) NOPASSWD: {UNIFIED_HELPER_PATH} internal nfs-client-admin --peer-uid {peer_uid}\n"
+    ))
+}
+
+fn nfs_client_sudoers_install_script(peer_uid: u32) -> Result<String, String> {
+    let content = shell_quote(&nfs_client_sudoers_content(peer_uid)?);
+    let target = shell_quote(NFS_CLIENT_SUDOERS_PATH);
+    Ok(format!(
+        r#"set -eu
+sudoers=/private/etc/sudoers
+sudoers_dir=/private/etc/sudoers.d
+target={target}
+if ! /usr/bin/grep -Eq '^[[:space:]]*[#@]includedir[[:space:]]+/private/etc/sudoers\.d([[:space:]]|$)' "$sudoers"; then
+  echo 'macOS sudoers does not include /private/etc/sudoers.d; refusing to install NFS client authorization' >&2
+  exit 1
+fi
+if [ -L "$sudoers_dir" ] || {{ [ -e "$sudoers_dir" ] && [ ! -d "$sudoers_dir" ]; }}; then
+  echo 'unsafe /private/etc/sudoers.d path' >&2
+  exit 1
+fi
+if [ ! -e "$sudoers_dir" ]; then
+  /bin/mkdir -p "$sudoers_dir"
+  /usr/sbin/chown root:wheel "$sudoers_dir"
+  /bin/chmod 755 "$sudoers_dir"
+else
+  dir_owner=$(/usr/bin/stat -f '%u' "$sudoers_dir")
+  dir_mode=$(/usr/bin/stat -f '%Lp' "$sudoers_dir")
+  [ "$dir_owner" = 0 ] && [ $((0$dir_mode & 022)) -eq 0 ] || {{ echo 'unsafe ownership or permissions on /private/etc/sudoers.d' >&2; exit 1; }}
+fi
+if [ -e "$target" ] || [ -L "$target" ]; then
+  [ -f "$target" ] && [ ! -L "$target" ] || {{ echo 'unsafe existing macluster NFS sudoers file' >&2; exit 1; }}
+  [ "$(/usr/bin/stat -f '%u' "$target")" = 0 ] && [ "$(/usr/bin/stat -f '%g' "$target")" = 0 ] || {{ echo 'existing macluster NFS sudoers file is not root:wheel owned' >&2; exit 1; }}
+  /usr/bin/grep -q '^# Managed by macluster; do not edit\.$' "$target" || {{ echo 'existing macluster NFS sudoers file is not managed by macluster' >&2; exit 1; }}
+fi
+temp=$(/usr/bin/mktemp "$sudoers_dir/.macluster_nfs_client.XXXXXX")
+backup="$sudoers_dir/.macluster_nfs_client.backup.$$"
+had_previous=0
+cleanup() {{ /bin/rm -f "$temp" "$backup"; }}
+trap cleanup EXIT HUP INT TERM
+/usr/bin/printf '%s' {content} > "$temp"
+/usr/sbin/chown root:wheel "$temp"
+/bin/chmod 440 "$temp"
+/usr/sbin/visudo -c -f "$temp" >/dev/null
+if [ -f "$target" ]; then
+  if [ "$(/usr/bin/stat -f '%Lp' "$target")" = 440 ] && /usr/bin/cmp -s "$temp" "$target"; then exit 0; fi
+  /bin/cp -p "$target" "$backup"
+  had_previous=1
+fi
+/bin/mv -f "$temp" "$target"
+if /usr/sbin/visudo -c >/dev/null 2>&1; then
+  exit 0
+fi
+if [ "$had_previous" -eq 1 ]; then
+  /bin/mv -f "$backup" "$target"
+else
+  /bin/rm -f "$target"
+fi
+echo 'sudoers validation failed; the previous policy was restored' >&2
+exit 1
+"#
+    ))
+}
+
 fn apply_privileged_nfs_export_cleanup(
     operation_id: &str,
     exports: &[NfsExportCleanup],
@@ -8323,6 +8559,74 @@ fn apply_privileged_nfs_export_cleanup(
     if changed || transaction_pending {
         let script = nfs_exports_update_commands(&candidate, &original, operation_id)?;
         run_privileged_nfs_script(&script, "removing deferred managed NFS exports")?;
+    }
+    Ok(())
+}
+
+fn apply_privileged_nfs_refresh_mounts(mounts: &[NfsMount], peer_uid: u32) -> Result<(), String> {
+    let table = local_mount_table()?;
+    let mut requests = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        match named_share_mount_status(&table, &mount.source, &mount.target) {
+            NamedShareMountStatus::Expected
+                if exact_mount_count(&table, &mount.source, &mount.target) == 1 => {}
+            NamedShareMountStatus::Expected => {
+                return Err(format!(
+                    "NFS mount {} contains stacked mounts; refusing a recovery-policy refresh",
+                    mount.target
+                ));
+            }
+            NamedShareMountStatus::NotMounted => {
+                return Err(format!(
+                    "NFS mount {} is not active; a refresh request cannot create it",
+                    mount.target
+                ));
+            }
+            NamedShareMountStatus::MountedElsewhere(source) => {
+                return Err(format!(
+                    "mount point {} is occupied by {source}; refusing a recovery-policy refresh",
+                    mount.target
+                ));
+            }
+        }
+        requests.push(ClientMountRequest {
+            source: mount.source.clone(),
+            mount_root: PathBuf::from(&mount.target),
+            share_uuid: mount.share_uuid.clone(),
+            source_alias: mount.alias.as_deref().map(PathBuf::from),
+            needs_privileged_mkdir: false,
+            needs_mount: false,
+            force_unmount_existing: false,
+            allow_existing_contents: mount.allow_existing_contents,
+        });
+    }
+    let Some(script) =
+        persistent_mount_batch_script_with_binary(HELPER_PATH, Some(peer_uid), &requests)
+    else {
+        return Ok(());
+    };
+    run_privileged_nfs_script(&script, "refreshing managed NFS shares")?;
+    let table = local_mount_table()?;
+    for mount in mounts {
+        match named_share_mount_status(&table, &mount.source, &mount.target) {
+            NamedShareMountStatus::Expected => {
+                if let Some(alias) = &mount.alias {
+                    verify_local_share_alias(Path::new(alias), Path::new(&mount.target))?;
+                }
+            }
+            NamedShareMountStatus::NotMounted => {
+                return Err(format!(
+                    "NFS mount {} disappeared during recovery-policy refresh",
+                    mount.target
+                ));
+            }
+            NamedShareMountStatus::MountedElsewhere(source) => {
+                return Err(format!(
+                    "NFS mount {} changed to {source} during recovery-policy refresh",
+                    mount.target
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -8645,6 +8949,15 @@ fn refresh_stale_nfs_recovery_services(
         ));
     }
     let mount_table = String::from_utf8_lossy(&mount_table.stdout);
+    let missing_mounts = missing_client_nfs_mount_requests(config, node_id, &mount_table)?;
+    if !missing_mounts.is_empty() {
+        run_client_mount_batch(
+            node,
+            &missing_mounts,
+            None,
+            "restoring missing configured NFS mounts and recovery services",
+        )?;
+    }
     let expected_mounts = mounts
         .iter()
         .enumerate()
@@ -8689,7 +9002,7 @@ fn refresh_stale_nfs_recovery_services(
         return Ok(());
     }
 
-    match request_nfs_admin_service(node, &client_mount_admin_request(&refresh))? {
+    match request_nfs_client_admin(node, &client_mount_admin_request(&refresh))? {
         Some(()) => Ok(()),
         None => Err(format!(
             "privileged NFS service is unavailable while refreshing NFS recovery helpers on {node_id}"
@@ -8815,7 +9128,7 @@ fn refresh_agent_helpers_with_signed_updater(
         }
         if let Err(error) = refresh_stale_nfs_recovery_services(config, node_id, node) {
             eprintln!(
-                "NFS recovery helper refresh on {node_id} is pending; Agent update will continue: {error}"
+                "NFS mount/recovery repair on {node_id} is pending; Agent update will continue: {error}"
             );
         }
     }
@@ -8937,7 +9250,21 @@ fn refresh_one_privileged_helper_bundle(update: &PrivilegedHelperUpdate<'_>) -> 
             ));
         }
     }
+    ensure_nfs_client_mount_sudoers(update.node)?;
     Ok(())
+}
+
+fn ensure_nfs_client_mount_sudoers(node: &NodeConfig) -> Result<(), String> {
+    let request = NfsAdminRequest {
+        operation: NfsAdminOperation::EnsureClientMountSudoers,
+    };
+    match request_nfs_admin_service(node, &request)? {
+        Some(()) => Ok(()),
+        None => Err(format!(
+            "the privileged NFS service on {} cannot install the client mount authorization yet; rerun the command after its automatic helper update",
+            node.host
+        )),
+    }
 }
 
 fn update_node_facts(node: &NodeConfig) -> Result<(u32, String), String> {
@@ -11439,6 +11766,81 @@ fn request_nfs_admin_service(
     ))
 }
 
+fn request_nfs_client_admin(
+    node: &NodeConfig,
+    request: &NfsAdminRequest,
+) -> Result<Option<()>, String> {
+    let peer_uid = nfs_admin_peer_uid(node)?;
+    request.validate(peer_uid)?;
+    match node.transport {
+        Transport::Local | Transport::Ssh => {
+            for attempt in 0..2 {
+                match run_direct_nfs_client_admin(node, peer_uid, request) {
+                    Ok(()) => return Ok(Some(())),
+                    Err(error) if error == MISSING_NFS_CLIENT_SUDO_AUTH && attempt == 0 => {
+                        ensure_nfs_client_mount_sudoers(node)?;
+                    }
+                    Err(error) if error == MISSING_NFS_CLIENT_SUDO_AUTH => {
+                        return Err(
+                            "NFS client sudo authorization is still unavailable after its setup; inspect /private/etc/sudoers.d/macluster_nfs_client".into(),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("the client authorization retry is bounded to two attempts")
+        }
+        Transport::Storage => Err("external storage nodes do not run NFS client mounts".into()),
+    }
+}
+
+const MISSING_NFS_CLIENT_SUDO_AUTH: &str = "__MACLUSTER_NFS_CLIENT_SUDO_AUTH_MISSING__";
+
+fn run_direct_nfs_client_admin(
+    node: &NodeConfig,
+    peer_uid: u32,
+    request: &NfsAdminRequest,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let command = format!(
+        "/usr/bin/sudo -n {} internal nfs-client-admin --peer-uid {peer_uid}",
+        shell_quote(UNIFIED_HELPER_PATH)
+    );
+    // For SSH nodes this executes through sshd; for a local compute node the
+    // same wrapper runs as a short-lived local shell. In both cases sudo is
+    // non-interactive and restricted by the exact UID-scoped sudoers rule.
+    let output = ssh_output_with_timeout(node, &command, Some(&bytes), ADMIN_COMMAND_LIMIT)
+        .map_err(|(_, error)| error)?;
+    if let Ok(reply) = serde_json::from_slice::<NfsAdminReply>(&output.stdout) {
+        if reply.service_version != NFS_ADMIN_SERVICE_VERSION {
+            return Err(format!(
+                "NFS client helper version {} does not match this client {}; refresh the node helper and retry",
+                reply.service_version, NFS_ADMIN_SERVICE_VERSION
+            ));
+        }
+        return if reply.ok {
+            Ok(())
+        } else {
+            Err(reply
+                .error
+                .unwrap_or_else(|| "NFS client mount operation failed".into()))
+        };
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if nfs_client_sudo_authorization_missing(&stderr) {
+        return Err(MISSING_NFS_CLIENT_SUDO_AUTH.into());
+    }
+    Err(command_error("NFS client mount command failed", &output))
+}
+
+fn nfs_client_sudo_authorization_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("a password is required")
+        || stderr.contains("not allowed to execute")
+        || stderr.contains("not in the sudoers file")
+        || stderr.contains("may not run sudo")
+}
+
 fn current_nfs_admin_ping(node: &NodeConfig) -> Result<Option<NfsAdminReply>, String> {
     let request = NfsAdminRequest {
         operation: NfsAdminOperation::Ping,
@@ -11527,13 +11929,13 @@ fn stale_nfs_admin_reply(
     reply: &NfsAdminReply,
     operation: &NfsAdminOperation,
 ) -> Option<Result<Option<()>, String>> {
-    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-5" {
+    if reply.service_version == "nfs-admin-1" && NFS_ADMIN_SERVICE_VERSION == "nfs-admin-6" {
         return Some(Ok(None));
     }
     if !matches!(
         reply.service_version.as_str(),
-        "nfs-admin-2" | "nfs-admin-3" | "nfs-admin-4"
-    ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-5"
+        "nfs-admin-2" | "nfs-admin-3" | "nfs-admin-4" | "nfs-admin-5" | "nfs-admin-6"
+    ) || NFS_ADMIN_SERVICE_VERSION != "nfs-admin-7"
     {
         return None;
     }
@@ -11546,8 +11948,8 @@ fn stale_nfs_admin_reply(
         })));
     }
     match operation {
-        // nfs-admin-2 and nfs-admin-3 understand signed self-update. Their
-        // daemon restarts into the current protocol after refreshing helpers.
+        // Versions 2 through 6 understand signed self-update. Their daemon
+        // restarts into the current protocol after refreshing helpers.
         NfsAdminOperation::Ping | NfsAdminOperation::UpdateHelpers { .. } => Some(Ok(Some(()))),
         _ => Some(Err(format!(
             "NFS administrator service version {} must be refreshed before this operation; rerun the command after the automatic helper update",
@@ -11721,7 +12123,18 @@ fn run_nfs_admin_service_operation(
 ) -> Result<(), String> {
     let peer_uid = nfs_admin_peer_uid(node)?;
     request.validate(peer_uid)?;
-    match request_nfs_admin_service(node, request)? {
+    let response = if matches!(node.transport, Transport::Local | Transport::Ssh)
+        && matches!(
+            &request.operation,
+            NfsAdminOperation::Mount { .. }
+                | NfsAdminOperation::RefreshMounts { .. }
+                | NfsAdminOperation::Unmount { .. }
+        ) {
+        request_nfs_client_admin(node, request)?
+    } else {
+        request_nfs_admin_service(node, request)?
+    };
+    match response {
         Some(()) => Ok(()),
         None => Err(format!(
             "NFS administrator service is unavailable while attempting to {purpose}; run `mtop` from Terminal to finish the one-time helper enrollment or automatic update, then retry"
@@ -11744,9 +12157,8 @@ fn nfs_admin_peer_uid(node: &NodeConfig) -> Result<u32, String> {
     }
 }
 
-/// Remove exact configured NFS mounts through the persistent administrator
-/// service. Installing or refreshing that service is the only sudo step; once
-/// installed, later cleanup and migration requests use the authenticated socket.
+/// Remove exact configured NFS mounts through the restricted client command.
+/// Other privileged NFS operations continue to use the authenticated service.
 pub(crate) fn unmount_managed_nfs(
     node: &NodeConfig,
     mounts: &[NfsMount],
@@ -13946,7 +14358,7 @@ fn remove_registered_share(
         config_path,
         state_dir,
         "named-share removal",
-        MaintenanceScope::Cluster,
+        MaintenanceScope::NamedShare(share_id.to_owned()),
     )?;
     if maintenance.recovered {
         return Ok(());
@@ -14376,6 +14788,9 @@ fn remove_registered_share(
                 })?;
             let mut blockers = Vec::new();
             for job in jobs {
+                if !config.job_may_use_named_share(share_id, job.spec.required_shares.as_deref()) {
+                    continue;
+                }
                 if matches!(
                     job.state,
                     macluster_protocol::types::JobState::Starting
@@ -16238,6 +16653,20 @@ fn aggregate_nfs_mappings(rows: &[NodeListRow]) -> Vec<NodeNfsMapping> {
             mapping.state = state;
         }
     }
+    mappings.sort_by(|left, right| {
+        let protocol_rank = |protocol| match protocol {
+            StorageProtocol::Nfs => 0,
+            StorageProtocol::Smb => 1,
+        };
+        protocol_rank(left.protocol)
+            .cmp(&protocol_rank(right.protocol))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
     mappings
 }
 
@@ -16331,27 +16760,33 @@ fn format_node_list_view(
     let mappings = aggregate_nfs_mappings(rows);
     if !mappings.is_empty() {
         output.push_str("\nSTORAGE MAPPINGS\n");
-        let name_width = mappings
-            .iter()
-            .map(|mapping| mapping.name.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max("ID".len());
-        let source_width = mappings
-            .iter()
-            .map(|mapping| mapping.source_uri.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max("SOURCE".len());
-        output.push_str(&format!(
-            "    {:<name_width$}  {:<7}  {:<source_width$}  TARGET\n",
-            "ID", "STATE", "SOURCE",
-        ));
-        for mapping in mappings {
-            output.push_str(&format!(
-                "    {:<name_width$}  {:<7}  {:<source_width$}  {}\n",
-                mapping.name, mapping.state, mapping.source_uri, mapping.target,
-            ));
+        for (label, protocol) in [("NFS", StorageProtocol::Nfs), ("SMB", StorageProtocol::Smb)] {
+            let group = mappings
+                .iter()
+                .filter(|mapping| mapping.protocol == protocol)
+                .collect::<Vec<_>>();
+            if group.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("  {label}\n"));
+            let name_width = group
+                .iter()
+                .map(|mapping| mapping.name.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("ID".len());
+            let source_width = group
+                .iter()
+                .map(|mapping| mapping.source_uri.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("SOURCE".len());
+            for mapping in group {
+                output.push_str(&format!(
+                    "    {:<name_width$}  {:<7}  {:<source_width$}  {}\n",
+                    mapping.name, mapping.state, mapping.source_uri, mapping.target,
+                ));
+            }
         }
     }
     output
@@ -18046,14 +18481,6 @@ fn umount_storage(
             let Some(share_uuid) = pending_smb_cleanup_share_id(&cleanup, &target) else {
                 return Err(error);
             };
-            if !force && !wait {
-                return Err((
-                    1,
-                    format!(
-                        "SMB share {share_uuid} is already removed from the cluster but its physical mount cleanup is pending; use `mnode -umount {share_uuid} --force --yes` or `--wait`"
-                    ),
-                ));
-            }
             return cleanup_pending_smb_share(
                 &cleanup_path,
                 &share_uuid,
@@ -18112,6 +18539,32 @@ fn cleanup_pending_smb_share(
         .collect::<Vec<_>>();
     if node_ids.is_empty() {
         return Err((2, format!("pending SMB cleanup {share_uuid} was not found")));
+    }
+    if !force {
+        let now_unix_ms = unix_time_ms();
+        let outcome =
+            force_pending_smb_share_with(&mut journal, share_uuid, now_unix_ms, |node, share| {
+                if node.transport == Transport::Ssh && !node_ssh_endpoint_reachable(node) {
+                    return Err(format!("{} is offline", node.host));
+                }
+                unmount_smb_share_for_cleanup(node, share)
+            });
+        journal.save(cleanup_path).map_err(io_error)?;
+        for node_id in &outcome.forced_nodes {
+            println!("SMB cleanup completed on {node_id} for {share_uuid}.");
+        }
+        if !outcome.failures.is_empty() {
+            for (node_id, error) in &outcome.failures {
+                eprintln!("SMB cleanup failed on {node_id}: {error}");
+            }
+            return Err((
+                1,
+                format!(
+                    "SMB cleanup failed on {} node(s); the cleanup journal remains queued",
+                    outcome.failures.len()
+                ),
+            ));
+        }
     }
     if force {
         if !assume_yes && !confirm_force_smb_unmount(&node_ids) {
@@ -18554,11 +19007,15 @@ fn smb_unmount_script(share: &ShareConfig, force: bool) -> AppResult<String> {
     let physical_path = smb_backing_path(&share.share_uuid);
     let physical = shell_quote(&physical_path.to_string_lossy());
     let logical = shell_quote(&share.mount_root.to_string_lossy());
-    let managed_root = shell_quote("/Users/Shared/.macluster-mounts");
     let label = format!("org.macluster.smb.{}", share.share_uuid.trim());
     let state = format!("\"$HOME/Library/Application Support/macluster/smb/{label}.state\"");
     let (_, full) = smb_share_parts(share)?;
     let (_, subpath) = full.split_once('/').unwrap_or((full.as_str(), ""));
+    let alias_suffix = shell_quote(&if subpath.is_empty() {
+        String::new()
+    } else {
+        format!("/{subpath}")
+    });
     let logical_target = if subpath.is_empty() {
         physical_path.clone()
     } else {
@@ -18575,9 +19032,10 @@ fn smb_unmount_script(share: &ShareConfig, force: bool) -> AppResult<String> {
             .map_err(|error| (1, format!("cannot encode SMB unmount request: {error}")))?,
     );
     Ok(format!(
-        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then\n  response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n  /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nfi\nif [ \"$backing\" != \"$physical\" ] && /sbin/mount | /usr/bin/grep -F \" on $backing (smbfs\" >/dev/null 2>&1; then /sbin/umount \"$backing\"; fi\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); case \"$actual\" in {managed_root}/*) /bin/rm -f \"$logical\" ;; esac; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
+        "set -eu\nuid=$(/usr/bin/id -u)\n[ \"$uid\" -ne 0 ] || {{ echo 'SMB mounts belong to the logged-in user session' >&2; exit 1; }}\n/bin/launchctl bootout \"gui/$uid/{label}\" >/dev/null 2>&1 || true\nphysical={physical}\nlogical={logical}\nstate={state}\nbacking=$physical\nif [ -f \"$state\" ]; then state_backing=$(/usr/bin/sed -n '4p' \"$state\"); [ -z \"$state_backing\" ] || backing=$state_backing; fi\nif [ \"$backing\" = \"$physical\" ]; then\n  mounts=$(/sbin/mount)\n  if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n    if [ {try_owner_unmount} = 1 ]; then\n      /usr/bin/perl -e 'alarm 5; exec @ARGV or die $!' /sbin/umount \"$physical\" || true\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then\n      response=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n    /usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\n    fi\n    mounts=$(/sbin/mount)\n    if /usr/bin/printf '%s\\n' \"$mounts\" | /usr/bin/grep -F \" on $physical (smbfs,\" >/dev/null; then echo 'SMB mount remains active after unmount' >&2; exit 1; fi\n  fi\nfi\nexpected_alias=\"$backing\"{alias_suffix}\nresponse=$(/usr/bin/printf '%s' {request} | /usr/bin/nc -U /var/run/org.macluster.smb-credential.sock) || {{ echo 'SMB credential helper is unavailable' >&2; exit 1; }}\n/usr/bin/printf '%s' \"$response\" | /usr/bin/grep -F '\"type\":\"unmounted\"' >/dev/null || {{ /usr/bin/printf 'SMB helper unmount failed: %s\\n' \"$response\" >&2; exit 1; }}\nif [ -L \"$logical\" ]; then actual=$(/usr/bin/readlink \"$logical\"); if [ \"$actual\" = \"$expected_alias\" ]; then /bin/rm -f \"$logical\" 2>/dev/null || true; fi; fi\n/bin/rm -f \"$HOME/Library/Application Support/macluster/smb/{label}.sh\" \"$HOME/Library/Application Support/macluster/smb/{label}.state\" \"$HOME/Library/LaunchAgents/{label}.plist\"\n",
+        try_owner_unmount = u8::from(!force),
         request = request,
-        managed_root = managed_root,
+        alias_suffix = alias_suffix,
     ))
 }
 
@@ -19204,7 +19662,11 @@ fn register_smb_share(
         config_path,
         state_dir,
         "SMB share setup",
-        MaintenanceScope::Cluster,
+        if options.update_credential {
+            MaintenanceScope::Cluster
+        } else {
+            MaintenanceScope::NamedShare(share_id.to_owned())
+        },
     )?;
     let mut credential_plan = None;
     let result = (|| -> AppResult<()> {
@@ -19483,7 +19945,7 @@ fn unregister_smb_share_with_cleanup_wait(
         config_path,
         state_dir,
         "SMB share removal",
-        MaintenanceScope::Cluster,
+        MaintenanceScope::NamedShare(share_id.to_owned()),
     )?;
     let result = (|| -> AppResult<Option<(String, Duration)>> {
         MaintenanceLock::bind_state_dir(config_path, state_dir).map_err(|error| {
@@ -19913,6 +20375,14 @@ fn smb_share_removal_blockers(
 ) -> Vec<String> {
     jobs.iter()
         .filter_map(|job| {
+            if job
+                .spec
+                .required_shares
+                .as_ref()
+                .is_some_and(|required| !required.iter().any(|id| id == share_id))
+            {
+                return None;
+            }
             if matches!(
                 job.state,
                 macluster_protocol::types::JobState::Starting
@@ -19951,7 +20421,13 @@ fn register_named_share(
         config_path,
         state_dir,
         "named-share setup",
-        MaintenanceScope::Cluster,
+        if queue_server
+            || allow_existing_contents && !read_config(config_path)?.shares.contains_key(share_id)
+        {
+            MaintenanceScope::Cluster
+        } else {
+            MaintenanceScope::NamedShare(share_id.to_owned())
+        },
     )?;
     if maintenance.recovered {
         return Ok(());
@@ -21812,7 +22288,7 @@ fn run_client_mount_batch_with_preparation(
     purpose: &str,
 ) -> Result<(), String> {
     if power_script.is_none() && preparation.is_empty() && !requests.is_empty() {
-        match request_nfs_admin_service(node, &client_mount_admin_request(requests))? {
+        match request_nfs_client_admin(node, &client_mount_admin_request(requests))? {
             Some(()) => return Ok(()),
             None => {
                 return Err(
@@ -24026,10 +24502,11 @@ mod tests {
         maintenance_inputs_unchanged, managed_binary_digest, migration_controller_epoch,
         mount_point_permission_error, named_share_mount_root, named_share_mount_status,
         named_share_operation_endpoint, named_share_operation_matches, named_share_request_matches,
-        nfs_exports_read_command, nfs_exports_update_baseline_read_command,
-        nfs_exports_update_script, nfs_exports_update_script_for_expected, nfs_mapping,
-        nfs_mount_source, node_admin_recovery_pending, node_nfs_mappings,
-        node_ssh_endpoint_reachable, normalize_binary_path, parse_action, parse_agent_build_probe,
+        nfs_client_sudoers_content, nfs_client_sudoers_install_script, nfs_exports_read_command,
+        nfs_exports_update_baseline_read_command, nfs_exports_update_script,
+        nfs_exports_update_script_for_expected, nfs_mapping, nfs_mount_source,
+        node_admin_recovery_pending, node_nfs_mappings, node_ssh_endpoint_reachable,
+        normalize_binary_path, parse_action, parse_agent_build_probe,
         parse_nfs_exports_update_baseline, peer_config_sync_pending,
         pending_add_may_have_client_state, pending_add_operation_for_endpoint,
         pending_combined_ssh_add, pending_local_share_retry_node,
@@ -24040,7 +24517,8 @@ mod tests {
         remote_execution_status, reset_admin_operations, reset_node_from_endpoint,
         resume_existing_ssh_add_sync, save_admin_state, shell_quote, should_resume_add_operation,
         shutdown_confirmation_accepted, unavailable_share_client_nodes, update_recovery,
-        validate_pending_node_identity, validate_storage_root_access,
+        validate_nfs_client_admin_invocation, validate_pending_node_identity,
+        validate_storage_root_access,
     };
     use macluster_core::config::{NodeConfig, Transport};
     use macluster_core::maintenance::MaintenanceLock;
@@ -24049,13 +24527,13 @@ mod tests {
     use macluster_core::storage_uri::{StorageProtocol, StorageUri};
     use macluster_protocol::framing::sha256_hex;
     use macluster_protocol::identifiers::{Id128, NodeId, QueueName};
-    use macluster_protocol::nfs_admin::NfsAdminOperation;
+    use macluster_protocol::nfs_admin::{NfsAdminOperation, NfsAdminRequest, NfsMount};
     use macluster_protocol::types::{ControllerEpoch, JobMode, JobSpec, NodeHealth};
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
         net::TcpListener,
-        os::unix::fs::{MetadataExt, PermissionsExt},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         path::{Path, PathBuf},
         process::{Command, Output, Stdio},
         sync::{Arc, Mutex},
@@ -24984,7 +25462,6 @@ exec "$@"
         assert_eq!(command.matches("/usr/bin/sudo").count(), 1);
         assert!(script.contains("install power"));
         let mkdir = mounts.find("/bin/mkdir -p /Volumes/macluster").unwrap();
-        let empty_check = mounts.find("mount point is not empty").unwrap();
         let primary_mount = mounts
             .find(&format!(
                 "/sbin/mount_nfs -o {} 192.0.2.1:/Users/Shared/primary",
@@ -25000,11 +25477,10 @@ exec "$@"
         let alias = mounts
             .find("/bin/ln -s \"$target_path\" \"$alias_path\"")
             .unwrap();
-        assert!(mkdir < empty_check);
-        assert!(empty_check < primary_mount);
+        assert!(mkdir < primary_mount);
         assert!(primary_mount < second_mount);
         assert!(second_mount < alias);
-        assert!(mounts.contains("/bin/ls -A /Volumes/macluster"));
+        assert!(!mounts.contains("/bin/ls -A /Volumes/macluster"));
     }
 
     #[test]
@@ -25022,7 +25498,7 @@ exec "$@"
 
         let script = client_mount_batch_script(&[request]).expect("build stale mount recovery");
         let detach = script
-            .find("/usr/sbin/diskutil unmount force /Users/Shared/macluster")
+            .find("/sbin/umount -f /Users/Shared/macluster")
             .expect("forced detach");
         let mount = script
             .find(&format!(
@@ -25108,7 +25584,7 @@ exec "$@"
         assert!(script.starts_with("set -e\n"));
         assert!(script.contains("trap macluster_rollback_mounts EXIT"));
         assert!(script.contains("192.0.2.1:/Users/operator/.cargo"));
-        assert!(script.contains("/usr/sbin/diskutil unmount force /Users/operator/.cargo"));
+        assert!(script.contains("/sbin/umount -f /Users/operator/.cargo"));
         assert!(script.contains("internal nfs-recovery remove"));
         let syntax = Command::new("/bin/sh")
             .args(["-n", "-c", &script])
@@ -25164,7 +25640,7 @@ exec "$@"
         };
         let mut script = super::mount_batch_rollback_script(&[request]);
         script = script.replace("/sbin/mount", &fake_mount.to_string_lossy());
-        script = script.replace("/usr/sbin/diskutil", &fake_umount.to_string_lossy());
+        script = script.replace("/sbin/umount", &fake_umount.to_string_lossy());
         script.push_str("false\n");
         let output = Command::new("/bin/sh")
             .args(["-c", &script])
@@ -25265,7 +25741,7 @@ exec "$@"
 
         let script = client_nfs_cleanup_batch_script(&requests, &aliases);
 
-        assert_eq!(script.matches("/usr/sbin/diskutil unmount").count(), 2);
+        assert_eq!(script.matches("/sbin/umount ").count(), 2);
         assert!(script.contains("192.0.2.1:/Users/Shared/primary"));
         assert!(
             !script.contains("/bin/cat"),
@@ -25299,9 +25775,9 @@ exec "$@"
             super::client_nfs_cleanup_batch_script_with_force(&[request.clone()], &[], false);
         let forced = super::client_nfs_cleanup_batch_script_with_force(&[request], &[], true);
 
-        assert!(normal.contains("/usr/sbin/diskutil unmount /Users/Shared/data"));
-        assert!(!normal.contains("/usr/sbin/diskutil unmount force"));
-        assert!(forced.contains("/usr/sbin/diskutil unmount force /Users/Shared/data"));
+        assert!(normal.contains("/sbin/umount /Users/Shared/data"));
+        assert!(!normal.contains("/sbin/umount -f"));
+        assert!(forced.contains("/sbin/umount -f /Users/Shared/data"));
         let syntax = Command::new("/bin/sh")
             .args(["-n", "-c", &forced])
             .output()
@@ -25496,6 +25972,103 @@ share_uuid = "33333333-3333-4333-8333-333333333333"
             "192.0.2.2:/Users/Shared/worker-tools"
         );
         assert_eq!(server_aliases.len(), 1);
+    }
+
+    #[test]
+    fn missing_nfs_mount_plan_repairs_only_configured_nfs_mounts() {
+        let config = ClusterConfig::parse(
+            r#"
+[cluster]
+name = "test"
+default_queue = "arm"
+login_node = "login"
+shared_root = "/Users/Shared/macluster"
+share_uuid = "11111111-1111-4111-8111-111111111111"
+storage_server = "storage"
+protocol_version = 1
+
+[queues.arm]
+nodes = ["worker"]
+scheduler = "fifo"
+
+[nodes.login]
+host = "192.0.2.3"
+transport = "local"
+remote_binary = "/usr/local/bin/macluster"
+machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
+execution_uid = 501
+
+[nodes.storage]
+host = "192.0.2.1"
+transport = "ssh"
+ssh_user = "operator"
+
+[nodes.worker]
+host = "192.0.2.2"
+transport = "ssh"
+ssh_user = "operator"
+
+[nodes.nas]
+host = "192.0.2.5"
+transport = "storage"
+
+[shares.tools]
+server = "storage"
+source_root = "/Users/Shared/tools"
+mount_root = "/Volumes/tools"
+share_uuid = "22222222-2222-4222-8222-222222222222"
+
+[shares.nas-data]
+protocol = "smb"
+server = "nas"
+source_root = "/data"
+mount_root = "/Volumes/data"
+share_uuid = "33333333-3333-4333-8333-333333333333"
+smb_user = "operator"
+"#,
+        )
+        .expect("parse NFS mount recovery fixture");
+
+        let missing = super::missing_client_nfs_mount_requests(&config, "worker", "").unwrap();
+
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0].source, "192.0.2.1:/Users/Shared/macluster");
+        assert_eq!(
+            missing[0].mount_root,
+            PathBuf::from("/Users/Shared/macluster")
+        );
+        assert!(missing[0].needs_mount);
+        assert!(!missing[0].allow_existing_contents);
+        assert_eq!(missing[0].source_alias, None);
+        assert_eq!(missing[1].source, "192.0.2.1:/Users/Shared/tools");
+        assert_eq!(missing[1].mount_root, PathBuf::from("/Volumes/tools"));
+        assert_eq!(
+            missing[1].source_alias,
+            Some(PathBuf::from("/Users/Shared/tools"))
+        );
+        assert!(missing[1].needs_mount);
+        assert!(
+            missing
+                .iter()
+                .all(|request| request.source != "192.0.2.5:/data")
+        );
+
+        let primary_mounted = super::missing_client_nfs_mount_requests(
+            &config,
+            "worker",
+            "192.0.2.1:/Users/Shared/macluster on /Users/Shared/macluster (nfs)\n",
+        )
+        .unwrap();
+        assert_eq!(primary_mounted.len(), 1);
+        assert_eq!(primary_mounted[0].source, "192.0.2.1:/Users/Shared/tools");
+
+        let foreign_mount = super::missing_client_nfs_mount_requests(
+            &config,
+            "worker",
+            "192.0.2.9:/unrelated on /Volumes/tools (nfs)\n",
+        )
+        .expect_err("automatic recovery must preserve a foreign mount");
+        assert!(foreign_mount.contains("refusing automatic recovery"));
     }
 
     #[test]
@@ -26646,8 +27219,7 @@ execution_uid = 501
             Some(replacement)
         );
         assert!(
-            preferred_local_host(&config, Some("198.18.2.9".parse().unwrap()), &addresses)
-                .is_err()
+            preferred_local_host(&config, Some("198.18.2.9".parse().unwrap()), &addresses).is_err()
         );
         config.nodes.remove("login");
         assert_eq!(
@@ -26864,14 +27436,67 @@ execution_uid = 501
             "{output}"
         );
         assert!(output.contains("/Volumes/project"), "{output}");
-        let mapping_header = output
-            .lines()
-            .find(|line| line.contains("STATE") && line.contains("SOURCE"))
-            .expect("mapping table header must exist");
-        assert_eq!(
-            mapping_header.split_whitespace().collect::<Vec<_>>(),
-            ["ID", "STATE", "SOURCE", "TARGET"]
+        assert!(
+            !output.lines().any(|line| {
+                line.split_whitespace().collect::<Vec<_>>() == ["ID", "STATE", "SOURCE", "TARGET"]
+            }),
+            "mapping table header should be omitted:\n{output}"
         );
+    }
+
+    #[test]
+    fn storage_mapping_display_groups_protocols_and_sorts_ids() {
+        let mapping = |name: &str, protocol: StorageProtocol| NodeNfsMapping {
+            name: name.into(),
+            protocol,
+            state: "READY",
+            kind: "MOUNT",
+            source_node: "login".into(),
+            source_uri: format!("{protocol}://login/{name}"),
+            target: format!("/mnt/{name}"),
+        };
+        let row = NodeListRow {
+            columns: [
+                "login".into(),
+                "192.0.2.1".into(),
+                "local".into(),
+                "22".into(),
+                "CONTROLLER".into(),
+                "-".into(),
+                "READY".into(),
+            ],
+            mappings: vec![
+                mapping("B-smb", StorageProtocol::Smb),
+                mapping("Z-nfs", StorageProtocol::Nfs),
+                mapping("a-smb", StorageProtocol::Smb),
+                mapping("a-nfs", StorageProtocol::Nfs),
+            ],
+            storage: NodeStorageInventory::default(),
+        };
+
+        let output = format_node_list(&[row], false);
+        let lines = output.lines().collect::<Vec<_>>();
+        let category = |name: &str| {
+            lines
+                .iter()
+                .position(|line| line.trim() == name)
+                .unwrap_or_else(|| panic!("missing {name} mapping group:\n{output}"))
+        };
+        let mapping_row = |id: &str| {
+            lines
+                .iter()
+                .position(|line| line.split_whitespace().next() == Some(id))
+                .unwrap_or_else(|| panic!("missing {id} mapping:\n{output}"))
+        };
+
+        let nfs = category("NFS");
+        let smb = category("SMB");
+        let nfs_a = mapping_row("a-nfs");
+        let nfs_z = mapping_row("Z-nfs");
+        let smb_a = mapping_row("a-smb");
+        let smb_z = mapping_row("B-smb");
+        assert!(nfs < nfs_a && nfs_a < nfs_z && nfs_z < smb, "{output}");
+        assert!(smb < smb_a && smb_a < smb_z, "{output}");
     }
 
     #[test]
@@ -26931,7 +27556,7 @@ execution_uid = 501
     }
 
     #[test]
-    fn storage_mapping_table_omits_redundant_type_and_kind_columns() {
+    fn storage_mapping_display_omits_redundant_table_header() {
         let row = NodeListRow {
             columns: [
                 "login-01".into(),
@@ -26956,17 +27581,13 @@ execution_uid = 501
 
         let output = format_node_list(&[row], false);
         assert!(output.contains("STORAGE MAPPINGS"), "{output}");
-        let mapping_header = output
-            .lines()
-            .find(|line| line.contains("STATE") && line.contains("SOURCE"))
-            .expect("mapping table header must exist");
-        assert_eq!(
-            mapping_header.split_whitespace().collect::<Vec<_>>(),
-            ["ID", "STATE", "SOURCE", "TARGET"],
-            "{output}"
+        assert!(output.contains("primary  READY"), "{output}");
+        assert!(
+            !output.lines().any(|line| {
+                line.split_whitespace().collect::<Vec<_>>() == ["ID", "STATE", "SOURCE", "TARGET"]
+            }),
+            "mapping table header should be omitted:\n{output}"
         );
-        assert!(!mapping_header.contains("TYPE"), "{output}");
-        assert!(!mapping_header.contains("KIND"), "{output}");
     }
 
     #[test]
@@ -28131,13 +28752,10 @@ execution_uid = 501
     #[test]
     fn storage_provider_alias_recovers_the_original_ipv4_host() {
         assert_eq!(
-            super::storage_provider_host_from_id("nas-01"),
+            super::storage_provider_host_from_id("nas-192-0-2-5"),
             Some("192.0.2.5".into())
         );
-        assert_eq!(
-            super::storage_provider_host_from_id("nas-nas-user-abcd1234"),
-            None
-        );
+        assert_eq!(super::storage_provider_host_from_id("nas-01"), None);
     }
 
     #[test]
@@ -28250,8 +28868,8 @@ execution_uid = 501
 
         match parse_action(&args).expect("an IPv4 storage URI must be accepted") {
             Action::Mount { uri, options } => {
-                assert_eq!(uri.server.as_str(), "nas-01");
-                assert_eq!(uri.canonical, "smb://nas-01/data");
+                assert_eq!(uri.server.as_str(), "nas-192-0-2-5");
+                assert_eq!(uri.canonical, "smb://nas-192-0-2-5/data");
                 assert_eq!(options.server_host.as_deref(), Some("192.0.2.5"));
                 assert_eq!(options.mount_root, PathBuf::from("/Volumes/test_data"));
                 assert_eq!(options.smb_user.as_deref(), Some("nas-user"));
@@ -28753,8 +29371,24 @@ execution_uid = 501
                 .unwrap();
         let unmount = super::smb_unmount_script(&share, false).unwrap();
         assert!(
-            unmount.contains("case \"$actual\" in /Users/Shared/.macluster-mounts/*"),
-            "removal must clean a stale managed logical alias even when no SMB mount remains"
+            unmount.contains("expected_alias=\"$backing\""),
+            "removal must target the exact logical alias recorded by the mapping"
+        );
+        assert!(
+            unmount.contains("[ \"$backing\" = \"$physical\" ]"),
+            "only the SMB mount created by this mapping may be unmounted"
+        );
+        assert!(
+            !unmount.contains("[ \"$backing\" != \"$physical\" ]"),
+            "a reused SMB mount belongs to another mapping and must stay mounted"
+        );
+        assert!(
+            unmount.contains("mounts=$(/sbin/mount)"),
+            "mount-table inspection failures must not be mistaken for an already-detached mount"
+        );
+        assert!(
+            unmount.contains("SMB mount remains active after unmount"),
+            "the state may be cleared only after the helper confirms the physical mount is gone"
         );
 
         for script in [mount, unmount] {
@@ -28772,6 +29406,61 @@ execution_uid = 501
             assert!(!script.contains("/Library/LaunchDaemons"), "{script}");
             assert!(!script.contains("sudo"), "{script}");
         }
+    }
+
+    #[test]
+    fn smb_unmount_still_calls_the_privileged_helper_when_the_physical_mount_is_gone() {
+        let root =
+            std::env::temp_dir().join(format!("macluster-smb-unmount-script-{}", Id128::random()));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let mount = root.join("mount");
+        let nc = root.join("nc");
+        let launchctl = root.join("launchctl");
+        let helper_called = root.join("helper-called");
+        fs::write(&mount, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &nc,
+            format!(
+                "#!/bin/sh\n/usr/bin/touch {}\n/bin/cat <<'EOF'\n{{\"service_version\":\"smb-credential-26\",\"type\":\"unmounted\",\"result\":{{}}}}\nEOF\n",
+                shell_quote(&helper_called.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
+        for executable in [&mount, &nc, &launchctl] {
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let share = ShareConfig {
+            protocol: StorageProtocol::Smb,
+            server: NodeId::new("nas").unwrap(),
+            source_root: "/Partition_2".into(),
+            mount_root: root.join("data"),
+            share_uuid: "990cf04e-f2e3-45c3-a45d-a34278d0075b".into(),
+            smb_user: Some("Jingxian".into()),
+            allow_existing_contents: false,
+        };
+        let script = super::smb_unmount_script(&share, false)
+            .unwrap()
+            .replace("/sbin/mount", &mount.to_string_lossy())
+            .replace("/usr/bin/nc", &nc.to_string_lossy())
+            .replace("/bin/launchctl", &launchctl.to_string_lossy());
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            helper_called.exists(),
+            "the root helper must remove a managed root-owned logical alias even without an active mount"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -31301,8 +31990,8 @@ remote_binary = "/usr/local/bin/macluster"
         assert!(!output.contains("\n  login-01\n"), "{output}");
         assert!(!output.contains("\n  arm-a\n"), "{output}");
         assert!(!output.contains("PHASE"));
-        assert!(output.contains("SOURCE"), "{output}");
-        assert!(output.contains("TARGET"), "{output}");
+        assert!(!output.contains("SOURCE"), "{output}");
+        assert!(!output.contains("TARGET"), "{output}");
         assert!(output.contains("ROLES"), "{output}");
         assert!(output.contains("CONTROLLER"), "{output}");
         assert!(output.contains("COMPUTE"), "{output}");
@@ -32134,7 +32823,10 @@ ssh_port = 22
             "the unified helper must be installed exactly once"
         );
         assert!(!script.contains("NFS admin staging file"));
-        assert!(!script.contains("sudo"));
+        assert!(script.contains("/private/etc/sudoers.d/macluster_nfs_client"));
+        assert!(script.contains("NOPASSWD:"));
+        assert!(!script.contains("/usr/bin/sudo "));
+        assert!(!script.contains("sudo -n "));
     }
 
     #[test]
@@ -32195,12 +32887,12 @@ ssh_port = 22
             "nfs-admin-1"
         ));
         assert!(
-            !super::nfs_admin_cli_revision_at_least("nfs-admin-7", super::NFS_ADMIN_CLI_REVISION),
-            "the changed root NFS CLI must force a refresh of existing nfs-admin-7 installations"
+            !super::nfs_admin_cli_revision_at_least("nfs-admin-16", super::NFS_ADMIN_CLI_REVISION),
+            "the changed root NFS CLI must force a refresh of existing nfs-admin-16 installations"
         );
         assert!(
-            !super::nfs_admin_cli_revision_at_least("nfs-admin-8", super::NFS_ADMIN_CLI_REVISION),
-            "the changed root NFS CLI must refresh the currently installed nfs-admin-8"
+            super::nfs_admin_cli_revision_at_least("nfs-admin-18", super::NFS_ADMIN_CLI_REVISION),
+            "a newer root NFS CLI implementation remains compatible"
         );
         assert!(super::nfs_admin_cli_revision_at_least(
             "nfs-admin-7",
@@ -32229,7 +32921,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
         );
         assert!(script.contains(super::NFS_ADMIN_CLI_REVISION));
-        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-5");
+        assert_eq!(super::NFS_ADMIN_SERVICE_VERSION, "nfs-admin-7");
     }
 
     #[test]
@@ -32249,12 +32941,9 @@ ssh_port = 22
             cluster_id: "00000000-0000-4000-8000-000000000001".into(),
         };
 
-        assert_eq!(
-            super::stale_nfs_admin_reply(&reply("nfs-admin-1", true), &ping)
-                .unwrap()
-                .unwrap(),
-            None,
-            "the pre-updater service must use the one-time enrollment migration"
+        assert!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-1", true), &ping).is_none(),
+            "the pre-updater service requires an explicit helper migration"
         );
         assert_eq!(
             super::stale_nfs_admin_reply(&reply("nfs-admin-2", true), &ping)
@@ -32279,7 +32968,7 @@ ssh_port = 22
                 .unwrap()
                 .unwrap(),
             Some(()),
-            "nfs-admin-3 can authenticate the signed upgrade path to protocol 5"
+            "nfs-admin-3 can authenticate the signed upgrade path to protocol 6"
         );
         assert_eq!(
             super::stale_nfs_admin_reply(&reply("nfs-admin-3", true), &update)
@@ -32297,10 +32986,36 @@ ssh_port = 22
                 .unwrap()
                 .unwrap(),
             Some(()),
-            "nfs-admin-4 can authenticate the signed upgrade path to protocol 5"
+            "nfs-admin-4 can authenticate the signed upgrade path to protocol 6"
         );
         assert_eq!(
             super::stale_nfs_admin_reply(&reply("nfs-admin-4", true), &update)
+                .unwrap()
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-5", true), &ping)
+                .unwrap()
+                .unwrap(),
+            Some(()),
+            "nfs-admin-5 can authenticate the signed upgrade path to protocol 6"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-5", true), &update)
+                .unwrap()
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-6", true), &ping)
+                .unwrap()
+                .unwrap(),
+            Some(()),
+            "nfs-admin-6 can authenticate the signed upgrade path to protocol 7"
+        );
+        assert_eq!(
+            super::stale_nfs_admin_reply(&reply("nfs-admin-6", true), &update)
                 .unwrap()
                 .unwrap(),
             Some(())
@@ -32452,6 +33167,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
             Some(("/tmp/update-key.bin", &trust)),
             None,
+            501,
         );
         assert!(script.contains("org.macluster.update/public-key"));
         assert!(script.contains("org.macluster.update/cluster-id"));
@@ -32495,6 +33211,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
             Some(("/tmp/update-key.bin", &trust)),
             Some(foreign_cluster_id),
+            501,
         );
         assert!(script.contains(&format!(
             "[ \"$installed_cluster_id\" = {foreign_cluster_id} ]"
@@ -32523,6 +33240,7 @@ ssh_port = 22
             super::NFS_ADMIN_CLI_REVISION,
             None,
             None,
+            501,
         );
         assert!(script.contains("/var/run/org.macluster.smb-credential.sock"));
         assert!(
@@ -32569,6 +33287,111 @@ ssh_port = 22
         };
         assert_eq!(mounts[0].share_uuid, "79b24deb-6e78-5720-aaee-1ff0fb8d35f4");
         assert_eq!(mounts[0].target, "/Users/Shared/data");
+    }
+
+    #[test]
+    fn client_mount_admin_request_refreshes_an_existing_mount_without_remounting_it_as_new() {
+        let admin = client_mount_admin_request(&[ClientMountRequest {
+            source: "192.0.2.1:/Users/Shared/data".into(),
+            mount_root: PathBuf::from("/Users/Shared/data"),
+            share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
+            source_alias: None,
+            needs_privileged_mkdir: false,
+            needs_mount: false,
+            force_unmount_existing: false,
+            allow_existing_contents: false,
+        }]);
+
+        assert_eq!(
+            serde_json::to_value(admin.operation).unwrap()["kind"],
+            "refresh_mounts"
+        );
+    }
+
+    #[test]
+    fn client_mount_admin_requires_the_invoking_account_and_only_mount_operations() {
+        let request = NfsAdminRequest {
+            operation: NfsAdminOperation::Mount {
+                mounts: vec![NfsMount {
+                    source: "192.0.2.1:/Users/Shared/data".into(),
+                    target: "/Users/Shared/data".into(),
+                    share_uuid: "79b24deb-6e78-5720-aaee-1ff0fb8d35f4".into(),
+                    alias: None,
+                    allow_existing_contents: false,
+                }],
+            },
+        };
+        assert!(validate_nfs_client_admin_invocation(&request, 501, Some(501)).is_ok());
+        assert!(validate_nfs_client_admin_invocation(&request, 501, Some(502)).is_err());
+        assert!(validate_nfs_client_admin_invocation(&request, 501, None).is_err());
+
+        let unrelated = NfsAdminRequest {
+            operation: NfsAdminOperation::Ping,
+        };
+        assert!(validate_nfs_client_admin_invocation(&unrelated, 501, Some(501)).is_err());
+    }
+
+    #[test]
+    fn nfs_client_sudoers_policy_is_exact_and_uid_scoped() {
+        let rule = nfs_client_sudoers_content(501).unwrap();
+        assert_eq!(
+            rule,
+            concat!(
+                "# Managed by macluster; do not edit.\n",
+                "#501 ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/org.macluster.macluster internal nfs-client-admin --peer-uid 501\n"
+            )
+        );
+        assert!(nfs_client_sudoers_content(0).is_err());
+    }
+
+    #[test]
+    fn nfs_client_sudoers_install_script_is_valid_and_uses_a_narrow_rule() {
+        let script = nfs_client_sudoers_install_script(501).unwrap();
+        assert!(script.contains("/private/etc/sudoers.d/macluster_nfs_client"));
+        assert!(script.contains("/usr/sbin/visudo -c -f"));
+        assert!(script.contains("/usr/sbin/visudo -c"));
+        assert!(script.contains("/bin/chmod 440"));
+        assert!(script.contains("internal nfs-client-admin --peer-uid 501"));
+        assert!(!script.contains("NOPASSWD: ALL"));
+        let syntax = Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            syntax.status.success(),
+            "{}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+
+        let Some(visudo) = ["/usr/sbin/visudo", "/usr/bin/visudo"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+        else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("macluster-sudoers-{}.conf", Id128::random()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        file.write_all(nfs_client_sudoers_content(501).unwrap().as_bytes())
+            .unwrap();
+        drop(file);
+        let validation = Command::new(visudo)
+            .args(["-c", "-f"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            validation.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&validation.stdout),
+            String::from_utf8_lossy(&validation.stderr)
+        );
     }
 
     #[test]
@@ -33503,7 +34326,7 @@ share_uuid="928e8976-c946-509d-9e62-a3ef787664b7"
         let blockers = super::smb_share_removal_blockers(&jobs, "smb-project");
 
         assert!(
-            blockers.iter().any(|blocker| blocker.contains("job 1")),
+            !blockers.iter().any(|blocker| blocker.contains("job 1")),
             "{blockers:?}"
         );
         assert!(

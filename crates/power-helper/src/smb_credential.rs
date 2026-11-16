@@ -1175,38 +1175,44 @@ fn unmount_smb(
     logical_target: &str,
     force: bool,
 ) -> Result<(), String> {
-    let (user, home) = smb_session_account(uid)?;
+    // The credential socket authenticates this request as a real node user,
+    // while the system helper already has the privilege needed to detach the
+    // exact managed SMB mount. Do not hop through launchctl + sudo: that can
+    // target a different GUI session or wait for a session that is not logged
+    // in (common on headless compute nodes).
+    let _ = smb_session_account(uid)?;
     unmount_smb_with(logical, logical_target, || {
-        if smb_mount_is_active(target)? {
-            let mut command = Command::new("/bin/launchctl");
-            command.args([
-                "asuser",
-                &uid.to_string(),
-                "/usr/bin/sudo",
-                "-u",
-                &user,
-                "-H",
-                "/sbin/umount",
-            ]);
-            command.args(smb_unmount_arguments(target, force));
+        let result = if smb_mount_is_active(target)? {
+            let (program, arguments) = smb_unmount_invocation(target, force);
+            let mut command = Command::new(program);
             command
+                .args(arguments)
                 .env_clear()
-                .env("HOME", &home)
-                .env("USER", &user)
-                .env("LOGNAME", &user)
                 .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
                 .env("LC_ALL", "C")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            let status = run_bounded_process_group(command, SMB_UNMOUNT_TIMEOUT)
-                .map_err(|error| format!("unmount SMB share {target}: {error}"))?;
-            if !status.success() {
-                return Err(format!("unmount SMB share {target} exited with {status}"));
+            match run_bounded_process_group(command, SMB_UNMOUNT_TIMEOUT) {
+                Ok(status) if status.success() => Ok(()),
+                Ok(status) => Err(format!("unmount SMB share {target} exited with {status}")),
+                Err(error) => Err(format!("unmount SMB share {target}: {error}")),
             }
-        }
-        Ok(())
+        } else {
+            Ok(())
+        };
+        confirm_unmount_completion(result, || smb_mount_is_active(target))
     })
+}
+
+fn smb_unmount_invocation(target: &str, force: bool) -> (&'static str, Vec<String>) {
+    (
+        "/sbin/umount",
+        smb_unmount_arguments(target, force)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 fn smb_unmount_arguments(target: &str, force: bool) -> Vec<&str> {
@@ -1214,6 +1220,25 @@ fn smb_unmount_arguments(target: &str, force: bool) -> Vec<&str> {
         vec!["-f", target]
     } else {
         vec![target]
+    }
+}
+
+fn confirm_unmount_completion(
+    result: Result<(), String>,
+    mount_is_active: impl FnOnce() -> Result<bool, String>,
+) -> Result<(), String> {
+    match mount_is_active() {
+        Ok(false) => Ok(()),
+        Ok(true) => match result {
+            Ok(()) => Err("SMB mount remains active after unmount".into()),
+            Err(error) => Err(error),
+        },
+        Err(probe_error) => match result {
+            Ok(()) => Err(format!("cannot verify SMB unmount: {probe_error}")),
+            Err(unmount_error) => Err(format!(
+                "{unmount_error}; cannot verify SMB unmount: {probe_error}"
+            )),
+        },
     }
 }
 
@@ -1684,11 +1709,12 @@ mod tests {
     use super::{
         CredentialVault, FileSecretStore, KeychainCredentialVault, MemorySecretStore,
         SMB_UNMOUNT_TIMEOUT, SecretStore, SmbMountBackend, SmbMountReadability,
-        arp_delete_arguments, direct_storage_subnet_route_arguments, ensure_smb_logical_alias,
-        read_pinned_cluster, reconcile_smb_mount_with_backend, record_smb_repair_failure,
-        remove_smb_logical_alias, route_delete_arguments, route_output_is_direct,
-        run_bounded_process_group, serve_client_with, smb_mount_arguments, smb_repair_allowed,
-        smb_tcp_endpoint_reachable, smb_unmount_arguments, unmount_smb_with,
+        arp_delete_arguments, confirm_unmount_completion, direct_storage_subnet_route_arguments,
+        ensure_smb_logical_alias, read_pinned_cluster, reconcile_smb_mount_with_backend,
+        record_smb_repair_failure, remove_smb_logical_alias, route_delete_arguments,
+        route_output_is_direct, run_bounded_process_group, serve_client_with, smb_mount_arguments,
+        smb_repair_allowed, smb_tcp_endpoint_reachable, smb_unmount_arguments,
+        smb_unmount_invocation, unmount_smb_with,
     };
 
     fn cluster() -> Id128 {
@@ -2110,6 +2136,42 @@ mod tests {
     }
 
     #[test]
+    fn smb_unmount_runs_directly_and_is_idempotent_after_a_lost_reply() {
+        assert_eq!(
+            smb_unmount_invocation("/Users/Shared/.macluster-mounts/share", false),
+            (
+                "/sbin/umount",
+                vec!["/Users/Shared/.macluster-mounts/share".to_owned()]
+            )
+        );
+        assert_eq!(
+            smb_unmount_invocation("/Users/Shared/.macluster-mounts/share", true),
+            (
+                "/sbin/umount",
+                vec![
+                    "-f".to_owned(),
+                    "/Users/Shared/.macluster-mounts/share".to_owned()
+                ]
+            )
+        );
+
+        let timed_out = confirm_unmount_completion(
+            Err("operation remained busy after 10 seconds".to_owned()),
+            || Ok(false),
+        );
+        assert_eq!(timed_out, Ok(()));
+
+        let still_busy = confirm_unmount_completion(
+            Err("operation remained busy after 10 seconds".to_owned()),
+            || Ok(true),
+        );
+        assert_eq!(
+            still_busy,
+            Err("operation remained busy after 10 seconds".to_owned())
+        );
+    }
+
+    #[test]
     fn same_subnet_storage_route_is_pinned_to_its_direct_interface() {
         assert_eq!(
             direct_storage_subnet_route_arguments("192.0.2.0", "255.255.255.0", "bridge0"),
@@ -2132,14 +2194,7 @@ mod tests {
         ));
         assert_eq!(
             route_delete_arguments("192.0.2.5", "bridge0"),
-            [
-                "-n",
-                "delete",
-                "-host",
-                "192.0.2.5",
-                "-ifscope",
-                "bridge0"
-            ]
+            ["-n", "delete", "-host", "192.0.2.5", "-ifscope", "bridge0"]
         );
         assert_eq!(arp_delete_arguments("192.0.2.5"), ["-d", "192.0.2.5"]);
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

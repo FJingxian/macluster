@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_NFS_ADMIN_REQUEST_BYTES: usize = 1024 * 1024;
 /// Wire version for requests handled by the privileged NFS service. Keep this
 /// independent from the installed root-owned CLI implementation revision.
-pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-5";
+pub const NFS_ADMIN_SERVICE_VERSION: &str = "nfs-admin-7";
 const MAX_BATCH_ITEMS: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -21,7 +21,17 @@ pub struct NfsAdminRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NfsAdminOperation {
     Ping,
+    /// Install the exact, UID-scoped sudo rule used by the short-lived SSH
+    /// client mount path. The socket derives the UID from its authenticated
+    /// peer, so the request cannot choose another account.
+    EnsureClientMountSudoers,
     Mount {
+        mounts: Vec<NfsMount>,
+    },
+    /// Reconcile an already exact managed mount without creating it.
+    /// The privileged helper may remount it after validating the exact
+    /// source/target so recovery policy changes take effect.
+    RefreshMounts {
         mounts: Vec<NfsMount>,
     },
     Unmount {
@@ -130,7 +140,8 @@ impl NfsAdminRequest {
         }
         match &self.operation {
             NfsAdminOperation::Ping => Ok(()),
-            NfsAdminOperation::Mount { mounts } => {
+            NfsAdminOperation::EnsureClientMountSudoers => Ok(()),
+            NfsAdminOperation::Mount { mounts } | NfsAdminOperation::RefreshMounts { mounts } => {
                 validate_batch_size(mounts.len())?;
                 for mount in mounts {
                     mount.validate()?;
@@ -405,6 +416,20 @@ mod tests {
     };
 
     #[test]
+    fn client_mount_sudoers_setup_is_an_authenticated_non_root_request() {
+        let request = NfsAdminRequest {
+            operation: NfsAdminOperation::EnsureClientMountSudoers,
+        };
+        request.validate(501).unwrap();
+        assert!(request.validate(0).is_err());
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<NfsAdminRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn deferred_export_cleanup_round_trips_and_rejects_unscoped_requests() {
         let valid = NfsAdminRequest {
             operation: NfsAdminOperation::RemoveExports {
@@ -469,7 +494,7 @@ mod tests {
             valid
         );
 
-        for cluster_id in ["not-a-uuid", "79b24deb-6e78-5720-aaee-1ff0fb8d35f4"] {
+        for cluster_id in ["not-a-uuid", "79B24DEB-6E78-5720-AAEE-1FF0FB8D35F4"] {
             let request = NfsAdminRequest {
                 operation: NfsAdminOperation::ForgetClusterUpdater {
                     cluster_id: cluster_id.into(),

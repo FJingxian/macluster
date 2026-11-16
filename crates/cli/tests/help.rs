@@ -128,7 +128,7 @@ fn detailed_help_has_clear_examples_and_section_headings() {
             &["mnode", "--help"][..],
             &[
                 "ADD NODES",
-                "SHARES",
+                "STORAGE MAPPINGS",
                 "NFS CLIENT RECOVERY",
                 "REMOVE NODES",
                 "EXAMPLES",

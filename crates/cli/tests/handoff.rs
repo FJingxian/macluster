@@ -90,7 +90,12 @@ impl Fixture {
             .unwrap()
             .result
     }
-    fn claim(&self, config: &Path, controller: ControllerEpoch) -> std::process::Output {
+    fn claim(
+        &self,
+        config: &Path,
+        namespace: Id128,
+        controller: ControllerEpoch,
+    ) -> std::process::Output {
         macluster_command()
             .arg("--config")
             .arg(config)
@@ -105,6 +110,12 @@ impl Fixture {
                 &controller.controller_uuid.to_string(),
                 "--epoch",
                 &controller.epoch.to_string(),
+                "--share-id",
+                &namespace.to_string(),
+                "--machine-uuid",
+                &self.uuid,
+                "--execution-uid",
+                &unsafe { libc::geteuid() }.to_string(),
             ])
             .output()
             .unwrap()
@@ -204,9 +215,10 @@ fn busy_foreign_reset_and_idle_handoff_preserve_previous_job_one() {
         release.display()
     );
     f.start(&cfg_a, a, owner_a, &script);
-    let busy = f.claim(&cfg_b, owner_b);
+    let busy = f.claim(&cfg_b, b, owner_b);
     assert!(!busy.status.success());
-    assert!(String::from_utf8_lossy(&busy.stderr).contains("active job"));
+    let busy_stderr = String::from_utf8_lossy(&busy.stderr);
+    assert!(busy_stderr.contains("active job"), "{busy_stderr}");
     let preserved = f.archive(b);
     assert!(
         preserved.status.success(),
@@ -220,7 +232,7 @@ fn busy_foreign_reset_and_idle_handoff_preserve_previous_job_one() {
     assert!(!f.root.join("reset-archive").exists());
     fs::write(&release, b"release").unwrap();
     f.finish(&cfg_a);
-    let claimed = f.claim(&cfg_b, owner_b);
+    let claimed = f.claim(&cfg_b, b, owner_b);
     assert!(
         claimed.status.success(),
         "{}",

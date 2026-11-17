@@ -16,7 +16,9 @@ pub const MAX_CONTROL_JOB_PAGE: usize = 256;
 pub const MAX_CONTROL_COMPATIBILITY_NODES: usize = 128;
 pub const MAX_CONTROL_MONITOR_NODES: usize = 128;
 pub const MAX_CONTROL_MONITOR_SUBSCRIPTION_NODES: usize = 4096;
-pub const MAX_MONITOR_PROCESS_ROWS: usize = 32;
+// ps already enumerates the full process table. Keep enough rows for tall
+// terminals while bounding monitor frames and retained controller state.
+pub const MAX_MONITOR_PROCESS_ROWS: usize = 1024;
 pub const MULTI_ENTRY_CLIENT_FEATURE: &str = "multi-entry-client.v1";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

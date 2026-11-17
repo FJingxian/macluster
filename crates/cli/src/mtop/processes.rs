@@ -12,13 +12,13 @@ use std::{
 };
 
 use macluster_core::config::{NodeConfig, Transport};
+use macluster_protocol::control::MAX_MONITOR_PROCESS_ROWS;
 
 const PREVIEW_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_SAMPLE_COMMAND: &str = "LC_ALL=C /bin/ps -A -o pid=,pcpu=,rss=,time=,ucomm=";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const PROCESS_STALE_AFTER: Duration = Duration::from_secs(10);
 const MAX_PROCESS_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PROCESS_ROWS: usize = 32;
 
 #[cfg(test)]
 const PROCESS_TABLE_MARKER: &str = "__MACLUSTER_PS_NAMES__";
@@ -273,7 +273,7 @@ impl ProcessSampler {
                                     result.received_at,
                                 );
                                 sort_processes(rows, ProcessSort::Cpu);
-                                rows.truncate(MAX_PROCESS_ROWS);
+                                rows.truncate(MAX_MONITOR_PROCESS_ROWS);
                                 ready
                             }
                             Err(_) => true,
@@ -625,7 +625,7 @@ fn parse_preview_processes(input: &str) -> Result<Vec<ProcessInfo>, String> {
         return Err("process preview returned no valid rows".into());
     }
     sort_processes(&mut rows, ProcessSort::Cpu);
-    rows.truncate(32);
+    rows.truncate(MAX_MONITOR_PROCESS_ROWS);
     Ok(rows)
 }
 
@@ -742,6 +742,18 @@ mod tests {
         assert!(
             matches!(cache.view_at(now), ProcessView::Available {rows, warning: None, ..} if rows.is_empty())
         );
+    }
+
+    #[test]
+    fn preview_keeps_enough_rows_to_fill_a_tall_process_pane() {
+        let input = (0..128)
+            .map(|pid| format!("{pid} 0.0 1024 0:00.01 worker-{pid}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let rows = parse_preview_processes(&input).unwrap();
+
+        assert_eq!(rows.len(), 128);
     }
 
     #[test]

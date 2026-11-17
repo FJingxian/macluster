@@ -750,6 +750,10 @@ pub enum Operation {
         obsolete_markers: Vec<NfsShareMarker>,
         #[serde(default)]
         obsolete_exports: Vec<NfsExportCleanup>,
+    },
+    ReconcileSmb {
+        controller: ControllerEpoch,
+        config_toml: String,
         #[serde(default)]
         smb_credentials: Vec<crate::smb_credential::SmbCredentialProvision>,
         #[serde(default)]
@@ -988,8 +992,6 @@ mod interactive_job_compatibility_tests {
                 share_uuid: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into(),
                 node_id: "worker-008".into(),
             }],
-            smb_credentials: Vec::new(),
-            obsolete_smb_credentials: Vec::new(),
         };
 
         let encoded = serde_json::to_value(&operation).unwrap();
@@ -1002,6 +1004,25 @@ mod interactive_job_compatibility_tests {
             serde_json::to_value(Operation::Ping).unwrap(),
             json!({ "type": "ping" })
         );
+    }
+
+    #[test]
+    fn smb_reconciliation_is_separate_from_nfs_reconciliation() {
+        let operation = Operation::ReconcileSmb {
+            controller: ControllerEpoch {
+                controller_uuid: ControllerUuid(
+                    Id128::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+                ),
+                epoch: 7,
+            },
+            config_toml: "[cluster]\nname = \"test\"\n".into(),
+            smb_credentials: Vec::new(),
+            obsolete_smb_credentials: Vec::new(),
+        };
+        let encoded = serde_json::to_vec(&operation).unwrap();
+        let decoded: Operation = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, operation);
+        assert!(matches!(decoded, Operation::ReconcileSmb { .. }));
     }
 
     #[test]

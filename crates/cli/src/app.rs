@@ -52,6 +52,9 @@ const INTERACTIVE_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SUBMISSION_CACHE_ENTRIES: usize = 1024;
 const MAX_SUBMISSION_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const SUBMITTER_HOME_ENV: &str = "MCLUSTER_INTERNAL_SUBMITTER_HOME";
+const DISABLE_DEFERRED_UPDATE_SPAWN_ENV: &str = "MACLUSTER_DISABLE_DEFERRED_UPDATE_SPAWN";
+const DEFERRED_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const DEFERRED_UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const REMOTE_INTERACTIVE_EXECUTION_ENV: &[&str] = &[
     "HOME",
     "USER",
@@ -569,6 +572,7 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         }
     }
     let mut hidden_node_notice_printed = false;
+    let mut deferred_submit_update = false;
     if command == "submit" && !submit_help_requested(&args) {
         parse_submit_args(&args).map_err(cli_error)?;
     }
@@ -576,11 +580,12 @@ pub fn run(program: &str, input: &[String]) -> AppResult<()> {
         && !address_migration_deferred
         && is_macluster_executable()
     {
-        hidden_node_notice_printed = preflight_agent_update(&command, &args, &global)?;
+        hidden_node_notice_printed =
+            preflight_agent_update(&command, &args, &global, &mut deferred_submit_update)?;
     }
 
     match command.as_str() {
-        "submit" => submit(global, &args, command_started_at),
+        "submit" => submit(global, &args, command_started_at, deferred_submit_update),
         "job" => job(global, &args),
         "queue" => queue(global, &args),
         "kill" => kill(global, &args),
@@ -1515,9 +1520,6 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
         && args
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "-rm" | "--remove"))
-        && !args
-            .get(1)
-            .is_some_and(|target| target.starts_with("share:"))
     {
         return false;
     }
@@ -1541,7 +1543,10 @@ fn should_preflight_agent_update(command: &str, args: &[String]) -> bool {
 }
 
 fn should_refresh_node_addresses(command: &str, args: &[String]) -> bool {
-    if matches!(command, "internal" | "agent" | "init") || is_node_network_scan(command, args) {
+    if matches!(command, "internal" | "agent" | "init")
+        || is_read_only_query(command, args)
+        || is_node_network_scan(command, args)
+    {
         return false;
     }
     if command == "node"
@@ -1762,8 +1767,8 @@ fn can_defer_agent_update_for_work(command: &str, args: &[String]) -> bool {
                 .is_some_and(|arg| matches!(arg.as_str(), "-l" | "--list" | "--failed"))
 }
 
-fn submission_must_wait_for_agent_update(command: &str) -> bool {
-    command == "submit"
+fn controller_update_blocks_submission(recovery_pending: bool, controller_mismatch: bool) -> bool {
+    recovery_pending || controller_mismatch
 }
 
 fn should_defer_address_migration(can_defer: bool, active_jobs: bool) -> bool {
@@ -1787,8 +1792,9 @@ fn preflight_agent_update(
     command: &str,
     args: &[String],
     global: &GlobalOptions,
+    deferred_submit_update: &mut bool,
 ) -> AppResult<bool> {
-    preflight_agent_update_with_compatibility(command, args, global, None)
+    preflight_agent_update_with_compatibility(command, args, global, None, deferred_submit_update)
 }
 
 fn preflight_agent_update_with_compatibility(
@@ -1796,6 +1802,7 @@ fn preflight_agent_update_with_compatibility(
     args: &[String],
     global: &GlobalOptions,
     checked_compatibility: Option<crate::node_admin::AgentBuildCompatibility>,
+    deferred_submit_update: &mut bool,
 ) -> AppResult<bool> {
     let config_path = resolved_config_path(global.config.as_deref());
     let config_exists = match fs::symlink_metadata(&config_path) {
@@ -1989,17 +1996,26 @@ fn preflight_agent_update_with_compatibility(
             )
         })?
     {
-        if submission_must_wait_for_agent_update(command) {
+        if command == "submit"
+            && controller_update_blocks_submission(recovery_pending, controller_mismatch)
+        {
             return Err((
                 1,
-                "active jobs or output sync remain before Agent update; no job was submitted. Retry `msub` after the work drains.".into(),
+                "Controller update is required before a new submission can be queued safely, but active jobs or output sync prevent restarting it. Retry `msub` after the work drains.".into(),
             ));
         }
         let hidden_count = hidden_fan_node_count(&config, &state_dir);
         let deferred = deferred_nodes_summary(hidden_count);
-        eprintln!(
-            "Agent update is deferred while active tasks or output synchronization remain; continuing with `{command}`. Retry after the work drains to resume the automatic update.{deferred}"
-        );
+        if command == "submit" {
+            *deferred_submit_update = true;
+            eprintln!(
+                "Agent update is deferred while active tasks or output synchronization remain; the submission will continue and affected nodes will keep the job queued until the update completes.{deferred}"
+            );
+        } else {
+            eprintln!(
+                "Agent update is deferred while active tasks or output synchronization remain; continuing with `{command}`. Retry after the work drains to resume the automatic update.{deferred}"
+            );
+        }
         return Ok(hidden_count > 0);
     }
     if update_required
@@ -2090,6 +2106,127 @@ fn preflight_agent_update_with_compatibility(
 fn deferred_nodes_summary(count: usize) -> String {
     crate::node_admin::hidden_node_notice(count)
         .map_or_else(String::new, |notice| format!("\n{notice}"))
+}
+
+fn schedule_deferred_agent_update(config_path: &Path, state_dir: &Path) -> AppResult<()> {
+    crate::node_admin::request_deferred_agent_update(config_path, state_dir)
+        .map_err(|error| (1, error))?;
+    if env::var_os(DISABLE_DEFERRED_UPDATE_SPAWN_ENV).is_some() {
+        return Ok(());
+    }
+    let executable = env::current_exe().map_err(|error| (1, error.to_string()))?;
+    let log_path = state_dir.join("agent-update-waiter.log");
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|error| (1, format!("cannot open deferred Agent update log: {error}")))?;
+    let stderr = log.try_clone().map_err(|error| {
+        (
+            1,
+            format!("cannot clone deferred Agent update log: {error}"),
+        )
+    })?;
+    process::Command::new("/usr/bin/nohup")
+        .arg(executable)
+        .arg("--config")
+        .arg(config_path)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .args(["internal", "wait-agent-update"])
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::from(log))
+        .stderr(process::Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| {
+            (
+                1,
+                format!("cannot start deferred Agent update worker: {error}"),
+            )
+        })?;
+    eprintln!(
+        "Deferred Agent update worker started; queued jobs will resume after the update completes."
+    );
+    Ok(())
+}
+
+fn deferred_agent_update_satisfied(
+    global: &GlobalOptions,
+    config_path: &Path,
+    state_dir: &Path,
+) -> Result<bool, String> {
+    if !crate::node_admin::deferred_agent_update_request_current(config_path, state_dir)? {
+        return Ok(false);
+    }
+    if crate::node_admin::agent_update_recovery_pending(config_path, state_dir)? {
+        return Ok(false);
+    }
+    let config = load_config(Some(config_path))?;
+    if !crate::node_admin::agent_helper_refresh_pending_nodes(state_dir, &config)?.is_empty() {
+        return Ok(false);
+    }
+    let compatibility = crate::node_admin::configured_agent_build_compatibility_cached(
+        &config,
+        &state_dir.join("mtop-cache"),
+    )
+    .map_err(|(_, error)| error)?;
+    Ok(!compatibility.requires_update() && !controller_build_mismatch(global, state_dir))
+}
+
+fn run_deferred_agent_update(global: GlobalOptions) -> AppResult<()> {
+    let config_path = resolved_config_path(global.config.as_deref());
+    let state_dir = state_root(global.state_dir.as_deref())?;
+    if !crate::node_admin::deferred_agent_update_request_current(&config_path, &state_dir)
+        .map_err(|error| (1, error))?
+    {
+        return Ok(());
+    }
+    let Some(_lock) = crate::node_admin::try_deferred_agent_update_lock(&state_dir)
+        .map_err(|error| (1, error))?
+    else {
+        return Ok(());
+    };
+    let mut next_update_attempt = Instant::now();
+    loop {
+        if !crate::node_admin::deferred_agent_update_request_current(&config_path, &state_dir)
+            .map_err(|error| (1, error))?
+        {
+            return Ok(());
+        }
+        match crate::node_admin::agent_update_blocked_by_work(&state_dir) {
+            Ok(true) => {}
+            Ok(false) if Instant::now() >= next_update_attempt => {
+                let mut deferred_submit_update = false;
+                match preflight_agent_update("top", &[], &global, &mut deferred_submit_update) {
+                    Ok(_) => {}
+                    Err((_, error)) => {
+                        eprintln!("macluster: deferred Agent update attempt failed: {error}");
+                    }
+                }
+                match deferred_agent_update_satisfied(&global, &config_path, &state_dir) {
+                    Ok(true) => {
+                        crate::node_admin::clear_deferred_agent_update(&state_dir)
+                            .map_err(|error| (1, error))?;
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "macluster: deferred Agent update completion check failed: {error}"
+                        );
+                    }
+                }
+                next_update_attempt = Instant::now() + DEFERRED_UPDATE_RETRY_INTERVAL;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("macluster: cannot check active work for deferred Agent update: {error}");
+                next_update_attempt = Instant::now() + DEFERRED_UPDATE_RETRY_INTERVAL;
+            }
+        }
+        thread::sleep(DEFERRED_UPDATE_POLL_INTERVAL);
+    }
 }
 
 fn query_controller_agent_compatibility(
@@ -2433,7 +2570,12 @@ fn is_submit_command_boundary(argument: &str) -> bool {
     argument == "--" || argument == "--wrap" || argument.is_empty() || !argument.starts_with('-')
 }
 
-fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -> AppResult<()> {
+fn submit(
+    global: GlobalOptions,
+    args: &[String],
+    command_started_at: Instant,
+    mut deferred_agent_update: bool,
+) -> AppResult<()> {
     if let Some(mode) = submit_help_mode(args) {
         print_submit_help(mode);
         return Ok(());
@@ -2443,7 +2585,7 @@ fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -
     crate::init::reset::ensure_no_reset_in_progress(&config_file, &state_root)?;
     crate::node_admin::ensure_no_node_maintenance_in_progress(&config_file, &state_root)
         .map_err(|error| (1, error))?;
-    let _maintenance = MaintenanceLock::try_shared(&config_file).map_err(|error| {
+    let maintenance = MaintenanceLock::try_shared(&config_file).map_err(|error| {
         (
             1,
             format!("cannot use cluster config while node maintenance is active: {error}"),
@@ -2524,10 +2666,10 @@ fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -
             )
         })?
     {
-        return Err((
-            1,
-            "active jobs or output sync remain before Agent update; no job was submitted. Retry `msub` after the work drains.".into(),
-        ));
+        deferred_agent_update = true;
+        eprintln!(
+            "Agent update is deferred while active tasks or output synchronization remain; the submission will continue and affected nodes will keep the job queued until the update completes."
+        );
     }
     if spec.mode == JobMode::Interactive
         && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
@@ -2617,7 +2759,15 @@ fn submit(global: GlobalOptions, args: &[String], command_started_at: Instant) -
     } else {
         println!("Request ID: {request_id}");
     }
+    if deferred_agent_update
+        && let Err((_, error)) = schedule_deferred_agent_update(&config_file, &state_root)
+    {
+        eprintln!(
+            "Agent update remains deferred, but its automatic retry could not be scheduled: {error}"
+        );
+    }
     if record.spec.mode == JobMode::Interactive {
+        drop(maintenance);
         let config = config.expect("interactive config was validated before submission");
         return run_interactive_submission(
             &storage,
@@ -6812,65 +6962,15 @@ fn top(global: GlobalOptions, args: &[String], address_migration_deferred: bool)
         io::stdout().is_terminal(),
         term_is_dumb,
     ) {
-        let power_setup_attempted = std::cell::Cell::new(false);
-        return run_tui_with_updates(
-            || {
-                // Updates may replace Agent paths and synchronized config.
-                // Rebuild the entire view from the committed configuration.
-                let current = load_config(global.config.as_deref()).map_err(config_error)?;
-                if let Some(queue) = &selected_queue {
-                    if !current.queues.contains_key(queue.as_str()) {
-                        return Err((2, format!("queue '{queue}' is not configured")));
-                    }
-                }
-                let action = crate::mtop::run_interactive(
-                    current,
-                    state_dir.clone(),
-                    resolved_config_path(global.config.as_deref()),
-                    selected_queue.as_ref().map(ToString::to_string),
-                    env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
-                    address_migration_deferred,
-                    !power_setup_attempted.get(),
-                )
-                .map_err(|error| (1, error))?;
-                if address_migration_deferred
-                    || crate::node_admin::address_migration_pending(&state_dir)
-                    || !is_macluster_executable()
-                {
-                    return Ok(None);
-                }
-                Ok(action)
-            },
-            |action| match action {
-                #[cfg(test)]
-                crate::mtop::MtopPostAction::CheckBuilds(compatibility) => {
-                    preflight_agent_update_with_compatibility(
-                        "top",
-                        args,
-                        &global,
-                        Some(compatibility),
-                    )
-                    .map(|_| ())
-                }
-                #[cfg(test)]
-                crate::mtop::MtopPostAction::RecoverMaintenance => {
-                    preflight_agent_update("top", args, &global).map(|_| ())
-                }
-                crate::mtop::MtopPostAction::SetupLocalPower => {
-                    power_setup_attempted.set(true);
-                    let config = load_config(global.config.as_deref()).map_err(config_error)?;
-                    if let Err(error) =
-                        crate::node_admin::ensure_local_power_sampler(&config, &state_dir)
-                    {
-                        eprintln!(
-                            "Power sampler setup remains incomplete: {error}. Monitoring continues; reopen mtop to retry authorization."
-                        );
-                    }
-                    Ok(())
-                }
-                crate::mtop::MtopPostAction::UpdateDeferred => Ok(()),
-            },
-        );
+        return crate::mtop::run_interactive(
+            config,
+            state_dir.clone(),
+            resolved_config_path(global.config.as_deref()),
+            selected_queue.as_ref().map(ToString::to_string),
+            env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+            address_migration_deferred,
+        )
+        .map_err(|error| (1, error));
     }
 
     let view = sample_cluster(
@@ -6925,41 +7025,6 @@ NOTES
   Values depend on hardware and installed helpers. Unsupported power, GPU,
   temperature, or fan readings are shown as N/A."#
         }
-    }
-}
-
-// Only startup recovery reopens the TUI. A user-requested exit must not
-// launch a second view or start maintenance after quitting.
-fn run_tui_with_updates(
-    mut view: impl FnMut() -> AppResult<Option<crate::mtop::MtopPostAction>>,
-    mut update: impl FnMut(crate::mtop::MtopPostAction) -> AppResult<()>,
-) -> AppResult<()> {
-    let mut recovered = false;
-    let mut power_repaired = false;
-    loop {
-        let action = match view()? {
-            None | Some(crate::mtop::MtopPostAction::UpdateDeferred) => return Ok(()),
-            #[cfg(test)]
-            Some(crate::mtop::MtopPostAction::CheckBuilds(ref compatibility))
-                if !compatibility.requires_update() =>
-            {
-                return Ok(());
-            }
-            Some(action) => action,
-        };
-        if matches!(&action, crate::mtop::MtopPostAction::SetupLocalPower) {
-            if power_repaired {
-                return Err((1, "Power sampler setup did not restore its socket/service; inspect the administrator command output before retrying mtop".into()));
-            }
-            update(action)?;
-            power_repaired = true;
-            continue;
-        }
-        if recovered {
-            return Err((1, "Agent validation still requires maintenance after an automatic update; inspect `mnode -l` and controller status before retrying".into()));
-        }
-        update(action)?;
-        recovered = true;
     }
 }
 
@@ -8467,9 +8532,11 @@ fn internal(global: GlobalOptions, args: &[String]) -> AppResult<()> {
             if args.len() != 1 {
                 return Err((2, "internal submit-preflight takes no arguments".into()));
             }
-            preflight_agent_update("submit", &[], &global)?;
+            let mut deferred_submit_update = false;
+            preflight_agent_update("submit", &[], &global, &mut deferred_submit_update)?;
             Ok(())
         }
+        Some("wait-agent-update") if args.len() == 1 => run_deferred_agent_update(global),
         Some("controller-service") => {
             if args.len() != 1 {
                 return Err((2, "internal controller-service takes no arguments".into()));
@@ -9496,18 +9563,18 @@ mod tests {
         ACTIVE_ENV_PREFIX_ENV, ClusterMetricView, EXPLICIT_TASK_PATH_ENV, NodeMetricRow,
         SUBMITTER_HOME_ENV, aggregate_metrics, build_submission, cached_monitor_samples,
         can_defer_agent_update_for_work, controller_should_resume_after_agent_update,
-        controller_startup_policy, deferred_nodes_summary, display_width,
-        explain_legacy_power_agent, format_fan_control_table, format_job_details,
+        controller_startup_policy, controller_update_blocks_submission, deferred_nodes_summary,
+        display_width, explain_legacy_power_agent, format_fan_control_table, format_job_details,
         format_jobs_table, format_power, format_queue_output, interactive_job_ready_to_attach,
         is_macluster_binary_path, maybe_run_agent_update, metric_row, metric_table_header,
         one_shot_task_count, prepare_task_environment, promote_inline_command,
-        prune_submission_cache, required_named_shares, sampled_node_belongs_in_cluster_rows,
-        selected_local_node_id, should_block_agent_update_for_pending_node_recovery,
-        should_defer_address_migration, should_defer_agent_update_for_node_recovery,
-        should_preflight_agent_update, smb_shares_referenced_by_submit_options,
-        submission_must_wait_for_agent_update, visible_unassigned_operational_nodes,
+        prune_submission_cache, required_named_shares, run_deferred_agent_update,
+        sampled_node_belongs_in_cluster_rows, selected_local_node_id,
+        should_block_agent_update_for_pending_node_recovery, should_defer_address_migration,
+        should_defer_agent_update_for_node_recovery, should_preflight_agent_update,
+        smb_shares_referenced_by_submit_options, visible_unassigned_operational_nodes,
     };
-    use macluster_core::config::ClusterConfig;
+    use macluster_core::{config::ClusterConfig, storage::Storage};
     use macluster_protocol::{
         control::{
             AgentCompatibilityRecord, AgentCompatibilityState, CONTROL_PROTOCOL_VERSION,
@@ -9934,10 +10001,10 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
             "node",
             &["-a".into(), "operator@192.0.2.20".into()]
         ));
-        assert!(
-            should_preflight_agent_update("node", &["-rm".into(), "share:external-disk".into()],),
-            "named-share removal needs the current privileged NFS protocol"
-        );
+        assert!(!should_preflight_agent_update(
+            "node",
+            &["-rm".into(), "share:external-disk".into()],
+        ));
     }
 
     #[test]
@@ -10012,9 +10079,118 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn submission_waits_when_active_work_prevents_a_stale_controller_restart() {
-        assert!(submission_must_wait_for_agent_update("submit"));
-        assert!(!submission_must_wait_for_agent_update("job"));
+    fn only_controller_update_work_blocks_new_submission_queueing() {
+        assert!(controller_update_blocks_submission(true, false));
+        assert!(controller_update_blocks_submission(false, true));
+        assert!(!controller_update_blocks_submission(false, false));
+    }
+
+    #[test]
+    fn deferred_agent_update_worker_clears_its_marker_when_nothing_remains() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-deferred-update-worker-{}",
+            Id128::random()
+        ));
+        let shared = root.join("shared");
+        let state_dir = root.join("controller");
+        fs::create_dir_all(&shared).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[cluster]\nname = \"test\"\ndefault_queue = \"default\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"worker\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"worker\"]\nscheduler = \"fifo\"\n\n[nodes.worker]\nhost = \"127.0.0.1\"\ntransport = \"ssh\"\nremote_binary = \"{}\"\n",
+                shared.display(),
+                executable.display()
+            ),
+        )
+        .unwrap();
+        Storage::open(&state_dir).unwrap();
+        crate::node_admin::request_deferred_agent_update(&config_path, &state_dir).unwrap();
+
+        run_deferred_agent_update(super::GlobalOptions {
+            config: Some(config_path.clone()),
+            state_dir: Some(state_dir.clone()),
+            cluster: None,
+        })
+        .unwrap();
+
+        assert!(!state_dir.join("agent-update.pending").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deferred_agent_update_worker_waits_for_active_work_to_drain() {
+        let root = std::env::temp_dir().join(format!(
+            "macluster-deferred-update-active-{}",
+            Id128::random()
+        ));
+        let shared = root.join("shared");
+        let state_dir = root.join("controller");
+        fs::create_dir_all(&shared).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[cluster]\nname = \"test\"\ndefault_queue = \"default\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"worker\"\nprotocol_version = 1\n\n[queues.default]\nnodes = [\"worker\"]\nscheduler = \"fifo\"\n\n[nodes.worker]\nhost = \"127.0.0.1\"\ntransport = \"ssh\"\nremote_binary = \"{}\"\n",
+                shared.display(),
+                executable.display()
+            ),
+        )
+        .unwrap();
+        let storage = Storage::open(&state_dir).unwrap();
+        let snapshot = storage.stage_snapshot(b"sleep 60\n").unwrap();
+        let active = storage
+            .submit_once(
+                macluster_protocol::identifiers::RequestId::random(),
+                serde_json::from_value(serde_json::json!({
+                    "queue":"default",
+                    "node":null,
+                    "name":"active-during-update",
+                    "cwd":shared.display().to_string(),
+                    "stdout_path":shared.join("stdout.log").display().to_string(),
+                    "stderr_path":shared.join("stderr.log").display().to_string(),
+                    "walltime_secs":null,
+                    "env":{},
+                    "snapshot":snapshot,
+                    "mode":"batch"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        storage.publish_snapshot(active.id, &shared).unwrap();
+        storage
+            .reserve_job(active.id, NodeId::new("worker").unwrap())
+            .unwrap();
+        storage.mark_running(active.id).unwrap();
+        crate::node_admin::request_deferred_agent_update(&config_path, &state_dir).unwrap();
+        let marker = state_dir.join("agent-update.pending");
+
+        let worker = thread::spawn(move || {
+            run_deferred_agent_update(super::GlobalOptions {
+                config: Some(config_path),
+                state_dir: Some(state_dir),
+                cluster: None,
+            })
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            marker.is_file(),
+            "the update request must remain pending while work is active"
+        );
+
+        storage
+            .finish_job(active.id, JobState::Completed, Some(0), None)
+            .unwrap();
+        drop(storage);
+        worker.join().unwrap().unwrap();
+
+        assert!(
+            !marker.exists(),
+            "the worker must clear the request after active work drains"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10161,102 +10337,23 @@ share_uuid = "00000000-0000-4000-8000-000000000005"
     }
 
     #[test]
-    fn top_reopens_after_update_and_exits_normally_after_quit() {
-        for recovery in [false, true] {
-            let mut draws = 0;
-            let mut updates = 0;
-            let refreshed = std::cell::Cell::new(false);
-            super::run_tui_with_updates(
-                || {
-                    draws += 1;
-                    Ok(if draws == 1 {
-                        Some(if recovery {
-                            crate::mtop::MtopPostAction::RecoverMaintenance
-                        } else {
-                            crate::mtop::MtopPostAction::CheckBuilds(
-                                crate::node_admin::AgentBuildCompatibility {
-                                    stale: vec!["worker".into()],
-                                    ..Default::default()
-                                },
-                            )
-                        })
-                    } else {
-                        assert!(
-                            refreshed.get(),
-                            "update must complete before reentering the view"
-                        );
-                        None
-                    })
-                },
-                |_| {
-                    updates += 1;
-                    refreshed.set(true);
-                    Ok(())
-                },
-            )
-            .unwrap();
-            assert_eq!(draws, 2);
-            assert_eq!(updates, 1);
+    fn observation_commands_never_start_agent_maintenance() {
+        for (command, args) in [
+            ("top", vec![]),
+            ("top", vec!["--once".into()]),
+            ("top", vec!["--json".into()]),
+            ("fans", vec!["--status".into()]),
+            ("fans", vec!["-l".into()]),
+        ] {
+            assert!(
+                !should_preflight_agent_update(command, &args),
+                "{command} {args:?} must remain read-only"
+            );
+            assert!(
+                !super::should_refresh_node_addresses(command, &args),
+                "{command} {args:?} must not start address migration"
+            );
         }
-        super::run_tui_with_updates(|| Ok(None), |_| panic!("quitting must not update")).unwrap();
-        super::run_tui_with_updates(
-            || Ok(Some(crate::mtop::MtopPostAction::UpdateDeferred)),
-            |_| panic!("deferred update must not run after quit"),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn power_setup_and_agent_recovery_each_run_once_before_reopening_top() {
-        let mut actions = std::collections::VecDeque::from([
-            Some(crate::mtop::MtopPostAction::SetupLocalPower),
-            Some(crate::mtop::MtopPostAction::RecoverMaintenance),
-            None,
-        ]);
-        let mut updates = 0;
-        super::run_tui_with_updates(
-            || Ok(actions.pop_front().unwrap()),
-            |_| {
-                updates += 1;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(updates, 2);
-        let mut repairs = 0;
-        let result = super::run_tui_with_updates(
-            || Ok(Some(crate::mtop::MtopPostAction::SetupLocalPower)),
-            |_| {
-                repairs += 1;
-                Ok(())
-            },
-        );
-        assert!(result.unwrap_err().1.contains("Power sampler setup"));
-        assert_eq!(repairs, 1);
-    }
-
-    #[test]
-    fn top_does_not_loop_when_update_fails_or_does_not_resolve_maintenance() {
-        let mut draws = 0;
-        let result = super::run_tui_with_updates(
-            || {
-                draws += 1;
-                Ok(Some(crate::mtop::MtopPostAction::RecoverMaintenance))
-            },
-            |_| Err((1, "update failed".into())),
-        );
-        assert_eq!(result.unwrap_err().1, "update failed");
-        assert_eq!(draws, 1);
-        let mut updates = 0;
-        let result = super::run_tui_with_updates(
-            || Ok(Some(crate::mtop::MtopPostAction::RecoverMaintenance)),
-            |_| {
-                updates += 1;
-                Ok(())
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(updates, 1);
     }
 
     #[test]
@@ -12448,7 +12545,7 @@ Modules
   queue (mqueue)       Show queue membership and job counts.
   kill (mkill)         Cancel one or more jobs.
   top (mtop)           View node resources in a live display.
-  node (mnode)         Add, list, and remove nodes or shared paths.
+  node (mnode)         Add, list, and remove nodes; manage storage mounts.
   fans (mfans)         Inspect or set node fan policies.
 
 Run `macluster <MODULE> --help` for module details."#

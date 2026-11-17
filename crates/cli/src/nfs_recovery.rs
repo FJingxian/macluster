@@ -17,26 +17,29 @@ const DEPLOYED_HELPER: &str = crate::node_admin::UNIFIED_HELPER_PATH;
 // Privileged service release version, independent of the Agent build. Bump
 // whenever recovery behavior or its runtime dependencies change (including
 // named_share_mount_status and run_child_bounded). Comments/tests need no bump.
-const SERVICE_VERSION: &str = "nfs-recovery-20";
+const SERVICE_VERSION: &str = "nfs-recovery-23";
 pub(crate) const NFS_MOUNT_LOCK_PATH: &str = "/var/run/org.macluster.nfs-mount.lock";
 pub(crate) const NFS_MOUNT_TIMEOUT_SECS: &str = "10";
 const DEFERRED_IO_UPGRADE_RETRY_SECS: u64 = 300;
 // macOS and some NFS servers negotiate lower values than the requested mount
-// options. These are the effective limits observed on the managed cluster;
-// retrying an upgrade below them can cause periodic unmounts without changing
-// the live mount parameters.
+// options. Accept those lower values, but reject the oversized read windows
+// that stalled on the Mini's 2.5GbE NFS path. Bounded retries keep failed I/O
+// visible instead of leaving an uninterruptible task blocked indefinitely.
 const MIN_EFFECTIVE_NFS_BLOCK_SIZE: u32 = 32 * 1024;
 const MIN_EFFECTIVE_NFS_READAHEAD: u32 = 16;
-// Request 1 MiB reads with a 128-request read-ahead window. Keep writes at
-// 64 KiB until larger writes have been benchmarked. macOS or the server
-// may negotiate smaller effective values; the threshold above prevents
-// repeatedly recycling mounts when that happens. Keep TCP explicit but allow
-// the client and server to negotiate NFS version for provider compatibility.
+const MAX_EFFECTIVE_NFS_BLOCK_SIZE: u32 = 1024 * 1024;
+const MAX_EFFECTIVE_NFS_READAHEAD: u32 = 16;
+const MIN_EFFECTIVE_NFS_TIMEOUT: u32 = 100;
+const MIN_EFFECTIVE_NFS_RETRANSMISSIONS: u32 = 5;
+// Request 1 MiB reads with a 16-request read-ahead window. The 1 MiB block
+// preserves sequential throughput, while 1 MiB/128 caused sustained reads to
+// stop responding on the Mini's 2.5GbE bridge. Keep TCP explicit but allow the
+// client and server to negotiate NFS version for provider compatibility.
 // A hard mount can leave a task blocked in an uninterruptible vnode lookup
 // after the node's interface address changes. Bound retries so the task fails
 // visibly and the recovery service can reconnect instead of wedging the node.
 pub(crate) const NFS_MOUNT_OPTIONS: &str =
-    "tcp,soft,resvport,intr,timeo=50,retrans=3,rsize=1048576,wsize=65536,readahead=128";
+    "tcp,soft,resvport,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=16";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 // One recovery attempt can run five bounded child commands. Leave margin for
 // process termination and lock handoff before install/remove gives up.
@@ -391,8 +394,9 @@ fn nfs_mount_needs_io_upgrade(output: &str, target: &Path) -> bool {
             .and_then(|value| value.parse::<u32>().ok())
     };
     !options.contains(&"soft")
-        || numeric_option("timeo").is_some_and(|actual| actual < 50)
-        || numeric_option("retrans").is_some_and(|actual| actual < 3)
+        || numeric_option("timeo").is_some_and(|actual| actual < MIN_EFFECTIVE_NFS_TIMEOUT)
+        || numeric_option("retrans")
+            .is_some_and(|actual| actual < MIN_EFFECTIVE_NFS_RETRANSMISSIONS)
         || [
             ("rsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
             ("wsize", MIN_EFFECTIVE_NFS_BLOCK_SIZE),
@@ -400,6 +404,13 @@ fn nfs_mount_needs_io_upgrade(output: &str, target: &Path) -> bool {
         ]
         .into_iter()
         .any(|(name, minimum)| numeric_option(name).is_some_and(|actual| actual < minimum))
+        || [
+            ("rsize", MAX_EFFECTIVE_NFS_BLOCK_SIZE),
+            ("wsize", MAX_EFFECTIVE_NFS_BLOCK_SIZE),
+            ("readahead", MAX_EFFECTIVE_NFS_READAHEAD),
+        ]
+        .into_iter()
+        .any(|(name, maximum)| numeric_option(name).is_some_and(|actual| actual > maximum))
 }
 
 fn remount_with_managed_io_options(
@@ -1273,13 +1284,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn managed_nfs_mounts_use_bounded_retries_after_a_network_change() {
+    fn managed_nfs_mounts_use_stable_io_options_after_a_network_change() {
         let options = NFS_MOUNT_OPTIONS.split(',').collect::<Vec<_>>();
 
         assert!(options.contains(&"soft"), "{NFS_MOUNT_OPTIONS}");
         assert!(options.contains(&"intr"), "{NFS_MOUNT_OPTIONS}");
-        assert!(options.contains(&"timeo=50"), "{NFS_MOUNT_OPTIONS}");
-        assert!(options.contains(&"retrans=3"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"timeo=100"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"retrans=5"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"rsize=1048576"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"wsize=65536"), "{NFS_MOUNT_OPTIONS}");
+        assert!(options.contains(&"readahead=16"), "{NFS_MOUNT_OPTIONS}");
+    }
+
+    #[test]
+    fn oversized_readahead_is_refreshed_without_reducing_the_read_block_size() {
+        let target = Path::new("/Volumes/wdisk");
+        let mount_output = |parameters: &str| {
+            format!(
+                "{} from 192.0.2.1:/data\n  -- Current mount parameters:\n     {parameters}\n  Status flags: 0x0\n",
+                target.display()
+            )
+        };
+
+        assert!(nfs_mount_needs_io_upgrade(
+            &mount_output(
+                "vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=128"
+            ),
+            target,
+        ));
+        assert!(!nfs_mount_needs_io_upgrade(
+            &mount_output(
+                "vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=16"
+            ),
+            target,
+        ));
     }
 
     #[test]
@@ -1471,7 +1509,7 @@ mod tests {
         assert_eq!(marker, directory(target).join("version"));
         let version = helper_version();
         assert_eq!(version, SERVICE_VERSION);
-        assert_eq!(version, "nfs-recovery-20");
+        assert_eq!(version, "nfs-recovery-23");
     }
 
     #[test]
@@ -1525,7 +1563,7 @@ mod tests {
                     );
                     mounts += 1;
                     mounted = true;
-                    parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128";
+                    parameters = "vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=16";
                     Ok(String::new())
                 }
             }
@@ -1582,7 +1620,7 @@ mod tests {
                         Ok(String::new())
                     } else {
                         mounted = true;
-                        parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128";
+                        parameters = "vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=16";
                         Ok(String::new())
                     }
                 }
@@ -1634,9 +1672,9 @@ mod tests {
                 "/usr/bin/lockf" if args.contains(&"/sbin/mount_nfs") => {
                     mounts += 1;
                     mounted = true;
-                    // The macOS NFS client negotiates lower effective values
-                    // than the 64 KiB / 128 options requested by macluster.
-                    parameters = "vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=32768,wsize=32768,readahead=16";
+                    // The macOS NFS client negotiates a lower effective block
+                    // size than the 64 KiB value requested by macluster.
+                    parameters = "vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=32768,wsize=32768,readahead=16";
                     Ok(String::new())
                 }
                 "/usr/bin/lockf" => panic!("unexpected lockf operation: {args:?}"),
@@ -1830,7 +1868,7 @@ mod tests {
                 target.display()
             )),
             "/usr/bin/nfsstat" => Ok(format!(
-                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,soft,intr,timeo=50,retrans=3,rsize=65536,wsize=65536,readahead=128\n  Status flags: 0x0\n",
+                "{} from {}\n  -- Current mount parameters:\n     vers=3,tcp,soft,intr,timeo=100,retrans=5,rsize=1048576,wsize=65536,readahead=16\n  Status flags: 0x0\n",
                 target.display(),
                 manifest.source
             )),

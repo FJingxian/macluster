@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use macluster_core::config::ClusterConfig;
+use macluster_core::config::{ClusterConfig, Transport};
 use macluster_protocol::{
     control::{MaintenancePhase, MaintenanceScope, MaintenanceStatus, MaintenanceTicket},
     framing::sha256_hex,
@@ -58,10 +58,32 @@ pub fn validate_scope_config_change(
                     "named-share maintenance cannot replace a mapping's source or target".into(),
                 );
             }
+            let released_external_provider = old
+                .shares
+                .get(id)
+                .filter(|_| !next.shares.contains_key(id))
+                .and_then(|share| {
+                    old.nodes
+                        .get(share.server.as_str())
+                        .filter(|provider| provider.transport == Transport::Storage)
+                        .and_then(|_| {
+                            (share.server != old.storage_server
+                                && !next
+                                    .shares
+                                    .values()
+                                    .any(|other| other.server == share.server)
+                                && !next.nodes.contains_key(share.server.as_str()))
+                            .then(|| share.server.clone())
+                        })
+                });
             let after = next.shares.get(id);
             expected.shares.remove(id);
             if let Some(share) = after {
                 expected.shares.insert(id.clone(), share.clone());
+            }
+            if let Some(provider) = released_external_provider {
+                expected.nodes.remove(provider.as_str());
+                expected.roles.remove(provider.as_str());
             }
             return if &expected == next {
                 Ok(())
@@ -70,7 +92,6 @@ pub fn validate_scope_config_change(
             };
         }
         MaintenanceScope::StorageProvider(id) => {
-            use macluster_core::config::Transport;
             let before = old.nodes.get(id.as_str());
             if old.shares.values().any(|share| &share.server == id)
                 || &old.storage_server == id
@@ -88,6 +109,10 @@ pub fn validate_scope_config_change(
                 .filter(|node| node.transport == Transport::Storage)
             {
                 expected.nodes.insert(id.to_string(), node.clone());
+                expected.roles.insert(
+                    id.to_string(),
+                    next.roles.get(id.as_str()).cloned().unwrap_or_default(),
+                );
             }
             return if &expected == next {
                 Ok(())
@@ -667,7 +692,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use macluster_core::config::{ClusterConfig, ShareConfig};
+    use macluster_core::config::{ClusterConfig, ShareConfig, Transport};
     use macluster_protocol::{
         control::{MaintenancePhase, MaintenanceScope},
         identifiers::{Id128, NodeId},
@@ -1010,5 +1035,124 @@ mod tests {
         assert!(
             validate_scope_config_change(&old, &changed_login, &MaintenanceScope::Cluster).is_err()
         );
+    }
+
+    #[test]
+    fn named_share_removal_may_remove_its_last_external_storage_provider_reference() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("shared");
+        fs::create_dir_all(&root).unwrap();
+        let mut old = config(&["login"], &root);
+        let mut provider = old.nodes["arm-a"].clone();
+        provider.host = "nas-01.example.test".into();
+        provider.transport = Transport::Storage;
+        old.nodes.insert("nas-01".into(), provider);
+        old.roles.insert("nas-01".into(), BTreeSet::new());
+        old.shares.insert(
+            "external".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
+                server: NodeId::new("nas-01").unwrap(),
+                source_root: PathBuf::from("/export/data"),
+                mount_root: PathBuf::from("/Volumes/data"),
+                share_uuid: "external-share-id".into(),
+                smb_user: None,
+                allow_existing_contents: false,
+            },
+        );
+        let scope = MaintenanceScope::NamedShare("external".into());
+
+        let mut remove_last_reference = old.clone();
+        remove_last_reference.shares.remove("external");
+        remove_last_reference.nodes.remove("nas-01");
+        remove_last_reference.roles.remove("nas-01");
+        assert!(validate_scope_config_change(&old, &remove_last_reference, &scope).is_ok());
+
+        let mut old_with_second_reference = old.clone();
+        old_with_second_reference.shares.insert(
+            "remaining".into(),
+            ShareConfig {
+                protocol: macluster_core::storage_uri::StorageProtocol::Nfs,
+                server: NodeId::new("nas-01").unwrap(),
+                source_root: PathBuf::from("/export/remaining"),
+                mount_root: PathBuf::from("/Volumes/remaining"),
+                share_uuid: "remaining-share-id".into(),
+                smb_user: None,
+                allow_existing_contents: false,
+            },
+        );
+        let mut remove_provider_with_remaining_reference = old_with_second_reference.clone();
+        remove_provider_with_remaining_reference
+            .shares
+            .remove("external");
+        remove_provider_with_remaining_reference
+            .nodes
+            .remove("nas-01");
+        assert!(
+            validate_scope_config_change(
+                &old_with_second_reference,
+                &remove_provider_with_remaining_reference,
+                &scope,
+            )
+            .is_err()
+        );
+
+        let mut unrelated = old.nodes["arm-a"].clone();
+        unrelated.host = "nas-02.example.test".into();
+        unrelated.transport = Transport::Storage;
+        let mut old_with_unrelated = old.clone();
+        old_with_unrelated.nodes.insert("nas-02".into(), unrelated);
+        old_with_unrelated
+            .roles
+            .insert("nas-02".into(), BTreeSet::new());
+        let mut remove_selected_and_unrelated = old_with_unrelated.clone();
+        remove_selected_and_unrelated.shares.remove("external");
+        remove_selected_and_unrelated.nodes.remove("nas-01");
+        remove_selected_and_unrelated.roles.remove("nas-01");
+        remove_selected_and_unrelated.nodes.remove("nas-02");
+        remove_selected_and_unrelated.roles.remove("nas-02");
+        assert!(
+            validate_scope_config_change(
+                &old_with_unrelated,
+                &remove_selected_and_unrelated,
+                &scope,
+            )
+            .is_err()
+        );
+
+        let mut replace_selected_source = remove_last_reference.clone();
+        replace_selected_source
+            .nodes
+            .insert("nas-01".into(), old.nodes["nas-01"].clone());
+        replace_selected_source.shares.insert(
+            "external".into(),
+            ShareConfig {
+                source_root: PathBuf::from("/export/replaced"),
+                ..old.shares["external"].clone()
+            },
+        );
+        assert!(validate_scope_config_change(&old, &replace_selected_source, &scope).is_err());
+    }
+
+    #[test]
+    fn storage_provider_registration_allows_its_derived_empty_role_entry() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("shared");
+        fs::create_dir_all(&root).unwrap();
+        let old = config(&["login"], &root);
+        let mut next = old.clone();
+        let provider = NodeId::new("nas-192-168-2-5").unwrap();
+        let mut node = old.nodes["arm-a"].clone();
+        node.host = "192.0.2.5".into();
+        node.transport = Transport::Storage;
+        next.nodes.insert(provider.to_string(), node);
+        next.roles.insert(provider.to_string(), BTreeSet::new());
+
+        let scope = MaintenanceScope::StorageProvider(provider.clone());
+        assert!(validate_scope_config_change(&old, &next, &scope).is_ok());
+
+        let mut unrelated_role_change = next.clone();
+        unrelated_role_change.roles.remove("arm-b");
+        assert!(validate_scope_config_change(&old, &unrelated_role_change, &scope).is_err());
     }
 }

@@ -53,7 +53,7 @@ fn bounded_timeout(configured: Duration, maximum: Duration) -> Duration {
 
 fn operation_timeout(operation: &Operation, configured: Duration) -> Duration {
     match operation {
-        Operation::ReconcileNfs { .. } => NFS_RECONCILE_TIMEOUT,
+        Operation::ReconcileNfs { .. } | Operation::ReconcileSmb { .. } => NFS_RECONCILE_TIMEOUT,
         Operation::Fence { .. }
         | Operation::Status
         | Operation::RecoverJob { .. }
@@ -1422,23 +1422,32 @@ mod tests {
 
     #[test]
     fn nfs_reconciliation_uses_a_bounded_longer_timeout_only_for_that_operation() {
+        let controller = macluster_protocol::types::ControllerEpoch {
+            controller_uuid: macluster_protocol::identifiers::ControllerUuid(
+                macluster_protocol::identifiers::Id128::random(),
+            ),
+            epoch: 1,
+        };
         let reconcile = Operation::ReconcileNfs {
-            controller: macluster_protocol::types::ControllerEpoch {
-                controller_uuid: macluster_protocol::identifiers::ControllerUuid(
-                    macluster_protocol::identifiers::Id128::random(),
-                ),
-                epoch: 1,
-            },
+            controller: controller.clone(),
             config_toml: String::new(),
             obsolete_mounts: Vec::new(),
             obsolete_aliases: Vec::new(),
             obsolete_markers: Vec::new(),
             obsolete_exports: Vec::new(),
+        };
+        assert_eq!(
+            operation_timeout(&reconcile, Duration::from_secs(5)),
+            NFS_RECONCILE_TIMEOUT
+        );
+        let smb_reconcile = Operation::ReconcileSmb {
+            controller,
+            config_toml: String::new(),
             smb_credentials: Vec::new(),
             obsolete_smb_credentials: Vec::new(),
         };
         assert_eq!(
-            operation_timeout(&reconcile, Duration::from_secs(5)),
+            operation_timeout(&smb_reconcile, Duration::from_secs(5)),
             NFS_RECONCILE_TIMEOUT
         );
         assert_eq!(

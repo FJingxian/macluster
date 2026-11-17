@@ -375,25 +375,10 @@ fn handle_operation_with_config_path(
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
-            smb_credentials,
-            obsolete_smb_credentials,
         } => {
             let config_path = config_path.ok_or_else(|| {
                 ProtocolError::Failed("NFS reconciliation requires a config path".into())
             })?;
-            let cluster_uuid = Id128::parse(&config.share_uuid)
-                .map_err(|error| ProtocolError::Failed(error.to_string()))?;
-            let smb_state_dir = default_smb_credentials_state_dir();
-            let smb_runner = ChildSmbKeychainRunner {
-                config_path: config_path.to_path_buf(),
-            };
-            reconcile_smb_credentials_with(
-                &smb_state_dir,
-                cluster_uuid,
-                &smb_credentials,
-                &[],
-                &smb_runner,
-            )?;
             reconcile_nfs(
                 controller,
                 &config_toml,
@@ -406,12 +391,26 @@ fn handle_operation_with_config_path(
                 local_node_id,
                 config_path,
             )?;
-            reconcile_smb_credentials_with(
-                &smb_state_dir,
-                cluster_uuid,
-                &[],
+            Ok(ResponseBody::Ack)
+        }
+        Operation::ReconcileSmb {
+            controller,
+            config_toml,
+            smb_credentials,
+            obsolete_smb_credentials,
+        } => {
+            let config_path = config_path.ok_or_else(|| {
+                ProtocolError::Failed("SMB reconciliation requires a config path".into())
+            })?;
+            reconcile_smb(
+                controller,
+                &config_toml,
+                &smb_credentials,
                 &obsolete_smb_credentials,
-                &smb_runner,
+                config,
+                state_dir,
+                local_node_id,
+                config_path,
             )?;
             Ok(ResponseBody::Ack)
         }
@@ -839,15 +838,69 @@ fn reconcile_nfs(
     }
 
     atomic_replace_config(config_path, config_toml).map_err(protocol_failed)?;
-    if desired_config.shares.values().any(|share| {
-        share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
-            && share.server.as_str() != local_node_id
-    }) {
-        reconcile_smb_user_mounts(config_path, local_node_id)?;
-    }
     store.controller = Some(controller);
     write_store(state_dir, &store).map_err(protocol_failed)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_smb(
+    controller: ControllerEpoch,
+    config_toml: &str,
+    smb_credentials: &[macluster_protocol::smb_credential::SmbCredentialProvision],
+    obsolete_smb_credentials: &[macluster_protocol::smb_credential::SmbKeychainEndpoint],
+    current_config: &ClusterConfig,
+    state_dir: &Path,
+    local_node_id: &str,
+    config_path: &Path,
+) -> Result<(), ProtocolError> {
+    if config_toml.len() > MAX_SNAPSHOT_BYTES as usize {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    let desired_config = ClusterConfig::parse(config_toml).map_err(|error| {
+        ProtocolError::Failed(format!("invalid SMB reconciliation config: {error}"))
+    })?;
+    validate_reconcile_config_identity(current_config, &desired_config, local_node_id)
+        .map_err(ProtocolError::Failed)?;
+    let desired_node = desired_config
+        .nodes
+        .get(local_node_id)
+        .ok_or(ProtocolError::NotPermitted)?;
+    validate_current_node_identity(desired_node).map_err(ProtocolError::Failed)?;
+    atomic_replace_config(config_path, config_toml).map_err(protocol_failed)?;
+
+    let cluster_uuid = Id128::parse(&desired_config.share_uuid)
+        .map_err(|error| ProtocolError::Failed(error.to_string()))?;
+    let smb_state_dir = default_smb_credentials_state_dir();
+    let smb_runner = ChildSmbKeychainRunner {
+        config_path: config_path.to_path_buf(),
+    };
+    reconcile_smb_credentials_with(
+        &smb_state_dir,
+        cluster_uuid,
+        smb_credentials,
+        &[],
+        &smb_runner,
+    )?;
+    reconcile_smb_user_mounts(config_path, local_node_id)?;
+    reconcile_smb_credentials_with(
+        &smb_state_dir,
+        cluster_uuid,
+        &[],
+        obsolete_smb_credentials,
+        &smb_runner,
+    )?;
+    if let Err(error) = write_controller_epoch(state_dir, controller) {
+        eprintln!("macluster: SMB reconciliation completed but epoch persistence failed: {error}");
+    }
+    Ok(())
+}
+
+fn write_controller_epoch(state_dir: &Path, controller: ControllerEpoch) -> Result<(), String> {
+    let _lock = StateLock::acquire(state_dir).map_err(|error| error.to_string())?;
+    let mut store = read_store(state_dir).map_err(|error| error.to_string())?;
+    admit_epoch(&mut store, controller).map_err(|error| error.to_string())?;
+    write_store(state_dir, &store).map_err(|error| error.to_string())
 }
 
 trait SmbNodeKeychainRunner: Send + Sync {

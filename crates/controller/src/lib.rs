@@ -964,7 +964,7 @@ pub(crate) fn agent_build_waiting_reason(
         .collect::<Vec<_>>();
     (!stale.is_empty()).then(|| {
         format!(
-            "waiting for the current Agent build on {}; retry an Agent-dependent macluster command after the node is reachable",
+            "waiting for the current Agent build on {}; the deferred cluster update will refresh it, then this job remains queued",
             stale.join(", ")
         )
     })

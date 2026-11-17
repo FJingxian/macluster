@@ -2143,7 +2143,7 @@ fn read_only_job_query_validates_an_invalid_existing_config_without_agent_prefli
 }
 
 #[test]
-fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission() {
+fn stale_agent_update_is_deferred_by_active_work_and_new_submission_is_queued() {
     let (root, shared, config) = fixture();
     let home = root.join("test-home");
     fs::create_dir_all(&home).unwrap();
@@ -2200,19 +2200,34 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
     symlink(env!("CARGO_BIN_EXE_macluster"), &alias).unwrap();
     let output = Command::new(&alias)
         .env("HOME", &home)
+        .env("MACLUSTER_DISABLE_SERVICE_AUTOSTART", "1")
+        .env("MACLUSTER_DISABLE_DEFERRED_UPDATE_SPAWN", "1")
         .args([
             "--config",
             config.to_str().unwrap(),
             "--state-dir",
             state.to_str().unwrap(),
+            "--cwd",
+            shared.to_str().unwrap(),
             "--wrap",
             "echo should-not-submit",
         ])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        output.status.success(),
+        "submission should queue while Agent maintenance waits for active work: {stderr}"
+    );
     assert!(!stderr.contains("Stop it for Agent update"), "{stderr}");
+    assert!(
+        stderr.contains("Agent update is deferred") && stderr.contains("queued"),
+        "{stderr}"
+    );
+    assert!(
+        state.join("agent-update.pending").is_file(),
+        "the deferred update request must survive the msub process"
+    );
 
     let inspection = macluster_command()
         .env("HOME", &home)
@@ -2241,10 +2256,16 @@ fn stale_agent_update_is_blocked_by_active_work_before_any_prompt_or_submission(
 
     let storage = Storage::open(&state).unwrap();
     let jobs = storage.list_jobs(None).unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].id, active.id);
-    assert_eq!(jobs[0].state, JobState::Running);
-    assert_eq!(fs::read_dir(state.join("snapshots")).unwrap().count(), 1);
+    assert_eq!(jobs.len(), 2);
+    assert!(
+        jobs.iter()
+            .any(|job| job.id == active.id && job.state == JobState::Running)
+    );
+    assert!(
+        jobs.iter()
+            .any(|job| job.id != active.id && job.state == JobState::Pending)
+    );
+    assert_eq!(fs::read_dir(state.join("snapshots")).unwrap().count(), 2);
     fs::remove_dir_all(root).unwrap();
 }
 

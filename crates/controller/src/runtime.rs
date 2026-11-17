@@ -53,6 +53,7 @@ const FAN_CONTROL_ENDPOINT_TIMEOUT: Duration = Duration::from_millis(350);
 const SHARE_WORKERS: usize = 1;
 const SNAPSHOT_WORKERS: usize = 2;
 const NFS_RECONCILE_WORKERS: usize = 2;
+const SMB_RECONCILE_WORKERS: usize = 2;
 const WORK_QUEUE_FACTOR: usize = 1;
 const NODE_STATUS_TTL: Duration = Duration::from_secs(6);
 const IDLE_NODE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -61,7 +62,9 @@ const NODE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const NODE_STALE_AGENT_RETRY: Duration = Duration::from_secs(30);
 const MAINTENANCE_HOST_UNREACHABLE_TTL: Duration = Duration::from_secs(30);
 const NFS_RECONCILE_LOG_INTERVAL: Duration = Duration::from_secs(300);
+const SMB_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const SHARE_HEALTH_TTL: Duration = Duration::from_secs(10);
+const SHARE_HEALTH_REFRESH_GRACE: Duration = Duration::from_secs(5);
 const SHARE_HEALTH_RETRY: Duration = Duration::from_secs(5);
 const MAX_WORK_RESULT_AGE: Duration = Duration::from_secs(12);
 const MAX_NFS_RECONCILE_RESULT_AGE: Duration = Duration::from_secs(180);
@@ -150,6 +153,7 @@ enum WorkKind {
     Probe,
     Health,
     ReconcileNfs,
+    ReconcileSmb,
     Start,
     Cancel,
     ShareHealth,
@@ -179,6 +183,10 @@ enum WorkerResult {
     Probe(ProbeResult),
     Control(Result<ResponseBody, TransportError>),
     ReconcileNfs {
+        result: Result<(), String>,
+        acknowledged: NfsCleanupAck,
+    },
+    ReconcileSmb {
         result: Result<(), String>,
         acknowledged: NfsCleanupAck,
     },
@@ -261,6 +269,10 @@ struct NodeRuntime {
     next_nfs_reconcile_at: Instant,
     nfs_reconcile_in_flight: Option<u64>,
     last_nfs_reconcile_log: Option<(String, Instant)>,
+    smb_reconcile_attempts: u8,
+    next_smb_reconcile_at: Instant,
+    smb_reconcile_in_flight: Option<u64>,
+    last_smb_reconcile_log: Option<(String, Instant)>,
     pending_start: Option<JobRecord>,
 }
 
@@ -283,6 +295,10 @@ impl NodeRuntime {
             next_nfs_reconcile_at: now,
             nfs_reconcile_in_flight: None,
             last_nfs_reconcile_log: None,
+            smb_reconcile_attempts: 0,
+            next_smb_reconcile_at: now,
+            smb_reconcile_in_flight: None,
+            last_smb_reconcile_log: None,
             pending_start: None,
         }
     }
@@ -335,6 +351,22 @@ impl NodeRuntime {
 
     fn clear_nfs_reconcile_log(&mut self) {
         self.last_nfs_reconcile_log = None;
+    }
+
+    fn should_log_smb_reconcile(&mut self, error: &str, now: Instant) -> bool {
+        let current = error.chars().take(512).collect::<String>();
+        if let Some((previous, logged_at)) = &self.last_smb_reconcile_log
+            && previous == &current
+            && now.saturating_duration_since(*logged_at) < NFS_RECONCILE_LOG_INTERVAL
+        {
+            return false;
+        }
+        self.last_smb_reconcile_log = Some((current, now));
+        true
+    }
+
+    fn clear_smb_reconcile_log(&mut self) {
+        self.last_smb_reconcile_log = None;
     }
 }
 
@@ -466,42 +498,6 @@ fn pending_queue_heads(jobs: &[JobRecord]) -> HashMap<String, usize> {
     heads
 }
 
-fn reconciliation_config_without_unavailable_smb_servers(
-    source: &str,
-    config: &ClusterConfig,
-    unavailable_servers: &[NodeId],
-) -> Result<String, String> {
-    if unavailable_servers.is_empty() {
-        return Ok(source.to_owned());
-    }
-    let unavailable = unavailable_servers
-        .iter()
-        .map(NodeId::as_str)
-        .collect::<BTreeSet<_>>();
-    let mut filtered = String::with_capacity(source.len());
-    let mut skipping_share = false;
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping_share = trimmed
-                .strip_prefix("[shares.")
-                .and_then(|section| section.strip_suffix(']'))
-                .map(|share_id| share_id.trim_matches('"'))
-                .and_then(|share_id| config.shares.get(share_id))
-                .is_some_and(|share| {
-                    share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
-                        && unavailable.contains(share.server.as_str())
-                });
-        }
-        if !skipping_share {
-            filtered.push_str(line);
-        }
-    }
-    ClusterConfig::parse(&filtered)
-        .map_err(|error| format!("cannot filter reconciliation SMB shares: {error}"))?;
-    Ok(filtered)
-}
-
 fn dispatch_pause_reason(
     share_ready: bool,
     cleanup_journal_blocked: bool,
@@ -509,7 +505,7 @@ fn dispatch_pause_reason(
     queues_empty: bool,
 ) -> Option<&'static str> {
     if !share_ready {
-        Some("waiting for shared-storage health; controller dispatch is paused")
+        Some("waiting for a fresh shared-storage health check; controller dispatch is paused")
     } else if cleanup_journal_blocked {
         Some("waiting for the NFS cleanup journal; controller dispatch is paused")
     } else if !dispatch_allowed {
@@ -519,6 +515,25 @@ fn dispatch_pause_reason(
     } else {
         None
     }
+}
+
+fn share_health_sample_usable(
+    sample: Option<(bool, Instant)>,
+    refresh_in_flight: bool,
+    now: Instant,
+) -> bool {
+    let Some((ready, sampled_at)) = sample else {
+        return false;
+    };
+    if !ready {
+        return false;
+    }
+    let maximum_age = if refresh_in_flight {
+        SHARE_HEALTH_TTL + SHARE_HEALTH_REFRESH_GRACE
+    } else {
+        SHARE_HEALTH_TTL
+    };
+    now.saturating_duration_since(sampled_at) < maximum_age
 }
 
 fn storage_health_with_transport<T: NodeTransport>(config: &ClusterConfig, transport: &T) -> bool {
@@ -689,6 +704,7 @@ struct RuntimeState {
     control_pool: WorkerPool<WorkerCompletion>,
     fan_control_pool: WorkerPool<()>,
     nfs_reconcile_pool: WorkerPool<WorkerCompletion>,
+    smb_reconcile_pool: WorkerPool<WorkerCompletion>,
     share_pool: WorkerPool<WorkerCompletion>,
     snapshot_pool: WorkerPool<WorkerCompletion>,
     storage_usage_pool: WorkerPool<WorkerCompletion>,
@@ -781,6 +797,11 @@ impl RuntimeState {
                 NFS_RECONCILE_WORKERS * WORK_QUEUE_FACTOR,
                 signal.clone(),
             )?,
+            smb_reconcile_pool: WorkerPool::new(
+                SMB_RECONCILE_WORKERS,
+                SMB_RECONCILE_WORKERS * WORK_QUEUE_FACTOR,
+                signal.clone(),
+            )?,
             share_pool: WorkerPool::new(
                 SHARE_WORKERS,
                 SHARE_WORKERS * WORK_QUEUE_FACTOR,
@@ -842,6 +863,7 @@ impl RuntimeState {
             + self.control_pool.pending
             + self.fan_control_pool.pending
             + self.nfs_reconcile_pool.pending
+            + self.smb_reconcile_pool.pending
             + self.share_pool.pending
             + self.snapshot_pool.pending
     }
@@ -1016,9 +1038,7 @@ impl RuntimeState {
     }
 
     fn share_ready(&self, now: Instant) -> bool {
-        self.share_ready.is_some_and(|(ready, sampled_at)| {
-            ready && now.saturating_duration_since(sampled_at) < SHARE_HEALTH_TTL
-        })
+        share_health_sample_usable(self.share_ready, self.share_in_flight.is_some(), now)
     }
 
     fn poll_workers<T: NodeTransport>(
@@ -1032,6 +1052,7 @@ impl RuntimeState {
             .into_iter()
             .chain(self.control_pool.poll())
             .chain(self.nfs_reconcile_pool.poll())
+            .chain(self.smb_reconcile_pool.poll())
             .chain(self.share_pool.poll())
             .chain(self.snapshot_pool.poll())
             .chain(self.storage_usage_pool.poll())
@@ -1188,6 +1209,69 @@ impl RuntimeState {
                     }
                 }
             }
+            WorkKind::ReconcileSmb => {
+                let Some(node_id) = tag.node_id.as_deref() else {
+                    return Ok(());
+                };
+                let Some(runtime) = self.nodes.get_mut(node_id) else {
+                    return Ok(());
+                };
+                if runtime.smb_reconcile_in_flight != Some(tag.operation_id) {
+                    return Ok(());
+                }
+                runtime.smb_reconcile_in_flight = None;
+                if !identity_current
+                    || !node_result_is_current(
+                        &tag,
+                        service.epoch,
+                        &tag.config_digest,
+                        runtime.generation,
+                        now,
+                    )
+                {
+                    runtime.next_probe_at = now;
+                    return Ok(());
+                }
+                let WorkerResult::ReconcileSmb {
+                    result,
+                    acknowledged,
+                } = completion.result
+                else {
+                    return Ok(());
+                };
+                match result {
+                    Ok(()) => {
+                        if let Err(error) =
+                            remove_acknowledged_nfs_cleanup(service.storage.root(), &acknowledged)
+                        {
+                            runtime.smb_reconcile_attempts =
+                                runtime.smb_reconcile_attempts.saturating_add(1);
+                            runtime.next_smb_reconcile_at =
+                                now + retry_delay(runtime.smb_reconcile_attempts);
+                            if runtime.should_log_smb_reconcile(&error.to_string(), now) {
+                                eprintln!(
+                                    "macluster: SMB reconciliation completed on {node_id}, but its cleanup journal could not be updated: {error}"
+                                );
+                            }
+                        } else {
+                            runtime.smb_reconcile_attempts = 0;
+                            runtime.next_smb_reconcile_at = now + SMB_RECONCILE_INTERVAL;
+                            runtime.clear_smb_reconcile_log();
+                        }
+                    }
+                    Err(error) => {
+                        runtime.smb_reconcile_attempts =
+                            runtime.smb_reconcile_attempts.saturating_add(1);
+                        runtime.next_smb_reconcile_at =
+                            now + retry_delay(runtime.smb_reconcile_attempts);
+                        if runtime.should_log_smb_reconcile(&error, now) {
+                            eprintln!(
+                                "macluster: SMB reconciliation on {node_id} will retry independently: {error}"
+                            );
+                        }
+                    }
+                }
+            }
             WorkKind::Probe | WorkKind::Health | WorkKind::Start | WorkKind::Cancel => {
                 let Some(node_id) = tag.node_id.as_deref() else {
                     return Ok(());
@@ -1245,6 +1329,7 @@ impl RuntimeState {
                                 probe.agent_responding,
                             );
                             self.schedule_nfs_reconciliation(service, node_id)?;
+                            self.schedule_smb_reconciliation(service, node_id)?;
                         }
                     }
                     WorkKind::Start | WorkKind::Cancel => {
@@ -1658,48 +1743,6 @@ impl RuntimeState {
                 return Ok(());
             }
         };
-        let (smb_credentials, missing_smb_credentials) =
-            match load_available_smb_credential_provisions(
-                &service.config,
-                &CredentialHelperClient::system(),
-            ) {
-                Ok(credentials) => credentials,
-                Err(error) => {
-                    self.defer_nfs_reconciliation(node_id, error, now);
-                    return Ok(());
-                }
-            };
-        if !missing_smb_credentials.is_empty()
-            && let Some(runtime) = self.nodes.get_mut(node_id)
-            && runtime.should_log_nfs_reconcile(
-                &missing_smb_credentials
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                now,
-            )
-        {
-            eprintln!(
-                "macluster: NFS reconciliation for {node_id} continues without unavailable SMB shares: {}",
-                missing_smb_credentials
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        let reconciliation_config_toml = match reconciliation_config_without_unavailable_smb_servers(
-            &config_toml,
-            &service.config,
-            &missing_smb_credentials,
-        ) {
-            Ok(config) => config,
-            Err(error) => {
-                self.defer_nfs_reconciliation(node_id, error, now);
-                return Ok(());
-            }
-        };
         let has_deferred_cleanup = cleanup_state
             .entries
             .values()
@@ -1711,10 +1754,6 @@ impl RuntimeState {
             || cleanup_state
                 .exports
                 .values()
-                .any(|entry| entry.node_id == node_id)
-            || cleanup_state
-                .credential_entries
-                .values()
                 .any(|entry| entry.node_id == node_id);
         if has_deferred_cleanup && health_ready {
             if let Some(runtime) = self.nodes.get_mut(node_id)
@@ -1724,7 +1763,7 @@ impl RuntimeState {
                 health.retry_at = reconcile_retry_at;
             }
         }
-        if now < reconcile_retry_at || (health_ready && !has_deferred_cleanup) {
+        if now < reconcile_retry_at {
             return Ok(());
         }
         let expected_machine_uuid = node_config.machine_uuid.as_deref().unwrap_or_default();
@@ -1789,24 +1828,6 @@ impl RuntimeState {
             }
             cleanup.exports.push(entry.clone());
         }
-        for entry in cleanup_state
-            .credential_entries
-            .values()
-            .filter(|entry| entry.node_id == node_id)
-        {
-            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
-                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
-            }) {
-                self.defer_nfs_reconciliation(
-                    node_id,
-                    "deferred SMB credential cleanup identity does not match this node".into(),
-                    now,
-                );
-                return Ok(());
-            }
-            cleanup.credentials.push(entry.clone());
-        }
-
         let obsolete_mounts = cleanup
             .clients
             .iter()
@@ -1860,20 +1881,13 @@ impl RuntimeState {
                 node_id: entry.client_node_id.clone(),
             })
             .collect::<Vec<_>>();
-        let obsolete_smb_credentials = cleanup
-            .credentials
-            .iter()
-            .flat_map(|entry| entry.endpoints.clone())
-            .collect::<Vec<_>>();
         let operation = Operation::ReconcileNfs {
             controller: service.epoch,
-            config_toml: reconciliation_config_toml,
+            config_toml,
             obsolete_mounts,
             obsolete_aliases,
             obsolete_markers,
             obsolete_exports,
-            smb_credentials,
-            obsolete_smb_credentials,
         };
         let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
         let node_config = node_config.clone();
@@ -1932,6 +1946,199 @@ impl RuntimeState {
         );
         if runtime.should_log_nfs_reconcile(&error, now) {
             eprintln!("macluster: NFS reconciliation for {node_id} deferred: {error}");
+        }
+    }
+
+    fn schedule_smb_reconciliation<T: NodeTransport>(
+        &mut self,
+        service: &ControllerService<T>,
+        node_id: &str,
+    ) -> Result<(), ControllerError> {
+        let now = Instant::now();
+        let Some(status) = self
+            .nodes
+            .get(node_id)
+            .and_then(|runtime| runtime.status.as_ref())
+        else {
+            return Ok(());
+        };
+        let status_fresh = self
+            .nodes
+            .get(node_id)
+            .is_some_and(|runtime| runtime.status_fresh(now));
+        let reconcile_retry_at = self
+            .nodes
+            .get(node_id)
+            .map_or(now, |runtime| runtime.next_smb_reconcile_at);
+        if !status_fresh || !status.online || status.occupied {
+            return Ok(());
+        }
+        if self.nodes.get(node_id).is_some_and(|runtime| {
+            runtime.smb_reconcile_in_flight.is_some()
+                || runtime.in_flight.is_some()
+                || runtime.pending_start.is_some()
+        }) || service.node_is_maintenance_scoped(node_id)
+        {
+            return Ok(());
+        }
+        if service.storage.list_active_jobs()?.iter().any(|job| {
+            job.node
+                .as_ref()
+                .is_some_and(|assigned| assigned.as_str() == node_id)
+                && (!job.state.is_terminal() || job.snapshot_sync_pending || job.log_sync_pending)
+        }) {
+            return Ok(());
+        }
+        let cleanup_state = match DeferredShareCleanupState::load_from_dir(service.storage.root()) {
+            Ok(state) => state,
+            Err(error) => {
+                self.defer_smb_reconciliation(node_id, error.to_string(), now);
+                return Ok(());
+            }
+        };
+        let has_deferred_cleanup = cleanup_state
+            .credential_entries
+            .values()
+            .any(|entry| entry.node_id == node_id);
+        let has_smb_share = service.config.shares.values().any(|share| {
+            share.protocol == macluster_core::storage_uri::StorageProtocol::Smb
+                && share.server.as_str() != node_id
+        });
+        if !has_smb_share && !has_deferred_cleanup {
+            if let Some(runtime) = self.nodes.get_mut(node_id) {
+                runtime.smb_reconcile_attempts = 0;
+                runtime.next_smb_reconcile_at = now;
+                runtime.clear_smb_reconcile_log();
+            }
+            return Ok(());
+        }
+        if now < reconcile_retry_at {
+            return Ok(());
+        }
+        let Some(config_toml) = service.config_toml_snapshot.clone() else {
+            return Ok(());
+        };
+        let (smb_credentials, missing_smb_credentials) =
+            match load_available_smb_credential_provisions(
+                &service.config,
+                &CredentialHelperClient::system(),
+            ) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    self.defer_smb_reconciliation(node_id, error, now);
+                    return Ok(());
+                }
+            };
+        if !missing_smb_credentials.is_empty()
+            && let Some(runtime) = self.nodes.get_mut(node_id)
+            && runtime.should_log_smb_reconcile(
+                &missing_smb_credentials
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                now,
+            )
+        {
+            eprintln!(
+                "macluster: SMB reconciliation for {node_id} has unavailable credential server(s): {}",
+                missing_smb_credentials
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let mut acknowledged = NfsCleanupAck::default();
+        for entry in cleanup_state
+            .credential_entries
+            .values()
+            .filter(|entry| entry.node_id == node_id)
+        {
+            let expected_machine_uuid = service
+                .config
+                .nodes
+                .get(node_id)
+                .and_then(|node| node.machine_uuid.as_deref())
+                .unwrap_or_default();
+            if entry.machine_uuid.as_deref().is_none_or(|machine_uuid| {
+                !machine_uuid.eq_ignore_ascii_case(expected_machine_uuid)
+            }) {
+                self.defer_smb_reconciliation(
+                    node_id,
+                    "deferred SMB credential cleanup identity does not match this node".into(),
+                    now,
+                );
+                return Ok(());
+            }
+            acknowledged.credentials.push(entry.clone());
+        }
+        let obsolete_smb_credentials = acknowledged
+            .credentials
+            .iter()
+            .flat_map(|entry| entry.endpoints.clone())
+            .collect::<Vec<_>>();
+        let operation = Operation::ReconcileSmb {
+            controller: service.epoch,
+            config_toml,
+            smb_credentials,
+            obsolete_smb_credentials,
+        };
+        let node = service
+            .config
+            .nodes
+            .get(node_id)
+            .cloned()
+            .expect("scheduled node is configured");
+        let node_id_protocol = NodeId::new(node_id.to_owned()).expect("validated node id");
+        let transport = Arc::clone(&service.transport);
+        let operation_id = self.operation_id();
+        let tag = self.tag(
+            service,
+            Some(node_id.to_owned()),
+            self.nodes
+                .get(node_id)
+                .map_or(0, |runtime| runtime.generation),
+            operation_id,
+            WorkKind::ReconcileSmb,
+            None,
+        );
+        let worker_tag = tag.clone();
+        if self.smb_reconcile_pool.try_spawn(move || {
+            let result = transport
+                .call(&node_id_protocol, &node, operation)
+                .and_then(|response| match response {
+                    ResponseBody::Ack => Ok(()),
+                    _ => Err(TransportError::Protocol(
+                        "SMB reconciliation returned an unexpected response".into(),
+                    )),
+                })
+                .map_err(|error| error.to_string());
+            WorkerCompletion {
+                tag: worker_tag,
+                received_at: Instant::now(),
+                result: WorkerResult::ReconcileSmb {
+                    result,
+                    acknowledged,
+                },
+            }
+        }) && let Some(runtime) = self.nodes.get_mut(node_id)
+        {
+            runtime.smb_reconcile_in_flight = Some(operation_id);
+        }
+        Ok(())
+    }
+
+    fn defer_smb_reconciliation(&mut self, node_id: &str, error: String, now: Instant) {
+        let Some(runtime) = self.nodes.get_mut(node_id) else {
+            return;
+        };
+        runtime.smb_reconcile_attempts = runtime.smb_reconcile_attempts.saturating_add(1);
+        runtime.next_smb_reconcile_at = now + retry_delay(runtime.smb_reconcile_attempts);
+        if runtime.should_log_smb_reconcile(&error, now) {
+            eprintln!(
+                "macluster: SMB reconciliation for {node_id} deferred independently: {error}"
+            );
         }
     }
 
@@ -3621,7 +3828,7 @@ fn node_result_is_current(
     now: Instant,
 ) -> bool {
     let max_age = match tag.kind {
-        WorkKind::ReconcileNfs => MAX_NFS_RECONCILE_RESULT_AGE,
+        WorkKind::ReconcileNfs | WorkKind::ReconcileSmb => MAX_NFS_RECONCILE_RESULT_AGE,
         _ => MAX_WORK_RESULT_AGE,
     };
     tag.epoch == epoch
@@ -3658,9 +3865,8 @@ mod tests {
         WorkTag, WorkerCompletion, WorkerPool, WorkerResult, claim_background_worker,
         dispatch_pause_reason, health_retry_delay, maintenance_drain_complete,
         node_probe_retry_delay, node_result_is_current, now_ms, pending_queue_heads, probe_delay,
-        publish_snapshot_with_transport, reconciliation_config_without_unavailable_smb_servers,
-        reset_drain_complete, retry_delay, run_forever, should_measure_job_storage,
-        smb_cleanup_worker_required, stage_job_snapshot_with_transport,
+        publish_snapshot_with_transport, reset_drain_complete, retry_delay, run_forever,
+        should_measure_job_storage, smb_cleanup_worker_required, stage_job_snapshot_with_transport,
         storage_health_with_transport,
     };
     use crate::events::RuntimeSignal;
@@ -4055,69 +4261,10 @@ transport = "ssh"
     }
 
     #[test]
-    fn reconciliation_config_omits_only_smb_shares_with_unavailable_credentials() {
-        let source = r#"[cluster]
-name = "test"
-default_queue = "default"
-login_node = "login"
-shared_root = "/Users/Shared/macluster"
-share_uuid = "00000000-0000-4000-8000-000000000001"
-storage_server = "login"
-protocol_version = 1
-
-[queues.default]
-nodes = ["login"]
-scheduler = "fifo"
-
-[nodes.login]
-host = "192.0.2.1"
-transport = "local"
-machine_uuid = "01234567-89ab-cdef-0123-456789abcdef"
-execution_uid = 501
-
-[nodes.nas-01]
-host = "192.0.2.10"
-transport = "storage"
-
-[nodes.nas-02]
-host = "192.0.2.11"
-transport = "storage"
-
-[shares.keep]
-protocol = "smb"
-server = "nas-01"
-source_root = "/keep"
-mount_root = "/Users/Shared/keep"
-share_uuid = "20000000-0000-4000-8000-000000000001"
-smb_user = "operator"
-
-[shares.drop]
-protocol = "smb"
-server = "nas-02"
-source_root = "/drop"
-mount_root = "/Users/Shared/drop"
-share_uuid = "30000000-0000-4000-8000-000000000001"
-smb_user = "operator"
-"#;
-        let config = ClusterConfig::parse(source).unwrap();
-        let filtered = reconciliation_config_without_unavailable_smb_servers(
-            source,
-            &config,
-            &[NodeId::new("nas-02").unwrap()],
-        )
-        .unwrap();
-        let filtered_config = ClusterConfig::parse(&filtered).unwrap();
-
-        assert!(filtered_config.shares.contains_key("keep"));
-        assert!(!filtered_config.shares.contains_key("drop"));
-        assert!(!filtered.contains("[shares.drop]"));
-    }
-
-    #[test]
     fn dispatch_pause_reason_identifies_the_first_global_blocker() {
         assert_eq!(
             dispatch_pause_reason(false, false, true, false),
-            Some("waiting for shared-storage health; controller dispatch is paused")
+            Some("waiting for a fresh shared-storage health check; controller dispatch is paused")
         );
         assert_eq!(
             dispatch_pause_reason(true, true, true, false),
@@ -4132,6 +4279,31 @@ smb_user = "operator"
             Some("no queue is configured; this job remains queued")
         );
         assert_eq!(dispatch_pause_reason(true, false, true, false), None);
+    }
+
+    #[test]
+    fn healthy_share_sample_bridges_an_overlapping_refresh_probe() {
+        let now = Instant::now();
+        assert!(super::share_health_sample_usable(
+            Some((true, now - Duration::from_secs(12))),
+            true,
+            now,
+        ));
+        assert!(!super::share_health_sample_usable(
+            Some((true, now - Duration::from_secs(12))),
+            false,
+            now,
+        ));
+        assert!(!super::share_health_sample_usable(
+            Some((false, now)),
+            true,
+            now,
+        ));
+        assert!(!super::share_health_sample_usable(
+            Some((true, now - Duration::from_secs(16))),
+            true,
+            now,
+        ));
     }
 
     #[test]
@@ -4607,6 +4779,207 @@ scheduler = "fifo"
             "[cluster]\nname = \"test\"\ndefault_queue = \"mini01\"\nlogin_node = \"login\"\nshared_root = \"{}\"\nshare_uuid = \"00000000-0000-4000-8000-000000000001\"\nstorage_server = \"login\"\nprotocol_version = 1\n\n[queues.mini01]\nnodes = [\"login\", \"worker\"]\nscheduler = \"fifo\"\n\n[nodes.login]\nhost = \"192.0.2.1\"\ntransport = \"local\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdef\"\nexecution_uid = 501\n\n[nodes.worker]\nhost = \"192.0.2.2\"\ntransport = \"ssh\"\nmachine_uuid = \"01234567-89ab-cdef-0123-456789abcdee\"\nexecution_uid = 501\n",
             shared_root.display()
         )
+    }
+
+    #[test]
+    fn nfs_reconciliation_does_not_wait_for_smb_credentials() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-nfs-without-smb-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config_toml = nfs_reconcile_config_source(&root);
+        config_toml.push_str(
+            "\n[nodes.nas-01]\nhost = \"192.0.2.10\"\ntransport = \"storage\"\n\n[shares.smb]\nprotocol = \"smb\"\nserver = \"nas-01\"\nsource_root = \"/data\"\nmount_root = \"/Volumes/data\"\nshare_uuid = \"00000000-0000-4000-8000-000000000010\"\nsmb_user = \"operator\"\n",
+        );
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config,
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        let worker = runtime.nodes.get_mut("worker").unwrap();
+        worker.status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+        worker.health = Some(NodeHealthCache {
+            valid: true,
+            ready: false,
+            job_storage_ready: false,
+            ready_shares: BTreeSet::new(),
+            agent_current: true,
+            interactive_pty: false,
+            namespaced_jobs: false,
+            logical_cpus: None,
+            sampled_at: now,
+            retry_at: now,
+        });
+
+        runtime
+            .schedule_nfs_reconciliation(&service, "worker")
+            .unwrap();
+        assert!(runtime.nodes["worker"].nfs_reconcile_in_flight.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.nodes["worker"].nfs_reconcile_in_flight.is_some() {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let operations = operations.lock().unwrap();
+        let Operation::ReconcileNfs { config_toml, .. } = &operations[0] else {
+            panic!("expected NFS reconciliation");
+        };
+        assert!(
+            config_toml.contains("[shares.smb]"),
+            "NFS reconciliation must retain the complete config without consulting SMB credentials"
+        );
+        drop(operations);
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn smb_reconciliation_has_an_independent_worker_budget() {
+        use crate::ControllerService;
+        use macluster_core::config::ClusterConfig;
+        use macluster_core::storage::Storage;
+
+        let root = std::env::temp_dir().join(format!(
+            "macluster-controller-smb-worker-budget-{}-{}",
+            std::process::id(),
+            Id128::random()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_toml = nfs_reconcile_config_source(&root);
+        let config = ClusterConfig::parse(&config_toml).unwrap();
+        let storage = Storage::open(root.join("controller")).unwrap();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut service = ControllerService::new(
+            config.clone(),
+            storage,
+            NfsReconcileTransport {
+                operations: Arc::clone(&operations),
+                fail: false,
+            },
+        )
+        .unwrap();
+        service.set_config_toml_snapshot(config_toml);
+        let mut runtime = RuntimeState::new(&service, Duration::from_secs(2)).unwrap();
+        let now = Instant::now();
+        runtime.nodes.get_mut("worker").unwrap().status = Some(NodeStatusCache {
+            online: true,
+            occupied: false,
+            sampled_at: now,
+        });
+
+        let mut cleanup = DeferredShareCleanupState {
+            version: 1,
+            ..DeferredShareCleanupState::default()
+        };
+        cleanup.credential_entries.insert(
+            "worker".into(),
+            DeferredSmbCredentialCleanup {
+                node_id: "worker".into(),
+                machine_uuid: config.nodes["worker"].machine_uuid.clone(),
+                node: config.nodes["worker"].clone(),
+                shares: Vec::new(),
+                endpoints: Vec::new(),
+                wait_for_unmount: true,
+                attempts: 0,
+                next_retry_unix_ms: 0,
+                last_error_kind: None,
+                last_error_summary: None,
+            },
+        );
+        cleanup.save_to_dir(service.storage.root()).unwrap();
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let tag = WorkTag {
+            epoch: service.epoch,
+            config_digest: runtime.digest.clone(),
+            node_id: None,
+            generation: 0,
+            operation_id: 0,
+            kind: WorkKind::ReconcileNfs,
+            job_id: None,
+            started_at: now,
+        };
+        let fill_deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.nfs_reconcile_pool.pending < runtime.nfs_reconcile_pool.max_pending
+            && Instant::now() < fill_deadline
+        {
+            let release = Arc::clone(&release);
+            let tag = tag.clone();
+            let spawned = runtime.nfs_reconcile_pool.try_spawn(move || {
+                let (lock, ready) = &*release;
+                let guard = lock.lock().unwrap();
+                let _guard = ready.wait_while(guard, |released| !*released).unwrap();
+                WorkerCompletion {
+                    tag,
+                    received_at: Instant::now(),
+                    result: WorkerResult::ReconcileNfs {
+                        result: Ok(()),
+                        acknowledged: Default::default(),
+                    },
+                }
+            });
+            if !spawned {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            runtime.nfs_reconcile_pool.pending,
+            runtime.nfs_reconcile_pool.max_pending
+        );
+        assert_eq!(
+            runtime.nodes["worker"].smb_reconcile_in_flight, None,
+            "SMB reconciliation must not already be scheduled"
+        );
+
+        runtime
+            .schedule_smb_reconciliation(&service, "worker")
+            .unwrap();
+        let smb_scheduled = runtime.nodes["worker"].smb_reconcile_in_flight.is_some();
+
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while runtime.nfs_reconcile_pool.pending > 0 {
+            runtime.poll_workers(&mut service).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "NFS worker saturation did not drain"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            smb_scheduled,
+            "SMB credential cleanup must not wait for the NFS reconciliation worker budget"
+        );
+        drop(runtime);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -32,6 +32,7 @@ struct FakeState {
     starts: usize,
     lose_start_reply_once: bool,
     features: Vec<String>,
+    agent_build_id: Option<String>,
     lose_status_once: bool,
     recovery_state: Option<JobState>,
     recoveries: usize,
@@ -57,6 +58,9 @@ impl FakeTransport {
             .unwrap()
             .features
             .push("agent.interactive-pty.v1".into());
+    }
+    fn set_agent_build(&self, build_id: &str) {
+        self.state.lock().unwrap().agent_build_id = Some(build_id.to_owned());
     }
     fn starts(&self) -> usize {
         self.state.lock().unwrap().starts
@@ -169,7 +173,12 @@ impl NodeTransport for FakeTransport {
                 macluster_protocol::types::NodeHealth {
                     machine_uuid: String::new(),
                     execution_uid: 0,
-                    build_id: Some(macluster_protocol::BUILD_ID.to_owned()),
+                    build_id: Some(
+                        state
+                            .agent_build_id
+                            .clone()
+                            .unwrap_or_else(|| macluster_protocol::BUILD_ID.to_owned()),
+                    ),
                     logical_cpus: None,
                     execution_digest: String::new(),
                     primary_share_ready: true,
@@ -217,7 +226,9 @@ impl NodeTransport for FakeTransport {
             )),
             Operation::Ping => Ok(ResponseBody::Pong),
             Operation::TaskResources { .. } => Err(TransportError::Remote(ProtocolError::NotFound)),
-            Operation::ReconcileNfs { .. } => Ok(ResponseBody::Ack),
+            Operation::ReconcileNfs { .. } | Operation::ReconcileSmb { .. } => {
+                Ok(ResponseBody::Ack)
+            }
         }
     }
 }
@@ -493,6 +504,41 @@ fn pending_interactive_wait_reason_clears_when_capable_node_appears() {
 
     controller.tick_with_storage_health(true).unwrap();
     transport.add_interactive_pty();
+    controller.tick_with_storage_health(true).unwrap();
+
+    let started = controller_storage(&root).get_job(job.id).unwrap().unwrap();
+    assert_eq!(started.state, JobState::Starting);
+    assert_eq!(started.waiting_reason, None);
+    assert_eq!(transport.starts(), 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn queued_job_waits_for_agent_update_then_starts() {
+    let (root, config, storage, spec) = fixture();
+    let job = storage
+        .submit_once(
+            macluster_protocol::identifiers::RequestId(Id128::random()),
+            spec,
+        )
+        .unwrap();
+    storage
+        .publish_snapshot(job.id, &root.join("shared"))
+        .unwrap();
+    let transport = FakeTransport::default();
+    transport.set_agent_build("stale-build");
+    let mut controller = ControllerService::new(config, storage, transport.clone()).unwrap();
+
+    controller.tick_with_storage_health(true).unwrap();
+
+    let waiting = controller_storage(&root).get_job(job.id).unwrap().unwrap();
+    assert_eq!(waiting.state, JobState::Pending);
+    assert!(waiting.waiting_reason.as_deref().is_some_and(|reason| {
+        reason.contains("current Agent build") && reason.contains("deferred cluster update")
+    }));
+    assert_eq!(transport.starts(), 0);
+
+    transport.set_agent_build(macluster_protocol::BUILD_ID);
     controller.tick_with_storage_health(true).unwrap();
 
     let started = controller_storage(&root).get_job(job.id).unwrap().unwrap();

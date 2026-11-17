@@ -39,7 +39,7 @@ use self::{
     processes::{ProcessCache, ProcessInfo, ProcessSampler, ProcessTarget, ProcessView},
     sampler::{MetricSampler, SampleTarget},
     terminal::{TerminalGuard, install_panic_restore_hook},
-    ui::{AppState, InputAction, UiNode, handle_key, render},
+    ui::{AppState, InputAction, UiNode, handle_key_with_node_page_size, node_page_size, render},
 };
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
@@ -48,50 +48,32 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const ONE_SHOT_DEADLINE: Duration = Duration::from_secs(10);
 const PROCESS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-pub(crate) enum MtopPostAction {
-    #[cfg(test)]
-    CheckBuilds(crate::node_admin::AgentBuildCompatibility),
-    #[cfg(test)]
-    RecoverMaintenance,
-    SetupLocalPower,
-    UpdateDeferred,
-}
-
 enum StartupValidation {
     AddressMigration,
     NodeMaintenancePending,
     Builds,
-    RecoverMaintenance,
-    SetupLocalPower,
-    UpdateDeferred,
+    UpdatePending,
+    PowerUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartupPreparation {
-    UpdateAgents,
-    SetupLocalPower,
+enum StartupObservation {
+    AgentUpdatePending,
+    LocalPowerUnavailable,
     Continue,
 }
 
-fn startup_preparation(
+fn startup_observation(
     agent_update_required: bool,
     local_power_setup_required: bool,
-) -> StartupPreparation {
+) -> StartupObservation {
     if agent_update_required {
-        StartupPreparation::UpdateAgents
+        StartupObservation::AgentUpdatePending
     } else if local_power_setup_required {
-        StartupPreparation::SetupLocalPower
+        StartupObservation::LocalPowerUnavailable
     } else {
-        StartupPreparation::Continue
+        StartupObservation::Continue
     }
-}
-
-fn should_defer_startup_update(
-    recovery_pending: bool,
-    update_required: bool,
-    work_pending: bool,
-) -> bool {
-    work_pending && (recovery_pending || update_required)
 }
 
 fn now_unix_ms() -> u64 {
@@ -202,8 +184,7 @@ pub fn run_interactive(
     selected_queue: Option<String>,
     no_color: bool,
     address_migration_deferred: bool,
-    allow_power_setup: bool,
-) -> Result<Option<MtopPostAction>, String> {
+) -> Result<(), String> {
     static PANIC_HOOK: Once = Once::new();
     PANIC_HOOK.call_once(install_panic_restore_hook);
 
@@ -352,12 +333,7 @@ pub fn run_interactive(
                     return Ok(StartupValidation::NodeMaintenancePending);
                 }
                 if update_recovery {
-                    let work_pending =
-                        crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
-                    if should_defer_startup_update(true, false, work_pending) {
-                        return Ok(StartupValidation::UpdateDeferred);
-                    }
-                    return Ok(StartupValidation::RecoverMaintenance);
+                    return Ok(StartupValidation::UpdatePending);
                 }
                 let compatibility = crate::node_admin::configured_agent_build_compatibility_cached(
                     &validation_config,
@@ -365,22 +341,18 @@ pub fn run_interactive(
                 )
                 .map_err(|(_, error)| error)?;
                 let local_power_setup_required =
-                    allow_power_setup && crate::node_admin::local_power_sampler_needs_setup()?;
-                match startup_preparation(
+                    crate::node_admin::local_power_sampler_needs_setup()?;
+                match startup_observation(
                     compatibility.requires_update(),
                     local_power_setup_required,
                 ) {
-                    StartupPreparation::UpdateAgents => {
-                        let work_pending =
-                            crate::node_admin::agent_update_blocked_by_work(&validation_state_dir)?;
-                        if should_defer_startup_update(false, true, work_pending) {
-                            return Ok(StartupValidation::UpdateDeferred);
-                        }
+                    StartupObservation::AgentUpdatePending => {
+                        return Ok(StartupValidation::UpdatePending);
                     }
-                    StartupPreparation::SetupLocalPower => {
-                        return Ok(StartupValidation::SetupLocalPower);
+                    StartupObservation::LocalPowerUnavailable => {
+                        return Ok(StartupValidation::PowerUnavailable);
                     }
-                    StartupPreparation::Continue => {}
+                    StartupObservation::Continue => {}
                 }
                 Ok(StartupValidation::Builds)
             })();
@@ -389,7 +361,6 @@ pub fn run_interactive(
         .map_err(|error| format!("could not start background Agent validation: {error}"))?;
     let mut validation_finished = false;
     let mut address_migration_waiting = false;
-    let mut post_action = None;
     let mut last_draw = Instant::now() - REDRAW_INTERVAL;
     let mut next_age_tick = Instant::now() + Duration::from_secs(1);
     let mut dirty = true;
@@ -405,26 +376,21 @@ pub fn run_interactive(
                         validation_finished = true;
                         status_message = Some("Node address recovery needs attention; Agent updates are deferred and monitoring remains available".into());
                     }
-                    Ok(Ok(StartupValidation::SetupLocalPower)) => {
-                        post_action = Some(MtopPostAction::SetupLocalPower);
-                        break;
-                    }
                     Ok(Ok(StartupValidation::NodeMaintenancePending)) => {
                         validation_finished = true;
                         status_message = Some("Node setup/removal is incomplete; resume its original mnode command. Monitoring remains available".into());
                     }
-                    Ok(Ok(StartupValidation::RecoverMaintenance)) => {
+                    Ok(Ok(StartupValidation::UpdatePending)) => {
                         validation_finished = true;
                         status_message = Some(
-                            "Agent maintenance recovery is pending; monitoring continues and the update can be resumed after nodes are reachable and idle".into(),
+                            "Agent update is pending; monitoring is read-only. Run an Agent-dependent operation when the cluster is idle to update".into(),
                         );
                     }
-                    Ok(Ok(StartupValidation::UpdateDeferred)) => {
+                    Ok(Ok(StartupValidation::PowerUnavailable)) => {
                         validation_finished = true;
                         status_message = Some(
-                            "Agent update deferred while active tasks or output synchronization remain".into(),
+                            "Power sampling is unavailable; monitoring continues without updating computer settings".into(),
                         );
-                        post_action = Some(MtopPostAction::UpdateDeferred);
                     }
                     Ok(Ok(StartupValidation::Builds)) => {
                         validation_finished = true;
@@ -730,7 +696,16 @@ pub fn run_interactive(
             if event::poll(wait).map_err(|error| format!("mtop event polling failed: {error}"))? {
                 match event::read().map_err(|error| format!("mtop event read failed: {error}"))? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        quit = handle_key(&mut state, key) == InputAction::Quit;
+                        let page_size = terminal
+                            .terminal_mut()
+                            .size()
+                            .ok()
+                            .map(|area| {
+                                node_page_size(area.into(), state.nodes.len(), state.expanded)
+                            })
+                            .unwrap_or(10);
+                        quit = handle_key_with_node_page_size(&mut state, key, page_size)
+                            == InputAction::Quit;
                         dirty = true;
                         if !state.show_help && state.status_message.is_some() {
                             state.status_message = None;
@@ -760,7 +735,7 @@ pub fn run_interactive(
     match (result, restore) {
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(post_action),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 

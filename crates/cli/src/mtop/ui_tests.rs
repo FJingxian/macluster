@@ -6,8 +6,9 @@ use super::{
     model::{DisplayNodeIdentity, MetricView, NodeRole, SortKey, aggregate_power},
     processes::{ProcessInfo, ProcessView},
     ui::{
-        AppState, InputAction, LayoutMode, UiNode, handle_key, job_label, layout_mode, power_text,
-        render, resources,
+        AppState, InputAction, LayoutMode, UiNode, disk_capacity_columns, handle_key,
+        handle_key_with_node_page_size, job_label, layout_mode, logical_cpu_columns,
+        node_page_size, power_text, render, resources,
     },
 };
 
@@ -64,14 +65,6 @@ fn tui_requires_both_terminals_and_no_one_shot_mode() {
     assert!(!super::should_use_tui(false, false, false, true, false));
     assert!(!super::should_use_tui(false, false, true, false, false));
     assert!(!super::should_use_tui(false, false, true, true, true));
-}
-
-#[test]
-fn mtop_defers_recovery_or_required_update_only_while_work_is_pending() {
-    assert!(super::should_defer_startup_update(true, false, true));
-    assert!(super::should_defer_startup_update(false, true, true));
-    assert!(!super::should_defer_startup_update(false, false, true));
-    assert!(!super::should_defer_startup_update(true, false, false));
 }
 
 #[test]
@@ -215,7 +208,122 @@ fn expanded_resource_panel_fits_a_100_column_terminal() {
     let screen = rendered_lines(100, 24, &state).join("\n");
     assert!(screen.contains("RESOURCES"), "details: {screen:?}");
     assert!(screen.contains("TOP"), "details: {screen:?}");
-    assert!(screen.contains("CPU0"), "details: {screen:?}");
+    assert!(screen.contains("C1"), "details: {screen:?}");
+}
+
+#[test]
+fn expanded_resource_panel_fits_80x24_with_adaptive_gauges() {
+    let mut snapshot = macluster_metrics::unavailable(1, "fixture");
+    snapshot.cpu_percent = Some(325.0);
+    snapshot.cpu_max_percent = Some(1200.0);
+    snapshot.logical_cpu_percent = Some(vec![
+        5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0, 10.0, 20.0,
+    ]);
+    snapshot.memory_used_bytes = Some(12 * 1024 * 1024 * 1024);
+    snapshot.memory_total_bytes = Some(16 * 1024 * 1024 * 1024);
+    snapshot.gpu_percent = Some(42.0);
+    snapshot.gpu_age_ms = Some(0);
+    snapshot.power_watts = Some(18.4);
+    snapshot.power_scope = Some("System".into());
+    snapshot.power_age_ms = Some(0);
+    snapshot.cpu_temp_celsius = Some(61.2);
+    snapshot.fan_speed_rpm = Some(2400.0);
+    snapshot.system_disk_capacity = Some(macluster_protocol::types::DiskCapacity {
+        mount_point: "/".into(),
+        used_bytes: 128 * 1024_u64.pow(3),
+        total_bytes: 512 * 1024_u64.pow(3),
+    });
+    snapshot.external_disk_capacities = vec![
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/archive".into(),
+            used_bytes: 2 * 1024_u64.pow(4),
+            total_bytes: 4 * 1024_u64.pow(4),
+        },
+        macluster_protocol::types::DiskCapacity {
+            mount_point: "/Volumes/data".into(),
+            used_bytes: 3 * 1024_u64.pow(3),
+            total_bytes: 8 * 1024_u64.pow(3),
+        },
+    ];
+    let mut state = AppState::empty("mini01");
+    state.selected_id = Some("mini01-a".into());
+    state.expanded = true;
+    state.nodes.push(super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: "mini01-a".into(),
+            host: "192.0.2.11".into(),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Available {
+            snapshot,
+            age: std::time::Duration::ZERO,
+            stale: false,
+        },
+        jobs: Vec::new(),
+        cpu_history: Vec::new(),
+        last_error: None,
+        processes: ProcessView::Loading,
+    });
+
+    let lines = rendered_lines(80, 24, &state);
+    let screen = lines.join("\n");
+    assert!(screen.contains("RESOURCES"), "details: {screen}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("TOP") && line.contains("RESOURCES")),
+        "TOP and RESOURCES must remain side by side: {screen}"
+    );
+    assert!(
+        !screen.contains("RESOURCES · CPU") && !screen.contains("12 logical"),
+        "the redundant CPU summary row should be omitted: {screen}"
+    );
+    let first_cores = lines
+        .iter()
+        .find(|line| line.contains("C1"))
+        .unwrap_or_else(|| panic!("first CPU row missing: {screen}"));
+    assert!(
+        first_cores.contains("C2"),
+        "processor labels should share a row: {first_cores}"
+    );
+    assert!(
+        !screen.contains("CPU0"),
+        "compact processor labels must use C1..Cn: {screen}"
+    );
+    let memory_gpu = lines
+        .iter()
+        .find(|line| !line.contains("NODE") && line.contains("MEM") && line.contains("GPU"))
+        .unwrap_or_else(|| panic!("MEM and GPU should share a row: {screen}"));
+    assert!(
+        memory_gpu.contains('━') || memory_gpu.contains('█'),
+        "{memory_gpu}"
+    );
+    let sensors = lines
+        .iter()
+        .find(|line| line.contains("POWER") && line.contains("TEMP") && line.contains("FAN"))
+        .unwrap_or_else(|| panic!("sensor values should share a row: {screen}"));
+    assert!(sensors.contains("18.4"), "{sensors}");
+    assert!(sensors.contains("61.2"), "{sensors}");
+    assert!(sensors.contains("2400"), "{sensors}");
+    assert!(
+        screen.contains("SYS DISK"),
+        "system disk row missing: {screen}"
+    );
+    let external = lines
+        .iter()
+        .find(|line| line.contains("archive"))
+        .unwrap_or_else(|| panic!("external disk gauge missing: {screen}"));
+    assert!(external.contains('━') || external.contains('█'));
+}
+
+#[test]
+fn resource_bar_columns_adapt_to_available_width() {
+    assert_eq!(logical_cpu_columns(80, 12), 5);
+    assert!(logical_cpu_columns(160, 12) > logical_cpu_columns(80, 12));
+    assert_eq!(disk_capacity_columns(80, 4), 2);
+    assert_eq!(disk_capacity_columns(160, 4), 4);
 }
 
 #[test]
@@ -374,7 +482,6 @@ fn metric_units_are_in_headers_and_table_values_are_compact() {
     state.selected_id = Some("mini01-a".into());
     state.expanded = true;
     let details = rendered_lines(160, 24, &state).join("\n");
-    assert!(details.contains("100/800%"), "details: {details:?}");
     assert!(
         details.contains("MEM(GiB) 4.0/16.0"),
         "details: {details:?}"
@@ -451,7 +558,10 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
         1,
         "system-disk capacity should appear once in the details pane: {overview}"
     );
-    assert!(!overview.contains("EXT archive"), "overview: {overview}");
+    assert!(
+        !overview.contains("archive 2.0/4.0 TiB"),
+        "overview: {overview}"
+    );
 
     state.expanded = true;
     let details = rendered_lines(160, 40, &state).join("\n");
@@ -460,10 +570,10 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
         "details: {details}"
     );
     assert!(
-        details.contains("EXT archive 2.0/4.0 TiB"),
+        details.contains("archive 2.0/4.0 TiB"),
         "details: {details}"
     );
-    assert!(!details.contains("EXT Recovery"), "details: {details}");
+    assert!(!details.contains("Recovery"), "details: {details}");
 
     if let MetricView::Available { snapshot, .. } = &mut state.nodes[0].metrics {
         snapshot.external_disk_capacities[0].used_bytes = 64 * 1024_u64.pow(3);
@@ -471,7 +581,7 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
     }
     let distinct_recovery = rendered_lines(160, 40, &state).join("\n");
     assert!(
-        !distinct_recovery.contains("EXT Recovery"),
+        !distinct_recovery.contains("Recovery"),
         "{distinct_recovery}"
     );
 
@@ -480,8 +590,8 @@ fn system_disk_is_shown_in_details_but_not_the_node_table() {
     }
     state.nodes[0].identity.role = NodeRole::Login;
     let login_details = rendered_lines(160, 40, &state).join("\n");
-    assert!(!login_details.contains("EXT Recovery"), "{login_details}");
-    assert!(login_details.contains("EXT archive"), "{login_details}");
+    assert!(!login_details.contains("Recovery"), "{login_details}");
+    assert!(login_details.contains("archive"), "{login_details}");
 }
 
 #[test]
@@ -645,7 +755,7 @@ fn gpu_column_and_details_show_real_zero_and_expired_samples_as_na() {
 
     state.expanded = true;
     let details = rendered_lines(80, 24, &state).join("\n");
-    assert!(details.contains("GPU% 0.0"), "details: {details:?}");
+    assert!(details.contains("GPU 0.0%"), "details: {details:?}");
 }
 
 #[test]
@@ -1195,14 +1305,15 @@ fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tal
     let short = rendered_lines(160, 20, &state).join("\n");
 
     assert!(tall.contains("SYS DISK 128.0/512.0 GiB"), "{tall}");
-    assert!(tall.contains("EXT archive 2.0/4.0 TiB"), "{tall}");
+    assert!(tall.contains("archive 2.0/4.0 TiB"), "{tall}");
     let external_disk_lines = tall
         .lines()
-        .filter(|line| line.contains("EXT "))
+        .filter(|line| line.contains("archive 2.0/4.0 TiB"))
         .collect::<Vec<_>>();
     assert_eq!(external_disk_lines.len(), 1, "{tall}");
     assert!(
-        external_disk_lines[0].contains("EXT archive 2.0/4.0 TiB · data 3.0/8.0 GiB"),
+        external_disk_lines[0].contains("archive 2.0/4.0 TiB")
+            && external_disk_lines[0].contains("data 3.0/8.0 GiB"),
         "{tall}"
     );
     assert!(short.contains("SYS DISK 128.0/512.0 GiB"), "{short}");
@@ -1210,7 +1321,7 @@ fn expanded_details_always_show_system_disk_and_only_fit_external_disks_when_tal
 }
 
 #[test]
-fn process_preview_header_identifies_ps_average_until_interval_sample_arrives() {
+fn process_table_always_uses_a_single_cpu_label() {
     let mut state = AppState::empty("mini01");
     state.selected_id = Some("mini01-c".into());
     state.expanded = true;
@@ -1236,15 +1347,22 @@ fn process_preview_header_identifies_ps_average_until_interval_sample_arrives() 
             }],
             age: std::time::Duration::from_secs(1),
             stale: false,
-            warning: Some("Preview: ps average CPU%, RSS memory; interval sample pending".into()),
+            warning: None,
         },
     });
 
     let screen = rendered_lines(160, 40, &state).join("\n");
 
-    assert!(screen.contains("CPU(avg)%"), "{screen}");
+    assert!(screen.contains("CPU"), "{screen}");
+    assert!(!screen.contains("CPU(avg)"), "{screen}");
+    assert!(!screen.contains("ps average CPU%"), "{screen}");
     assert!(!screen.contains("refresh failed: Preview:"), "{screen}");
     assert!(screen.contains("rustc"), "{screen}");
+    let compact = rendered_lines(80, 24, &state).join("\n");
+    assert!(
+        !compact.contains("CPU(avg)"),
+        "compact process table must use CPU as its label: {compact}"
+    );
 }
 
 #[test]
@@ -1484,6 +1602,101 @@ fn input_sorts_and_keeps_selected_node_stable() {
         KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
     );
     assert!(state.refresh_requested);
+}
+
+#[test]
+fn left_and_right_keys_page_nodes_ten_at_a_time() {
+    let mut state = AppState::empty("mini01");
+    state.nodes = (0..25)
+        .map(|index| super::ui::UiNode {
+            identity: DisplayNodeIdentity {
+                id: format!("node-{index:02}"),
+                host: format!("192.0.2.{}", index + 1),
+                role: NodeRole::Compute,
+                queues: vec!["mini01".into()],
+                compute_member: true,
+            },
+            metrics: MetricView::Loading,
+            jobs: vec![],
+            cpu_history: vec![],
+            last_error: None,
+            processes: Default::default(),
+        })
+        .collect();
+    state.selected_id = Some("node-00".into());
+
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(state.selected_id.as_deref(), Some("node-10"));
+    handle_key(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(state.selected_id.as_deref(), Some("node-20"));
+    handle_key(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(state.selected_id.as_deref(), Some("node-10"));
+}
+
+#[test]
+fn node_height_adapts_and_the_table_pages_after_ten_rows() {
+    let node = |index: usize| super::ui::UiNode {
+        identity: DisplayNodeIdentity {
+            id: format!("node-{index:02}"),
+            host: format!("192.0.2.{}", index + 1),
+            role: NodeRole::Compute,
+            queues: vec!["mini01".into()],
+            compute_member: true,
+        },
+        metrics: MetricView::Loading,
+        jobs: vec![],
+        cpu_history: vec![],
+        last_error: None,
+        processes: Default::default(),
+    };
+    let mut few = AppState::empty("mini01");
+    few.expanded = true;
+    few.nodes = (0..2).map(node).collect();
+    few.selected_id = Some("node-00".into());
+    let few_lines = rendered_lines(160, 40, &few);
+    let few_top_y = few_lines.iter().position(|line| line.contains("TOP ·"));
+
+    let mut many = AppState::empty("mini01");
+    many.expanded = true;
+    many.nodes = (0..12).map(node).collect();
+    many.selected_id = Some("node-00".into());
+    let first_page = rendered_lines(160, 40, &many);
+    let many_top_y = first_page.iter().position(|line| line.contains("TOP ·"));
+    assert!(
+        many_top_y > few_top_y,
+        "node height should adapt to node count"
+    );
+    let first_page_text = first_page.join("\n");
+    assert!(first_page_text.contains("node-09"), "{first_page_text}");
+    assert!(!first_page_text.contains("node-10"), "{first_page_text}");
+
+    handle_key(&mut many, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    let second_page = rendered_lines(160, 40, &many).join("\n");
+    assert!(second_page.contains("node-10"), "{second_page}");
+    assert!(second_page.contains("node-11"), "{second_page}");
+    assert!(!second_page.contains("node-00"), "{second_page}");
+
+    let mut compact = AppState::empty("mini01");
+    compact.expanded = true;
+    compact.nodes = (0..12).map(node).collect();
+    compact.selected_id = Some("node-00".into());
+    let compact_page_size = node_page_size(Rect::new(0, 0, 80, 24), compact.nodes.len(), true);
+    assert_eq!(compact_page_size, 5);
+    handle_key_with_node_page_size(
+        &mut compact,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        compact_page_size,
+    );
+    let compact_page = rendered_lines(80, 24, &compact).join("\n");
+    assert!(compact_page.contains("node-05"), "{compact_page}");
+    assert!(!compact_page.contains("node-00"), "{compact_page}");
+    assert!(!compact_page.contains("node-10"), "{compact_page}");
 }
 
 #[test]

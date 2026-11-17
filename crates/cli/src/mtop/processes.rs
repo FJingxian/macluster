@@ -118,7 +118,6 @@ pub(super) enum ProcessView {
 pub(super) struct ProcessCache {
     last_success: Option<(Vec<ProcessInfo>, Instant)>,
     last_error: Option<String>,
-    preview: bool,
 }
 
 impl ProcessCache {
@@ -130,14 +129,12 @@ impl ProcessCache {
         // A slower SSH preview must never overwrite an interval sample.
         if self.needs_preview() {
             self.last_success = Some((rows, at));
-            self.preview = true;
         }
     }
 
     pub fn apply_success(&mut self, rows: Vec<ProcessInfo>, at: Instant) {
         self.last_success = Some((rows, at));
         self.last_error = None;
-        self.preview = false;
     }
 
     pub fn apply_error(&mut self, reason: String) {
@@ -151,16 +148,7 @@ impl ProcessCache {
                 rows: rows.clone(),
                 age,
                 stale: age >= PROCESS_STALE_AFTER,
-                warning: if self.preview {
-                    let mut warning =
-                        "Preview: ps average CPU%, RSS memory; interval sample pending".to_owned();
-                    if let Some(error) = &self.last_error {
-                        warning.push_str(&format!("; {error}"));
-                    }
-                    Some(warning)
-                } else {
-                    self.last_error.clone()
-                },
+                warning: self.last_error.clone(),
             };
         }
         match &self.last_error {
@@ -713,7 +701,20 @@ mod tests {
         PREVIEW_COMMAND, PROCESS_COMMAND, ProcessCache, ProcessInfo, ProcessSort, ProcessView,
         parse_preview_processes, parse_top_processes, sort_processes,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     const SAMPLE: &str = "top first sample\nPID    %CPU MEM   TIME     COMMAND\n11 90.0 2M 00:00.01 first_low\n12 2.0 4M 00:00.02 first_busy\nProcesses: 8 total\nPID    %CPU MEM   TIME     COMMAND\n11 1.5 2M 00:00.03 top_low_worker\n12 82.0 4M 00:00.04 top_busy_worker (Renderer)\n13 35.0 1M 00:00.02 top_middle_worker\n__MACLUSTER_PS_NAMES__\n   11 low_worker\n   12 busy_worker\n   13 middle_worker\n";
 
@@ -730,14 +731,11 @@ mod tests {
         cache.apply_preview(rows.clone(), now);
         assert!(matches!(
             cache.view_at(now),
-            ProcessView::Available {
-                warning: Some(_),
-                ..
-            }
+            ProcessView::Available { warning: None, .. }
         ));
         cache.apply_error("interval probe failed".into());
         assert!(
-            matches!(cache.view_at(now), ProcessView::Available {warning: Some(warning), ..} if warning.contains("ps average CPU%") && warning.contains("interval probe failed"))
+            matches!(cache.view_at(now), ProcessView::Available {warning: Some(warning), ..} if warning == "interval probe failed")
         );
         cache.apply_success(Vec::new(), now);
         cache.apply_preview(rows, now);
@@ -798,6 +796,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].cpu_percent, 420.0);
+    }
+
+    #[test]
+    fn cpu_time_delta_preserves_multicore_process_percent() {
+        let mut samples = std::collections::BTreeMap::new();
+        let started = Instant::now();
+        let mut first = vec![ProcessInfo {
+            pid: 42,
+            cpu_percent: 120.0,
+            memory: "32M".into(),
+            cpu_time: "00:10.00".into(),
+            command: "worker".into(),
+        }];
+        assert!(!super::apply_instantaneous_cpu(
+            &mut samples,
+            "local",
+            &mut first,
+            started,
+        ));
+
+        let mut second = vec![ProcessInfo {
+            pid: 42,
+            cpu_percent: 120.0,
+            memory: "32M".into(),
+            cpu_time: "00:14.20".into(),
+            command: "worker".into(),
+        }];
+        assert!(super::apply_instantaneous_cpu(
+            &mut samples,
+            "local",
+            &mut second,
+            started + Duration::from_secs(1),
+        ));
+        assert!((second[0].cpu_percent - 420.0).abs() < 0.001);
     }
 
     #[test]
@@ -938,5 +970,77 @@ mod tests {
             pair[0].cpu_percent >= pair[1].cpu_percent
                 || pair[0].cpu_percent == pair[1].cpu_percent && pair[0].pid <= pair[1].pid
         }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual process CPU parity check with a controlled busy process"]
+    fn local_interval_cpu_matches_system_top_for_controlled_process() {
+        let child = Command::new("/usr/bin/yes")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child = ChildGuard(child);
+        let pid = child.0.id();
+        thread::sleep(Duration::from_millis(250));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut samples = std::collections::BTreeMap::new();
+
+        let mut first = super::sample_target(&super::ProcessTarget::Local, &stop).unwrap();
+        let first_at = Instant::now();
+        assert!(!super::apply_instantaneous_cpu(
+            &mut samples,
+            "local",
+            &mut first,
+            first_at,
+        ));
+
+        let top_child = Command::new("/usr/bin/top")
+            .args([
+                "-l",
+                "4",
+                "-s",
+                "1",
+                "-pid",
+                &pid.to_string(),
+                "-stats",
+                "pid,cpu",
+                "-o",
+                "cpu",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_secs(2));
+        let mut second = super::sample_target(&super::ProcessTarget::Local, &stop).unwrap();
+        let sampled_at = Instant::now();
+        assert!(super::apply_instantaneous_cpu(
+            &mut samples,
+            "local",
+            &mut second,
+            sampled_at,
+        ));
+        let ours = second
+            .iter()
+            .find(|row| row.pid == pid)
+            .map(|row| row.cpu_percent)
+            .unwrap();
+
+        let top = top_child.wait_with_output().unwrap();
+        let system_cpu = String::from_utf8_lossy(&top.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                (fields.first().and_then(|value| value.parse::<u32>().ok()) == Some(pid))
+                    .then(|| fields.get(1)?.parse::<f64>().ok())
+                    .flatten()
+            })
+            .last()
+            .unwrap();
+        eprintln!("pid {pid}: mtop interval CPU {ours:.1}%, system top {system_cpu:.1}%");
+        assert!(
+            (ours - system_cpu).abs() <= 25.0,
+            "interval CPU differs from top: mtop={ours:.1}, top={system_cpu:.1}"
+        );
     }
 }

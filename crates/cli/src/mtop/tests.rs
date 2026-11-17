@@ -63,18 +63,18 @@ fn node_task_counts_include_active_and_node_pinned_pending_jobs() {
 }
 
 #[test]
-fn cluster_agent_update_precedes_local_power_setup() {
+fn startup_checks_are_observational_only() {
     assert_eq!(
-        super::startup_preparation(true, true),
-        super::StartupPreparation::UpdateAgents
+        super::startup_observation(true, true),
+        super::StartupObservation::AgentUpdatePending
     );
     assert_eq!(
-        super::startup_preparation(false, true),
-        super::StartupPreparation::SetupLocalPower
+        super::startup_observation(false, true),
+        super::StartupObservation::LocalPowerUnavailable
     );
     assert_eq!(
-        super::startup_preparation(false, false),
-        super::StartupPreparation::Continue
+        super::startup_observation(false, false),
+        super::StartupObservation::Continue
     );
 }
 

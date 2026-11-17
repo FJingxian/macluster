@@ -2,6 +2,7 @@
 **/controller.sqlite3
 **/agent-state.json
 **/*.log
+.macluster-share-id
 /docs/
 /.superpowers/
 /config/

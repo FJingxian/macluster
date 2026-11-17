@@ -307,7 +307,7 @@ macluster top                                  # Terminal dashboard
 macluster top --once                           # One-shot table
 ```
 
-In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast preview, then replace it with interval samples. The preview labels its average CPU and RSS memory.
+In the terminal: arrows or `j`/`k` select a node, Enter opens/closes process details, `c` sorts processes by CPU, `m` by memory, and `q` quits. Details first show a fast process preview, then replace it with interval CPU and RSS samples. The opening frame may still contain `ps` lifetime CPU averages under the same `CPU` heading, so treat it as provisional until the first interval refresh.
 
 CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, temperature, fan, and power readings depend on hardware/helper support; unavailable readings show `N/A`.
 

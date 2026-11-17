@@ -252,10 +252,10 @@ failures use bounded backoff rather than repeated forced detaches.
 To remove an SMB mapping:
 
 ```sh
-macluster node -umount mnt-0123456789abcdef
-macluster node -umount mnt-0123456789abcdef --force
-macluster node -umount mnt-0123456789abcdef --force --yes
-macluster node -umount mnt-0123456789abcdef --wait --timeout 60
+macluster node -umount 01234567
+macluster node -umount 01234567 --force
+macluster node -umount 01234567 --force --yes
+macluster node -umount 01234567 --wait --timeout 60
 ```
 
 The default is non-blocking: the mapping is removed immediately and the
@@ -287,7 +287,7 @@ Use `--update-credential` to validate and rotate the password before replacing t
 Inspect the mapping ID, canonical source URI, and local target with `mnode -l`. Remove a managed mount through either endpoint:
 
 ```sh
-macluster node -umount mnt-d2d3885d51b734dd
+macluster node -umount d2d3885d
 macluster node -umount smb://nas-user/data
 ```
 
@@ -321,8 +321,7 @@ CPU usage is summed across logical CPUs: an eight-CPU Mac can reach 800%. GPU, t
 | `macluster node --failed` | Unfinished enrollment/share/removal errors |
 | `macluster node -rm NODE_ID` | Remove an idle compute node; share servers need storage migration first |
 | `macluster node -rm NODE_ID --connect USER@IP[:PORT]` | Reach a moved node and verify its registered identity before removal |
-| `macluster node -rm share:SHARE_ID [--force]` | Remove a configured share or cancel incomplete setup; `--force` handles a mounted share still in use |
-| `macluster node -umount MAPPING_ID\|SOURCE_URI` | Detach a named NFS/SMB mount using the ID or source URI shown by `node -l` |
+| `macluster node -umount MAPPING_ID\|SOURCE_URI` | Detach a named NFS/SMB mount using the eight-character ID or source URI shown by `node -l` |
 | `macluster fans --status [--node ID]` | Fan policy and support |
 | `macluster fans --auto [--node ID]` | Linear 40–80°C temperature curve |
 | `macluster fans --power [--node ID]` | Logarithmic 40–80°C temperature curve |
